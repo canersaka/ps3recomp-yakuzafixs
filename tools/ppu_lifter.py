@@ -123,12 +123,17 @@ SOURCE_PREAMBLE = """\
  * redefining them is a hard error there -- only polyfill for real MSVC. */
 #ifndef __clang__
 static inline int __builtin_clz(unsigned int x) {
+    /* BSR leaves the index undefined for x==0; PowerPC cntlzw(0) is DEFINED
+     * as 32. Without the guard this returned 31 minus an uninitialized
+     * index for zero inputs. */
     unsigned long idx;
+    if (!x) return 32;
     _BitScanReverse(&idx, x);
     return 31 - (int)idx;
 }
 static inline int __builtin_clzll(unsigned long long x) {
     unsigned long idx;
+    if (!x) return 64;
     _BitScanReverse64(&idx, x);
     return 63 - (int)idx;
 }
@@ -623,8 +628,15 @@ class PPULifter:
             return f"ctx->gpr[{ra}] = (int64_t)(int32_t)ctx->gpr[{rs}];"
 
         if mn in ("cntlzw", "cntlzw."):
+            # cntlzw(0) is DEFINED as 32 on PowerPC; raw __builtin_clz(0) is
+            # UB (x86 BSR leaves the index undefined). cntlzd below already
+            # has the guard; mirror it. Sony's SPURS queue code gates its
+            # "queue was empty -> signal the waiting task" wakeup on
+            # cntlzw(pending)>>5, so an unguarded emission silently drops
+            # every such wakeup.
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{ra}] = __builtin_clz((uint32_t)ctx->gpr[{rs}]);"
+            return (f"ctx->gpr[{ra}] = (uint32_t)ctx->gpr[{rs}] ? "
+                    f"__builtin_clz((uint32_t)ctx->gpr[{rs}]) : 32;")
 
         if mn in ("cntlzd", "cntlzd."):
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
