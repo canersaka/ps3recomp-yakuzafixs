@@ -503,16 +503,25 @@ class PPULifter:
             return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((uint32_t){_imm(ops[1])} << 16);"
 
         if mn == "addi":
+            # Full 64-bit add (PowerISA): truncating to 32 bits corrupts any
+            # 64-bit pointer/counter arithmetic built with addi.
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)(ctx->gpr[{ra}] + {_imm(ops[2])});"
+            return f"ctx->gpr[{rd}] = ctx->gpr[{ra}] + (int64_t)({_imm(ops[2])});"
 
         if mn == "addis":
+            # 64-bit add of the sign-extended (imm << 16).
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)(ctx->gpr[{ra}] + ((uint32_t){_imm(ops[2])} << 16));"
+            return (f"ctx->gpr[{rd}] = ctx->gpr[{ra}] + "
+                    f"(int64_t)(int32_t)((uint32_t){_imm(ops[2])} << 16);")
 
         if mn == "addic" or mn == "addic.":
+            # 64-bit add + XER[CA] from the unsigned 64-bit carry-out
+            # (the old form truncated to 32 bits and never wrote CA).
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)(ctx->gpr[{ra}] + {_imm(ops[2])});"
+            return (f"{{ uint64_t _a = ctx->gpr[{ra}]; "
+                    f"uint64_t _r = _a + (uint64_t)(int64_t)({_imm(ops[2])}); "
+                    f"ctx->gpr[{rd}] = _r; "
+                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | ((_r < _a) ? (1u << 29) : 0u); }}")
 
         if mn in ("add", "add.", "addo", "addo."):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -527,20 +536,34 @@ class PPULifter:
             return f"ctx->gpr[{rd}] = ctx->gpr[{rb}] - ctx->gpr[{ra}];"
 
         if mn == "subfic":
+            # RT = EXTS(SI) - RA over the full 64 bits; XER[CA] = NOT borrow
+            # (carry-out of NOT(RA) + EXTS(SI) + 1, i.e. EXTS(SI) >= RA
+            # unsigned). The old form computed in 32 bits and never wrote CA.
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)({_imm(ops[2])} - (int32_t)ctx->gpr[{ra}]);"
+            return (f"{{ uint64_t _a = ctx->gpr[{ra}]; "
+                    f"uint64_t _b = (uint64_t)(int64_t)({_imm(ops[2])}); "
+                    f"ctx->gpr[{rd}] = _b - _a; "
+                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | ((_b >= _a) ? (1u << 29) : 0u); }}")
 
         if mn in ("neg", "neg."):
+            # 64-bit two's complement (neg of INT64_MIN stays INT64_MIN);
+            # the old 32-bit form zeroed the high word.
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)(-(int32_t)ctx->gpr[{ra}]);"
+            return f"ctx->gpr[{rd}] = (uint64_t)0 - ctx->gpr[{ra}];"
 
         if mn == "mulli":
+            # mulli is the low 64 bits of the full RA * EXTS(SI) product
+            # (PowerISA); a 32-bit multiply truncates it.
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((int32_t)ctx->gpr[{ra}] * {_imm(ops[2])});"
+            return (f"ctx->gpr[{rd}] = (uint64_t)((int64_t)ctx->gpr[{ra}] * "
+                    f"(int64_t)({_imm(ops[2])}));")
 
         if mn in ("mullw", "mullw."):
+            # Full 64-bit product of the sign-extended low words (PowerISA);
+            # multiplying as int32 truncates the high 32 bits of the result.
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((int32_t)ctx->gpr[{ra}] * (int32_t)ctx->gpr[{rb}]);"
+            return (f"ctx->gpr[{rd}] = (uint64_t)((int64_t)(int32_t)ctx->gpr[{ra}] * "
+                    f"(int64_t)(int32_t)ctx->gpr[{rb}]);")
 
         if mn in ("mulhw", "mulhw."):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -602,6 +625,11 @@ class PPULifter:
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return f"ctx->gpr[{ra}] = ~(ctx->gpr[{rs}] | ctx->gpr[{rb}]);"
 
+        if mn in ("eqv", "eqv."):
+            # eqv = complemented XOR (bitwise equivalence); was unhandled.
+            ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return f"ctx->gpr[{ra}] = ~(ctx->gpr[{rs}] ^ ctx->gpr[{rb}]);"
+
         if mn in ("andc", "andc."):
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return f"ctx->gpr[{ra}] = ctx->gpr[{rs}] & ~ctx->gpr[{rb}];"
@@ -650,11 +678,14 @@ class PPULifter:
             # the count to 5 bits, yielding a wrong nonzero value (breaks code
             # that shifts a mask to zero, e.g. binned allocators). Mirror sld.
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{ra}] = (int64_t)(int32_t)((ctx->gpr[{rb}] & 0x20) ? 0u : ((uint32_t)ctx->gpr[{rs}] << (ctx->gpr[{rb}] & 0x1F)));"
+            # slw/srw ZERO-extend: the rotate-and-mask definition clears the
+            # high 32 bits of RA. Sign-extending puts 0xFFFFFFFF in the high
+            # word whenever bit 31 of the 32-bit result is set.
+            return f"ctx->gpr[{ra}] = (uint64_t)((ctx->gpr[{rb}] & 0x20) ? 0u : ((uint32_t)ctx->gpr[{rs}] << (ctx->gpr[{rb}] & 0x1F)));"
 
         if mn in ("srw", "srw."):
             ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{ra}] = (int64_t)(int32_t)((ctx->gpr[{rb}] & 0x20) ? 0u : ((uint32_t)ctx->gpr[{rs}] >> (ctx->gpr[{rb}] & 0x1F)));"
+            return f"ctx->gpr[{ra}] = (uint64_t)((ctx->gpr[{rb}] & 0x20) ? 0u : ((uint32_t)ctx->gpr[{rs}] >> (ctx->gpr[{rb}] & 0x1F)));"
 
         if mn in ("sraw", "sraw."):
             # PPC sraw: for shift >= 32 the result is the sign bit replicated
