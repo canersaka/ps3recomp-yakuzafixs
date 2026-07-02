@@ -454,7 +454,9 @@ class SPULifter:
         if mn == "rdch":
             return f"{g(rt())} = spu_rdch(ctx, {_chan(ops[1])});"
         if mn == "rchcnt":
-            return f"{g(rt())} = spu_splat_u32(spu_rchcnt(ctx, {_chan(ops[1])}));"
+            # CBEA: the count lands in the PREFERRED word, remaining slots ZERO
+            # (splatting it is the spu_link bug class; RPCS3 = v128::from32r).
+            return f"{g(rt())} = spu_pref_u32(spu_rchcnt(ctx, {_chan(ops[1])}));"
         if mn == "wrch":
             # operands: channel, $rt
             return f"spu_wrch(ctx, {_chan(ops[0])}, {g(_reg(ops[1]))});"
@@ -468,7 +470,9 @@ class SPULifter:
             # recover it from the raw encoding (rt = bits 25-31 = raw & 0x7F).
             link_rt = insn.raw & 0x7F
             tgt = self._branch_target(insn)
-            link = f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X});"
+            # Link register: preferred word only, other slots ZERO (real HW /
+            # RPCS3 v128::from32r) -- splatting corrupts full-quadword link use.
+            link = f"{g(link_rt)} = spu_link(0x{addr + 4:X});"
             if tgt is not None:
                 self.call_targets.add(tgt)
                 return f"{link} {self.prefix}spu_func_{tgt:08X}(ctx);"
@@ -496,7 +500,7 @@ class SPULifter:
         if mn in ("bisl",):
             link_rt = insn.raw & 0x7F            # link reg dropped from operands
             tgt_reg = _reg(ops[0])
-            return (f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
+            return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
                     f"ctx->pc = {g(tgt_reg)}._u32[0]; spu_indirect_branch(ctx);")
         # biz/binz/bihz/bihnz: ops[0] = condition reg, ops[1] = target reg.
         if mn in ("biz", "binz", "bihz", "bihnz"):

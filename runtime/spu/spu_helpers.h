@@ -37,6 +37,19 @@ static inline int spu_clz32(uint32_t x) { return x ? __builtin_clz(x) : 32; }
 static inline u128 spu_splat_u32(uint32_t v) {
     u128 r; r._u32[0]=v; r._u32[1]=v; r._u32[2]=v; r._u32[3]=v; return r;
 }
+/* Link register value for brsl/bisl/bisled: the SPU writes the return address
+ * into the PREFERRED word (word 0) and ZEROS the other three slots (matches
+ * RPCS3 v128::from32r, SPUInterpreter.cpp BRSL). Splatting it (the old bug)
+ * corrupts any code that saves/reloads/operates on the full 128-bit link. */
+static inline u128 spu_link(uint32_t addr) {
+    u128 r; r._u32[0]=addr; r._u32[1]=0; r._u32[2]=0; r._u32[3]=0; return r;
+}
+/* Preferred-slot scalar: value in word 0, remaining slots ZERO. CBEA's scalar
+ * channel convention -- rchcnt returns the count this way (RPCS3 measured
+ * {1,0,0,0} where the old splat gave {1,1,1,1}). Same bug class as spu_link. */
+static inline u128 spu_pref_u32(uint32_t v) {
+    u128 r; r._u32[0]=v; r._u32[1]=0; r._u32[2]=0; r._u32[3]=0; return r;
+}
 static inline u128 spu_splat_u16(uint16_t v) {
     u128 r; for (int i=0;i<8;i++) r._u16[i]=v; return r;
 }
