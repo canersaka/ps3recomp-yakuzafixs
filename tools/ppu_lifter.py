@@ -1708,6 +1708,30 @@ class PPULifter:
                     f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
                     f"for(int i=0;i<4;i++) d[i]=a[i]==b[i]?~0u:0; }}")
 
+        # Vector compare greater-than, signed/unsigned, byte/half/word.
+        # Previously unhandled (fell to the TODO catch-all = silently skipped
+        # stores, so vD kept stale data). Dot forms set CR6 per the AltiVec
+        # PEM: bit0 (value 8) = all lanes true, bit2 (value 2) = all lanes
+        # false, written to CR field 6 (bits 4-7 of our packed ctx->cr).
+        vcmpgt_family = {
+            "vcmpgtsb": ("int8_t",   16), "vcmpgtsh": ("int16_t",  8),
+            "vcmpgtsw": ("int32_t",   4),
+            "vcmpgtub": ("uint8_t",  16), "vcmpgtuh": ("uint16_t", 8),
+            "vcmpgtuw": ("uint32_t",  4),
+        }
+        base_mn = mn.rstrip(".")
+        if base_mn in vcmpgt_family:
+            ety, n = vcmpgt_family[base_mn]
+            uty = ety.replace("int", "uint") if not ety.startswith("u") else ety
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            body = (f"{{ {ety}* a=({ety}*)&ctx->vr[{va}]; {ety}* b=({ety}*)&ctx->vr[{vb}]; "
+                    f"{uty}* d=({uty}*)&ctx->vr[{vd}]; int t=0; "
+                    f"for(int i=0;i<{n};i++){{ {uty} r=a[i]>b[i]?({uty})~({uty})0:0; d[i]=r; t+=r?1:0; }}")
+            if mn.endswith("."):
+                body += (f" uint32_t c6=(t=={n}?8u:0u)|(t==0?2u:0u); "
+                         f"ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);")
+            return body + " }"
+
         # ------- VMX integer arithmetic (generated from disasm decode table) -------
         # These are simple per-element operations on vector registers.
 
