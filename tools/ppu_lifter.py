@@ -116,6 +116,14 @@ SOURCE_PREAMBLE = """\
 #include <string.h>
 #include <math.h>
 
+/* The guest timebase (mftb/mftbu): one global monotonic clock scaled to the
+ * PS3's 79.8 MHz, provided by the runtime (runtime/syscalls/sys_timer.c). */
+#ifdef __cplusplus
+extern "C" uint64_t ppu_timebase_now(void);
+#else
+extern uint64_t ppu_timebase_now(void);
+#endif
+
 /* MSVC compatibility helpers */
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -1416,15 +1424,20 @@ class PPULifter:
                     f"ctx->gpr[{rd}] = (int64_t)(int16_t)vm_read16(ea); ctx->gpr[{ra}] = ea; }}")
 
         # ------- Move from time base -------
+        # THE guest clock. The old emission was a per-call-site static that
+        # advanced 16667 ticks PER READ -- not time: every site had a private
+        # counter that only moved when polled, so all guest elapsed-time math
+        # (media pacers, throttles, profilers, timeout loops) computed garbage
+        # from it. Real semantics: one global monotonic timebase at 79.8 MHz
+        # (runtime ppu_timebase_now, consistent with
+        # sys_time_get_timebase_frequency).
         if mn == "mftb":
             rd = _reg_idx(ops[0])
-            return (f"{{ static uint64_t tb = 79800000ULL; tb += 16667; "
-                    f"ctx->gpr[{rd}] = tb; }}")
+            return f"ctx->gpr[{rd}] = ppu_timebase_now();"
 
         if mn == "mftbu":
             rd = _reg_idx(ops[0])
-            return (f"{{ static uint64_t tb = 79800000ULL; tb += 16667; "
-                    f"ctx->gpr[{rd}] = (tb >> 32); }}")
+            return f"ctx->gpr[{rd}] = (ppu_timebase_now() >> 32);"
 
         # ------- Cache/sync ops (safe to no-op) -------
         # dcbz zeros a 128-byte cache line — MUST be implemented, not no-oped!
