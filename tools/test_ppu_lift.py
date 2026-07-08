@@ -502,6 +502,52 @@ def build_vcases():
 build_vcases()
 
 # ---------------------------------------------------------------------------
+# Reservation cases: lwarx/stwcx/ldarx/stdcx VALUE-verified CAS. These need a
+# real backing buffer (RCASES drives two lifted instructions in sequence
+# against it, with an optional simulated concurrent write in between) so they
+# get their own case list and driver section rather than reusing CASES.
+#
+# The case this is actually here to catch: a stwcx/stdcx whose EA still
+# matches the reservation but whose granule VALUE changed underneath it
+# (another processor's store landed between the lwarx/ldarx and the
+# stwcx/stdcx) must FAIL and leave that other store's value intact. An
+# address-only reservation check gets this wrong: it succeeds and clobbers
+# the concurrent writer's value with the stale one -- a lost-update race.
+# ---------------------------------------------------------------------------
+
+def x_resv(xo, rt, ra, rb, rc=0):
+    return (31 << 26) | (rt << 21) | (ra << 16) | (rb << 11) | (xo << 1) | rc
+
+RCASES = []  # dicts, see rcase() for fields
+
+def rcase(name, kind, ea, pre_val, store_val, expect_ok, writer_val=None, ea2=None, ra_reg=9,
+          no_load=False):
+    RCASES.append(dict(name=name, kind=kind, ea=ea, ea2=(ea2 if ea2 is not None else ea),
+                       pre_val=pre_val, writer_val=writer_val, store_val=store_val,
+                       expect_ok=expect_ok, ra_reg=ra_reg, no_load=no_load))
+
+def build_rcases():
+    RB = 10   # index register for both the load and store EA (base contribution via ra_reg)
+    RD, RS = 8, 11   # load destination / store source
+
+    # --- 32-bit: lwarx / stwcx. ---
+    rcase("stwcx basic success", "w", 0x2000, 0x11223344, 0xAABBCCDD, True)
+    rcase("stwcx race fails (concurrent writer)", "w", 0x2000, 0x11223344, 0xAABBCCDD, False,
+          writer_val=0x99999999)
+    rcase("stwcx no reservation fails", "w", 0x2004, 0x55667788, 0xAABBCCDD, False, no_load=True)
+    rcase("stwcx wrong address fails", "w", 0x2000, 0x11223344, 0xAABBCCDD, False, ea2=0x2010)
+    rcase("stwcx ra=0 literal EA success", "w", 0x2000, 0x11223344, 0xAABBCCDD, True, ra_reg=0)
+
+    # --- 64-bit: ldarx / stdcx. ---
+    rcase("stdcx basic success", "d", 0x2000, 0x1122334455667788, 0xAABBCCDDEEFF0011, True)
+    rcase("stdcx race fails (concurrent writer)", "d", 0x2000, 0x1122334455667788,
+          0xAABBCCDDEEFF0011, False, writer_val=0x9999999999999999)
+    rcase("stdcx no reservation fails", "d", 0x2008, 0x5566778899AABBCC,
+          0xAABBCCDDEEFF0011, False, no_load=True)
+
+build_rcases()
+
+# ---------------------------------------------------------------------------
 # C driver generation
 # ---------------------------------------------------------------------------
 
@@ -548,6 +594,37 @@ static void check_vr(const char* name, const uint8_t* got, const uint8_t* want) 
         printf("\\n");
         g_fail++;
     } else g_pass++;
+}
+static void check_mem_be32(const char* name, const uint8_t* p, uint32_t want) {
+    uint32_t got = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+    if (got != want) {
+        printf("FAIL %s: mem32 = 0x%08X want 0x%08X\\n", name, got, want);
+        g_fail++;
+    } else g_pass++;
+}
+static void check_mem_be64(const char* name, const uint8_t* p, uint64_t want) {
+    uint64_t got = 0;
+    for (int i = 0; i < 8; i++) got = (got << 8) | p[i];
+    if (got != want) {
+        printf("FAIL %s: mem64 = 0x%016llX want 0x%016llX\\n", name,
+               (unsigned long long)got, (unsigned long long)want);
+        g_fail++;
+    } else g_pass++;
+}
+
+/* Backing store for vm_base -- RCASES need a real addressable buffer, unlike
+ * the register-only CASES/VCASES above. */
+#define G_MEM_SIZE 0x4000
+static uint8_t g_mem[G_MEM_SIZE];
+uint8_t* vm_base = g_mem;
+
+static void mem_put_be32(uint32_t ea, uint32_t v) {
+    uint8_t* p = g_mem + ea;
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
+}
+static void mem_put_be64(uint32_t ea, uint64_t v) {
+    uint8_t* p = g_mem + ea;
+    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (56 - 8 * i));
 }
 """)
     out.append("int main(void) {")
@@ -620,6 +697,73 @@ static void check_vr(const char* name, const uint8_t* got, const uint8_t* want) 
                     f'check_vr("{nm}", (const uint8_t*)&ctx->vr[{c["vd_reg"]}], _want); }}')
         out.append("    }")
 
+    RB = 10
+    RD, RS = 8, 11
+    for i, c in enumerate(RCASES):
+        is64 = c["kind"] == "d"
+        load_mn = "ldarx" if is64 else "lwarx"
+        store_mn = "stdcx." if is64 else "stwcx."
+        load_word = x_resv(84 if is64 else 20, RD, c["ra_reg"], RB, rc=0)
+        store_word = x_resv(214 if is64 else 150, RS, c["ra_reg"], RB, rc=1)
+
+        load_code = None
+        if not c["no_load"]:
+            insn = ppu_disasm.decode(load_word, 0x40000 + i * 8)
+            if insn.mnemonic != load_mn:
+                print(f"ENCODING mismatch for {c['name']!r} (load): decoded as "
+                      f"{insn.mnemonic} {insn.operands} -- case skipped")
+                n_encoding_skipped += 1
+                continue
+            load_code = lifter._translate(insn, dummy)
+            if load_code.startswith("/*"):
+                print(f"UNHANDLED by lifter: {c['name']!r} (load) -> {load_code[:60]} -- case skipped")
+                n_encoding_skipped += 1
+                continue
+
+        insn2 = ppu_disasm.decode(store_word, 0x40000 + i * 8 + 4)
+        if insn2.mnemonic != store_mn:
+            print(f"ENCODING mismatch for {c['name']!r} (store): decoded as "
+                  f"{insn2.mnemonic} {insn2.operands} -- case skipped")
+            n_encoding_skipped += 1
+            continue
+        store_code = lifter._translate(insn2, dummy)
+        if store_code.startswith("/*"):
+            print(f"UNHANDLED by lifter: {c['name']!r} (store) -> {store_code[:60]} -- case skipped")
+            n_encoding_skipped += 1
+            continue
+
+        nm = c["name"].replace('"', "'")
+        put = "mem_put_be64" if is64 else "mem_put_be32"
+        chk = "check_mem_be64" if is64 else "check_mem_be32"
+        width_mask = "0xFFFFFFFFFFFFFFFFULL" if is64 else "0xFFFFFFFFULL"
+        exp_mem = c["store_val"] if c["expect_ok"] else (
+            c["writer_val"] if c["writer_val"] is not None else c["pre_val"])
+
+        out.append(f'    {{ /* rcase {i}: {nm} | {load_mn if load_code else "(no load)"} + {store_mn} */')
+        out.append("      memset(ctx, 0, sizeof(*ctx));")
+        out.append(f"      {put}(0x{c['ea']:X}, 0x{c['pre_val']:X}ULL & {width_mask});")
+        if c["ea2"] != c["ea"]:
+            out.append(f"      {put}(0x{c['ea2']:X}, 0x{c['pre_val']:X}ULL & {width_mask});")
+        if c["ra_reg"] == 0:
+            # PPC rule: rA=0 means the literal 0, not GPR r0's contents --
+            # seed r0 with garbage so a lifter bug that reads ctx->gpr[0]
+            # anyway produces a visibly wrong EA.
+            out.append("      ctx->gpr[0] = 0xDEADBEEFDEADBEEFULL;")
+        else:
+            out.append(f"      ctx->gpr[{c['ra_reg']}] = 0;")
+        if load_code:
+            out.append(f"      ctx->gpr[{RB}] = 0x{c['ea']:X}ULL;")
+            out.append(f"      {load_code}")
+            if c["writer_val"] is not None:
+                out.append(f"      {put}(0x{c['ea']:X}, 0x{c['writer_val']:X}ULL & {width_mask});"
+                           "  /* simulated concurrent writer, between lwarx/ldarx and stwcx/stdcx */")
+        out.append(f"      ctx->gpr[{RB}] = 0x{c['ea2']:X}ULL;")
+        out.append(f"      ctx->gpr[{RS}] = 0x{c['store_val']:X}ULL;")
+        out.append(f"      {store_code}")
+        out.append(f'      check_cr("{nm}", ctx->cr, {2 if c["expect_ok"] else 0}, 28);')
+        out.append(f'      {chk}("{nm}", g_mem + 0x{c["ea2"]:X}, 0x{exp_mem:X}ULL & {width_mask});')
+        out.append("    }")
+
     out.append("""
     printf("\\n[ppu-conformance] %d checks passed, %d FAILED, %d skipped\\n",
            g_pass, g_fail, g_skip);
@@ -628,7 +772,7 @@ static void check_vr(const char* name, const uint8_t* got, const uint8_t* want) 
 """)
     with open(path, "w") as f:
         f.write("\n".join(out))
-    n_total = len(CASES) + len(VCASES)
+    n_total = len(CASES) + len(VCASES) + len(RCASES)
     print(f"wrote {path}: {n_total - n_encoding_skipped} cases "
           f"({n_encoding_skipped} skipped at generation)")
 
