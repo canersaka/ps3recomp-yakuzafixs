@@ -502,6 +502,69 @@ def build_vcases():
 build_vcases()
 
 # ---------------------------------------------------------------------------
+# Memory-backed cases: stvlx/stvrx/stvlxl/stvrxl (Cell unaligned vector
+# stores). These were previously undecoded entirely (ppu_disasm fell through
+# to the op31_x catch-all, which the lifter lifts as a TODO no-op) -- a
+# silent memory non-write, not merely a wrong value, so this needs an actual
+# backing buffer at vm_base to observe (a register-only CASES entry can't
+# catch "nothing was written"). MCASES exercise the real emitted memcpy/loop
+# against a guest quadword straddling the EA, both the store bytes AND the
+# untouched bytes outside the stored range (a byte-off-by-one here would
+# corrupt an adjacent field in real vector code).
+# ---------------------------------------------------------------------------
+
+def stvx_x(xo, vs, ra, rb):
+    return (31 << 26) | (vs << 21) | (ra << 16) | (rb << 11) | (xo << 1)
+
+MCASES = []  # dicts: name, word, ra_val, rb_val, ra_reg, vs_bytes, pre_mem(16), exp_mem(16)
+
+def mcase(name, word, ra_reg, ra_val, rb_val, vs_bytes, pre_mem, exp_mem):
+    MCASES.append(dict(name=name, word=word, ra_reg=ra_reg, ra_val=ra_val, rb_val=rb_val,
+                       vs_bytes=vs_bytes, pre_mem=pre_mem, exp_mem=exp_mem))
+
+def build_mcases():
+    VS, RA, RB = 3, 6, 7
+    vs_bytes = bytes(range(0x10, 0x20))          # vS = 0x10..0x1F, one byte per lane
+    pre = bytes(range(0xA0, 0xB0))                # pre-existing quadword content 0xA0..0xAF
+    BASE = 0x1000                                  # 16-aligned guest EA the quadword lives at
+
+    for sh in (0, 5, 15):
+        ea = BASE + sh
+        # stvlx: bytes [sh..15] of the quadword <- vS[0 .. 15-sh]; [0..sh-1] untouched.
+        exp = bytearray(pre)
+        for i in range(sh, 16):
+            exp[i] = vs_bytes[i - sh]
+        mcase(f"stvlx sh={sh}", stvx_x(647, VS, RA, RB), RA, BASE, sh, vs_bytes, pre, bytes(exp))
+        # stvrx: bytes [0..sh-1] of the quadword <- vS[16-sh .. 15]; [sh..15] untouched.
+        exp2 = bytearray(pre)
+        for i in range(0, sh):
+            exp2[i] = vs_bytes[16 - sh + i]
+        mcase(f"stvrx sh={sh}", stvx_x(679, VS, RA, RB), RA, BASE, sh, vs_bytes, pre, bytes(exp2))
+
+    # Cache-hint forms (stvlxl/stvrxl): same data semantics as stvlx/stvrx --
+    # one representative case each confirms decode + lifter route them
+    # through the same emission, not the op31_x TODO fallback.
+    sh = 3
+    exp = bytearray(pre)
+    for i in range(sh, 16):
+        exp[i] = vs_bytes[i - sh]
+    mcase(f"stvlxl sh={sh}", stvx_x(903, VS, RA, RB), RA, BASE, sh, vs_bytes, pre, bytes(exp))
+    exp2 = bytearray(pre)
+    for i in range(0, sh):
+        exp2[i] = vs_bytes[16 - sh + i]
+    mcase(f"stvrxl sh={sh}", stvx_x(935, VS, RA, RB), RA, BASE, sh, vs_bytes, pre, bytes(exp2))
+
+    # rA=0: PPC indexed addressing rule -- an rA field of 0 means the literal
+    # value 0, not GPR r0's contents. EA must come from rB alone.
+    sh = 4
+    exp = bytearray(pre)
+    for i in range(sh, 16):
+        exp[i] = vs_bytes[i - sh]
+    mcase("stvlx ra=0", stvx_x(647, VS, 0, RB), 0, 0, BASE + sh, vs_bytes, pre, bytes(exp))
+
+build_mcases()
+
+# ---------------------------------------------------------------------------
 # C driver generation
 # ---------------------------------------------------------------------------
 
@@ -549,6 +612,22 @@ static void check_vr(const char* name, const uint8_t* got, const uint8_t* want) 
         g_fail++;
     } else g_pass++;
 }
+static void check_mem(const char* name, const uint8_t* got, const uint8_t* want, int n) {
+    if (memcmp(got, want, n) != 0) {
+        printf("FAIL %s: mem =", name);
+        for (int i = 0; i < n; i++) printf(" %02X", got[i]);
+        printf(" want");
+        for (int i = 0; i < n; i++) printf(" %02X", want[i]);
+        printf("\\n");
+        g_fail++;
+    } else g_pass++;
+}
+
+/* Backing store for vm_base -- the memory-op cases (MCASES) need a real
+ * addressable buffer, unlike the register-only CASES/VCASES above. */
+#define G_MEM_SIZE 0x2000
+static uint8_t g_mem[G_MEM_SIZE];
+uint8_t* vm_base = g_mem;
 """)
     out.append("int main(void) {")
     out.append("    ppu_context* ctx = &g_ctx;")
@@ -620,6 +699,42 @@ static void check_vr(const char* name, const uint8_t* got, const uint8_t* want) 
                     f'check_vr("{nm}", (const uint8_t*)&ctx->vr[{c["vd_reg"]}], _want); }}')
         out.append("    }")
 
+    for i, c in enumerate(MCASES):
+        insn = ppu_disasm.decode(c["word"], 0x30000 + i * 4)
+        exp_mn = c["name"].split()[0]
+        if insn.mnemonic != exp_mn:
+            print(f"ENCODING mismatch for {c['name']!r}: decoded as "
+                  f"{insn.mnemonic} {insn.operands} (word {c['word']:#010x}) -- case skipped")
+            n_encoding_skipped += 1
+            continue
+        code = lifter._translate(insn, dummy)
+        if code.startswith("/*"):
+            print(f"UNHANDLED by lifter: {c['name']!r} -> {code[:60]} -- case skipped")
+            n_encoding_skipped += 1
+            continue
+        nm = c["name"].replace('"', "'")
+        vs_hex = ", ".join(f"0x{b:02X}" for b in c["vs_bytes"])
+        pre_hex = ", ".join(f"0x{b:02X}" for b in c["pre_mem"])
+        want_hex = ", ".join(f"0x{b:02X}" for b in c["exp_mem"])
+        base = 0x1000   # matches BASE in build_mcases(); quadword lives at g_mem[0x1000..0x100F]
+        out.append(f'    {{ /* mcase {i}: {nm} | {insn.mnemonic} {insn.operands} */')
+        out.append("      memset(ctx, 0, sizeof(*ctx));")
+        out.append(f"      memset(g_mem, 0xCC, G_MEM_SIZE);")
+        out.append(f"      {{ uint8_t _pre[16] = {{ {pre_hex} }}; memcpy(g_mem + 0x{base:X}, _pre, 16); }}")
+        out.append(f"      {{ uint8_t _vs[16] = {{ {vs_hex} }}; memcpy(&ctx->vr[{3}], _vs, 16); }}")
+        if c["ra_reg"] == 0:
+            # PPC rule: rA=0 in indexed addressing means the literal 0, not
+            # GPR r0's contents -- seed r0 with garbage so a lifter bug that
+            # reads ctx->gpr[0] anyway produces a visibly wrong EA/store.
+            out.append("      ctx->gpr[0] = 0xDEADBEEFDEADBEEFULL;")
+        else:
+            out.append(f"      ctx->gpr[{c['ra_reg']}] = 0x{c['ra_val']:X}ULL;")
+        out.append(f"      ctx->gpr[7] = 0x{c['rb_val']:X}ULL;")
+        out.append(f"      {code}")
+        out.append(f"      {{ uint8_t _want[16] = {{ {want_hex} }}; "
+                    f'check_mem("{nm}", g_mem + 0x{base:X}, _want, 16); }}')
+        out.append("    }")
+
     out.append("""
     printf("\\n[ppu-conformance] %d checks passed, %d FAILED, %d skipped\\n",
            g_pass, g_fail, g_skip);
@@ -628,7 +743,7 @@ static void check_vr(const char* name, const uint8_t* got, const uint8_t* want) 
 """)
     with open(path, "w") as f:
         f.write("\n".join(out))
-    n_total = len(CASES) + len(VCASES)
+    n_total = len(CASES) + len(VCASES) + len(MCASES)
     print(f"wrote {path}: {n_total - n_encoding_skipped} cases "
           f"({n_encoding_skipped} skipped at generation)")
 
