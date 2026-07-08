@@ -116,6 +116,28 @@ SOURCE_PREAMBLE = """\
 #include <string.h>
 #include <math.h>
 
+/* Float->int conversion per Book I 4.6.7: SATURATE out-of-range (positive
+ * overflow => max, negative => min, NaN => min) and honor the rounding mode
+ * (rn=1: FPSCR default round-to-nearest-even via nearbyint; rn=0: the z
+ * forms truncate). A plain C cast here is UB on overflow/NaN and MSVC
+ * sign-flips positive overflow to INT_MIN on x86. */
+static inline uint32_t ppu_f2i32(double v, int rn)
+{
+    if (v != v) return 0x80000000u;
+    double r = rn ? nearbyint(v) : trunc(v);
+    if (r >= 2147483647.0)  return 0x7FFFFFFFu;
+    if (r <= -2147483648.0) return 0x80000000u;
+    return (uint32_t)(int32_t)r;
+}
+static inline uint64_t ppu_f2i64(double v, int rn)
+{
+    if (v != v) return 0x8000000000000000ULL;
+    double r = rn ? nearbyint(v) : trunc(v);
+    if (r >= 9223372036854775807.0)  return 0x7FFFFFFFFFFFFFFFULL;
+    if (r <= -9223372036854775808.0) return 0x8000000000000000ULL;
+    return (uint64_t)(int64_t)r;
+}
+
 /* The guest timebase (mftb/mftbu): one global monotonic clock scaled to the
  * PS3's 79.8 MHz, provided by the runtime (runtime/syscalls/sys_timer.c). */
 #ifdef __cplusplus
@@ -1143,6 +1165,14 @@ class PPULifter:
             fra = _reg_idx(ops[1])
             frb = _reg_idx(ops[2])
             op_c = fp_binary[mn_base]
+            # Book I 4.6.5: the single forms (fadds/fsubs/fmuls/fdivs) round
+            # the result to single precision before storing back to the
+            # 64-bit FPR; keeping the double intermediate diverges from real
+            # HW (breaks exact-compare/convergence idioms and oracle
+            # comparability against a real PPU).
+            if mn_base.endswith("s"):
+                return (f"ctx->fpr[{frd}] = (double)(float)"
+                        f"(ctx->fpr[{fra}] {op_c} ctx->fpr[{frb}]);")
             return f"ctx->fpr[{frd}] = ctx->fpr[{fra}] {op_c} ctx->fpr[{frb}];"
 
         if mn_base in ("fmr",):
@@ -1165,39 +1195,62 @@ class PPULifter:
             frb = _reg_idx(ops[1])
             return f"ctx->fpr[{frd}] = -fabs(ctx->fpr[{frb}]);"
 
+        # The single fused forms (fmadds/fmsubs/fnmadds/fnmsubs) round to
+        # single precision too (same Book I 4.6.5 rule as fp_binary above).
         if mn_base in ("fmadd", "fmadds"):
             frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
-            return f"ctx->fpr[{frd}] = ctx->fpr[{fra}] * ctx->fpr[{frc}] + ctx->fpr[{frb}];"
+            expr = f"ctx->fpr[{fra}] * ctx->fpr[{frc}] + ctx->fpr[{frb}]"
+            if mn_base.endswith("s"):
+                return f"ctx->fpr[{frd}] = (double)(float)({expr});"
+            return f"ctx->fpr[{frd}] = {expr};"
 
         if mn_base in ("fmsub", "fmsubs"):
             frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
-            return f"ctx->fpr[{frd}] = ctx->fpr[{fra}] * ctx->fpr[{frc}] - ctx->fpr[{frb}];"
+            expr = f"ctx->fpr[{fra}] * ctx->fpr[{frc}] - ctx->fpr[{frb}]"
+            if mn_base.endswith("s"):
+                return f"ctx->fpr[{frd}] = (double)(float)({expr});"
+            return f"ctx->fpr[{frd}] = {expr};"
 
         if mn_base in ("fnmadd", "fnmadds"):
             frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
-            return f"ctx->fpr[{frd}] = -(ctx->fpr[{fra}] * ctx->fpr[{frc}] + ctx->fpr[{frb}]);"
+            expr = f"-(ctx->fpr[{fra}] * ctx->fpr[{frc}] + ctx->fpr[{frb}])"
+            if mn_base.endswith("s"):
+                return f"ctx->fpr[{frd}] = (double)(float)({expr});"
+            return f"ctx->fpr[{frd}] = {expr};"
 
         if mn_base in ("fnmsub", "fnmsubs"):
             frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
-            return f"ctx->fpr[{frd}] = -(ctx->fpr[{fra}] * ctx->fpr[{frc}] - ctx->fpr[{frb}]);"
+            expr = f"-(ctx->fpr[{fra}] * ctx->fpr[{frc}] - ctx->fpr[{frb}])"
+            if mn_base.endswith("s"):
+                return f"ctx->fpr[{frd}] = (double)(float)({expr});"
+            return f"ctx->fpr[{frd}] = {expr};"
 
         if mn_base in ("frsp",):
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
             return f"ctx->fpr[{frd}] = (float)ctx->fpr[{frb}];"
 
+        # Book I 4.6.7 float->int: SATURATE (>max => max, <min => min,
+        # NaN => min) and fctiw/fctid round per FPSCR[RN] (default nearest-
+        # even) where the z forms truncate. A plain C cast is UB on
+        # NaN/inf/overflow (MSVC: sign-flips positive overflow). Helpers in
+        # the preamble (ppu_f2i32/ppu_f2i64; nearbyint = host default
+        # rounding = nearest-even, matching the FPSCR default titles
+        # normally never change).
         if mn_base in ("fctiw", "fctiwz"):
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
-            return (f"{{ int32_t iv = (int32_t)ctx->fpr[{frb}]; uint64_t tmp; "
+            rn = 0 if mn_base.endswith("z") else 1
+            return (f"{{ uint32_t iv = ppu_f2i32(ctx->fpr[{frb}], {rn}); uint64_t tmp; "
                     f"memcpy(&tmp, &ctx->fpr[{frd}], 8); "
-                    f"tmp = (tmp & 0xFFFFFFFF00000000ULL) | (uint32_t)iv; "
+                    f"tmp = (tmp & 0xFFFFFFFF00000000ULL) | iv; "
                     f"memcpy(&ctx->fpr[{frd}], &tmp, 8); }}")
 
         if mn_base in ("fctid", "fctidz"):
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
-            return (f"{{ int64_t iv = (int64_t)ctx->fpr[{frb}]; "
+            rn = 0 if mn_base.endswith("z") else 1
+            return (f"{{ uint64_t iv = ppu_f2i64(ctx->fpr[{frb}], {rn}); "
                     f"memcpy(&ctx->fpr[{frd}], &iv, 8); }}")
 
         if mn_base in ("fcfid",):
@@ -1209,16 +1262,22 @@ class PPULifter:
         if mn_base == "fsqrt" or mn_base == "fsqrts":
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
+            if mn_base.endswith("s"):
+                return f"ctx->fpr[{frd}] = (double)(float)sqrt(ctx->fpr[{frb}]);"
             return f"ctx->fpr[{frd}] = sqrt(ctx->fpr[{frb}]);"
 
         if mn_base in ("frsqrte", "frsqrtes"):
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
+            if mn_base == "frsqrtes":
+                return f"ctx->fpr[{frd}] = (double)(float)(1.0 / sqrt(ctx->fpr[{frb}]));"
             return f"ctx->fpr[{frd}] = 1.0 / sqrt(ctx->fpr[{frb}]);"
 
         if mn_base in ("fre", "fres"):
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
+            if mn_base == "fres":
+                return f"ctx->fpr[{frd}] = (double)(float)(1.0 / ctx->fpr[{frb}]);"
             return f"ctx->fpr[{frd}] = 1.0 / ctx->fpr[{frb}];"
 
         if mn_base == "fsel":
@@ -1236,8 +1295,11 @@ class PPULifter:
                 fra = _reg_idx(ops[0])
                 frb = _reg_idx(ops[1])
             shift = (7 - bf) * 4
+            # Book I 4.6.8: either operand NaN => c = 0b0001 (FU/unordered).
+            # Mapping NaN to EQ steers every cror-composed >=/<= the wrong
+            # way on a NaN-poisoned float.
             return (f"{{ double a = ctx->fpr[{fra}]; double b = ctx->fpr[{frb}]; "
-                    f"uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; "
+                    f"uint32_t cr_val = (a != a || b != b) ? 1 : (a < b) ? 8 : (a > b) ? 4 : 2; "
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
         # ------- 64-bit multiply / divide -------
@@ -1945,13 +2007,21 @@ class PPULifter:
             return (f"{{ float* d=(float*)&ctx->vr[{vd}]; {src_ty}* b=({src_ty}*)&ctx->vr[{vb}]; "
                     f"for(int i=0;i<4;i++) d[i]=(float)b[i]{scale}; }}")
 
+        # PEM vctsxs/vctuxs: SATURATE out-of-range (a plain cast is UB and
+        # sign-flips positive overflow on x86); NaN => 0.
         if mn == "vctsxs" or mn == "vctuxs":
             vd, vb = int(ops[0][1:]), int(ops[1][1:])
             uimm = int(ops[2]) if len(ops) > 2 and not ops[2].startswith("v") else 0
             dst_ty = "int32_t" if mn == "vctsxs" else "uint32_t"
             scale = f" * {1 << uimm}.0f" if uimm > 0 else ""
+            if mn == "vctsxs":
+                sat = ("(v!=v) ? 0 : (v>=2147483647.0f) ? 2147483647 : "
+                       "(v<=-2147483648.0f) ? (-2147483647-1) : (int32_t)v")
+            else:
+                sat = ("(v!=v) ? 0u : (v>=4294967295.0f) ? 4294967295u : "
+                       "(v<=0.0f) ? 0u : (uint32_t)v")
             return (f"{{ {dst_ty}* d=({dst_ty}*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=({dst_ty})(b[i]{scale}); }}")
+                    f"for(int i=0;i<4;i++){{ float v=b[i]{scale}; d[i]=({sat}); }} }}")
 
         # Compare with Rc (vcmpeqfp., vcmpgefp., etc.)
         if mn.startswith("vcmpbfp"):
