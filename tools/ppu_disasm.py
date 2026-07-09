@@ -938,6 +938,13 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             266: "vrefp", 330: "vrsqrtefp",
             1034: "vmaxfp", 1098: "vminfp",
             714: "vrfim",  # round to FP integer toward -inf (floor)
+            # The other three round-to-FP-integer forms (PEM 6-126..6-128) plus
+            # the two base-2 estimates (PEM 6-42/6-43), same VX shape as vrfim.
+            394: "vexptefp",  # 2^x estimate
+            458: "vlogefp",   # log2(x) estimate
+            522: "vrfin",     # round to nearest
+            586: "vrfiz",     # round toward zero
+            650: "vrfip",     # round toward +inf
 
             # Integer add/sub
             0: "vaddubm", 64: "vadduhm", 128: "vadduwm",

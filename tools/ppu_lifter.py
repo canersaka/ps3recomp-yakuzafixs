@@ -1996,6 +1996,25 @@ class PPULifter:
                     f"float r[4]; for(int i=0;i<4;i++) r[i]=floorf(vrf(b,i)); "
                     f"for(int i=0;i<4;i++) vstf(d,i,r[i]); }}")
 
+        # The other three round-to-FP-integer forms (AltiVec PEM 6-126..6-128):
+        # nearest, toward zero, toward +inf. Same vD,vB shape as vrfim above,
+        # routed through vrf/vstf the same way.
+        if mn in ("vrfin", "vrfiz", "vrfip"):
+            vd, vb = int(ops[0][1:]), int(ops[-1][1:])
+            fn = {"vrfin": "nearbyintf", "vrfiz": "truncf", "vrfip": "ceilf"}[mn]
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* b=&ctx->vr[{vb}]; "
+                    f"float r[4]; for(int i=0;i<4;i++) r[i]={fn}(vrf(b,i)); "
+                    f"for(int i=0;i<4;i++) vstf(d,i,r[i]); }}")
+
+        # 2**x / log2(x) estimates (AltiVec PEM 6-42/6-43). Same vD,vB shape,
+        # same vrf/vstf routing.
+        if mn in ("vexptefp", "vlogefp"):
+            vd, vb = int(ops[0][1:]), int(ops[-1][1:])
+            fn = "exp2f" if mn == "vexptefp" else "log2f"
+            return (f"{{ void* d=&ctx->vr[{vd}]; void* b=&ctx->vr[{vb}]; "
+                    f"float r[4]; for(int i=0;i<4;i++) r[i]={fn}(vrf(b,i)); "
+                    f"for(int i=0;i<4;i++) vstf(d,i,r[i]); }}")
+
         # Float/int convert (operand form "vD, vB, UIMM" — UIMM is a bare int).
         # Word/float lanes are reinterpreted on both sides: read via vrw
         # (vcfsx/vcfux) or vrf (vctsxs/vctuxs), write via vstf/vstw.

@@ -26,6 +26,7 @@ need a vm stub harness).
 """
 
 import argparse
+import math
 import os
 import random
 import struct
@@ -224,6 +225,24 @@ def ref_vupkhsb(vb16):
 def ref_vupklsb(vb16):
     bytes8 = struct.unpack(">8b", vb16[8:16])        # low 8 bytes (byte lanes: order-agnostic)
     return struct.pack(">8h", *bytes8)
+
+# --- vrfin/vrfiz/vrfip/vexptefp/vlogefp: like vrfim/vrefp/vrsqrtefp (see
+# ppu_lifter.py), these route through the vrf/vstf big-endian lane accessors
+# (ppu-vmx-lane-byteorder), so the true guest float value is what gets
+# rounded/exponentiated. '>4f' (big-endian) is what predicts that, not '<4f'
+# (host order) -- an older version of this branch modeled the pre-fix
+# byte-reversed convention as "correct"; it wasn't, same bug class the lane
+# fix addresses everywhere else.
+def ref_vrfin(vb16):   # round to nearest, ties to even (PEM 6-126)
+    return struct.pack(">4f", *[round(v) for v in struct.unpack(">4f", vb16)])
+def ref_vrfiz(vb16):   # round toward zero (PEM 6-128)
+    return struct.pack(">4f", *[math.trunc(v) for v in struct.unpack(">4f", vb16)])
+def ref_vrfip(vb16):   # round toward +inf (PEM 6-127)
+    return struct.pack(">4f", *[math.ceil(v) for v in struct.unpack(">4f", vb16)])
+def ref_vexptefp(vb16):   # 2**x estimate (PEM 6-42); exact for power-of-two inputs
+    return struct.pack(">4f", *[2.0 ** v for v in struct.unpack(">4f", vb16)])
+def ref_vlogefp(vb16):    # log2(x) estimate (PEM 6-43); exact for power-of-two inputs
+    return struct.pack(">4f", *[math.log2(v) for v in struct.unpack(">4f", vb16)])
 
 def cr_nibble_signed(a, b):
     if s64(a) < s64(b): return 8
@@ -577,6 +596,22 @@ def build_vcases():
     vcase("vsplth w=3 canary", vx_form(588, 2, 3, 5),
           5, be_h([0x1234, 0x5678, 0x9ABC, 0xDEF0, 0x1111, 0x2222, 0x3333, 0x4444]),
           2, be_h([0xDEF0] * 8))
+
+    # vrfin/vrfiz/vrfip: a tie (1.5, -1.5), a plain fraction (2.7) and a
+    # whole number (-3.0, an identity check for all three) so round/trunc/
+    # ceil each disagree with at least one sibling on at least one lane.
+    # xo=522/586/650 in the vmx_vx table (vD, vB shape, same as vrfim).
+    vb_round = be_f([1.5, -1.5, 2.7, -3.0])
+    vcase("vrfin round-forms", vx_form(522, VD, 0, VB), VB, vb_round, VD, ref_vrfin(vb_round))
+    vcase("vrfiz round-forms", vx_form(586, VD, 0, VB), VB, vb_round, VD, ref_vrfiz(vb_round))
+    vcase("vrfip round-forms", vx_form(650, VD, 0, VB), VB, vb_round, VD, ref_vrfip(vb_round))
+
+    # vexptefp/vlogefp: power-of-two inputs so 2**x / log2(x) land on exactly
+    # representable float32 values (no estimate-error tolerance needed).
+    vb_exp = be_f([0.0, 1.0, 3.0, -2.0])
+    vcase("vexptefp powers-of-two", vx_form(394, VD, 0, VB), VB, vb_exp, VD, ref_vexptefp(vb_exp))
+    vb_log = be_f([1.0, 2.0, 8.0, 0.25])
+    vcase("vlogefp powers-of-two", vx_form(458, VD, 0, VB), VB, vb_log, VD, ref_vlogefp(vb_log))
 
 build_vcases()
 
