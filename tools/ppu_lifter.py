@@ -2175,6 +2175,22 @@ class PPULifter:
             return (f"{{ void* d=&ctx->vr[{vd}]; void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; "
                     f"for(int i=0;i<4;i++) vstw(d,i,(uint32_t)((int32_t)(int16_t)vrh(a,2*i+1)*(int32_t)(int16_t)vrh(b,2*i+1))); }}")
 
+        # Integer multiply (odd/even unsigned BYTE), mirroring vmulouh/
+        # vmuleuh's even/odd lane pairing exactly (even = storage index 2*i,
+        # odd = storage index 2*i+1), just one width narrower: byte sources
+        # are single-byte lanes so a raw uint8_t* read is fine (no swap
+        # needed), but the halfword PRODUCT (max 255*255=65025, straddles a
+        # byte) must be written through vsth, same as every other multi-byte
+        # lane write in this file.
+        if mn == "vmuloub":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ void* d=&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<8;i++) vsth(d,i,(uint16_t)((uint16_t)a[2*i+1]*(uint16_t)b[2*i+1])); }}")
+        if mn == "vmuleub":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ void* d=&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<8;i++) vsth(d,i,(uint16_t)((uint16_t)a[2*i]*(uint16_t)b[2*i])); }}")
+
         # Average unsigned byte
         if mn == "vavgub":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
@@ -2204,6 +2220,18 @@ class PPULifter:
             return (f"{{ void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; uint8_t r[16]; "
                     f"for(int i=0;i<8;i++){{int32_t v=(int16_t)vrh(a,i); r[i]=(uint8_t)(int8_t)(v>127?127:v<-128?-128:v);}} "
                     f"for(int i=0;i<8;i++){{int32_t v=(int16_t)vrh(b,i); r[8+i]=(uint8_t)(int8_t)(v>127?127:v<-128?-128:v);}} "
+                    f"memcpy(&ctx->vr[{vd}], r, 16); }}")
+
+        # Pack signed halfword UNSIGNED saturate (mirrors vpkshss immediately
+        # above, same read-side bug: source halfword lanes must be reread via
+        # vrh as signed, not a raw storage-order byte pair). Clamp is [0,255]
+        # rather than [-128,127], and the packed result is unsigned, but it's
+        # still a plain byte array either way, so no write-side swap needed.
+        if mn == "vpkshus":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ void* a=&ctx->vr[{va}]; void* b=&ctx->vr[{vb}]; uint8_t r[16]; "
+                    f"for(int i=0;i<8;i++){{int32_t v=(int16_t)vrh(a,i); r[i]=(uint8_t)(v>255?255:v<0?0:v);}} "
+                    f"for(int i=0;i<8;i++){{int32_t v=(int16_t)vrh(b,i); r[8+i]=(uint8_t)(v>255?255:v<0?0:v);}} "
                     f"memcpy(&ctx->vr[{vd}], r, 16); }}")
 
         # vmsummbm (VA-form, 4 operands). Source bytes are order-agnostic; the

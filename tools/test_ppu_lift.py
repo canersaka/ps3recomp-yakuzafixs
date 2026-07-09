@@ -578,6 +578,36 @@ def build_vcases():
           5, be_h([0x1234, 0x5678, 0x9ABC, 0xDEF0, 0x1111, 0x2222, 0x3333, 0x4444]),
           2, be_h([0xDEF0] * 8))
 
+    # vmuleub/vmuloub: 16 all-distinct byte lanes so every one of the 16
+    # products is unique, catching a scrambled or off-by-one lane pairing
+    # (mirrors vmuleuh/vmulouh's even=storage index 2*i / odd=2*i+1
+    # convention scaled down to bytes). Storage index 0 is the classic
+    # 200*200=40000 example: the halfword product straddles a byte boundary,
+    # so a write that lands it in host (little-endian) order instead of
+    # through vsth comes out byte-swapped (0x409C instead of the correct
+    # big-endian 0x9C40).
+    mul_a = bytes([200, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29])
+    mul_b = bytes([200, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30])
+    even_products = [mul_a[2 * i] * mul_b[2 * i] for i in range(8)]
+    odd_products = [mul_a[2 * i + 1] * mul_b[2 * i + 1] for i in range(8)]
+    assert len(set(even_products + odd_products)) == 16, "products must all be distinct"
+    vcase("vmuleub distinct lanes", vx_form(520, VD, 0, VB),
+          VB, mul_b, VD, be_h(even_products), va_reg=0, va_bytes=mul_a)
+    vcase("vmuloub distinct lanes", vx_form(8, VD, 0, VB),
+          VB, mul_b, VD, be_h(odd_products), va_reg=0, va_bytes=mul_a)
+
+    # vpkshus: negative halfwords clamp to 0, values above 255 clamp to 255,
+    # in-range halfwords pass through unchanged. Mirrors vpkshss's shape
+    # (vA feeds packed result bytes 0-7, vB feeds bytes 8-15) with an
+    # unsigned [0,255] clamp instead of the signed [-128,127] one.
+    def clamp_u8(v):
+        return 0 if v < 0 else 255 if v > 255 else v
+    pk_a = [-1, -100, -32768, 0, 100, 255, 32767, -5]
+    pk_b = [256, 1000, -256, 254, 1, 0, -1, 128]
+    vcase("vpkshus clamp", vx_form(270, VD, 0, VB),
+          VB, be_h(pk_b), VD, bytes([clamp_u8(v) for v in pk_a] + [clamp_u8(v) for v in pk_b]),
+          va_reg=0, va_bytes=be_h(pk_a))
+
 build_vcases()
 
 # ---------------------------------------------------------------------------
