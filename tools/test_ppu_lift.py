@@ -22,7 +22,9 @@ scratch\\dobuild2.bat when cl is absent).
 Scope (tranche 1): integer ALU/rotate/shift/carry/compare classes -- the
 proven silent-miscompile territory. Memory ops, FP, and VMX are follow-on
 tranches (VMX semantics already have manual-verified handling; loads/stores
-need a vm stub harness).
+need a vm stub harness). A first slice of that vm stub harness now backs the
+lmw/stmw cases below (CASES gained optional in_mem/exp_mem fields); it is
+minimal on purpose and can grow with later memory-op tranches.
 """
 
 import argparse
@@ -251,10 +253,13 @@ rng = random.Random(0x59414B5A)   # deterministic
 E64 += [rng.getrandbits(64) for _ in range(4)]
 
 CASES = []   # dicts: name, word, in_regs {idx:val}, in_ca, expects [(reg, val, mask)], exp_ca, exp_cr(nibble,pos), may_trap
+             # in_mem/exp_mem {addr: bytes} back the lmw/stmw memory-op cases below.
 
-def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False):
+def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False,
+         in_mem=None, exp_mem=None):
     CASES.append(dict(name=name, word=word, in_regs=in_regs, expects=expects,
-                      in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap))
+                      in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap,
+                      in_mem=in_mem or {}, exp_mem=exp_mem or {}))
 
 # VMX/vector cases: unlike the GPR CASES above, a vupk-family op reads/writes
 # ctx->vr[] directly (no memory load/store instructions needed to exercise
@@ -476,6 +481,33 @@ def build_cases():
         case(f"add. a={a:#x} b={b:#x}", xo_form(266, R[0], R[1], R[2], rc=1),
              {R[1]: a, R[2]: b}, [(R[0], v, MASK64)], exp_cr=(nib, 28))
 
+    # --- lmw/stmw (load/store multiple word) -------------------------------
+    # PowerISA_V2.03_Final_Public.pdf p.72: EA = (RA=0 ? 0 : GPR[RA]) + D, then
+    # each word r..31 is loaded/stored 4 bytes at a time, big-endian, RA=0
+    # meaning a literal zero base rather than GPR[0]. Cover both a normal
+    # nonzero-base EA and the RA=0 literal-base rule, for both directions.
+    w29, w30, w31 = 0x11223344, 0xAABBCCDD, 0x00000001
+    ea = 0x2030
+    case("lmw r29..r31 base=r4", d_form(46, 29, R[1], 0x30), {R[1]: 0x2000},
+         [(29, w29, MASK64), (30, w30, MASK64), (31, w31, MASK64)],
+         in_mem={ea: struct.pack(">III", w29, w30, w31)})
+
+    w29b, w30b, w31b = 0xDEADBEEF, 0x00000001, 0xFFFFFFFF
+    ea = 0x3040
+    case("stmw r29..r31 base=r4", d_form(47, 29, R[1], 0x40), {R[1]: 0x3000, 29: w29b, 30: w30b, 31: w31b},
+         [], exp_mem={ea: struct.pack(">III", w29b, w30b, w31b)})
+
+    w29c, w30c, w31c = 0x55667788, 0x99AABBCC, 0x0000002A
+    ea = 0x100
+    case("lmw r29..r31 base=0", d_form(46, 29, 0, 0x100), {},
+         [(29, w29c, MASK64), (30, w30c, MASK64), (31, w31c, MASK64)],
+         in_mem={ea: struct.pack(">III", w29c, w30c, w31c)})
+
+    w29d, w30d, w31d = 0x01020304, 0xFFEEDDCC, 0x00000000
+    ea = 0x200
+    case("stmw r29..r31 base=0", d_form(47, 29, 0, 0x200), {29: w29d, 30: w30d, 31: w31d},
+         [], exp_mem={ea: struct.pack(">III", w29d, w30d, w31d)})
+
 build_cases()
 
 def build_vcases():
@@ -549,6 +581,25 @@ static void check_vr(const char* name, const uint8_t* got, const uint8_t* want) 
         g_fail++;
     } else g_pass++;
 }
+static void check_mem(const char* name, uint64_t addr, const uint8_t* got, const uint8_t* want, int n) {
+    for (int i = 0; i < n; i++) {
+        if (got[i] != want[i]) {
+            printf("FAIL %s: mem[0x%llX] byte %d = 0x%02X want 0x%02X\\n",
+                   name, (unsigned long long)addr, i, got[i], want[i]);
+            g_fail++;
+            return;
+        }
+    }
+    g_pass++;
+}
+/* vm stub over a 64 KB scratch page for the memory-op cases (lmw/stmw); EAs
+ * are masked into it. Only lmw/stmw exercise this today, so vm_read/write
+ * beyond 8/16/32 bits aren't provided yet -- add as later tranches need them. */
+#include <stdlib.h>   /* MSVC _byteswap_* */
+static uint8_t g_vm_stub[65536];
+#define VMOFF(a) ((uint32_t)(a) & 0xFFFFu)
+extern "C" uint32_t vm_read32(uint64_t a) { uint32_t v; memcpy(&v, g_vm_stub + VMOFF(a), 4); return _byteswap_ulong(v); }
+extern "C" void vm_write32(uint64_t a, uint32_t v) { v = _byteswap_ulong(v); memcpy(g_vm_stub + VMOFF(a), &v, 4); }
 """)
     out.append("int main(void) {")
     out.append("    ppu_context* ctx = &g_ctx;")
@@ -570,14 +621,24 @@ static void check_vr(const char* name, const uint8_t* got, const uint8_t* want) 
         nm = c["name"].replace('"', "'")
         out.append(f'    {{ /* case {i}: {nm} | {insn.mnemonic} {insn.operands} */')
         out.append("      memset(ctx, 0, sizeof(*ctx));")
+        if c["in_mem"] or c["exp_mem"]:
+            out.append("      memset(g_vm_stub, 0, sizeof(g_vm_stub));")
         for reg, val in c["in_regs"].items():
             out.append(f"      ctx->gpr[{reg}] = 0x{val:016X}ULL;")
         if c["in_ca"]:
             out.append("      ctx->xer |= (1u << 29);")
+        for addr, blob in c["in_mem"].items():
+            byts = ", ".join(f"0x{b:02X}" for b in blob)
+            out.append(f"      {{ static const uint8_t _m[{len(blob)}] = {{ {byts} }}; "
+                       f"memcpy(g_vm_stub + VMOFF(0x{addr:X}), _m, {len(blob)}); }}")
         body = [f"        {code}"]
         for reg, val, mask in c["expects"]:
             body.append(f'        check_reg("{nm}", {reg}, ctx->gpr[{reg}], '
                         f"0x{val:016X}ULL, 0x{mask:016X}ULL);")
+        for addr, blob in c["exp_mem"].items():
+            byts = ", ".join(f"0x{b:02X}" for b in blob)
+            body.append(f'        {{ static const uint8_t _want[{len(blob)}] = {{ {byts} }}; '
+                        f'check_mem("{nm}", 0x{addr:X}ULL, g_vm_stub + VMOFF(0x{addr:X}), _want, {len(blob)}); }}')
         if c["exp_ca"] is not None:
             body.append(f'        check_ca("{nm}", ctx->xer, {int(bool(c["exp_ca"]))});')
         if c["exp_cr"] is not None:
