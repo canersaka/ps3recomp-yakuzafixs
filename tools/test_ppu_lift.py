@@ -22,7 +22,9 @@ scratch\\dobuild2.bat when cl is absent).
 Scope (tranche 1): integer ALU/rotate/shift/carry/compare classes -- the
 proven silent-miscompile territory. Memory ops, FP, and VMX are follow-on
 tranches (VMX semantics already have manual-verified handling; loads/stores
-need a vm stub harness).
+need a vm stub harness). A first slice of that vm stub harness now backs the
+D-form load/store rA=0 cases below (CASES gained optional in_mem/exp_mem
+fields); it is minimal on purpose and can grow with later memory-op tranches.
 """
 
 import argparse
@@ -56,6 +58,9 @@ def x_logic(xo, rs, ra, rb, rc=0):   # and/or/... rs sits in the rt slot
 
 def d_form(op, rt, ra, imm):
     return (op << 26) | (rt << 21) | (ra << 16) | (imm & 0xFFFF)
+
+def ds_form(op, rt, ra, ds, xo):   # ld/ldu/lwa (op 58), std/stdu (op 62)
+    return (op << 26) | (rt << 21) | (ra << 16) | ((ds & 0x3FFF) << 2) | (xo & 0x3)
 
 def m_form(op, rs, ra, sh, mb, me, rc=0):
     return (op << 26) | (rs << 21) | (ra << 16) | (sh << 11) | (mb << 6) | (me << 1) | rc
@@ -251,10 +256,17 @@ rng = random.Random(0x59414B5A)   # deterministic
 E64 += [rng.getrandbits(64) for _ in range(4)]
 
 CASES = []   # dicts: name, word, in_regs {idx:val}, in_ca, expects [(reg, val, mask)], exp_ca, exp_cr(nibble,pos), may_trap
+             # in_mem/exp_mem {addr: bytes} back the D-form load/store rA=0 cases below.
+             # in_fpr {freg: raw64 bits} / exp_fpr [(freg, raw64 bits)] back the
+             # FP D-form load/store rA=0 cases (ctx->fpr is a double[32]; bits
+             # are compared as the raw IEEE-754 pattern via memcpy, not value).
 
-def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False):
+def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False,
+         in_mem=None, exp_mem=None, in_fpr=None, exp_fpr=None):
     CASES.append(dict(name=name, word=word, in_regs=in_regs, expects=expects,
-                      in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap))
+                      in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap,
+                      in_mem=in_mem or {}, exp_mem=exp_mem or {},
+                      in_fpr=in_fpr or {}, exp_fpr=exp_fpr or []))
 
 # VMX/vector cases: unlike the GPR CASES above, a vupk-family op reads/writes
 # ctx->vr[] directly (no memory load/store instructions needed to exercise
@@ -476,6 +488,64 @@ def build_cases():
         case(f"add. a={a:#x} b={b:#x}", xo_form(266, R[0], R[1], R[2], rc=1),
              {R[1]: a, R[2]: b}, [(R[0], v, MASK64)], exp_cr=(nib, 28))
 
+    # --- D-form (and DS-form) load/store rA=0 literal-zero base ------------
+    # PowerISA_V2.03_Final_Public.pdf p.64 (loads, "Load Word and Zero
+    # D-form") and p.67 (stores, "Fixed-Point Store Instructions"): for these
+    # forms EA = (RA=0 ? 0 : GPR[RA]) + D -- RA=0 means a LITERAL ZERO base,
+    # not GPR[0]. Every rA=0 case below poisons gpr[0] with a nonzero value
+    # so a lifter that mistakenly emits ctx->gpr[0] computes a different (and
+    # in these cases, unpopulated/unchecked) address and the case fails.
+    POISON0 = 0x1122334455667788
+
+    # lwz rD,0x40(0): correct EA=0x40; buggy EA=(POISON0+0x40) masked by the
+    # vm stub's 64 KB window, a location this case never populates.
+    case("lwz literal-zero base rA=0 (r0 poisoned)", d_form(32, 10, 0, 0x40),
+         {0: POISON0}, [(10, 0x89ABCDEF, MASK64)],
+         in_mem={0x40: struct.pack(">I", 0x89ABCDEF)})
+
+    # lwz rD,0x30(r4): base != 0, must be unaffected by the fix (regression).
+    case("lwz normal base rA=4", d_form(32, 11, 4, 0x30),
+         {4: 0x2000}, [(11, 0x13572468, MASK64)],
+         in_mem={0x2030: struct.pack(">I", 0x13572468)})
+
+    # stw rS,0x40(0): correct EA=0x40; a buggy store lands elsewhere and 0x40
+    # is left at its memset-zero value, so exp_mem catches it.
+    case("stw literal-zero base rA=0 (r0 poisoned)", d_form(36, 12, 0, 0x40),
+         {0: POISON0, 12: 0xCAFEBABE}, [],
+         exp_mem={0x40: struct.pack(">I", 0xCAFEBABE)})
+
+    # stw rS,0x50(r4): base != 0, regression check.
+    case("stw normal base rA=4", d_form(36, 13, 4, 0x50),
+         {4: 0x3000, 13: 0x0F0E0D0C}, [],
+         exp_mem={0x3050: struct.pack(">I", 0x0F0E0D0C)})
+
+    # lwa rD,0x40(0): DS-form algebraic load, same literal-zero rule; also
+    # exercises sign extension of the loaded (negative) word.
+    lwa_word_val = 0x89ABCDEF
+    lwa_expect = s32(lwa_word_val) & MASK64
+    case("lwa literal-zero base rA=0 (r0 poisoned)", ds_form(58, 14, 0, 0x40 >> 2, 2),
+         {0: POISON0}, [(14, lwa_expect, MASK64)],
+         in_mem={0x40: struct.pack(">I", lwa_word_val)})
+
+    # --- FP D-form load/store rA=0 literal-zero base ------------------------
+    # Same rule, same page cites, applied to lfs/lfd/stfs/stfd. lfd (opcode
+    # 50) reads a raw double bit pattern through vm_read64; stfs (opcode 52)
+    # narrows a double to float and stores it through vm_write32 (already
+    # backed by the stub), so it needs no new memory-access width.
+    pi_bits = struct.unpack(">Q", struct.pack(">d", 3.14159265358979))[0]
+    case("lfd literal-zero base rA=0 (r0 poisoned)", d_form(50, 5, 0, 0x40),
+         {0: POISON0}, [],
+         in_mem={0x40: struct.pack(">Q", pi_bits)},
+         exp_fpr=[(5, pi_bits)])
+
+    fp_val = 2.5   # exactly representable in both float and double
+    fp_double_bits = struct.unpack(">Q", struct.pack(">d", fp_val))[0]
+    fp_float_bytes = struct.pack(">f", fp_val)
+    case("stfs literal-zero base rA=0 (r0 poisoned)", d_form(52, 6, 0, 0x50),
+         {0: POISON0}, [],
+         in_fpr={6: fp_double_bits},
+         exp_mem={0x50: fp_float_bytes})
+
 build_cases()
 
 def build_vcases():
@@ -549,6 +619,34 @@ static void check_vr(const char* name, const uint8_t* got, const uint8_t* want) 
         g_fail++;
     } else g_pass++;
 }
+static void check_mem(const char* name, uint64_t addr, const uint8_t* got, const uint8_t* want, int n) {
+    for (int i = 0; i < n; i++) {
+        if (got[i] != want[i]) {
+            printf("FAIL %s: mem[0x%llX] byte %d = 0x%02X want 0x%02X\\n",
+                   name, (unsigned long long)addr, i, got[i], want[i]);
+            g_fail++;
+            return;
+        }
+    }
+    g_pass++;
+}
+static void check_fpr(const char* name, int reg, uint64_t got, uint64_t want) {
+    if (got != want) {
+        printf("FAIL %s: f%d raw bits = 0x%016llX want 0x%016llX\\n",
+               name, reg, (unsigned long long)got, (unsigned long long)want);
+        g_fail++;
+    } else g_pass++;
+}
+/* vm stub over a 64 KB scratch page for the memory-op cases (D-form load/
+ * store rA=0, including the FP forms via vm_read64 for lfd); EAs are masked
+ * into it. Widths beyond 64 bits aren't provided yet -- add as later
+ * memory-op tranches need them. */
+#include <stdlib.h>   /* MSVC _byteswap_* */
+static uint8_t g_vm_stub[65536];
+#define VMOFF(a) ((uint32_t)(a) & 0xFFFFu)
+extern "C" uint32_t vm_read32(uint64_t a) { uint32_t v; memcpy(&v, g_vm_stub + VMOFF(a), 4); return _byteswap_ulong(v); }
+extern "C" void vm_write32(uint64_t a, uint32_t v) { v = _byteswap_ulong(v); memcpy(g_vm_stub + VMOFF(a), &v, 4); }
+extern "C" uint64_t vm_read64(uint64_t a) { uint64_t v; memcpy(&v, g_vm_stub + VMOFF(a), 8); return _byteswap_uint64(v); }
 """)
     out.append("int main(void) {")
     out.append("    ppu_context* ctx = &g_ctx;")
@@ -570,14 +668,29 @@ static void check_vr(const char* name, const uint8_t* got, const uint8_t* want) 
         nm = c["name"].replace('"', "'")
         out.append(f'    {{ /* case {i}: {nm} | {insn.mnemonic} {insn.operands} */')
         out.append("      memset(ctx, 0, sizeof(*ctx));")
+        if c["in_mem"] or c["exp_mem"]:
+            out.append("      memset(g_vm_stub, 0, sizeof(g_vm_stub));")
         for reg, val in c["in_regs"].items():
             out.append(f"      ctx->gpr[{reg}] = 0x{val:016X}ULL;")
         if c["in_ca"]:
             out.append("      ctx->xer |= (1u << 29);")
+        for addr, blob in c["in_mem"].items():
+            byts = ", ".join(f"0x{b:02X}" for b in blob)
+            out.append(f"      {{ static const uint8_t _m[{len(blob)}] = {{ {byts} }}; "
+                       f"memcpy(g_vm_stub + VMOFF(0x{addr:X}), _m, {len(blob)}); }}")
+        for reg, bits in c["in_fpr"].items():
+            out.append(f"      {{ uint64_t _b = 0x{bits:016X}ULL; memcpy(&ctx->fpr[{reg}], &_b, 8); }}")
         body = [f"        {code}"]
         for reg, val, mask in c["expects"]:
             body.append(f'        check_reg("{nm}", {reg}, ctx->gpr[{reg}], '
                         f"0x{val:016X}ULL, 0x{mask:016X}ULL);")
+        for addr, blob in c["exp_mem"].items():
+            byts = ", ".join(f"0x{b:02X}" for b in blob)
+            body.append(f'        {{ static const uint8_t _want[{len(blob)}] = {{ {byts} }}; '
+                        f'check_mem("{nm}", 0x{addr:X}ULL, g_vm_stub + VMOFF(0x{addr:X}), _want, {len(blob)}); }}')
+        for reg, bits in c["exp_fpr"]:
+            body.append(f'        {{ uint64_t _got; memcpy(&_got, &ctx->fpr[{reg}], 8); '
+                        f'check_fpr("{nm}", {reg}, _got, 0x{bits:016X}ULL); }}')
         if c["exp_ca"] is not None:
             body.append(f'        check_ca("{nm}", ctx->xer, {int(bool(c["exp_ca"]))});')
         if c["exp_cr"] is not None:
