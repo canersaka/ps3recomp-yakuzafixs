@@ -22,7 +22,9 @@ scratch\\dobuild2.bat when cl is absent).
 Scope (tranche 1): integer ALU/rotate/shift/carry/compare classes -- the
 proven silent-miscompile territory. Memory ops, FP, and VMX are follow-on
 tranches (VMX semantics already have manual-verified handling; loads/stores
-need a vm stub harness).
+need a vm stub harness). A first slice of that vm stub harness now backs the
+indexed-store-with-update cases below (CASES gained an optional exp_mem
+field); it is minimal on purpose and can grow with later memory-op tranches.
 """
 
 import argparse
@@ -251,10 +253,11 @@ rng = random.Random(0x59414B5A)   # deterministic
 E64 += [rng.getrandbits(64) for _ in range(4)]
 
 CASES = []   # dicts: name, word, in_regs {idx:val}, in_ca, expects [(reg, val, mask)], exp_ca, exp_cr(nibble,pos), may_trap
+             # exp_mem {addr: bytes} backs the indexed-store-with-update cases below.
 
-def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False):
+def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False, exp_mem=None):
     CASES.append(dict(name=name, word=word, in_regs=in_regs, expects=expects,
-                      in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap))
+                      in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap, exp_mem=exp_mem or {}))
 
 # VMX/vector cases: unlike the GPR CASES above, a vupk-family op reads/writes
 # ctx->vr[] directly (no memory load/store instructions needed to exercise
@@ -476,6 +479,28 @@ def build_cases():
         case(f"add. a={a:#x} b={b:#x}", xo_form(266, R[0], R[1], R[2], rc=1),
              {R[1]: a, R[2]: b}, [(R[0], v, MASK64)], exp_cr=(nib, 28))
 
+    # --- Indexed store with update (stwux/sthux/stbux) ----------------------
+    # Book I: RA <- EA on the update forms, in addition to the store itself.
+    # RS=5, RA=4 (base), RB=6 (offset); EA = GPR[RA] + GPR[RB].
+    rs, ra, rb = 5, 4, 6
+    val, base, off = 0xCAFEBABE, 0x4000, 0x20
+    ea = base + off
+    case("stwux rs..val store+writeback", x_logic(183, rs, ra, rb),
+         {rs: val, ra: base, rb: off}, [(ra, ea, MASK64)],
+         exp_mem={ea: struct.pack(">I", val)})
+
+    val, base, off = 0xBEEF, 0x5000, 0x10
+    ea = base + off
+    case("sthux rs..val store+writeback", x_logic(439, rs, ra, rb),
+         {rs: val, ra: base, rb: off}, [(ra, ea, MASK64)],
+         exp_mem={ea: struct.pack(">H", val)})
+
+    val, base, off = 0xAB, 0x6000, 0x01
+    ea = base + off
+    case("stbux rs..val store+writeback", x_logic(247, rs, ra, rb),
+         {rs: val, ra: base, rb: off}, [(ra, ea, MASK64)],
+         exp_mem={ea: bytes([val])})
+
 build_cases()
 
 def build_vcases():
@@ -549,6 +574,26 @@ static void check_vr(const char* name, const uint8_t* got, const uint8_t* want) 
         g_fail++;
     } else g_pass++;
 }
+static void check_mem(const char* name, uint64_t addr, const uint8_t* got, const uint8_t* want, int n) {
+    for (int i = 0; i < n; i++) {
+        if (got[i] != want[i]) {
+            printf("FAIL %s: mem[0x%llX] byte %d = 0x%02X want 0x%02X\\n",
+                   name, (unsigned long long)addr, i, got[i], want[i]);
+            g_fail++;
+            return;
+        }
+    }
+    g_pass++;
+}
+/* vm stub over a 64 KB scratch page for the memory-op cases (indexed store
+ * with update); EAs are masked into it. Only the store side is exercised
+ * today, so no vm_read helpers are provided yet -- add as later tranches need them. */
+#include <stdlib.h>   /* MSVC _byteswap_* */
+static uint8_t g_vm_stub[65536];
+#define VMOFF(a) ((uint32_t)(a) & 0xFFFFu)
+extern "C" void vm_write8 (uint64_t a, uint8_t  v) { g_vm_stub[VMOFF(a)] = v; }
+extern "C" void vm_write16(uint64_t a, uint16_t v) { v = _byteswap_ushort(v); memcpy(g_vm_stub + VMOFF(a), &v, 2); }
+extern "C" void vm_write32(uint64_t a, uint32_t v) { v = _byteswap_ulong(v);  memcpy(g_vm_stub + VMOFF(a), &v, 4); }
 """)
     out.append("int main(void) {")
     out.append("    ppu_context* ctx = &g_ctx;")
@@ -570,6 +615,8 @@ static void check_vr(const char* name, const uint8_t* got, const uint8_t* want) 
         nm = c["name"].replace('"', "'")
         out.append(f'    {{ /* case {i}: {nm} | {insn.mnemonic} {insn.operands} */')
         out.append("      memset(ctx, 0, sizeof(*ctx));")
+        if c["exp_mem"]:
+            out.append("      memset(g_vm_stub, 0, sizeof(g_vm_stub));")
         for reg, val in c["in_regs"].items():
             out.append(f"      ctx->gpr[{reg}] = 0x{val:016X}ULL;")
         if c["in_ca"]:
@@ -578,6 +625,10 @@ static void check_vr(const char* name, const uint8_t* got, const uint8_t* want) 
         for reg, val, mask in c["expects"]:
             body.append(f'        check_reg("{nm}", {reg}, ctx->gpr[{reg}], '
                         f"0x{val:016X}ULL, 0x{mask:016X}ULL);")
+        for addr, blob in c["exp_mem"].items():
+            byts = ", ".join(f"0x{b:02X}" for b in blob)
+            body.append(f'        {{ static const uint8_t _want[{len(blob)}] = {{ {byts} }}; '
+                        f'check_mem("{nm}", 0x{addr:X}ULL, g_vm_stub + VMOFF(0x{addr:X}), _want, {len(blob)}); }}')
         if c["exp_ca"] is not None:
             body.append(f'        check_ca("{nm}", ctx->xer, {int(bool(c["exp_ca"]))});')
         if c["exp_cr"] is not None:
