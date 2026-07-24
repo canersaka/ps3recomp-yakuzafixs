@@ -145,6 +145,13 @@ static int32_t call4(int64_t (*fn)(ppu_context*), ppu_context* ctx, uint64_t a0,
     ctx->gpr[3] = a0; ctx->gpr[4] = a1; ctx->gpr[5] = a2; ctx->gpr[6] = a3;
     return (int32_t)fn(ctx);
 }
+static int32_t call5(int64_t (*fn)(ppu_context*), ppu_context* ctx, uint64_t a0,
+                     uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
+{
+    ctx->gpr[3] = a0; ctx->gpr[4] = a1; ctx->gpr[5] = a2;
+    ctx->gpr[6] = a3; ctx->gpr[7] = a4;
+    return (int32_t)fn(ctx);
+}
 
 /* ---------------------------------------------------------------------------
  * Deterministic PRNG (xorshift32) seeded from argv -- NOT rand(), so runs are
@@ -1089,6 +1096,79 @@ static int test4_event_queue(void)
 }
 
 /* =========================================================================
+ * TEST 5 -- event-flag cancel wakes only the current waiter generation
+ * ========================================================================= */
+typedef struct {
+    uint32_t flag_id;
+    int32_t  wait_rc;
+} t5_wait_arg;
+
+static unsigned __stdcall t5_waiter(void* p)
+{
+    t5_wait_arg* arg = (t5_wait_arg*)p;
+    ppu_context ctx;
+    ctx_init_for_thread(&ctx, alloc_tid());
+    arg->wait_rc = call5((int64_t(*)(ppu_context*))sys_event_flag_wait, &ctx,
+                         arg->flag_id, 1, SYS_EVENT_FLAG_WAIT_OR, 0, 0);
+    return 0;
+}
+
+static int test5_event_flag_cancel(void)
+{
+    const char* name = "test5_event_flag_cancel";
+    LONG before = g_fail_count;
+    ppu_context ctx;
+    ctx_init_for_thread(&ctx, alloc_tid());
+
+    uint32_t id_addr = guest_alloc(4);
+    int32_t rc = call3((int64_t(*)(ppu_context*))sys_event_flag_create,
+                       &ctx, id_addr, 0, 0);
+    if (rc != CELL_OK) {
+        fail(name, "create rc=0x%08X", (unsigned)rc);
+        return 1;
+    }
+    uint32_t id = read_be32(id_addr);
+
+    t5_wait_arg arg = { id, 0 };
+    HANDLE waiter = (HANDLE)_beginthreadex(NULL, 0, t5_waiter, &arg, 0, NULL);
+
+    int parked = 0;
+    for (int i = 0; i < 1000 && !parked; i++) {
+        sys_event_flag_info* f = &g_sys_event_flags[id - 1];
+        EnterCriticalSection(&f->lock);
+        parked = (f->waiters == 1);
+        LeaveCriticalSection(&f->lock);
+        if (!parked) Sleep(1);
+    }
+    if (!parked) fail(name, "waiter did not park");
+
+    uint32_t count_addr = guest_alloc(4);
+    rc = call2((int64_t(*)(ppu_context*))sys_event_flag_cancel,
+               &ctx, id, count_addr);
+    if (rc != CELL_OK) fail(name, "cancel rc=0x%08X", (unsigned)rc);
+    if (read_be32(count_addr) != 1)
+        fail(name, "cancel reported %u waiters, expected 1", read_be32(count_addr));
+
+    if (WaitForSingleObject(waiter, 5000) != WAIT_OBJECT_0)
+        fail(name, "cancelled waiter did not return");
+    CloseHandle(waiter);
+    if (arg.wait_rc != (int32_t)CELL_ECANCELED)
+        fail(name, "wait rc=0x%08X expected CELL_ECANCELED", (unsigned)arg.wait_rc);
+
+    /* Cancellation is not sticky: a later set/trywait must work normally. */
+    rc = call2((int64_t(*)(ppu_context*))sys_event_flag_set, &ctx, id, 1);
+    if (rc != CELL_OK) fail(name, "set after cancel rc=0x%08X", (unsigned)rc);
+    rc = call4((int64_t(*)(ppu_context*))sys_event_flag_trywait, &ctx,
+               id, 1, SYS_EVENT_FLAG_WAIT_OR, 0);
+    if (rc != CELL_OK) fail(name, "trywait after cancel rc=0x%08X", (unsigned)rc);
+
+    call1((int64_t(*)(ppu_context*))sys_event_flag_destroy, &ctx, id);
+    int ok = (g_fail_count == before);
+    printf("[%s] cancelled=1 subsequent_wait=ok -> %s\n", name, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+/* =========================================================================
  * main
  * ========================================================================= */
 int main(int argc, char** argv)
@@ -1108,11 +1188,12 @@ int main(int argc, char** argv)
     int rc2 = test2_timed_wait_semantics();
     int rc3 = test3_semaphore_counting();
     int rc4 = test4_event_queue();
+    int rc5 = test5_event_flag_cancel();
 
     ULONGLONG total_ms = now_ms() - t_start;
     printf("=== total wall time: %llums ===\n", (unsigned long long)total_ms);
 
-    int failed = rc1a || rc1 || rc2 || rc3 || rc4 || (g_fail_count != 0);
+    int failed = rc1a || rc1 || rc2 || rc3 || rc4 || rc5 || (g_fail_count != 0);
     printf("=== RESULT: %s (fail_count=%ld) ===\n", failed ? "FAIL" : "PASS", g_fail_count);
     return failed ? 1 : 0;
 }

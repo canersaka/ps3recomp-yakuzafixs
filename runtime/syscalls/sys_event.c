@@ -991,9 +991,12 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
 
 #ifdef _WIN32
     EnterCriticalSection(&f->lock);
+    uint32_t cancel_generation = f->cancel_generation;
+    f->waiters++;
 
     if (timeout_us == 0) {
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+        while (!flag_check(f->pattern, bitpat, mode) && f->active &&
+               cancel_generation == f->cancel_generation) {
             SleepConditionVariableCS(&f->cv, &f->lock, INFINITE);
         }
     } else if (timeout_us < 1000) {
@@ -1003,13 +1006,15 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
          * dropped never misses a committed pattern change -- it just re-reads
          * the latest value on the next lock acquisition. */
         int64_t deadline = lv2_usec_deadline(timeout_us);
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+        while (!flag_check(f->pattern, bitpat, mode) && f->active &&
+               cancel_generation == f->cancel_generation) {
             if (lv2_deadline_passed(deadline)) {
                 /* Write current pattern even on timeout */
                 if (result_addr != 0) {
                     uint64_t* out = (uint64_t*)vm_to_host(result_addr);
                     *out = bswap64(f->pattern);
                 }
+                f->waiters--;
                 LeaveCriticalSection(&f->lock);
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
@@ -1019,7 +1024,8 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
         }
     } else {
         DWORD ms = (DWORD)(timeout_us / 1000);
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+        while (!flag_check(f->pattern, bitpat, mode) && f->active &&
+               cancel_generation == f->cancel_generation) {
             if (!SleepConditionVariableCS(&f->cv, &f->lock, ms)) {
                 if (GetLastError() == ERROR_TIMEOUT) {
                     /* Write current pattern even on timeout */
@@ -1027,11 +1033,18 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
                         uint64_t* out = (uint64_t*)vm_to_host(result_addr);
                         *out = bswap64(f->pattern);
                     }
+                    f->waiters--;
                     LeaveCriticalSection(&f->lock);
                     return (int64_t)(int32_t)CELL_ETIMEDOUT;
                 }
             }
         }
+    }
+
+    f->waiters--;
+    if (cancel_generation != f->cancel_generation) {
+        LeaveCriticalSection(&f->lock);
+        return (int64_t)(int32_t)CELL_ECANCELED;
     }
 
     uint64_t result = f->pattern;
@@ -1051,9 +1064,12 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     LeaveCriticalSection(&f->lock);
 #else
     pthread_mutex_lock(&f->lock);
+    uint32_t cancel_generation = f->cancel_generation;
+    f->waiters++;
 
     if (timeout_us == 0) {
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+        while (!flag_check(f->pattern, bitpat, mode) && f->active &&
+               cancel_generation == f->cancel_generation) {
             pthread_cond_wait(&f->cv, &f->lock);
         }
     } else {
@@ -1065,17 +1081,25 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
             ts.tv_sec++;
             ts.tv_nsec -= 1000000000L;
         }
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+        while (!flag_check(f->pattern, bitpat, mode) && f->active &&
+               cancel_generation == f->cancel_generation) {
             int rc = pthread_cond_timedwait(&f->cv, &f->lock, &ts);
             if (rc == ETIMEDOUT) {
                 if (result_addr != 0) {
                     uint64_t* out = (uint64_t*)vm_to_host(result_addr);
                     *out = bswap64(f->pattern);
                 }
+                f->waiters--;
                 pthread_mutex_unlock(&f->lock);
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
         }
+    }
+
+    f->waiters--;
+    if (cancel_generation != f->cancel_generation) {
+        pthread_mutex_unlock(&f->lock);
+        return (int64_t)(int32_t)CELL_ECANCELED;
     }
 
     uint64_t result = f->pattern;
@@ -1262,6 +1286,41 @@ int64_t sys_event_flag_get(ppu_context* ctx)
     return CELL_OK;
 }
 
+/* Cancel the waiters that are currently blocked on this flag. A generation
+ * counter makes cancellation one-shot: waits started after this call are not
+ * poisoned by an old cancellation. */
+int64_t sys_event_flag_cancel(ppu_context* ctx)
+{
+    uint32_t flag_id = LV2_ARG_U32(ctx, 0);
+    uint32_t num_ea  = LV2_ARG_PTR(ctx, 1);
+
+    if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
+        return (int64_t)(int32_t)CELL_ESRCH;
+
+    sys_event_flag_info* f = &g_sys_event_flags[flag_id - 1];
+    if (!f->active)
+        return (int64_t)(int32_t)CELL_ESRCH;
+
+    uint32_t woken;
+#ifdef _WIN32
+    EnterCriticalSection(&f->lock);
+    woken = (uint32_t)f->waiters;
+    f->cancel_generation++;
+    WakeAllConditionVariable(&f->cv);
+    LeaveCriticalSection(&f->lock);
+#else
+    pthread_mutex_lock(&f->lock);
+    woken = (uint32_t)f->waiters;
+    f->cancel_generation++;
+    pthread_cond_broadcast(&f->cv);
+    pthread_mutex_unlock(&f->lock);
+#endif
+
+    if (num_ea != 0)
+        write_be32(num_ea, woken);
+    return CELL_OK;
+}
+
 /* ---------------------------------------------------------------------------
  * Registration
  * -----------------------------------------------------------------------*/
@@ -1300,4 +1359,5 @@ void sys_event_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_EVENT_FLAG_SET,      sys_event_flag_set);
     lv2_syscall_register(tbl, SYS_EVENT_FLAG_CLEAR,    sys_event_flag_clear);
     lv2_syscall_register(tbl, SYS_EVENT_FLAG_GET,      sys_event_flag_get);
+    lv2_syscall_register(tbl, SYS_EVENT_FLAG_CANCEL,   sys_event_flag_cancel);
 }

@@ -104,6 +104,8 @@ typedef struct sys_event_flag_info {
     uint32_t type;       /* single / multi waiter */
     char     name[8];
     uint64_t pattern;    /* 64-bit flag word */
+    int      waiters;    /* threads currently parked in wait() */
+    uint32_t cancel_generation; /* incremented to cancel the current wait set */
 
 #ifdef _WIN32
     CRITICAL_SECTION lock;
@@ -141,6 +143,7 @@ int64_t sys_event_flag_trywait(ppu_context* ctx);
 int64_t sys_event_flag_set(ppu_context* ctx);
 int64_t sys_event_flag_clear(ppu_context* ctx);
 int64_t sys_event_flag_get(ppu_context* ctx);
+int64_t sys_event_flag_cancel(ppu_context* ctx);
 
 /* Registration */
 void sys_event_init(lv2_syscall_table* tbl);
