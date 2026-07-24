@@ -1361,9 +1361,11 @@ class PPULifter:
         # stack). LR holds the target (set by the preceding mtlr); dispatch like
         # bctrl, then CONTINUE (link = call).
         if mn == "blrl":
-            return "ctx->ctr = (uint32_t)ctx->lr; ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx);"
+            return (f"{{ uint32_t _target = (uint32_t)ctx->lr; "
+                    f"ctx->lr = 0x{insn.addr + 4:08X}u; ctx->ctr = _target; "
+                    f"ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx); }}")
 
-        if mn == "b":
+        if mn in ("b", "ba"):
             target = ops[0]
             try:
                 tgt = int(target, 16)
@@ -1391,7 +1393,7 @@ class PPULifter:
             except ValueError:
                 return f"goto {target}; /* branch */"
 
-        if mn == "bl":
+        if mn in ("bl", "bla"):
             target = ops[0]
             try:
                 tgt = int(target, 16)
@@ -1423,7 +1425,8 @@ class PPULifter:
         # of b<cond>ctrl below. Dispatch via LR, then CONTINUE (link = call).
         if (mn.endswith("lrl") and mn != "blrl" and mn.startswith("b")):
             cond = self._branch_condition(mn, ops)
-            return (f"if ({cond}) {{ ctx->ctr = (uint32_t)ctx->lr; "
+            return (f"if ({cond}) {{ uint32_t _target = (uint32_t)ctx->lr; "
+                    f"ctx->lr = 0x{insn.addr + 4:08X}u; ctx->ctr = _target; "
                     f"ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx); }}")
 
         # Indirect call/jump through CTR in any conditional or named form:
@@ -1438,7 +1441,8 @@ class PPULifter:
                 and (mn.endswith("ctr") or mn.endswith("ctrl"))):
             cond = self._branch_condition(mn, ops)
             if mn.endswith("ctrl"):   # link = call: keep executing after it
-                return f"if ({cond}) {{ ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx); }}"
+                return (f"if ({cond}) {{ ctx->lr = 0x{insn.addr + 4:08X}u; "
+                        f"ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx); }}")
             return f"if ({cond}) {{ ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx); return; }}"
 
         # Conditional branches
@@ -1447,6 +1451,15 @@ class PPULifter:
             target_str = ops[-1] if ops else ""
             try:
                 tgt = int(target_str, 16)
+                is_link = mn.endswith("l") or mn.endswith("la")
+                if is_link:
+                    cond = self._branch_condition(mn, ops)
+                    if self.code_hi is not None and not (self.code_lo <= tgt < self.code_hi):
+                        return f"/* {mn} -> non-code 0x{tgt:08X} */;"
+                    func.calls.append(tgt)
+                    self.call_targets.add(tgt)
+                    return (f"if ({cond}) {{ ctx->lr = 0x{insn.addr + 4:08X}u; "
+                            f"{self.prefix}func_{tgt:08X}(ctx); DRAIN_TRAMPOLINE(ctx); }}")
                 if (func.start_addr <= tgt < func.end_addr
                         and tgt != func.start_addr
                         and tgt in self.function_entries):
@@ -1491,7 +1504,8 @@ class PPULifter:
             # Indirect call through CTR register. The CTR value is a GUEST
             # address (or OPD pointer). We dispatch through a hash table
             # that maps guest addresses to host function pointers.
-            return "ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx);"
+            return (f"ctx->lr = 0x{insn.addr + 4:08X}u; "
+                    f"ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx);")
 
         # ------- SPR -------
         if mn == "mflr":
