@@ -274,6 +274,9 @@ static inline uint32_t ppu_res_bswap32(uint32_t v) {
 static inline uint64_t ppu_res_bswap64(uint64_t v) {
     return ((uint64_t)ppu_res_bswap32((uint32_t)v) << 32) | ppu_res_bswap32((uint32_t)(v >> 32));
 }
+static inline uint32_t ppu_res_cr0(int ok, uint32_t xer) {
+    return (ok ? 2u : 0u) | ((xer >> 31) & 1u);
+}
 static inline uint32_t ppu_res_lwarx(ppu_context* ctx, uint64_t ea) {
     uint32_t raw;
     memcpy(&raw, vm_base + (uint32_t)ea, 4);
@@ -297,8 +300,8 @@ static inline void ppu_res_stwcx(ppu_context* ctx, uint64_t ea, uint32_t val) {
     }
     ctx->reserve_valid = 0;
     ctx->reserve_addr  = 0;
-    ctx->cr = ok ? ((ctx->cr & ~(0xFu << 28)) | (2u << 28))
-                 :  (ctx->cr & ~(0xFu << 28));
+    uint32_t cr0 = ppu_res_cr0(ok, ctx->xer);
+    ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr0 << 28);
 }
 static inline uint64_t ppu_res_ldarx(ppu_context* ctx, uint64_t ea) {
     uint64_t raw;
@@ -323,8 +326,8 @@ static inline void ppu_res_stdcx(ppu_context* ctx, uint64_t ea, uint64_t val) {
     }
     ctx->reserve_valid = 0;
     ctx->reserve_addr  = 0;
-    ctx->cr = ok ? ((ctx->cr & ~(0xFu << 28)) | (2u << 28))
-                 :  (ctx->cr & ~(0xFu << 28));
+    uint32_t cr0 = ppu_res_cr0(ok, ctx->xer);
+    ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr0 << 28);
 }
 
 /* Indirect call dispatch (bctrl/bctr) — implemented by the game project.
@@ -1300,7 +1303,8 @@ class PPULifter:
             cast = "(int32_t)" if mn == "cmpwi" else "(int64_t)"
             shift = (7 - bf) * 4
             return (f"{{ int64_t a = {cast}ctx->gpr[{ra_i}]; int64_t b = (int64_t){imm}; "
-                    f"uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; "
+                    f"uint32_t cr_val = ((a < b) ? 8u : (a > b) ? 4u : 2u) | "
+                    f"((ctx->xer >> 31) & 1u); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
         if mn in ("cmplwi", "cmpldi"):
@@ -1315,7 +1319,8 @@ class PPULifter:
             cast = "(uint32_t)" if mn == "cmplwi" else "(uint64_t)"
             shift = (7 - bf) * 4
             return (f"{{ uint64_t a = {cast}ctx->gpr[{ra_i}]; uint64_t b = (uint64_t){imm}; "
-                    f"uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; "
+                    f"uint32_t cr_val = ((a < b) ? 8u : (a > b) ? 4u : 2u) | "
+                    f"((ctx->xer >> 31) & 1u); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
         if mn in ("cmpw", "cmpd"):
@@ -1330,7 +1335,8 @@ class PPULifter:
             cast = "(int32_t)" if mn == "cmpw" else "(int64_t)"
             shift = (7 - bf) * 4
             return (f"{{ int64_t a = {cast}ctx->gpr[{ra_i}]; int64_t b = {cast}ctx->gpr[{rb_i}]; "
-                    f"uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; "
+                    f"uint32_t cr_val = ((a < b) ? 8u : (a > b) ? 4u : 2u) | "
+                    f"((ctx->xer >> 31) & 1u); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
         if mn in ("cmplw", "cmpld"):
@@ -1345,7 +1351,8 @@ class PPULifter:
             cast = "(uint32_t)" if mn == "cmplw" else "(uint64_t)"
             shift = (7 - bf) * 4
             return (f"{{ uint64_t a = {cast}ctx->gpr[{ra_i}]; uint64_t b = {cast}ctx->gpr[{rb_i}]; "
-                    f"uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; "
+                    f"uint32_t cr_val = ((a < b) ? 8u : (a > b) ? 4u : 2u) | "
+                    f"((ctx->xer >> 31) & 1u); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
         # ------- Branches -------
