@@ -207,7 +207,7 @@ static s32 dispatch_func_stat(uint32_t func_opd, int is_new, const char* dirName
 
     printf("[cellSaveData] dispatching funcStat OPD=0x%08X (cb=0x%X get=0x%X set=0x%X, isNew=%d)\n",
            func_opd, cb_ea, get_ea, set_ea, is_new);
-    g_ps3_guest_caller(func_opd, cb_ea, get_ea, set_ea, 0);
+    g_ps3_guest_caller(func_opd, cb_ea, get_ea, set_ea, 0, 0, 0, 0, 0);
 
     s32 result = marshal_cbresult_read_result(cb_ea);
     printf("[cellSaveData] funcStat returned cbResult.result=%d\n", result);
