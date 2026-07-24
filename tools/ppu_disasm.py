@@ -649,7 +649,12 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             1014: "dcbz",
         }
         if xo_full in misc_x:
-            result.mnemonic = misc_x[xo_full]
+            if xo_full == 598:
+                # sync's L field selects the barrier strength.
+                result.mnemonic = {0: "sync", 1: "lwsync", 2: "ptesync"}.get(
+                    rd, "sync")
+            else:
+                result.mnemonic = misc_x[xo_full]
             if xo_full in (278, 246, 86, 54, 982, 758, 1014):
                 result.operands = f"r{ra}, r{rb}"
             return result

@@ -116,6 +116,14 @@ SOURCE_PREAMBLE = """\
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+/* Preserve guest ordering at host-thread boundaries. */
+#ifdef __cplusplus
+#include <atomic>
+#define PPU_FENCE(o) std::atomic_thread_fence(std::memory_order_##o)
+#else
+#include <stdatomic.h>
+#define PPU_FENCE(o) atomic_thread_fence(memory_order_##o)
+#endif
 
 /* Float->int conversion per Book I 4.6.7: SATURATE out-of-range (positive
  * overflow => max, negative => min, NaN => min) and honor the rounding mode
@@ -2080,9 +2088,16 @@ class PPULifter:
             return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0x7FULL; "
                     f"memset(vm_base + (uint32_t)ea, 0, 128); }}")
 
-        if mn in ("dcbt", "dcbtst", "dcbf", "dcbst", "dcba", "icbi",
-                  "sync", "eieio", "isync", "lwsync", "ptesync"):
-            return f"/* {mn}: cache/sync — no-op */;"
+        if mn in ("dcbt", "dcbtst", "dcbf", "dcbst", "dcba", "icbi"):
+            return f"/* {mn}: cache hint — no-op */;"
+        if mn in ("sync", "ptesync"):
+            return "PPU_FENCE(seq_cst);"
+        if mn == "lwsync":
+            return "PPU_FENCE(acq_rel);"
+        if mn == "eieio":
+            return "PPU_FENCE(release);"
+        if mn == "isync":
+            return "PPU_FENCE(acquire);"
 
         # ------- addme/subfme/subfze (carry arithmetic, 2-op) -------
         if mn.startswith("addme"):

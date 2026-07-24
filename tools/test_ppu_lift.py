@@ -689,8 +689,14 @@ def check_decode_and_lift():
     check("mtspr VRSAVE", spr_form(467, 3, 256), "mtspr",
           operand_substr="VRSAVE", code_substr="unmodeled")
 
-    n_ok = 5 - fails[0]
-    print(f"[fpscr/vrsave] {n_ok} checks passed, {fails[0]} FAILED")
+    check("sync", 0x7C0004AC, "sync", code_substr="PPU_FENCE(seq_cst)")
+    check("lwsync", 0x7C2004AC, "lwsync", code_substr="PPU_FENCE(acq_rel)")
+    check("ptesync", 0x7C4004AC, "ptesync", code_substr="PPU_FENCE(seq_cst)")
+    check("eieio", 0x7C0006AC, "eieio", code_substr="PPU_FENCE(release)")
+    check("isync", 0x4C00012C, "isync", code_substr="PPU_FENCE(acquire)")
+
+    n_ok = 10 - fails[0]
+    print(f"[decode/lift] {n_ok} checks passed, {fails[0]} FAILED")
     return fails[0] == 0
 
 # ---------------------------------------------------------------------------
