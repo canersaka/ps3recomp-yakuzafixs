@@ -8,7 +8,7 @@ chosen guest base, applies the SCE_PPURELA relocations, and emits:
   <name>_functions.json  function seeds for ppu_lifter (--raw --base mode):
                          every exported function's code address, region-bounded;
                          the lifter's discovery pass finds interior functions
-  <name>_exports.json    {library: {fnid_hex: opd_ea_hex}} for import binding
+  <name>_exports.json    module metadata, TOC, and export bindings
   <name>_imports.json    the module's own imports: {library: {fnid_hex:
                          stub_slot_ea_hex}} — slots the runner patches to its
                          HLE bridge descriptors
@@ -220,9 +220,9 @@ def main():
         funcs.append({"start": f"0x{s:08X}", "end": f"0x{e:08X}"})
 
     img_path = os.path.join(args.output, f"{stem}_image.bin")
+    funcs_path = os.path.join(args.output, f"{stem}_functions.json")
     open(img_path, "wb").write(img)
-    json.dump(funcs, open(os.path.join(args.output, f"{stem}_functions.json"), "w"),
-              indent=1)
+    json.dump(funcs, open(funcs_path, "w"), indent=1)
     json.dump({"module": name, "base": f"0x{args.base:08X}", "toc": f"0x{toc + args.base:08X}",
                "exports": exports, "opd_to_code": opd_map},
               open(os.path.join(args.output, f"{stem}_exports.json"), "w"), indent=1)
@@ -238,6 +238,10 @@ def main():
           f"in {len(imports)} libs")
     print(f"function seeds: {len(funcs)} ({n_opd_seeds} from internal OPD scan; "
           f"region-bounded; lifter discovery fills interiors)")
+    print("lift with:")
+    print(f'  python tools/ppu_lifter.py "{img_path}" --raw '
+          f'--base 0x{args.base:08X} --toc 0x{toc + args.base:08X} '
+          f'--functions "{funcs_path}" --symbol-prefix "{stem}_"')
 
 
 if __name__ == "__main__":

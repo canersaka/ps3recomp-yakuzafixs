@@ -3623,6 +3623,9 @@ def main() -> None:
     parser.add_argument("--raw", action="store_true", help="Treat input as raw binary")
     parser.add_argument("--base", type=lambda x: int(x, 0), default=0,
                         help="Base address (for raw binary)")
+    parser.add_argument("--toc", type=lambda x: int(x, 0), default=0,
+                        help="Module TOC address (raw binaries only; enables "
+                             "jump-table discovery)")
     parser.add_argument("--little-endian", action="store_true")
     parser.add_argument("--functions", metavar="FILE",
                         help="JSON file with function list [{start, end}, ...]")
@@ -3875,13 +3878,20 @@ def main() -> None:
     jt_targets = set()
     jt_dispatchers: dict[int, list[int]] = {}   # {bctr_addr: [case targets]}
     data_code_targets: set[int] = set()         # code ptrs found in data (indirect-call targets)
-    toc_candidates: list[int] = []              # raw mode has no ELF TOC; ELF path fills this below
-    if not args.raw:
+    toc_candidates: list[int] = []
+    # A relocated PRX has no ELF program headers or entry descriptor left, but
+    # lift_prx.py does know its module TOC. Treat the raw blob as one segment
+    # when --toc supplies that missing metadata. Without --toc raw lifting keeps
+    # the old behavior and skips this discovery pass.
+    if not args.raw or args.toc:
         try:
-            seg_map = [(ph.p_vaddr, ph.p_vaddr + ph.p_filesz,
-                        elf.get_segment_data(elf.program_headers.index(ph)))
-                       for ph in elf.program_headers
-                       if ph.p_type == PT_LOAD and ph.p_filesz > 0]
+            if args.raw:
+                seg_map = [(base_addr, base_addr + len(file_data), file_data)]
+            else:
+                seg_map = [(ph.p_vaddr, ph.p_vaddr + ph.p_filesz,
+                            elf.get_segment_data(elf.program_headers.index(ph)))
+                           for ph in elf.program_headers
+                           if ph.p_type == PT_LOAD and ph.p_filesz > 0]
             def _read_u32(a):
                 for v0, v1, d in seg_map:
                     if v0 <= a and a + 4 <= v1:
@@ -3892,15 +3902,17 @@ def main() -> None:
             text_hi = max(e for _, e in func_bounds)
             if args.code_end is not None:
                 text_hi = min(text_hi, args.code_end)
-            toc = _read_u32((elf.elf_header.e_entry + 4) & 0xFFFFFFFF) or 0
+            toc = (args.toc if args.raw
+                   else _read_u32((elf.elf_header.e_entry + 4) & 0xFFFFFFFF) or 0)
             # PSL1GHT/GCC ELFs: the entry descriptor's second word is NOT a TOC
             # (it repeats the code address); the real r2 the crt establishes is
             # .got + 0x8000 (the ELFv1 TOC bias). Without the right TOC every
             # `ld rT, disp(r2)` table-base load reads garbage and the jump-table
             # pass finds nothing (newlib's _vfprintf_r switch then dispatches to
             # unlifted case addresses at runtime).
-            code = _read_u32(elf.elf_header.e_entry & 0xFFFFFFFF) or 0
-            if toc == code or toc == 0:
+            code = (0 if args.raw
+                    else _read_u32(elf.elf_header.e_entry & 0xFFFFFFFF) or 0)
+            if not args.raw and (toc == code or toc == 0):
                 got_addr = None
                 for sec in getattr(elf, "section_headers", []) or []:
                     if getattr(sec, "name_str", "") == ".got":
