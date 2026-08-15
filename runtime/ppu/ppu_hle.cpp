@@ -404,7 +404,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 else if (vm_base[desc+0xC]!=0xFF) {
                     uint32_t iopd = prx_resolve_export(0x22AAB31Du);
                     static int _g=0; if(_g++<6) fprintf(stderr,"[GUESTINIT] pre-init descriptor 0x%08X via 0x22AAB31D (opd=0x%08X) before create-task\n", desc, iopd);
-                    if (iopd) { ppu_guest_call(iopd, desc, 1, 8, 0x398);
+                    if (iopd) { ppu_guest_call(iopd, desc, 1, 8, 0x398, 0, 0, 0, 0);
                         if(_g<=6) fprintf(stderr,"[GUESTINIT] after pre-init: descriptor 0x%08X +0xC=0x%02X\n", desc, vm_base[desc+0xC]); }
                 }
             }
