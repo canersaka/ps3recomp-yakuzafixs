@@ -669,7 +669,18 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
         uint32_t entry = spu_load_image_to_ls(t->img_ea, ls);
         fprintf(stderr, "[SPU-FRAME] tid=0x%X q=%u work=0x%08X -> re-run\n",
                 t->tid, comp_queue, work_ea);
-        spu_run_interp_job(ls, entry, t->args_ea, -1, t->tid, t->group_id, work_ea);
+        /* RD_SPU_FRAME_MBOX=1 restores seeding work_ea into the inbound mailbox.
+         * It is OFF by default because at least one sim image (the Rubber Ducky
+         * solver) uses `rchcnt SPU_RdInMbox` the other way round: its send-result
+         * helper at LS 0xC370 returns EBUSY when the inbox is NON-empty and only
+         * falls through to `wrch WrOutMbox; stop 0x110` when it is EMPTY. Seeding
+         * the mailbox made that check fail every pass, so the worker never
+         * signalled completion and spun (3M+ interpreted steps, no progress). */
+        int32_t frc = spu_run_interp_job(ls, entry, t->args_ea, -1, t->tid, t->group_id,
+                                         getenv("RD_SPU_FRAME_MBOX") ? work_ea : 0u);
+        { extern uint32_t g_spu_interp_last_pc; extern uint64_t g_spu_interp_steps;
+          fprintf(stderr, "[SPU-FRAME] tid=0x%X done (stop=0x%X, %llu insns, last pc=0x%05X)\n",
+                  t->tid, frc, (unsigned long long)g_spu_interp_steps, g_spu_interp_last_pc); }
         return 1;
     }
     return 0;
@@ -711,6 +722,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
      * group_join() blocks until all spawned host threads finish. */
     int spawned = 0;
     int instant = 0;
+    int nofb    = 0;   /* subset of `instant` that had no fallback at all */
     for (uint32_t i = 0; i < g->num_threads && i < 8; i++) {
         uint32_t idx = g->thread_indices[i];
         if (idx >= MAX_SPU_THREADS) continue;
@@ -728,7 +740,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         if (!fb) {
             t->exit_status = 0;
             t->running = 0;
-            instant++;
+            instant++; nofb++;
             continue;
         }
         t->fb_handler = fb;
@@ -777,8 +789,12 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         g->state = SPU_GROUP_STATE_STOPPED;
         g->cause = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
         g->exit_status = 0;
-        fprintf(stderr, "[SPU] group_start id=0x%X (no fallback for any of %u thread(s); instantly completed)\n",
-                id, g->num_threads);
+        /* `instant` counts BOTH no-fallback threads and threads that ran to
+         * completion synchronously (the interpreter path). Reporting "no
+         * fallback" whenever spawned==0 hid a perfectly working interpreted
+         * run -- say which it actually was. */
+        fprintf(stderr, "[SPU] group_start id=0x%X (%u thread(s), none spawned: %d ran synchronously, %d had no fallback)\n",
+                id, g->num_threads, instant - nofb, nofb);
     } else {
         fprintf(stderr, "[SPU] group_start id=0x%X (%d host threads running, %d instant)\n",
                 id, spawned, instant);

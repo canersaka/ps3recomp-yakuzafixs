@@ -345,6 +345,13 @@ uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; vm_hotmap(
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap16(v); }
 uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
+    /* RD_FORCE_ADDR=<hex>: force reads of one address to RD_FORCE_VAL (default 0)
+     * -- diagnostic to break a completion spin and see whether the game proceeds.
+     * (From eeff394; dropped by the runtime/spu consolidation, restored here.) */
+    { static int64_t _fa=-2; static uint32_t _fv=0;
+      if(_fa==-2){ const char* e=getenv("RD_FORCE_ADDR"); _fa=e?(int64_t)strtoul(e,0,16):-1;
+                   const char* ev=getenv("RD_FORCE_VAL"); _fv=ev?(uint32_t)strtoul(ev,0,16):0; }
+      if (_fa>=0 && (uint32_t)a==(uint32_t)_fa) return _fv; }
     /* GCM_REFPOLL: read-driven RSX fence publication. A spin-read of the ref
      * register (GCM_CONTROL+8 = 0x03002008) advances one queued fence (paced
      * <=1/ms), so cellGcmFinish makes progress even when the 60 Hz present
@@ -431,7 +438,8 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
     /* Hot-poll detector: a thread spinning on the same address (e.g. a GCM FIFO
      * get-pointer / label waiting on RSX) reads it thousands of times in a row. */
     { static __declspec(thread) uint32_t last=0xFFFFFFFFu; static __declspec(thread) uint32_t n=0;
-      if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD] spinning on 0x%08X (=0x%08X)\n", (uint32_t)a, __builtin_bswap32(v)); n=0;
+      if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD] spinning on 0x%08X (=0x%08X) guest cia=0x%08X lr=0x%08X\n", (uint32_t)a, __builtin_bswap32(v),
+          g_active_ctx?(uint32_t)g_active_ctx->cia:0, g_active_ctx?(uint32_t)g_active_ctx->lr:0); n=0;
 #ifdef _WIN32
         /* YDKJ_SPINBT=<addr>: one-shot host backtrace when the read32 hot spin
          * is on the watched address -- names the guest function containing the
