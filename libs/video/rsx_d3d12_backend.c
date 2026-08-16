@@ -3664,7 +3664,24 @@ static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
             for (u32 k = 0; k < n; k++) o->v[k] = rd_bef(p + k * 4);
             break;
         }
+        if (i == 0) { void rsx_vtx_pos_dbg(const rsx_state*, const float*, u32);
+                      rsx_vtx_pos_dbg(state, o->v, n); }
     }
+}
+
+/* VTX_POS=<N>: print the first fetched position of the first N draws. A guest
+ * vertex array that resolves to the wrong memory reads as garbage/denormals, and
+ * that is indistinguishable from "the shader is wrong" without seeing the input. */
+void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n)
+{
+    static int cap = -1, seen = 0;
+    if (cap < 0) { const char* e = getenv("VTX_POS"); cap = e ? atoi(e) : 0; }
+    if (!cap || seen >= cap) return;
+    seen++;
+    const rsx_vertex_attrib* a = &state->vertex_attribs[0];
+    fprintf(stderr, "[VTXPOS] a0 off=0x%X stride=%u size=%u type=%u -> (%g, %g, %g, %g)\n",
+            a->offset, a->stride, a->size, a->type,
+            n > 0 ? v[0] : 0.f, n > 1 ? v[1] : 0.f, n > 2 ? v[2] : 0.f, n > 3 ? v[3] : 0.f);
 }
 
 static void vp_attrs_dbg(const rsx_state* state)
@@ -4232,9 +4249,12 @@ static void d3d12_set_vertex_attribs(void* ud, const rsx_state* state)
     (void)ud;
     s_d3d.current_rsx_state = state;
 
-    /* Log enabled vertex attributes for debugging */
-    static int log_count = 0;
-    if (log_count < 5) {
+    /* Log enabled vertex attributes for debugging. RSX_VTXDBG=<N> raises the
+     * cap: the fixed 5 were all consumed by boot-time setup, so the layouts the
+     * real draws use were never printed. */
+    static int log_count = 0, log_cap = -1;
+    if (log_cap < 0) { const char* e = getenv("RSX_VTXDBG"); log_cap = e ? atoi(e) : 5; }
+    if (log_count < log_cap) {
         printf("[D3D12] set_vertex_attribs:\n");
         for (int i = 0; i < 16; i++) {
             const rsx_vertex_attrib* a = &state->vertex_attribs[i];

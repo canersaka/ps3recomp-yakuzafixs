@@ -249,7 +249,13 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
         attr->size      = (data >> 4) & 0xF;
         attr->stride    = (data >> 8) & 0xFF;
         attr->frequency = (data >> 16) & 0xFFFF;   /* instancing divisor */
-        attr->enabled   = (attr->type != 0); /* type 0 = disabled */
+        /* SIZE (the component count) is what enables the attribute: NV4097 uses
+         * size == 0 to mean "this array is off". Keying off `type` instead marked
+         * every unused slot enabled-with-zero-components, because PSGL writes a
+         * bare type (e.g. 0x00000002 = float32, size 0, stride 0) into the slots
+         * it is NOT using -- so the input layout was built from 16 attributes of
+         * which most were degenerate, and the draws rasterized nothing. */
+        attr->enabled   = (attr->size != 0);
         attr->format    = data;
         state->vertex_dirty = 1;
         return 0;
@@ -272,8 +278,12 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
 
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
-    { static int _rt=-1; if(_rt<0) _rt=getenv("YDKJ_RSXTRACE")?1:0;
-      if(_rt){ static int _m=0; if(_m++<250) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
+    /* YDKJ_RSXTRACE=<N>: trace the first N methods (bare "1" keeps the old 250).
+     * The fixed 250 was spent entirely on boot-time setup, so the methods around
+     * the first real draw -- exactly the ones worth seeing -- were never traced. */
+    { static int _rt=-1; if(_rt<0){ const char* e=getenv("YDKJ_RSXTRACE");
+        _rt = e ? (atoi(e) > 1 ? atoi(e) : 250) : 0; }
+      if(_rt){ static int _m=0; if(_m++<_rt) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
     /* Back-end write label / semaphore (cellGcmSetWriteBackEndLabel): the RSX
      * writes a value to a report/label the CPU polls for CPU<->RSX sync (double
      * buffering). Real hardware DOES this; without it the game's frame-fence
