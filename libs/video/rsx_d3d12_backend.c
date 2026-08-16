@@ -1518,6 +1518,24 @@ static int vp_get_vs(const rsx_state* st)
     if (getenv("VP_DUMP")) { static int _d=0; if (_d++ < 4) {
         FILE* f = fopen("vp2_dump.hlsl", _d==1 ? "w" : "a");
         if (f) { fprintf(f, "/* per-draw VS hash pending, %d instrs */%s%s", ni, hlsl, "\n"); fclose(f); } } }
+    /* VP_BYPASS=1: replace the guest transform with a direct map of attribute 0
+     * into clip space. If geometry appears with this on, everything from the
+     * input layout through raster/depth/present is sound and the fault is the
+     * transform (constants or the decompiled program); if it stays blank, the
+     * fault is upstream of the shader -- the attribute binding itself. Patched
+     * in place, space-padded to the original length so offsets stay valid. */
+    if (getenv("VP_BYPASS")) {
+        static const char anchor[] =
+            "Out.pos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);";
+        static const char repl[] = "Out.pos = float4(v[0].xy * 0.5, 0.5, 1.0);";
+        char* at = hlsl;
+        while ((at = strstr(at, anchor)) != NULL) {
+            size_t n = sizeof(anchor) - 1, m = sizeof(repl) - 1;
+            memcpy(at, repl, m);
+            memset(at + m, ' ', n - m);
+            at += n;
+        }
+    }
     ID3DBlob* vb = NULL; ID3DBlob* e = NULL;
     HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "guest_vp2", NULL, NULL,
                             "main", "vs_5_0", 0, 0, &vb, &e);
@@ -1539,6 +1557,18 @@ static int vp_get_vs(const rsx_state* st)
         (strstr(hlsl, "vp_c[0]") || strstr(hlsl, "vp_c[1]") ||
          strstr(hlsl, "vp_c[2]") || strstr(hlsl, "vp_c[3]")) ? 1 : 0;
     { static int _n=0; if (_n++<6) printf("[VP] per-draw VS cached (hash=0x%08X, %d instrs, slot %d)\n", hash, ni, slot); }
+    /* Build the base VP pipeline here if it does not exist yet. render_frame's
+     * trigger reads s_d3d.current_rsx_state, which by frame end no longer has
+     * the microcode -- so for a title that only ever compiles per-draw VS the
+     * base pipeline was never built, s_d3d.vp_ready stayed 0, and the VP draw
+     * pass it gates dropped every recorded is_vp draw. Here we are at RECORD
+     * time with a live state that definitely has microcode. */
+    if (!s_d3d.vp_ready && st && st->vp_ucode_bytes >= 16) {
+        const rsx_state* prev = s_d3d.current_rsx_state;
+        s_d3d.current_rsx_state = st;
+        compile_vp();
+        s_d3d.current_rsx_state = prev;
+    }
     return slot;
 }
 
@@ -2507,9 +2537,16 @@ static void render_frame(void)
 
     /* Compile the real vertex program once its microcode is captured, and keep
      * the constant bank uploaded for the VS. */
+    /* The base VP pipeline gates the ENTIRE vertex-program draw pass below
+     * (`if (s_d3d.vp_ready ...)`). The old trigger also required the microcode
+     * size to differ from the last compile, so a title whose first captured
+     * program has the same byte count as vp_compiled_bytes never built the base
+     * pipeline -- and then every is_vp draw record was silently dropped: draws
+     * recorded, constants uploaded, per-draw VS compiled and cached, and not one
+     * of them submitted. While !vp_ready there is nothing to be stale against,
+     * so only the "have microcode" test belongs here. */
     if (s_d3d.current_rsx_state && !s_d3d.vp_ready &&
-        s_d3d.current_rsx_state->vp_ucode_bytes >= 16 &&
-        s_d3d.vp_compiled_bytes != s_d3d.current_rsx_state->vp_ucode_bytes)
+        s_d3d.current_rsx_state->vp_ucode_bytes >= 16)
         compile_vp();
     /* Per-draw VP constants are snapshotted at record time (vp_record_cb). */
 
