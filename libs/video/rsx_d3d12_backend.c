@@ -1760,6 +1760,11 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * therefore means the guest EXPLICITLY masked every channel -- a depth-only
      * pass (e.g. DeferredShading's shadow-map generation). Honour it: forcing 0
      * back to 0xF splatters the depth pass's fragment colour onto the target. */
+    /* CMASK_FORCE=1: ignore the guest colour mask (write RGBA on every draw).
+     * A mis-decoded mask makes geometry rasterize correctly and write nothing,
+     * which is indistinguishable from "the draw never happened". */
+    { static int _cf = -1; if (_cf < 0) _cf = getenv("CMASK_FORCE") ? 1 : 0;
+      if (_cf) cmask = 0xF; }
     for (int _r = 0; _r < nrt; _r++)
         pd.BlendState.RenderTarget[_r].RenderTargetWriteMask = (UINT8)(cmask & 0xF);
     pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
