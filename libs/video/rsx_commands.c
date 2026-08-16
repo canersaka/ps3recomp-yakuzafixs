@@ -558,7 +558,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
             memcpy(&f, &data, 4);
             { static int _en=-1; if(_en<0){const char*e=getenv("TCONST_DBG");_en=e?1:0;}
               static int _n=0;
-              int _hit = _en && (getenv("TCONST_ALL") ? (_n<64) : (slot>=12 && slot<=30 && _n<400));
+              static int _max=-1; if(_max<0){const char*m=getenv("TCONST_MAX");_max=m?atoi(m):64;}
+              int _hit = _en && (getenv("TCONST_ALL") ? (_n<_max) : (slot>=12 && slot<=30 && _n<400));
               if(_hit){ _n++; fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); } }
             state->vertex_constants[slot][lane] = f;
             { static int _sq=0; if (getenv("SEQ_DBG") && slot==256 && lane==0 && _sq++ < 500)

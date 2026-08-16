@@ -2204,6 +2204,20 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
     char* dst = (char*)s_d3d.vp_cb_mapped
         + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_CB_STRIDE;
     memcpy(dst, st->vertex_constants, RSX_MAX_VERTEX_CONSTANTS * 16);
+    /* VP_MVP=<N>: the constant bank as the shader will see it, for the first N
+     * draws. A snapshot taken from a stale rsx_state looks exactly like a broken
+     * vertex program from the outside -- both give zero fragments. */
+    { static int cap = -1, seen = 0;
+      if (cap < 0) { const char* e = getenv("VP_MVP"); cap = e ? atoi(e) : 0; }
+      if (cap && seen < cap) { seen++;
+        const float* c = (const float*)dst;
+        int last_nz = -1;
+        for (int i = 0; i < RSX_MAX_VERTEX_CONSTANTS * 4; i++)
+            if (c[i] > 1e-9f || c[i] < -1e-9f) last_nz = i / 4;
+        fprintf(stderr, "[VPMVP] slot=%u lastNZ=c%d  c260=(%g %g %g %g) c261=(%g %g %g %g)\n",
+                slot, last_nz,
+                c[260*4+0], c[260*4+1], c[260*4+2], c[260*4+3],
+                c[261*4+0], c[261*4+1], c[261*4+2], c[261*4+3]); } }
     /* Viewport epilogue (see the render_frame notes this logic came from):
      * x/y identity, z lane remaps GL clip z when the guest programs one. */
     float* vpx = (float*)(dst + RSX_MAX_VERTEX_CONSTANTS * 16);
