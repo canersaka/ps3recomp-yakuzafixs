@@ -2309,6 +2309,19 @@ static u32 current_rt_off(u32* out_w, u32* out_h, u32 out_mrt[3])
                 st->surface_zeta_offset, st->surface_clip_w, st->surface_clip_h,
                 cellGcmOffsetIsDisplay(raw), cellGcmOffsetIsDisplay(raw) ? 0 : raw); }
     if (cellGcmOffsetIsDisplay(raw)) return 0;
+    /* RT_DISPLAY_BY_SIZE=1: also treat a single-target surface whose clip
+     * exactly matches the display resolution as the backbuffer.
+     *
+     * cellGcmSetDisplayBuffer only registers the buffers the FLIP may point at;
+     * a guest is free to render into a different surface of the same size and
+     * flip to it later (PSGL does). Matching offsets alone then classifies every
+     * draw as offscreen, has_display stays 0, and render_frame() -- which is
+     * what draws ALL recorded geometry -- is never called. The backbuffer shows
+     * only the clear, which looks exactly like "nothing rasterizes". */
+    { static int _bs = -1; if (_bs < 0) _bs = getenv("RT_DISPLAY_BY_SIZE") ? 1 : 0;
+      if (_bs && st->color_target < 0x13 &&
+          st->surface_clip_w == s_d3d.width && st->surface_clip_h == s_d3d.height)
+          return 0; }
     /* Surface clip dims when sane; else the window size. Any size works --
      * passes draw normalized full-surface quads -- this only picks resolution. */
     u32 w = st->surface_clip_w, h = st->surface_clip_h;
@@ -2938,6 +2951,17 @@ static void render_frame(void)
             (s_d3d.tex_ready && s_d3d.pipeline_state_vp) ? s_d3d.pipeline_state_vp
                                                          : s_d3d.pipeline_state_vp_color;
         if (!vpso) vpso = s_d3d.pipeline_state_vp;
+        { static int cap = -1, n = 0;
+          if (cap < 0) { const char* e = getenv("VP_SUBMIT"); cap = e ? atoi(e) : 0; }
+          if (cap && n < cap) { n++;
+            u32 nvp = 0, nclr = 0;
+            for (u32 d2 = 0; d2 < s_d3d.draw_count && d2 < MAX_DRAWS; d2++) {
+                if (s_d3d.draws[d2].is_vp)    nvp++;
+                if (s_d3d.draws[d2].is_clear) nclr++;
+            }
+            fprintf(stderr, "[VPPASS] records=%u is_vp=%u clears=%u any=%d vpso=%p rootsig=%p\n",
+                    s_d3d.draw_count, nvp, nclr, any,
+                    (void*)vpso, (void*)s_d3d.vp_root_sig); } }
         if (any && vpso) {
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.vp_root_sig);
             s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list, vpso);
@@ -3056,6 +3080,16 @@ static void render_frame(void)
                         + ((u64)s_d3d.vp_parity * MAX_DRAWS + d) * 256);
                 s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list,
                     dr->vertex_count, 1, dr->vb_byte_offset / 256, 0);
+                /* VP_SUBMIT=<N>: prove the VP pass actually reaches the GPU.
+                 * "records exist" and "draws were submitted" are different
+                 * claims, and every blank-output investigation conflates them. */
+                { static int cap = -1, n = 0;
+                  if (cap < 0) { const char* e = getenv("VP_SUBMIT"); cap = e ? atoi(e) : 0; }
+                  if (cap && n < cap) { n++;
+                    fprintf(stderr, "[VPSUBMIT] draw[%u] verts=%u startv=%u pso=%s rt=%u vpwh=%ux%u\n",
+                            d, dr->vertex_count, dr->vb_byte_offset / 256,
+                            dpso ? "guest-fp" : "fallback", dr->rt_off,
+                            dr->vp_w, dr->vp_h); } }
             }
             /* Leave the backbuffer bound for the dump/present epilogue. */
             if (cur_rt >= 0) {
@@ -4525,6 +4559,23 @@ void rsx_d3d12_backend_present(void)
             break;
         }
     if (has_display && s_d3d.draw_count > 0) s_seen_content = 1;
+
+    /* VP_SUBMIT=<N>: has_display gates render_frame() entirely, so a batch whose
+     * records all target an OFFSCREEN rt (rt_off != 0) presents without ever
+     * running the draw pass -- the backbuffer then shows only the clear, which
+     * reads as "nothing rasterizes" from every downstream check. */
+    { static int cap = -1, n = 0;
+      if (cap < 0) { const char* e = getenv("VP_SUBMIT"); cap = e ? atoi(e) : 0; }
+      if (cap && n < cap && s_d3d.draw_count) { n++;
+        u32 onscreen = 0, offscreen = 0, clears = 0;
+        for (u32 _i = 0; _i < s_d3d.draw_count && _i < MAX_DRAWS; _i++) {
+            if (s_d3d.draws[_i].is_clear) { clears++; continue; }
+            if (s_d3d.draws[_i].rt_off) offscreen++; else onscreen++;
+        }
+        fprintf(stderr, "[PRESENTGATE] records=%u onscreen=%u offscreen=%u clears=%u"
+                        " has_display=%d seen_content=%d -> render_frame=%s\n",
+                s_d3d.draw_count, onscreen, offscreen, clears, has_display,
+                s_seen_content, (s_d3d.initialized && has_display) ? "YES" : "SKIPPED"); } }
 
     if (s_d3d.initialized && has_display)
         render_frame();
