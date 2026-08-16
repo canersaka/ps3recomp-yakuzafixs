@@ -1062,6 +1062,9 @@ static void ydkj_spu_out_mbox_deliver(uint32_t group_id, uint32_t spu_id,
     spu_thread_t* t = spu_find_thread(spu_id);
     if (t && t->connected_queue) q = t->connected_queue;
     if (!q) { spu_group_t* g = spu_find_group(group_id); if (g) q = g->event_queue_id; }
+    { static int s_d = 0; if (getenv("YDKJ_MBOXTRACE") && s_d++ < 64)
+        fprintf(stderr, "[SPU->PPU] deliver? spu=0x%X intr=%d val=0x%08X q=%u (thread %s)\n",
+                spu_id, is_intr, value, q, t ? "found" : "MISSING"); }
     if (!q) return;
     /* SPURS SPU-event source convention: high word tags it as an SPU thread
      * event; data1 = the mailbox value. */

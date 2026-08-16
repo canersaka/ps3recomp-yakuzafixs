@@ -266,7 +266,15 @@ int64_t sys_fs_open(ppu_context* ctx)
      * handle pressure) -- which surfaced as a NONDETERMINISTIC "Cg shader file
      * could not be read" abort. Retry a few times with a brief backoff for a
      * read-only open of a file that exists; deterministic and cheap. */
-    if (!fp && !(flags & (CELL_FS_O_CREAT | CELL_FS_O_WRONLY | CELL_FS_O_TRUNC))) {
+    /* ...but ONLY when the failure could plausibly be transient. ENOENT is not:
+     * the path does not exist and never will within this open. Retrying it cost
+     * 3000 x Sleep(1) = tens of seconds of dead wall-clock PER probe, which is
+     * what made the Rubber Ducky demo look wedged at "Loading cviewer scene" --
+     * libxml2 probes /etc/xml/catalog there, and that file is absent by design.
+     * A share-lock/handle-pressure failure (the case this retry exists for)
+     * reports EACCES/EBUSY, not ENOENT, so the recovery still works. */
+    if (!fp && errno != ENOENT &&
+        !(flags & (CELL_FS_O_CREAT | CELL_FS_O_WRONLY | CELL_FS_O_TRUNC))) {
         for (int _r = 0; !fp && _r < 3000; _r++) {
 #ifdef _WIN32
             Sleep(1);
