@@ -1385,6 +1385,24 @@ u32 cellGcmResolveOffset(u32 offset)
     return s_config.localAddress + offset;
 }
 
+/* IO-table-first resolve: skip the local-page shortcut and ask the IO offset
+ * table, falling back to VRAM only if the page is unmapped. cellGcmResolveOffset
+ * prefers local for any page the guest ever derived from a local EA, which is
+ * right for a title that really does keep the data in VRAM but wrong for one
+ * that builds its textures in main memory on pages whose numbers happen to
+ * collide. Returns 0 when the IO table has no mapping, so a caller can tell
+ * "not IO-mapped" from "IO-mapped at 0". */
+u32 cellGcmResolveIO(u32 offset)
+{
+    u32 page = offset >> 20;
+    if (page < 65536) {
+        u16 ea_page = s_ea_address_table[page];
+        if (ea_page != 0 && ea_page != 0xFFFF)
+            return ((u32)ea_page << 20) | (offset & 0xFFFFF);
+    }
+    return 0;
+}
+
 /* Location-aware resolve. RSX offsets are TWO overlapping number spaces --
  * LOCAL (VRAM, ea = localAddress + offset) and MAIN (IO-mapped, via the
  * offset table). cellGcmResolveOffset guesses table-first, which breaks when

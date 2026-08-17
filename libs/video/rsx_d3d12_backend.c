@@ -1893,6 +1893,29 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
         if (!s_d3d.vp_tex[i].used && freeslot < 0) freeslot = i;
     }
     if (freeslot < 0) return -1;                  /* out of slots this frame */
+    /* TEX_SRCDBG=<N>: is the guest memory this slot uploads FROM actually
+     * populated? An empty source and a broken sampler both render flat. */
+    { static int cap = -1, n = 0;
+      if (cap < 0) { const char* e = getenv("TEX_SRCDBG"); cap = e ? atoi(e) : 0; }
+      if (cap && n < cap) { n++;
+        u32 nz = 0, tot = 0;
+        for (u32 i = 0; i < w * h * bpp && i < 0x40000u; i += 61) { tot++; if (vm_base[off + i]) nz++; }
+        long nearest = 0; u32 found = 0;
+        if (!nz) {   /* empty: where IS the data? scan out from the bind offset */
+            for (long d = 0x1000; d <= 0x1000000 && !found; d += 0x1000) {
+                for (int s = 0; s < 2 && !found; s++) {
+                    long a = (long)off + (s ? -d : d);
+                    if (a < 0x1000) continue;
+                    u32 c = 0;
+                    for (u32 i = 0; i < 0x1000u; i += 61) if (vm_base[a + i]) c++;
+                    if (c > 8) { nearest = (s ? -d : d); found = c; }
+                }
+            }
+        }
+        fprintf(stderr, "[TEXSRC] off=0x%08X %ux%u fmt=0x%02X bpp=%u nonzero=%u/%u"
+                        "%s%+ld (page nonzero=%u)\n",
+                off, w, h, fmt, bpp, nz, tot,
+                nz ? "" : "  nearest data at ", nz ? 0L : nearest, found); } }
     slot = freeslot;
     VPTexSlot* t = &s_d3d.vp_tex[slot];
     u32 pitch = ((dxt ? blkrow : w * bpp) + 255) & ~255u;
@@ -4312,7 +4335,16 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
          base_fmt == 0x8B /* G8B8: LBP's font atlas */ ||
          (base_fmt >= 0x86 && base_fmt <= 0x88) /* DXT1/23/45 */ ||
          base_fmt == 0x9A /* W16Z16Y16X16 half-float: RTT intermediates */)) {
-        s_d3d.cur_texs[unit].off = cellGcmResolveLocated((tex->format & 3) == 1, offset);
+        /* TEX_RESOLVE_AUTO=1: resolve through the page tables (local-page map
+         * then IO table) instead of trusting the format's location bits. A
+         * texture the guest built in main memory but tagged local resolves to
+         * untouched VRAM and samples as all-zero -- geometry renders, flat. */
+        { static int _ra = -1; if (_ra < 0) _ra = getenv("TEX_RESOLVE_AUTO") ? 1 : 0;
+          extern u32 cellGcmResolveIO(u32);
+          u32 _r = 0;
+          if (_ra) _r = cellGcmResolveIO(offset);          /* IO table first */
+          if (!_r) _r = cellGcmResolveLocated((tex->format & 3) == 1, offset);
+          s_d3d.cur_texs[unit].off = _r; }
         s_d3d.cur_texs[unit].raw = offset;
         s_d3d.cur_texs[unit].w = width; s_d3d.cur_texs[unit].h = height;
         s_d3d.cur_texs[unit].fmt = format;   /* full byte: LN(0x20)/UN(0x40) kept */
