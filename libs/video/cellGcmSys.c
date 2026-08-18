@@ -636,6 +636,53 @@ static struct {
     u32 size_out;     /* NV308A 0x0308 SET_SIZE_OUT                 */
 } s_gcm2d;
 
+static struct {
+    u32 src_dma, dst_surf, fmt, op, clip_pt, clip_sz, out_pt, out_sz;
+    u32 ds_dx, dt_dy, in_sz, in_fmt, in_off, in_uv;
+} s_nv3089;
+
+/* Execute one NV3089 blit into the currently-bound NV3062 destination surface.
+ * Point-sampled: ds/dx and dt/dy are 20.12 fixed point and are 0x100000 (1.0)
+ * for the straight uploads this exists for; a scaled blit still lands, just
+ * without filtering. */
+static void nv3089_blit(void)
+{
+    u32 out_w = s_nv3089.out_sz & 0xFFFF, out_h = s_nv3089.out_sz >> 16;
+    u32 out_x = s_nv3089.out_pt & 0xFFFF, out_y = s_nv3089.out_pt >> 16;
+    u32 in_pitch = s_nv3089.in_fmt & 0xFFFF;
+    u32 dst_pitch = s_gcm2d.pitch >> 16;
+    if (!out_w || !out_h || !in_pitch || !dst_pitch) return;
+    /* Only the 32-bit colour formats are handled; anything else would need a
+     * per-format converter and is better skipped loudly than written wrong. */
+    u32 f = s_nv3089.fmt & 0xFF;
+    if (f != 7 /* A8R8G8B8 */ && f != 8 /* X8R8G8B8 */ && f != 0xD /* A8B8G8R8 */) {
+        static int _w = 0;
+        if (_w++ < 4) printf("[NV3089] unsupported colour format 0x%X, blit skipped\n", f);
+        return;
+    }
+    int src_local = (s_nv3089.src_dma != 0xFEED0001u);
+    int dst_local = (s_gcm2d.dst_dma  != 0xFEED0001u);
+    u32 src = cellGcmResolveLocated(src_local, s_nv3089.in_off);
+    u32 dst = cellGcmResolveLocated(dst_local, s_gcm2d.dst_offset);
+    u32 u0 = s_nv3089.in_uv & 0xFFFF, v0 = s_nv3089.in_uv >> 16;   /* 12.4 start */
+    for (u32 y = 0; y < out_h; y++) {
+        u64 sv = ((u64)v0 << 8) + (u64)y * s_nv3089.dt_dy;         /* 20.12 */
+        u32 sy = (u32)(sv >> 20);
+        for (u32 x = 0; x < out_w; x++) {
+            u64 su = ((u64)u0 << 8) + (u64)x * s_nv3089.ds_dx;
+            u32 sx = (u32)(su >> 20);
+            u32 s = src + sy * in_pitch + sx * 4;
+            u32 d = dst + (out_y + y) * dst_pitch + (out_x + x) * 4;
+            vm_write32(d, vm_read32(s));
+        }
+    }
+    { static int _n = 0; static int cap = -1;
+      if (cap < 0) { const char* e = getenv("NV3089_DBG"); cap = e ? atoi(e) : 0; }
+      if (cap && _n < cap) { _n++;
+        printf("[NV3089] %ux%u fmt=0x%X src=0x%08X(pitch %u) -> dst=0x%08X(pitch %u) at %u,%u\n",
+               out_w, out_h, f, src, in_pitch, dst, dst_pitch, out_x, out_y); } }
+}
+
 static void gcm_2d_method(u32 subch, u32 method, u32 data)
 {
     /* Subchannel bindings are libgcm-version-specific (SET_OBJECT binds are
@@ -677,9 +724,43 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
         }
         return;
     }
-    /* NV0039 / NV309E / NV3089: not implemented yet -- log first sightings. */
-    static int warned = 0;
-    if (warned++ < 8)
+    /* NV3089 "scaled image from memory" -- the blit PSGL uses to move a texture
+     * it has assembled elsewhere into the VRAM the sampler reads. Without it a
+     * title's textures stay whatever the destination was before (zero), so
+     * geometry renders flat no matter how correct the sampler is.
+     *
+     * Registers: 0x0184 source DMA, 0x0198 destination surface (the NV3062
+     * state above), 0x0300 colour format, 0x0304 operation, 0x0308/0x030C clip
+     * point/size, 0x0310/0x0314 out point/size, 0x0318/0x031C ds/dx dt/dy in
+     * 20.12 fixed point, 0x0400 in size, 0x0404 (origin<<16)|pitch, 0x0408 in
+     * offset, 0x040C in u/v start -- which is also the trigger. */
+    if (subch == 6 || subch == 7) {
+        switch (method) {
+        case 0x0184: s_nv3089.src_dma   = data; return;
+        case 0x0198: s_nv3089.dst_surf  = data; return;
+        case 0x0300: s_nv3089.fmt       = data; return;
+        case 0x0304: s_nv3089.op        = data; return;
+        case 0x0308: s_nv3089.clip_pt   = data; return;
+        case 0x030C: s_nv3089.clip_sz   = data; return;
+        case 0x0310: s_nv3089.out_pt    = data; return;
+        case 0x0314: s_nv3089.out_sz    = data; return;
+        case 0x0318: s_nv3089.ds_dx     = data; return;
+        case 0x031C: s_nv3089.dt_dy     = data; return;
+        case 0x0400: s_nv3089.in_sz     = data; return;
+        case 0x0404: s_nv3089.in_fmt    = data; return;
+        case 0x0408: s_nv3089.in_off    = data; return;
+        case 0x040C: s_nv3089.in_uv     = data; nv3089_blit(); return;
+        }
+        return;
+    }
+    /* NV0039 / NV309E: not implemented yet -- log first sightings. */
+    /* GCM2D_DBG=<N> raises the cap and adds the data word: the fixed 8 showed
+     * only that SOMETHING was unhandled, not enough to implement it. */
+    static int warned = 0, wcap = -1;
+    if (wcap < 0) { const char* e = getenv("GCM2D_DBG"); wcap = e ? atoi(e) : 8; }
+    if (warned < wcap) { warned++;
+        printf("[GCM2D-UNH] subch %u method 0x%04X data=0x%08X\n", subch, method, data); }
+    if (0)
         printf("[cellGcmSys] FIFO subch %u method 0x%04X (unhandled 2D engine)\n",
                subch, method);
 }
@@ -1174,6 +1255,15 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
     uint32_t off_ea = (uint32_t)(uintptr_t)offset;
     if (!off_ea)
         return CELL_GCM_ERROR_INVALID_VALUE;
+    /* A2O_DBG=<N>: the EA->offset conversions a title asks for. A texture bound
+     * at an offset nothing ever writes usually means the offset came from an EA
+     * in a space we classified wrongly, and that is only visible here. */
+    { static int cap = -1, k = 0;
+      if (cap < 0) { const char* e = getenv("A2O_DBG"); cap = e ? atoi(e) : 0; }
+      if (cap && k < cap) { k++;
+        u32 nz = 0;
+        for (u32 i = 0; i < 0x400u; i += 13) if (vm_base && vm_base[address + i]) nz++;
+        printf("[A2O] ea=0x%08X  (first 1KB nonzero=%u/79)\n", address, nz); } }
 
     /* Local memory: offset = address - localBase. Record the offset page as
      * LOCAL-derived so cellGcmResolveOffset can disambiguate it from an IO
