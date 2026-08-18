@@ -1831,6 +1831,15 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
     pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
     pd.DepthStencilState.StencilEnable = FALSE;
+    /* DEPTH_OFF=1: drop the depth test for guest-FP draws, so submission order
+     * alone decides what is on top. Paired with DRAW_LAST_TEX this puts one
+     * object in front of everything and answers "is it merely occluded?" --
+     * which reordering alone cannot, because a relocated draw still fails the
+     * depth test against whatever is already in the buffer. Diagnostic. */
+    { static int doff = -1;
+      if (doff < 0) { const char* e = getenv("DEPTH_OFF"); doff = e ? atoi(e) : 0; }
+      if (doff) { pd.DepthStencilState.DepthEnable = FALSE;
+                  pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO; } }
     pd.SampleDesc.Count = 1;
 
     ID3D12PipelineState* pso = NULL;
