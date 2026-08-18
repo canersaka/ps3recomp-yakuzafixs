@@ -95,6 +95,12 @@ typedef struct {
      * offscreen surface (demosaic chains its effect passes through local-
      * memory buffers and composites from them). */
     u32 rt_off;
+    /* Which per-draw constant slot this record's constants were written to.
+     * vp_record_cb writes them keyed by the RECORD index, so any pass that
+     * reorders or compacts s_d3d.draws (DRAW_KEEP_TEX, DRAW_LAST_TEX,
+     * DRAW_LIMIT) would otherwise make every surviving draw read some other
+     * object's MVP -- silently transforming it somewhere else entirely. */
+    u32 cb_slot;
     u32 rt_mrt[3];      /* colour targets B,C,D (MRT1/2/3), 0 = none. Deferred
                          * shading G-buffers write 3-4 targets in one pass. */
     u32 rt_w, rt_h;     /* surface clip dims at record time (offscreen RT size) */
@@ -3456,11 +3462,11 @@ static void render_frame(void)
                 /* Per-draw constants: this draw's vp_cb + FP texscale slots. */
                 s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 0,
                     s_d3d.vp_cb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_cb)
-                    + ((u64)s_d3d.vp_parity * MAX_DRAWS + d) * VP_CB_STRIDE);
+                    + ((u64)s_d3d.vp_parity * MAX_DRAWS + dr->cb_slot) * VP_CB_STRIDE);
                 if (s_d3d.vp_fpcb)
                     s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 2,
                         s_d3d.vp_fpcb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_fpcb)
-                        + ((u64)s_d3d.vp_parity * MAX_DRAWS + d) * 256);
+                        + ((u64)s_d3d.vp_parity * MAX_DRAWS + dr->cb_slot) * 256);
                 s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list,
                     dr->vertex_count, 1, dr->vb_byte_offset / 256, 0);
                 /* VP_SUBMIT=<N>: prove the VP pass actually reaches the GPU.
@@ -4698,6 +4704,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->vp_w = s_d3d.current_rsx_state->viewport_w;
                     dr->vp_h = s_d3d.current_rsx_state->viewport_h;
                 } else { dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0; }
+                dr->cb_slot = s_d3d.draw_count;
                 vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
                 s_d3d.draw_count++;
             }
@@ -4784,7 +4791,8 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->vp_w = s_d3d.current_rsx_state->viewport_w;
                 dr->vp_h = s_d3d.current_rsx_state->viewport_h;
             } else { dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0; }
-            vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
+            dr->cb_slot = s_d3d.draw_count;
+                vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
             s_d3d.draw_count++;
         }
         return;
@@ -4893,7 +4901,8 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             dr->vp_w = s_d3d.current_rsx_state->viewport_w;
             dr->vp_h = s_d3d.current_rsx_state->viewport_h;
         } else { dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0; }
-        vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
+        dr->cb_slot = s_d3d.draw_count;
+                vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
         s_d3d.draw_count++;
     }
 }

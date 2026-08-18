@@ -499,7 +499,34 @@ skip_inject: ;
                  s_v[2]=(unsigned char)c; s_v[3]=(unsigned char)d; } }
       if (s_st) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
                   hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3];
-                  hs->connected = 1; } }
+                  hs->connected = 1; }
+      /* PAD_SWEEP=<seconds per step>: walk the sticks through a fixed set of
+       * deflections instead of holding one. Guessing a single stick position and
+       * re-running costs ~5 minutes a try; a sweep answers "can input move the
+       * camera anywhere useful" in one run, and the frame dumps say which step
+       * paid off. Steps: centre, each left-stick direction, then each right. */
+      { static int sw = -1; static clock_t t0 = 0;
+        if (sw < 0) { const char* e = getenv("PAD_SWEEP");
+                      sw = e ? atoi(e) : 0; if (sw < 0) sw = 0; }
+        if (sw) {
+            static const unsigned char steps[9][4] = {
+                {128,128,128,128},
+                {128,  0,128,128}, {128,255,128,128},
+                {  0,128,128,128}, {255,128,128,128},
+                {128,128,128,  0}, {128,128,128,255},
+                {128,128,  0,128}, {128,128,255,128},
+            };
+            if (!t0) t0 = clock();
+            long el = (long)((double)(clock() - t0) / (double)CLOCKS_PER_SEC);
+            int k = (int)((el / (sw > 0 ? sw : 1)) % 9);
+            hs->analog_lx = steps[k][0]; hs->analog_ly = steps[k][1];
+            hs->analog_rx = steps[k][2]; hs->analog_ry = steps[k][3];
+            hs->connected = 1;
+            { static int lastk = -1;
+              if (k != lastk) { lastk = k;
+                fprintf(stderr, "[PADSWEEP] step %d: l=(%u,%u) r=(%u,%u)%c", k,
+                        steps[k][0], steps[k][1], steps[k][2], steps[k][3], 10); } }
+        } } }
     data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X] = hs->analog_rx;
     data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y] = hs->analog_ry;
     data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X]  = hs->analog_lx;
