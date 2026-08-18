@@ -660,7 +660,24 @@ static void nv3089_blit(void)
     /* Only the 32-bit colour formats are handled; anything else would need a
      * per-format converter and is better skipped loudly than written wrong. */
     u32 f = s_nv3089.fmt & 0xFF;
+    /* NOTE: format 0x3 appears here as a downsample chain (1024x512 -> 1024x256
+     * -> 512x128 -> 256x64 -> 128x32, all into one destination) that builds a
+     * mip/blur pyramid, and skipping it leaves that texture empty. Treating it
+     * as 4-byte A8R8G8B8 like 7/8/0xD is WRONG -- it floods the scene blue
+     * (flat-blue coverage 17k -> 537k pixels), so its pixel layout differs.
+     * Decode it properly before enabling; do not just add it to this list. */
     if (f != 7 /* A8R8G8B8 */ && f != 8 /* X8R8G8B8 */ && f != 0xD /* A8B8G8R8 */) {
+        /* Log the GEOMETRY of a skipped blit, not just the format: a full-screen
+         * copy from the scene surface to a registered display buffer is the
+         * composite this title needs, and is worth telling apart from some
+         * incidental small transfer. */
+        { int _sl = (s_nv3089.src_dma != 0xFEED0001u);
+          int _dl = (s_gcm2d.dst_dma  != 0xFEED0001u);
+          printf("[NV3089] SKIPPED fmt=0x%X  %ux%u  src=0x%08X(pitch %u,%s) -> dst=0x%08X(pitch %u,%s) at %u,%u%c",
+                 f, out_w, out_h,
+                 cellGcmResolveLocated(_sl, s_nv3089.in_off), in_pitch, _sl?"LOCAL":"MAIN",
+                 cellGcmResolveLocated(_dl, s_gcm2d.dst_offset), dst_pitch, _dl?"LOCAL":"MAIN",
+                 out_x, out_y, 10); }
         static int _w = 0;
         if (_w++ < 4) printf("[NV3089] unsupported colour format 0x%X, blit skipped\n", f);
         return;

@@ -320,6 +320,12 @@ typedef struct {
 static D3D12State s_d3d;
 char g_rsx_title_base[128] = "ps3recomp";
 static u32 s_dbg_last_draws = 0;
+/* Raw bind offset of the duck's texture, identified by CONTENT (duck.tga is
+ * overwhelmingly yellow, avg 243,191,23). VRAM offsets move between runs, so a
+ * hard-coded offset in a filter silently matches nothing and the run looks like
+ * "renders nothing" -- which cost real time. DRAW_KEEP_TEX=duck resolves here. */
+static u32 s_duck_raw = 0;   /* as BOUND (what draw records carry) */
+static u32 s_duck_off = 0;   /* as RESOLVED (what the uploader sees)   */
 /* PERF=1: where a frame's CPU time actually goes. Guessing at this is how you
  * spend an afternoon optimising the wrong loop. */
 static double s_perf_tex = 0.0, s_perf_frame = 0.0, s_perf_vtx = 0.0, s_perf_rf = 0.0;
@@ -2395,15 +2401,36 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
         for (int i2 = 0; i2 < nseen; i2++) if (seen[i2] == off) { known = 1; break; }
         if (!known && nseen < 64) {
             seen[nseen++] = off;
-            u64 sr = 0, sg = 0, sb = 0; u32 cnt = 0;
+            /* Report the source as R,G,B,A -- the layout TEX_RGBA uploads (PSGL
+             * writes GL_RGBA/UNSIGNED_INT_8_8_8_8, so bytes land R,G,B,A). Alpha
+             * matters as much as colour here: a blended surface whose alpha is a
+             * flat 255 renders opaque no matter how correct the blend state is. */
+            u64 sr = 0, sg = 0, sb = 0, sa = 0; u32 cnt = 0, amin = 255, amax = 0;
             for (u32 i2 = 0; i2 + 3 < w * h * 4u; i2 += 4 * 37) {
                 const u8* q = vm_base + off + i2;
-                sr += q[1]; sg += q[2]; sb += q[3]; cnt++;   /* guest ARGB */
+                sr += q[0]; sg += q[1]; sb += q[2]; sa += q[3]; cnt++;
+                if (q[3] < amin) amin = q[3];
+                if (q[3] > amax) amax = q[3];
             }
-            if (cnt) fprintf(stderr, "[TEXAVG] off=0x%08X %4ux%-4u fmt=0x%02X avg=(%3u,%3u,%3u)%c",
-                             off, w, h, fmt, (u32)(sr/cnt), (u32)(sg/cnt), (u32)(sb/cnt), 10);
+            if (cnt) fprintf(stderr, "[TEXAVG] raw=0x%08X %4ux%-4u fmt=0x%02X"
+                                     " avgRGBA=(%3u,%3u,%3u,%3u) alpha[%u..%u]%c",
+                             key_off, w, h, fmt, (u32)(sr/cnt), (u32)(sg/cnt),
+                             (u32)(sb/cnt), (u32)(sa/cnt), amin, amax, 10);
         }
       } }
+    /* Content-identify the duck's texture so filters can say "duck". */
+    if (!dxt && bpp == 4 && w == 512 && h == 512 && s_duck_raw != key_off) {
+        u64 ar = 0, ag = 0, ab = 0; u32 n = 0;
+        for (u32 i2 = 0; i2 + 3 < w * h * 4u; i2 += 4 * 211) {
+            const u8* q = vm_base + off + i2;
+            ar += q[0]; ag += q[1]; ab += q[2]; n++;
+        }
+        if (n && ar/n > 200 && ag/n > 140 && ab/n < 90) {
+            s_duck_off = key_off;
+            { static u32 last = 0; if (last != key_off) { last = key_off;
+                fprintf(stderr, "[DUCKTEX] resolved=0x%08X identified by content%c", key_off, 10); } }
+        }
+    }
     /* TEX_HILITE=1: paint the duck's texture pure red. duck.tga is overwhelmingly
      * yellow (avg 243,191,23); with the R,G,B,A source order that is bytes
      * s[0] high, s[1] mid, s[2] low. Flooding it with an unmistakable colour
@@ -2907,6 +2934,15 @@ static void off_rt_transition(int slot, D3D12_RESOURCE_STATES to)
  * later batch samples -- but presenting it would show a half-built frame. */
 static int s_present_this_frame = 1;
 
+/* Resolve a DRAW_*_TEX value: a hex raw offset, or the literal "duck" for the
+ * content-identified duck texture. */
+static u32 draw_filter_tex(const char* e)
+{
+    if (!e) return 0;
+    if (e[0] == 'd' && e[1] == 'u') return s_duck_raw;
+    return (u32)strtoul(e, NULL, 16);
+}
+
 static void render_frame(void)
 {
     double _rf0 = perf_on() ? perf_now() : 0.0;
@@ -3100,8 +3136,8 @@ static void render_frame(void)
      * unit 0. The ducks sit behind the water's slab geometry, so removing the
      * occluder is the way to see whether the duck itself renders. Diagnostic. */
     { static const char* sk = (const char*)1; static u32 want = 0;
-      if (sk == (const char*)1) { sk = getenv("DRAW_SKIP_TEX");
-                                  want = sk ? (u32)strtoul(sk, NULL, 16) : 0; }
+      if (sk == (const char*)1) sk = getenv("DRAW_SKIP_TEX");
+      want = draw_filter_tex(sk);
       if (want) {
         u32 keep = 0;
         for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
@@ -3116,8 +3152,8 @@ static void render_frame(void)
      * that texture (plus clears). Isolates one object from everything drawn over
      * it, which is what finally shows the duck on its own. Diagnostic. */
     { static const char* kp = (const char*)1; static u32 want = 0;
-      if (kp == (const char*)1) { kp = getenv("DRAW_KEEP_TEX");
-                                  want = kp ? (u32)strtoul(kp, NULL, 16) : 0; }
+      if (kp == (const char*)1) kp = getenv("DRAW_KEEP_TEX");
+      want = draw_filter_tex(kp);
       /* DRAW_KEEP_NOCLEAR=1: also drop the clears. Keeping them preserves their
        * ORIGINAL position in the batch, so a clear that originally ran after the
        * kept draws still runs after them -- and wipes the very geometry being
@@ -3125,6 +3161,13 @@ static void render_frame(void)
        * nothing. */
       static int noclr = -1;
       if (noclr < 0) { const char* e = getenv("DRAW_KEEP_NOCLEAR"); noclr = e ? atoi(e) : 0; }
+      /* DRAW_KEEP_BLEND=0|1: further restrict DRAW_KEEP_TEX to draws with that
+       * blend flag. A mesh drawn twice -- once opaque, once blended -- is two
+       * different passes (body vs reflection shell) that a texture filter alone
+       * cannot separate. */
+      static int kblend = -2;
+      if (kblend == -2) { const char* e = getenv("DRAW_KEEP_BLEND");
+                          kblend = e ? atoi(e) : -1; }
       if (want) {
         /* Emit the CLEARS FIRST, then the kept draws. Preserving the original
          * order means a clear that ran after them still runs after them and
@@ -3138,6 +3181,7 @@ static void render_frame(void)
                 if (s_d3d.draws[_d].is_clear && nk < MAX_DRAWS) kept[nk++] = s_d3d.draws[_d];
         for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++)
             if (!s_d3d.draws[_d].is_clear && s_d3d.draws[_d].tex[0].raw == want
+                && (kblend < 0 || s_d3d.draws[_d].blend == kblend)
                 && nk < MAX_DRAWS)
                 kept[nk++] = s_d3d.draws[_d];
         for (u32 _k = 0; _k < nk; _k++) s_d3d.draws[_k] = kept[_k];
@@ -3150,8 +3194,8 @@ static void render_frame(void)
      * screen area, so anything that defeats the depth sort hides the duck
      * completely. Reordering separates "occluded" from "not rendered". */
     { static const char* lt = (const char*)1; static u32 want = 0;
-      if (lt == (const char*)1) { lt = getenv("DRAW_LAST_TEX");
-                                  want = lt ? (u32)strtoul(lt, NULL, 16) : 0; }
+      if (lt == (const char*)1) lt = getenv("DRAW_LAST_TEX");
+      want = draw_filter_tex(lt);
       if (want && s_d3d.draw_count > 1) {
         static D3D12DrawRecord moved[MAX_DRAWS];
         u32 nm = 0, keep = 0;
@@ -3224,6 +3268,10 @@ static void render_frame(void)
                                                 dr->tex[_u].h, dr->tex[_u].fmt);
                     if (perf_on()) { s_perf_tex += perf_now() - _tt; s_perf_ntex++;
                         s_perf_texbytes += (u64)dr->tex[_u].w * dr->tex[_u].h * 4u; }
+                    /* Both forms of the offset are in hand here; the filters
+                     * compare the BOUND one. */
+                    if (s_duck_off && dr->tex[_u].off == s_duck_off)
+                        s_duck_raw = dr->tex[_u].raw;
                     if (ts >= 0) {
                         DXGI_FORMAT sf =
                             (_bf == 0x85) ? DXGI_FORMAT_R8G8B8A8_UNORM :
