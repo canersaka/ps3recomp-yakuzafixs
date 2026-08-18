@@ -310,6 +310,11 @@ static u32 s_dbg_last_draws = 0;
  * as the magnification is high enough to make one recognisable. */
 static float s_lock_x = 0.0f, s_lock_y = 0.0f;
 static int   s_lock_valid = 0;
+/* Accumulated over one frame, published at the frame boundary. Averaging as the
+ * frame is recorded makes the aim wander while it is being used, which at high
+ * magnification walks the target off-screen entirely. */
+static double s_lock_sx = 0.0, s_lock_sy = 0.0;
+static u32    s_lock_n  = 0;
 
 /* ---------------------------------------------------------------------------
  * Win32 window
@@ -3480,6 +3485,12 @@ static void render_frame(void)
         }
     }
 
+    if (s_lock_n) {                       /* publish this frame's centroid */
+        s_lock_x = (float)(s_lock_sx / s_lock_n);
+        s_lock_y = (float)(s_lock_sy / s_lock_n);
+        s_lock_valid = 1;
+        s_lock_sx = s_lock_sy = 0.0; s_lock_n = 0;
+    }
     s_dbg_last_draws = s_d3d.draw_count;
     s_d3d.vb_offset  = 0; /* reset for next frame */
     s_d3d.vp_vb_offset = 0;
@@ -4440,16 +4451,10 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
           if (clip[3] > 1e-6f) {
               float nx = clip[0]/clip[3], ny = clip[1]/clip[3];
               if (nx > -2.0f && nx < 2.0f && ny > -2.0f && ny < 2.0f) {
-                  if (!s_lock_valid || pick != -2) {
+                  s_lock_sx += nx; s_lock_sy += ny; s_lock_n++;
+                  if (!s_lock_valid) {        /* seed so frame 1 is usable */
                       s_lock_x = nx; s_lock_y = ny; s_lock_valid = 1;
                   }
-                  else { float a = 0.5f;   /* DBG_LOCK_RATE */
-                         { static int r = -1; static float rv = 0.5f;
-                           if (r < 0) { const char* e = getenv("DBG_LOCK_RATE");
-                                        rv = e ? (float)atof(e) : 0.5f; r = 1; }
-                           a = rv; }
-                         s_lock_x += (nx - s_lock_x) * a;
-                         s_lock_y += (ny - s_lock_y) * a; }
               }
           }
       } }
