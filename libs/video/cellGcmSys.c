@@ -973,6 +973,25 @@ static void gcm_rsx_process_fifo_unlocked(void)
             u32 count  = (w >> 18) & 0x7FF;
             u32 method = w & 0x1FFCu;
             u32 subch  = (w >> 13) & 7;
+            /* TCONST_FIFO=1: how the title actually streams vertex constants.
+             * NV4097_SET_TRANSFORM_CONSTANT is a 32-register window; if a block
+             * arrives NON-INCREMENTING then every dword carries the same method
+             * and any handler that derives the constant slot from the method
+             * offset writes them all on top of each other. */
+            { static int tf = -1;
+              if (tf < 0) { const char* e = getenv("TCONST_FIFO"); tf = e ? atoi(e) : 0; }
+              if (tf && subch == 0) {
+                  static u32 hist[2048]; static u32 tot[2048]; static int dumped = 0;
+                  u32 mi = (method >> 2) & 2047;
+                  hist[mi]++; tot[mi] += count;
+                  static u64 seen = 0;
+                  if (++seen == 200000ull && !dumped) { dumped = 1;
+                      fprintf(stderr, "[TCFIFO] method histogram (blocks, dwords):%c", 10);
+                      for (u32 k = 0; k < 2048; k++) if (hist[k])
+                          fprintf(stderr, "[TCFIFO]   0x%04X  %8u blocks %10u dwords%c",
+                                  k << 2, hist[k], tot[k], 10);
+                  }
+              } }
             for (u32 i = 0; i < count; i++) {
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;

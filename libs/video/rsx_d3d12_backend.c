@@ -3413,9 +3413,25 @@ static void render_frame(void)
         }
       } }
 
+    /* CELLMARK_DUMP_MINDRAWS=<N>: only consider frames carrying at least N draw
+     * records. Most render_frame calls come from the guest flip with a batch the
+     * clear boundary already drained, so they present an empty backbuffer -- and
+     * sampling those wastes every dump on a black image while the frames that do
+     * hold the scene go uncaptured. */
+    { static int mind = -1;
+      if (mind < 0) { const char* e = getenv("CELLMARK_DUMP_MINDRAWS");
+                      mind = e ? atoi(e) : 0; }
+      /* draw_count is already reset by here; s_dbg_last_draws holds the
+       * count this frame actually rendered. */
+      if (mind > 0 && s_dbg_last_draws < (u32)mind) goto skip_dump_consider; }
     if (s_d3d.dump_skip_left > 0 && s_d3d.dump_frames_left > 0) s_d3d.dump_skip_left--;
+skip_dump_consider: ;
     int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
                    && s_d3d.dump_skip_left == 0);
+    { static int mind2 = -1;
+      if (mind2 < 0) { const char* e = getenv("CELLMARK_DUMP_MINDRAWS");
+                       mind2 = e ? atoi(e) : 0; }
+      if (mind2 > 0 && s_dbg_last_draws < (u32)mind2) dumping = 0; }
     /* CELLMARK_DUMP_EVERY=N: after each dump, skip N-1 frames -- samples the whole
      * run instead of one contiguous window, so a short burst of real content
      * can't fall between the dumped frames. */
@@ -3660,6 +3676,12 @@ static void d3d12_end_frame(void* ud)
 static u32 s_dbg_clears_since_present = 0;   /* CELLMARK_BLINKDBG */
 static u32 s_clear_presents = 0;   /* presents issued at clear (frame boundary) */
 
+/* FRAME_BUDGET=1: how much geometry a guest frame actually asks for, versus
+ * what the per-frame vertex buffer can hold. A frame that overflows is silently
+ * truncated -- the tail of the scene never renders -- which reads as "the object
+ * is missing" rather than "the batch is too small". */
+static u64 s_req_verts = 0, s_req_draws = 0, s_drop_draws = 0;
+
 static int blink_dbg(void)
 {
     static int v = -1;
@@ -3797,6 +3819,14 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
         if (blink_dbg())
             printf("[CLEAR] presenting %u accumulated draws at frame boundary\n",
                    s_d3d.draw_count);
+        { static int fb = -1;
+          if (fb < 0) { const char* e = getenv("FRAME_BUDGET"); fb = e ? atoi(e) : 0; }
+          if (fb) { static int n = 0; if (n++ < 24)
+            fprintf(stderr, "[BUDGET] frame: requested %llu verts / %llu draws, "
+                            "buffer holds %u verts, %llu draws truncated%c",
+                    (unsigned long long)s_req_verts, (unsigned long long)s_req_draws,
+                    MAX_VERTICES, (unsigned long long)s_drop_draws, 10); } }
+        s_req_verts = 0; s_req_draws = 0; s_drop_draws = 0;
         render_frame();
         s_clear_presents++;
     }
@@ -4106,11 +4136,12 @@ static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
 static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
 {
     extern uint8_t* vm_base;
+    s_req_verts += count; s_req_draws++;
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
     vp_attrs_dbg(state);
     u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
-    if (count > maxv) count = maxv - (maxv % 3);
+    if (count > maxv) { s_drop_draws++; count = maxv - (maxv % 3); }
     VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
         + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     for (u32 k = 0; k < count; k++)
@@ -4127,6 +4158,12 @@ static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
         for (u32 k = 0; k < count && k < 4; k++)
             fprintf(stderr, "  v%u=(%.2f,%.2f,%.2f)", k,
                     out[k*16].v[0], out[k*16].v[1], out[k*16].v[2]);
+        { int lo = -1, hi = -1, nz = 0;
+          for (int r = 0; r < RSX_MAX_VERTEX_CONSTANTS; r++) {
+              const float* m = state->vertex_constants[r];
+              if (m[0] || m[1] || m[2] || m[3]) { if (lo < 0) lo = r; hi = r; nz++; }
+          }
+          fprintf(stderr, "  | constants: %d non-zero, slots %d..%d", nz, lo, hi); }
         fprintf(stderr, "%c", 10);
       } }
     if (getenv("VTX_DUMP") && state->surface_color_offset[0] == 0xCC0000) {
@@ -4236,10 +4273,11 @@ static u32 upload_quads_vp_indexed(const rsx_state* state, u32 first, u32 count)
 static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
 {
     extern uint8_t* vm_base;
+    s_req_verts += count; s_req_draws++;
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
     u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
-    if (count > maxv) count = maxv - (maxv % 3);
+    if (count > maxv) { s_drop_draws++; count = maxv - (maxv % 3); }
     VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
         + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     for (u32 k = 0; k < count; k++)
@@ -4279,6 +4317,47 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
                         " obj-bbox x[%.3f,%.3f] y[%.3f,%.3f] z[%.3f,%.3f]%c",
                 first, count, _a0->type, _a0->size, _a0->stride, _a0->offset,
                 mnx,mxx, mny,mxy, mnz,mxz, 10);
+        /* Project the object-space bbox corners through the first four transform
+         * constants (the conventional MVP rows) and report NDC. Sub-pixel output
+         * with correct vertices means the placement transform is the problem, and
+         * the NDC extent says by how much. */
+        { float cx=(mnx+mxx)*0.5f, cy=(mny+mxy)*0.5f, cz=(mnz+mxz)*0.5f;
+          /* This title's Cg programs keep their MVP at c[256..259], not c[0..3]
+           * (see the vp_uses_c03 note); projecting through c0 reported zeros. */
+          static int MVP = -1;
+          if (MVP < 0) { const char* e = getenv("MVP_BASE"); MVP = e ? atoi(e) : 256; }
+          float v[4] = { cx, cy, cz, 1.0f };
+          float clip[4];
+          for (int r = 0; r < 4; r++) {
+              const float* m = state->vertex_constants[MVP + r];
+              clip[r] = m[0]*v[0] + m[1]*v[1] + m[2]*v[2] + m[3]*v[3];
+          }
+          float ex[4];
+          { float e[4] = { mxx-cx, mxy-cy, mxz-cz, 0.0f };
+            for (int r = 0; r < 4; r++) {
+                const float* m = state->vertex_constants[MVP + r];
+                ex[r] = m[0]*e[0] + m[1]*e[1] + m[2]*e[2];
+            } }
+          { int lo = -1, hi = -1, nz = 0;
+            for (int r = 0; r < RSX_MAX_VERTEX_CONSTANTS; r++) {
+                const float* m = state->vertex_constants[r];
+                if (m[0] || m[1] || m[2] || m[3]) { if (lo < 0) lo = r; hi = r; nz++; }
+            }
+            fprintf(stderr, "[DUCKVTX]   constants: %d non-zero, slots %d..%d;", nz, lo, hi);
+            for (int r = (lo < 0 ? 0 : lo); r < (lo < 0 ? 0 : lo) + 4 && r < RSX_MAX_VERTEX_CONSTANTS; r++)
+                fprintf(stderr, " c%d=(%.3f %.3f %.3f %.3f)", r,
+                        state->vertex_constants[r][0], state->vertex_constants[r][1],
+                        state->vertex_constants[r][2], state->vertex_constants[r][3]);
+            fprintf(stderr, "%c", 10); }
+          fprintf(stderr, "[DUCKVTX]   mvp0=(%.3f %.3f %.3f %.3f) clip=(%.3f %.3f %.3f w=%.3f)",
+                  state->vertex_constants[MVP][0], state->vertex_constants[MVP][1],
+                  state->vertex_constants[MVP][2], state->vertex_constants[MVP][3],
+                  clip[0], clip[1], clip[2], clip[3]);
+          if (clip[3] > 1e-6f)
+              fprintf(stderr, " ndc=(%.4f %.4f) half-extent-px=(%.2f %.2f)",
+                      clip[0]/clip[3], clip[1]/clip[3],
+                      ex[0]/clip[3]*640.0f, ex[1]/clip[3]*360.0f);
+          fprintf(stderr, "%c", 10); }
       } }
     /* IDX_DBG=<N>: the first indices and the position they resolve to. An index
      * buffer read with the wrong element size or base yields huge indices and

@@ -484,6 +484,22 @@ skip_inject: ;
       } }
 
     /* Analog sticks */
+    /* PAD_STICK="lx,ly,rx,ry" (0-255, 128 = centred): hold the analog sticks at
+     * fixed positions. Rubber Ducky drives its camera from the sticks and never
+     * moves on its own, so with no host pad the view is frozen wherever it
+     * started -- which can leave the subject of the demo off-screen or too far
+     * away to make out. Legit input simulation, same footing as YDKJ_INJECT_PAD. */
+    { static int s_st = -1;
+      static unsigned char s_v[4] = {128,128,128,128};
+      if (s_st < 0) { const char* e = getenv("PAD_STICK");
+        s_st = e ? 1 : 0;
+        if (e) { int a=128,b=128,c=128,d=128;
+                 sscanf(e, "%d,%d,%d,%d", &a,&b,&c,&d);
+                 s_v[0]=(unsigned char)a; s_v[1]=(unsigned char)b;
+                 s_v[2]=(unsigned char)c; s_v[3]=(unsigned char)d; } }
+      if (s_st) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
+                  hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3];
+                  hs->connected = 1; } }
     data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X] = hs->analog_rx;
     data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y] = hs->analog_ry;
     data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X]  = hs->analog_lx;
