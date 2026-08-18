@@ -249,6 +249,11 @@ typedef struct rsx_state {
 
     /* Vertex attributes */
     rsx_vertex_attrib vertex_attribs[RSX_MAX_VERTEX_ATTRIBS];
+    /* Constant ("current") vertex attributes -- NV4097_SET_VERTEX_DATA4F_M and
+     * friends. When an attribute array is DISABLED, the hardware feeds every
+     * vertex this register rather than zero, exactly like glColor4f with the
+     * colour array switched off. Default (0,0,0,1) matches the RSX reset state. */
+    float vertex_data4f[RSX_MAX_VERTEX_ATTRIBS][4];
     /* NV4097_SET_FREQUENCY_DIVIDER_OPERATION (0x1FC0): per-attribute bitmask
      * selecting how the frequency divisor is applied -- bit set = MODULO
      * (index = vertex % freq, repeats a mesh), clear = DIVIDE (index =

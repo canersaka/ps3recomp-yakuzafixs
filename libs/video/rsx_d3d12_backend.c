@@ -1727,6 +1727,19 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             fprintf(f, " */\n%s\n", hlsl); fclose(f);
         } } }
 
+    /* FP_PICK=<hex fp_addr>: write just that program, whatever order it compiles
+     * in. fp_dump.hlsl keeps only the first four, same trap as vp2_dump.hlsl. */
+    { static const char* fpk = (const char*)1; static u32 wantf = 0; static int done = 0;
+      if (fpk == (const char*)1) { fpk = getenv("FP_PICK");
+                                   wantf = fpk ? (u32)strtoul(fpk, NULL, 16) : 0; }
+      if (wantf && !done && fp_addr == wantf) { done = 1;
+          FILE* f = fopen("duck_fp.hlsl", "w");
+          if (f) { fprintf(f, "/* fp_addr=0x%08X, %d instrs */%s", fp_addr, n, hlsl);
+                   fclose(f); }
+          fprintf(stderr, "[DUCKFP] wrote duck_fp.hlsl (fp=0x%08X, %d instrs)%c",
+                  fp_addr, n, 10);
+      } }
+
     /* Debug FP_ONE=<hex fp_addr>: force that program's colour output to
      * all-ones (e.g. wave's colour-detect -> full mask -> island borders
      * everywhere -> the water sim must visibly radiate if it works). */
@@ -4104,7 +4117,14 @@ static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
     extern u32 cellGcmResolveLocated(int, u32);
     for (int i = 0; i < 16; i++) {
         VPSlot* o = &out16[i];
-        o->v[0] = o->v[1] = o->v[2] = 0.0f; o->v[3] = 1.0f;
+        /* A disabled attribute array feeds the CONSTANT vertex attribute
+         * register (NV4097_SET_VERTEX_DATA4F_M), not zero -- same rule as
+         * glColor4f with the colour array off. Defaulting these to black
+         * multiplied Rubber Ducky's duck texture away in the fragment program. */
+        o->v[0] = state->vertex_data4f[i][0];
+        o->v[1] = state->vertex_data4f[i][1];
+        o->v[2] = state->vertex_data4f[i][2];
+        o->v[3] = state->vertex_data4f[i][3];
         const rsx_vertex_attrib* a = &state->vertex_attribs[i];
         if (!a->enabled || a->stride == 0) continue;
         /* Vertex frequency divisor (instancing). freq 0/1 = per-vertex. For
@@ -4479,6 +4499,12 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
             if (x<mnx)mnx=x; if (y<mny)mny=y; if (z<mnz)mnz=z;
             if (x>mxx)mxx=x; if (y>mxy)mxy=y; if (z>mxz)mxz=z;
         }
+        const rsx_vertex_attrib* _a3 = &state->vertex_attribs[3];
+        fprintf(stderr, "[DUCKVTX] a3(en=%d type=%u size=%u stride=%u off=0x%08X freq=%u)"
+                        " -> col0 v0=(%.3f %.3f %.3f %.3f)%c",
+                _a3->enabled, _a3->type, _a3->size, _a3->stride, _a3->offset,
+                _a3->frequency,
+                out[3].v[0], out[3].v[1], out[3].v[2], out[3].v[3], 10);
         const rsx_vertex_attrib* _a0 = &state->vertex_attribs[0];
         fprintf(stderr, "[DUCKVTX] first=%u count=%u a0(type=%u size=%u stride=%u off=0x%08X)"
                         " obj-bbox x[%.3f,%.3f] y[%.3f,%.3f] z[%.3f,%.3f]%c",

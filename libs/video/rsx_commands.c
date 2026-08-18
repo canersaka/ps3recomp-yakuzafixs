@@ -48,6 +48,10 @@ rsx_backend* rsx_get_backend(void)
 void rsx_state_init(rsx_state* state)
 {
     memset(state, 0, sizeof(rsx_state));
+    /* RSX reset value for the constant vertex attributes is (0,0,0,1); a zeroed
+     * struct would leave w at 0. */
+    for (int _i = 0; _i < RSX_MAX_VERTEX_ATTRIBS; _i++)
+        state->vertex_data4f[_i][3] = 1.0f;
 
     /* Default viewport */
     state->viewport_w = 1280;
@@ -534,6 +538,28 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         state->vertex_attrib_output_mask = data;
         return 0;
     }
+    /* NV4097_SET_VERTEX_DATA4F_M (0x1C00): the constant/"current" value for each
+     * vertex attribute, 16 attributes x 4 floats. The hardware feeds this to
+     * every vertex when the attribute's ARRAY is disabled -- it is not zero.
+     *
+     * Rubber Ducky leaves attribute 3 (diffuse colour) disabled and sets it here
+     * instead; its duck shader computes (lighting * col0) * texture + spec, so a
+     * zero col0 multiplies the texture away and the ducks rendered as a dim grey
+     * specular term only -- present in the framebuffer, invisible on screen.
+     * SET_VERTEX_DATA2F/4UB/2S/4S are the other encodings of the same register
+     * file; add them if a title needs them. */
+    if (method >= 0x1C00u && method < 0x1C00u + RSX_MAX_VERTEX_ATTRIBS * 16u) {
+        u32 idx  = (method - 0x1C00u) >> 4;         /* attribute */
+        u32 lane = ((method - 0x1C00u) >> 2) & 3;   /* x/y/z/w   */
+        float f; memcpy(&f, &data, 4);
+        state->vertex_data4f[idx][lane] = f;
+        { static int _d = -1; if (_d < 0) _d = getenv("VDATA_DBG") ? 1 : 0;
+          static int _n = 0;
+          if (_d && _n < 32) { _n++;
+            fprintf(stderr, "[VDATA4F] attr=%u lane=%u = %.4f%c", idx, lane, f, 10); } }
+        return 0;
+    }
+
     if (method == NV4097_SET_TRANSFORM_CONSTANT_LOAD) {
         { static int _n=0; if (getenv("LOAD_DBG") && _n++ < 200)
             fprintf(stderr, "[LOAD] transform_constant_load = %u\n", data); }
