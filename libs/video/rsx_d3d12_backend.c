@@ -138,7 +138,7 @@ typedef struct {
  * so every draw past the fourth got slot -1 from vp_upload_tex_slot ("out of
  * slots") and drew UNTEXTURED. That reads as a correctly-lit but solid black
  * object, which is indistinguishable from a missing texture upload. */
-#define VP_TEX_SLOTS 32
+#define VP_TEX_SLOTS 96
 
 /* Decompiled-VS cache: one entry per distinct vertex-program ucode seen at
  * draw time (hashed). Apps switch VPs between draws (gcm/cube: its MVP cube VP
@@ -1841,6 +1841,16 @@ static u32 rsx_remap_to_d3d(u32 c1, u32 basef)
         u32 s = (c1 >> (i * 2)) & 3, op = (c1 >> (8 + i * 2)) & 3;
         out[i] = (op == 0) ? 4u : (op == 1) ? 5u : (u32)src2res[s];
     }
+    /* TEX_REMAP_ID=<n>: override the derived crossbar with a fixed mapping, to
+     * test channel order directly. The resource holds the guest's A8R8G8B8
+     * bytes straight through, so its components are (R=A, G=R, B=G, A=B) and
+     * the shader needs destR=1, destG=2, destB=3, destA=0 to see real RGBA.
+     *   1 = identity   2 = rotate (the ARGB fix)   3 = BGRA swap */
+    { static int fixed = -1;
+      if (fixed < 0) { const char* e = getenv("TEX_REMAP_ID"); fixed = e ? atoi(e) : 0; }
+      if (fixed == 1) return 0u | (1u<<3) | (2u<<6) | (3u<<9) | (1u<<12);
+      if (fixed == 2) return 1u | (2u<<3) | (3u<<6) | (0u<<9) | (1u<<12);
+      if (fixed == 3) return 2u | (1u<<3) | (0u<<6) | (3u<<9) | (1u<<12); }
     /* D3D12 mapping: destR | destG<<3 | destB<<6 | destA<<9 | valid bit */
     return out[2] | (out[1] << 3) | (out[0] << 6) | (out[3] << 9) | (1u << 12);
 }
@@ -2891,6 +2901,15 @@ static void render_frame(void)
                     }
                 }
             }
+            /* TEX_BINDDBG=<N>: a unit that ends up with a NULL SRV. The draw is
+             * still recorded, lit and transformed -- it just samples nothing,
+             * which renders as a solid black object. */
+            { static int cap = -1, n = 0;
+              if (cap < 0) { const char* e = getenv("TEX_BINDDBG"); cap = e ? atoi(e) : 0; }
+              if (cap && n < cap && dr->tex[_u].set) { n++;
+                fprintf(stderr, "[TEXBIND] null SRV unit=%d raw=0x%X off=0x%X %ux%u fmt=0x%02X%c",
+                        _u, dr->tex[_u].raw, dr->tex[_u].off, dr->tex[_u].w,
+                        dr->tex[_u].h, dr->tex[_u].fmt, 10); } }
             srv_write(wslot, NULL, DXGI_FORMAT_R8G8B8A8_UNORM,
                       D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
         }
