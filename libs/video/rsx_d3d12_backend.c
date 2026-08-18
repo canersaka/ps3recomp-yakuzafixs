@@ -133,7 +133,12 @@ typedef struct {
     u32 off, w, h, fmt; /* current contents (resource reused when dims match) */
     int used;           /* referenced this frame */
 } VPTexSlot;
-#define VP_TEX_SLOTS 4
+/* Distinct textures uploadable per frame. Four was enough for a UI/atlas-style
+ * frame but not for a scene: this title binds ~20 distinct textures per frame,
+ * so every draw past the fourth got slot -1 from vp_upload_tex_slot ("out of
+ * slots") and drew UNTEXTURED. That reads as a correctly-lit but solid black
+ * object, which is indistinguishable from a missing texture upload. */
+#define VP_TEX_SLOTS 32
 
 /* Decompiled-VS cache: one entry per distinct vertex-program ucode seen at
  * draw time (hashed). Apps switch VPs between draws (gcm/cube: its MVP cube VP
@@ -3186,10 +3191,10 @@ static void render_frame(void)
                 { static int cap = -1, n = 0;
                   if (cap < 0) { const char* e = getenv("VP_SUBMIT"); cap = e ? atoi(e) : 0; }
                   if (cap && n < cap) { n++;
-                    fprintf(stderr, "[VPSUBMIT] draw[%u] verts=%u startv=%u pso=%s rt=%u vpwh=%ux%u\n",
-                            d, dr->vertex_count, dr->vb_byte_offset / 256,
-                            dpso ? "guest-fp" : "fallback", dr->rt_off,
-                            dr->vp_w, dr->vp_h); } }
+                    fprintf(stderr, "[VPSUBMIT] draw[%u] verts=%u pso=%s vp=%ux%u tex0=0x%X(set=%d) tex1=0x%X slot=%d fp=0x%X%c",
+                            d, dr->vertex_count, dpso ? "guest-fp" : "fallback",
+                            dr->vp_w, dr->vp_h, dr->tex[0].raw, dr->tex[0].set,
+                            dr->tex[1].raw, dr->tex_slot, dr->fp_addr, 10); } }
             }
             /* Leave the backbuffer bound for the dump/present epilogue. */
             if (cur_rt >= 0) {
