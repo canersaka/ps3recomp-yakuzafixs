@@ -4418,7 +4418,15 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
                                   wantl = dl ? (u32)strtoul(dl, NULL, 16) : 0;
                                   const char* mb = getenv("MVP_BASE");
                                   if (mb) mvpb = atoi(mb); }
-      if (wantl && s_d3d.cur_texs[0].raw == wantl && count) {
+      /* DUCK_PICK=<first>: track ONLY the draw with that starting index. The
+       * mesh is one big vertex buffer sliced into 256-index chunks, so averaging
+       * across all of them converges on the centre of the whole field -- which is
+       * where there is nothing in particular. A single slice is a stable target
+       * and can be magnified without drifting off it. */
+      static int pick = -1;
+      if (pick < 0) { const char* e = getenv("DUCK_PICK"); pick = e ? atoi(e) : -2; }
+      if (wantl && s_d3d.cur_texs[0].raw == wantl && count
+          && (pick == -2 || (int)first == pick)) {
           double sx = 0, sy = 0, sz = 0;
           for (u32 k = 0; k < count; k++) {
               sx += out[k*16].v[0]; sy += out[k*16].v[1]; sz += out[k*16].v[2];
@@ -4432,7 +4440,9 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
           if (clip[3] > 1e-6f) {
               float nx = clip[0]/clip[3], ny = clip[1]/clip[3];
               if (nx > -2.0f && nx < 2.0f && ny > -2.0f && ny < 2.0f) {
-                  if (!s_lock_valid) { s_lock_x = nx; s_lock_y = ny; s_lock_valid = 1; }
+                  if (!s_lock_valid || pick != -2) {
+                      s_lock_x = nx; s_lock_y = ny; s_lock_valid = 1;
+                  }
                   else { float a = 0.5f;   /* DBG_LOCK_RATE */
                          { static int r = -1; static float rv = 0.5f;
                            if (r < 0) { const char* e = getenv("DBG_LOCK_RATE");
