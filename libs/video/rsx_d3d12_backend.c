@@ -3048,14 +3048,22 @@ static void render_frame(void)
       static int noclr = -1;
       if (noclr < 0) { const char* e = getenv("DRAW_KEEP_NOCLEAR"); noclr = e ? atoi(e) : 0; }
       if (want) {
-        u32 keep = 0;
-        for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
-            if (s_d3d.draws[_d].is_clear) { if (noclr) continue; }
-            else if (s_d3d.draws[_d].tex[0].raw != want) continue;
-            if (keep != _d) s_d3d.draws[keep] = s_d3d.draws[_d];
-            keep++;
-        }
-        s_d3d.draw_count = keep;
+        /* Emit the CLEARS FIRST, then the kept draws. Preserving the original
+         * order means a clear that ran after them still runs after them and
+         * wipes the isolated geometry; dropping the clears entirely (noclr)
+         * leaves stale DEPTH that rejects most of its fragments. Neither shows
+         * the object properly -- clear, then draw, does. */
+        static D3D12DrawRecord kept[MAX_DRAWS];
+        u32 nk = 0;
+        if (!noclr)
+            for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++)
+                if (s_d3d.draws[_d].is_clear && nk < MAX_DRAWS) kept[nk++] = s_d3d.draws[_d];
+        for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++)
+            if (!s_d3d.draws[_d].is_clear && s_d3d.draws[_d].tex[0].raw == want
+                && nk < MAX_DRAWS)
+                kept[nk++] = s_d3d.draws[_d];
+        for (u32 _k = 0; _k < nk; _k++) s_d3d.draws[_k] = kept[_k];
+        s_d3d.draw_count = nk;
       } }
 
     /* DRAW_LAST_TEX=<hex raw offset>: move the ops binding that texture to the
