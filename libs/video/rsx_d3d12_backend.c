@@ -1897,9 +1897,41 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
      * as all-zero, while [off - w*h*bpp, off) holds the image (3800-4160 of 4298
      * sampled bytes non-zero, for four different textures at three sizes). So
      * the offset the guest programs points PAST level 0 rather than at it. */
+    /* TEX_OFF_BIAS: 1 = one level-0 below the bound offset, 2 = one full MIP
+     * CHAIN above it. The measured upload-to-bind deltas on the Rubber Ducky
+     * demo are 0x2AAB00 for a 2MB level 0 and 0x555580 for a 4MB one -- both
+     * exactly the mipmap pyramid total (L0 * 4/3), which is what the guest
+     * reserves per texture. */
     { static int bias = -1;
       if (bias < 0) { const char* e = getenv("TEX_OFF_BIAS"); bias = e ? atoi(e) : 0; }
-      if (bias) { u32 sz = w * h * bpp; if (off > sz) off -= sz; } }
+      if (bias == 1) { u32 sz = w * h * bpp; if (off > sz) off -= sz; }
+      else if (bias == 2) {
+          u32 chain = 0;
+          for (u32 mw = w, mh = h; mw && mh; mw >>= 1, mh >>= 1) {
+              chain += mw * mh * bpp;
+              if (mw == 1 && mh == 1) break;
+          }
+          off += chain;
+      } }
+    /* TEX_REMAP=1: if the bound offset holds nothing, look the image up by size
+     * in the VRAM upload registry (cellGcmSys). For a title whose upload address
+     * and SET_TEXTURE_OFFSET disagree this puts the real bytes under the sampler
+     * without guessing a delta. */
+    { static int remap = -1;
+      if (remap < 0) { const char* e = getenv("TEX_REMAP"); remap = e ? atoi(e) : 0; }
+      if (remap) {
+        u32 nz = 0, sz = w * h * bpp;
+        for (u32 i = 0; i < sz && i < 0x20000u; i += 97) if (vm_base[off + i]) nz++;
+        if (!nz) {
+            extern u32 rsx_find_vram_upload(u32);
+            u32 alt = rsx_find_vram_upload(sz);
+            if (alt) {
+                static int _n = 0;
+                if (_n++ < 8) fprintf(stderr, "[TEXREMAP] 0x%08X (%ux%u, %u bytes) -> 0x%08X%c",
+                                      off, w, h, sz, alt, 10);
+                off = alt;
+            }
+        } } }
     if (freeslot < 0) return -1;                  /* out of slots this frame */
     /* TEX_SRCDBG=<N>: is the guest memory this slot uploads FROM actually
      * populated? An empty source and a broken sampler both render flat. */
@@ -4651,6 +4683,10 @@ void rsx_d3d12_backend_present(void)
      * it produces was never written and whatever sampled it later read an
      * empty resource. Only the Present needs onscreen content. */
     if (s_d3d.initialized && (has_display || s_d3d.draw_count > 0)) {
+        { extern void rsx_reset_upload_claims(void);
+          static int remap = -1;
+          if (remap < 0) { const char* e = getenv("TEX_REMAP"); remap = e ? atoi(e) : 0; }
+          if (remap) rsx_reset_upload_claims(); }
         s_present_this_frame = has_display;
         render_frame();
         s_present_this_frame = 1;

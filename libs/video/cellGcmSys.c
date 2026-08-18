@@ -2012,3 +2012,49 @@ u32 cellGcmGetReportDataLocation(u32 index, u32 location)
 
     return s_report_data[index].value;
 }
+
+/* ---------------------------------------------------------------------------
+ * VRAM upload registry
+ *
+ * A title whose texture uploads land at an address that does not match the
+ * offset it later programs into SET_TEXTURE_OFFSET leaves the sampler reading
+ * untouched memory. Recording what was uploaded lets the texture path find the
+ * real bytes by size instead of trusting the offset. Diagnostic bridge: it is
+ * a lookup, not a fix for the offset bookkeeping itself.
+ * -----------------------------------------------------------------------*/
+#define RSX_UPLOAD_LOG 256
+static struct { u32 dst, size; int claimed; } s_uploads[RSX_UPLOAD_LOG];
+static u32 s_upload_n;
+
+void rsx_note_vram_upload(u32 dst_ea, u32 size)
+{
+    if (!size) return;
+    s_uploads[s_upload_n % RSX_UPLOAD_LOG].dst     = dst_ea;
+    s_uploads[s_upload_n % RSX_UPLOAD_LOG].size    = size;
+    s_uploads[s_upload_n % RSX_UPLOAD_LOG].claimed = 0;
+    s_upload_n++;
+}
+
+/* OLDEST unclaimed upload of exactly `want` bytes, claimed on return. Matching
+ * by size alone hands every same-sized surface the same image; consuming them in
+ * order pairs the Nth bind of a size with the Nth upload of that size, which is
+ * the order a title loads and then draws its materials in. Returns 0 if none. */
+u32 rsx_find_vram_upload(u32 want)
+{
+    u32 n = s_upload_n < RSX_UPLOAD_LOG ? s_upload_n : RSX_UPLOAD_LOG;
+    u32 first = s_upload_n > RSX_UPLOAD_LOG ? s_upload_n - RSX_UPLOAD_LOG : 0;
+    for (u32 i = 0; i < n; i++) {
+        u32 idx = (first + i) % RSX_UPLOAD_LOG;
+        if (s_uploads[idx].size == want && !s_uploads[idx].claimed) {
+            s_uploads[idx].claimed = 1;
+            return s_uploads[idx].dst;
+        }
+    }
+    return 0;
+}
+
+/* Let the same pairing repeat next frame. */
+void rsx_reset_upload_claims(void)
+{
+    for (u32 i = 0; i < RSX_UPLOAD_LOG; i++) s_uploads[i].claimed = 0;
+}
