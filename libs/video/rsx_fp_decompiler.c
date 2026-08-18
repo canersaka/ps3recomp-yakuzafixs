@@ -416,6 +416,21 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
         case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
         case OP_RSQ: snprintf(rhs, sizeof(rhs), "rsqrt((%s).x)", a); break;
         case OP_EX2: snprintf(rhs, sizeof(rhs), "exp2((%s).x)", a); break;
+        /* LIF (0x3C) is NV40's LIT. Evidence from this title's shaders: the
+         * write mask is always .yz -- LIT's x and w results are the constant
+         * 1.0, so Cg masks them off -- and the source arrives swizzled .xyzz
+         * with .x a dot product, .y the diffuse term and .z already holding
+         * log2(specular) * power, i.e. the LG2/MUL half of a pow() the compiler
+         * emitted separately. So the remaining work is LIT's exponentiate and
+         * its "only if facing the light" gate:
+         *     dst = (1, max(s.x,0), s.x > 0 ? exp2(s.z) : 0, 1)
+         * Dropping it left .z holding log2(spec)*power -- a wrong, typically
+         * negative, specular fed straight into the lighting sum. */
+        case OP_LIF:
+            snprintf(rhs, sizeof(rhs),
+                     "float4(1.0, max((%s).x, 0.0), ((%s).x > 0.0) ? exp2((%s).z) : 0.0, 1.0)",
+                     a, a, a);
+            break;
         case OP_LG2: snprintf(rhs, sizeof(rhs), "log2((%s).x)", a); break;
         case OP_COS: snprintf(rhs, sizeof(rhs), "cos((%s).x)", a); break;
         case OP_SIN: snprintf(rhs, sizeof(rhs), "sin((%s).x)", a); break;
@@ -457,9 +472,18 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
             handled = 0;
             break; }
         default:
-            out_puts(&o, "    /* TODO: unhandled FP opcode ");
-            out_puts(&o, rsx_fp_opcode_name(opcode));
-            out_puts(&o, " */\n");
+            /* Report the dst register/mask and the raw words too: "unhandled
+             * opcode X" alone is not enough to implement it -- what it writes
+             * and what it reads is what tells you the semantics. */
+            { char _tb[256]; char _mm[5]; dest_mask(w0, _mm);
+              snprintf(_tb, sizeof _tb,
+                       "    /* TODO: unhandled FP opcode %s (0x%02X) dst=%s%u.%s"
+                       " src0=%s src1=%s src2=%s w=%08X %08X %08X %08X */%c",
+                       rsx_fp_opcode_name(opcode), opcode,
+                       (w0 & FP_OUT_HALF) ? "h" : "r",
+                       (unsigned)((w0 & FP_OUT_REG_MASK) >> FP_OUT_REG_SHIFT),
+                       _mm[0] ? _mm : "xyzw", a, b, c, w0, w1, w2, w3, 10);
+              out_puts(&o, _tb); }
             handled = 0;
             break;
         }
