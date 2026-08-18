@@ -1892,6 +1892,14 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
             return i;                             /* already uploaded this frame */
         if (!s_d3d.vp_tex[i].used && freeslot < 0) freeslot = i;
     }
+    /* TEX_OFF_BIAS=1: sample the image one whole level-0 BELOW the bound offset.
+     * Measured on the Rubber Ducky demo: at the bind offset every texture reads
+     * as all-zero, while [off - w*h*bpp, off) holds the image (3800-4160 of 4298
+     * sampled bytes non-zero, for four different textures at three sizes). So
+     * the offset the guest programs points PAST level 0 rather than at it. */
+    { static int bias = -1;
+      if (bias < 0) { const char* e = getenv("TEX_OFF_BIAS"); bias = e ? atoi(e) : 0; }
+      if (bias) { u32 sz = w * h * bpp; if (off > sz) off -= sz; } }
     if (freeslot < 0) return -1;                  /* out of slots this frame */
     /* TEX_SRCDBG=<N>: is the guest memory this slot uploads FROM actually
      * populated? An empty source and a broken sampler both render flat. */
@@ -1900,6 +1908,12 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
       if (cap && n < cap) { n++;
         u32 nz = 0, tot = 0;
         for (u32 i = 0; i < w * h * bpp && i < 0x40000u; i += 61) { tot++; if (vm_base[off + i]) nz++; }
+        /* Several of this title's textures are bound at EXACTLY the end address
+         * of an upload, so also sample the block immediately BELOW the bind
+         * offset: if that holds the image, the bind is one whole texture high. */
+        u32 nzb = 0, totb = 0;
+        { u32 sz = w * h * bpp; u32 base = (off > sz) ? off - sz : 0;
+          for (u32 i = 0; i < sz && i < 0x40000u; i += 61) { totb++; if (vm_base[base + i]) nzb++; } }
         long nearest = 0; u32 found = 0;
         if (!nz) {   /* empty: where IS the data? scan out from the bind offset */
             for (long d = 0x1000; d <= 0x1000000 && !found; d += 0x1000) {
@@ -1915,7 +1929,22 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
         fprintf(stderr, "[TEXSRC] off=0x%08X %ux%u fmt=0x%02X bpp=%u nonzero=%u/%u"
                         "%s%+ld (page nonzero=%u)\n",
                 off, w, h, fmt, bpp, nz, tot,
-                nz ? "" : "  nearest data at ", nz ? 0L : nearest, found); } }
+                nz ? "" : "  nearest data at ", nz ? 0L : nearest, found);
+        fprintf(stderr, "[TEXSRC]    block BELOW bind (off-%u): nonzero=%u/%u%c",
+                w * h * bpp, nzb, totb, 10);
+        /* Walk DOWN in 4KB steps to the first populated page whose predecessor
+         * is empty: that is where this texture's data actually begins, and the
+         * delta from the bound offset is the rule we are missing. */
+        { u32 step = 0x1000, prev_pop = 0; long start_delta = 0;
+          for (long d = 0; d >= -(long)(w * h * bpp) * 2; d -= step) {
+              u32 a = (u32)((long)off + d); u32 pop = 0;
+              if (a < 0x1000) break;
+              for (u32 i = 0; i < step; i += 53) if (vm_base[a + i]) pop++;
+              if (!pop && prev_pop) { start_delta = d + step; break; }
+              prev_pop = pop;
+          }
+          fprintf(stderr, "[TEXSRC]    data starts at off%+ld (level0=%u bytes)%c",
+                  start_delta, w * h * bpp, 10); } } }
     slot = freeslot;
     VPTexSlot* t = &s_d3d.vp_tex[slot];
     u32 pitch = ((dxt ? blkrow : w * bpp) + 255) & ~255u;
