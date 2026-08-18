@@ -300,6 +300,12 @@ typedef struct {
 static D3D12State s_d3d;
 char g_rsx_title_base[128] = "ps3recomp";
 static u32 s_dbg_last_draws = 0;
+/* DBG_LOCK: running clip-space centroid of the tracked mesh (DUCK_VTX's
+ * texture), so the debug camera can follow it. The ducks are driven by the
+ * physics sim and drift every frame, so a fixed DBG_CENTER loses them as soon
+ * as the magnification is high enough to make one recognisable. */
+static float s_lock_x = 0.0f, s_lock_y = 0.0f;
+static int   s_lock_valid = 0;
 
 /* ---------------------------------------------------------------------------
  * Win32 window
@@ -2462,6 +2468,29 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
     vpx[4] = vpx[5] = vpx[7] = 0.0f;
     if (vs_[2] != 0.0f) { vpx[2] = vs_[2]; vpx[6] = vo_[2]; }
     else                { vpx[2] = 1.0f;   vpx[6] = 0.0f;   }
+    /* DBG_ZOOM=<k> with DBG_CENTER="cx,cy": a debug camera applied in CLIP space,
+     * not a framebuffer crop -- the geometry is re-rasterized at full resolution.
+     * The shader epilogue already computes
+     *     pos.xyz = _p.xyz * vp_posscale + _p.w * vp_posoffset
+     * so recentring NDC point c and magnifying by k is exactly
+     *     pos.xy = _p.xy * k + _p.w * (-c * k).
+     * Rubber Ducky frames its ducks near the bottom edge of the viewport and its
+     * camera only moves from the analog sticks, so without this there is no way
+     * to look at the subject of the demo. It changes the view, nothing else:
+     * same draws, same transform, same textures. */
+    { static int z = -1; static float k = 1.0f, cx = 0.0f, cy = 0.0f;
+      if (z < 0) { const char* e = getenv("DBG_ZOOM");
+                   k = e ? (float)atof(e) : 1.0f;
+                   z = (e && k > 0.0f) ? 1 : 0;
+                   const char* ce = getenv("DBG_CENTER");
+                   if (ce) { double a = 0, b = 0; sscanf(ce, "%lf,%lf", &a, &b);
+                             cx = (float)a; cy = (float)b; } }
+      if (z) { float ux = cx, uy = cy;
+               static int lock = -1;
+               if (lock < 0) { const char* le = getenv("DBG_LOCK"); lock = le ? atoi(le) : 0; }
+               if (lock && s_lock_valid) { ux = s_lock_x; uy = s_lock_y; }
+               vpx[0] = k; vpx[1] = k; vpx[4] = -ux * k; vpx[5] = -uy * k; } }
+
     /* Garbage-projection fallback (vkcube; see the original comment). */
     int uses_c03 = (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n)
                        ? s_d3d.vp_vs[vs_idx].uses_c03 : s_d3d.vp_uses_c03;
@@ -4282,6 +4311,37 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
         + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     for (u32 k = 0; k < count; k++)
         read_vp_vertex(state, read_guest_index(state, first + k), &out[k*16]);
+    /* DBG_LOCK tracking: projected centroid of this mesh, updated every draw. */
+    { static const char* dl = (const char*)1; static u32 wantl = 0; static int mvpb = 256;
+      if (dl == (const char*)1) { dl = getenv("DUCK_VTX");
+                                  wantl = dl ? (u32)strtoul(dl, NULL, 16) : 0;
+                                  const char* mb = getenv("MVP_BASE");
+                                  if (mb) mvpb = atoi(mb); }
+      if (wantl && s_d3d.cur_texs[0].raw == wantl && count) {
+          double sx = 0, sy = 0, sz = 0;
+          for (u32 k = 0; k < count; k++) {
+              sx += out[k*16].v[0]; sy += out[k*16].v[1]; sz += out[k*16].v[2];
+          }
+          float v[4] = { (float)(sx/count), (float)(sy/count), (float)(sz/count), 1.0f };
+          float clip[4];
+          for (int r = 0; r < 4; r++) {
+              const float* m = state->vertex_constants[mvpb + r];
+              clip[r] = m[0]*v[0] + m[1]*v[1] + m[2]*v[2] + m[3]*v[3];
+          }
+          if (clip[3] > 1e-6f) {
+              float nx = clip[0]/clip[3], ny = clip[1]/clip[3];
+              if (nx > -2.0f && nx < 2.0f && ny > -2.0f && ny < 2.0f) {
+                  if (!s_lock_valid) { s_lock_x = nx; s_lock_y = ny; s_lock_valid = 1; }
+                  else { float a = 0.5f;   /* DBG_LOCK_RATE */
+                         { static int r = -1; static float rv = 0.5f;
+                           if (r < 0) { const char* e = getenv("DBG_LOCK_RATE");
+                                        rv = e ? (float)atof(e) : 0.5f; r = 1; }
+                           a = rv; }
+                         s_lock_x += (nx - s_lock_x) * a;
+                         s_lock_y += (ny - s_lock_y) * a; }
+              }
+          }
+      } }
     /* DUCK_SCALE=<f>: multiply attribute-0 positions for the draws binding
      * DUCK_VTX's texture. The duck's object-space bbox is ~0.2 units and its
      * draws rasterize only a few dozen pixels per frame -- sub-pixel. Growing it
@@ -4294,9 +4354,43 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
       static const char* dv2 = (const char*)1; static u32 want2 = 0;
       if (dv2 == (const char*)1) { dv2 = getenv("DUCK_VTX");
                                    want2 = dv2 ? (u32)strtoul(dv2, NULL, 16) : 0; }
-      if (sc > 0.0f && want2 && s_d3d.cur_texs[0].raw == want2) {
+      if (sc > 0.0f && want2 && s_d3d.cur_texs[0].raw == want2 && count) {
+        /* Magnify about a FIXED point captured from the first tracked draw, not
+         * about each chunk's own centre -- recentring per chunk would stack every
+         * chunk of the mesh on top of the others. Combined with VP_BYPASS (which
+         * maps attribute 0 straight to clip space) this renders the mesh's real
+         * geometry and texture at a readable size. */
+        /* DUCK_RECENTER=1: recentre EVERY chunk on its own centroid, overlaying
+         * them. If each chunk is one instance of the same mesh they align into a
+         * single silhouette; if they are arbitrary slices of one big mesh they
+         * smear. Either way the answer is visible at a glance. */
+        static int recen = -1;
+        if (recen < 0) { const char* e = getenv("DUCK_RECENTER"); recen = e ? atoi(e) : 0; }
+        static int have_c = 0; static float ox = 0, oy = 0, oz = 0;
+        if (!have_c || recen) {
+            double sx = 0, sy = 0, sz = 0;
+            for (u32 k = 0; k < count; k++) {
+                sx += out[k*16].v[0]; sy += out[k*16].v[1]; sz += out[k*16].v[2];
+            }
+            ox = (float)(sx/count); oy = (float)(sy/count); oz = (float)(sz/count);
+            have_c = 1;
+        }
         for (u32 k = 0; k < count; k++) {
-            out[k*16].v[0] *= sc; out[k*16].v[1] *= sc; out[k*16].v[2] *= sc;
+            /* DUCK_SHIFT="dx,dy": nudge after scaling. VP_BYPASS applies the
+             * guest's posoffset, so a recentred mesh does not land at screen
+             * centre -- without this the magnified geometry sits clipped against
+             * the top edge. */
+            static int shf = -1; static float dx = 0.0f, dy = 0.0f;
+            if (shf < 0) { const char* e = getenv("DUCK_SHIFT");
+                           if (e) { double a=0,b=0; sscanf(e, "%lf,%lf", &a, &b);
+                                    dx = (float)a; dy = (float)b; }
+                           shf = 1; }
+            out[k*16].v[0] = (out[k*16].v[0] - ox) * sc + dx;
+            out[k*16].v[1] = (out[k*16].v[1] - oy) * sc + dy;
+            /* Leave z alone: under VP_BYPASS the object z maps straight to clip
+             * z, so scaling it walks the geometry out of the depth range and
+             * everything clips away. */
+            (void)oz;
         }
       } }
     /* DUCK_VTX=<hex tex0 offset>: attribute-0 positions for the draws binding
