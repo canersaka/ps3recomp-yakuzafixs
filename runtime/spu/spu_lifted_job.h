@@ -70,6 +70,24 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
         ctx.gpr[3]._u32[0] = args_ea;
     }
     spu_interp_run(&ctx, entry_pc);
+    /* Completion signal, exactly ONCE per run. Real hardware raises a PPU event
+     * only from WrOutIntrMbox; the plain mailbox is PPU-polled. But a sim SPU
+     * that finishes by writing only the PLAIN mailbox (Rubber Ducky's
+     * rbodycoll/isosurf/hfluid write 0x3F and never touch the intr mbox) then
+     * never wakes the PPU, which blocks in sys_event_queue_receive on its
+     * connected queue forever. Synthesise the event for that case here rather
+     * than forwarding every plain write from spu_wrch: a run writes the mailbox
+     * several times, and one event per WRITE oversupplies the queue until it
+     * desynchronises from the frame loop and wedges. One per RUN keeps the
+     * queue 1:1 with frames. Per-context, so concurrent SPUs can't race.
+     * ponytail: end-of-run check, not a channel-level counter -- the context
+     * already records which mailbox the run last used. */
+    if (!spu_channel_has_data(&ctx.ch_out_intr_mbox) &&
+         spu_channel_has_data(&ctx.ch_out_mbox)) {
+        extern void (*g_spu_out_mbox_hook)(uint32_t, uint32_t, int, uint32_t);
+        if (g_spu_out_mbox_hook)
+            g_spu_out_mbox_hook(ctx.spu_group_id, ctx.spu_id, 1, ctx.ch_out_mbox.value);
+    }
     if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);
     return (int32_t)ctx.stop_code;
 }

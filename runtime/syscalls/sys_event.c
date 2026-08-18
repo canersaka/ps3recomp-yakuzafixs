@@ -325,6 +325,27 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
 #endif
     }
 
+    /* Demand-driven sim-SPU dispatch. The game's persistent worker SPUs are
+     * fed by event_port_send during ASSET LOAD, but its main loop never sends --
+     * it just receives each worker's per-frame completion, expecting the SPU to
+     * be free-running. A send-triggered dispatcher therefore starves the main
+     * loop: the first frame consumes the completions left over from load and
+     * every frame after blocks forever.
+     *
+     * Run the worker when the guest actually blocks on its completion queue
+     * instead. That is exactly 1:1 by construction -- one run per event the
+     * guest waits for -- so it can neither oversupply (which desynchronises the
+     * queue and wedges the loop, the failure mode of forwarding every plain
+     * WrOutMbox write) nor undersupply (the failure mode of one event per run,
+     * when a worker signals more than once per frame).
+     * ponytail: one attempt per receive, then fall through to the normal wait --
+     * no retry loop, so a worker that genuinely produces nothing still blocks
+     * rather than spinning. */
+    if (q->count == 0 && timeout_us == 0) {
+        extern int spu_dispatch_frame_by_queue(uint32_t, uint32_t);
+        spu_dispatch_frame_by_queue(queue_id, 0);
+    }
+
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
 
@@ -779,15 +800,24 @@ int64_t sys_event_port_send(ppu_context* ctx)
     evt.data2  = data2;
     evt.data3  = data3;
 
-    if (event_queue_push(q, &evt) < 0) {
-        return (int64_t)(int32_t)CELL_EBUSY;
-    }
-
     /* Per-frame sim-SPU trigger: the game sends the work-descriptor EA (data2) to
      * a "start" queue and waits on the SPU's completion queue (start+1). Re-run
-     * that SPU with the work EA so it produces this frame's result + completion. */
+     * that SPU with the work EA so it produces this frame's result + completion.
+     *
+     * Dispatch BEFORE the push, and skip the push entirely when a sim SPU took
+     * the work: on hardware the SPU thread is what drains its start queue, and we
+     * have no such thread -- so pushing anyway leaves the event queued forever.
+     * The queue then fills after ~190 frames and event_queue_push returns EBUSY,
+     * which the guest asserts on (SpuThreadGroup.cpp:315 ret == CELL_OK). */
     { extern int spu_dispatch_frame_by_queue(uint32_t, uint32_t);
-      spu_dispatch_frame_by_queue((uint32_t)qidx + 1, (uint32_t)data2); }
+      if (spu_dispatch_frame_by_queue((uint32_t)qidx + 1, (uint32_t)data2))
+          return CELL_OK; }
+
+    if (event_queue_push(q, &evt) < 0) {
+        fprintf(stderr, "[evt] port_send(port=%u): queue %d FULL -> EBUSY%c",
+                port_id, qidx, 10);
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
 
     return CELL_OK;
 }

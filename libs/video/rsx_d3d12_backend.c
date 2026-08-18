@@ -48,9 +48,9 @@
  * -----------------------------------------------------------------------*/
 
 #define FRAME_COUNT         2   /* double buffering */
-#define MAX_VERTICES     65536  /* per-frame vertex buffer (dbgfont submits
+#define MAX_VERTICES    262144  /* per-frame vertex buffer (dbgfont submits
                                  * ~7.5k verts/frame; leave generous headroom) */
-#define MAX_DRAWS         1024  /* per-frame draw records */
+#define MAX_DRAWS        16384  /* per-frame draw records */
 /* Per-draw VP constant-buffer slot: vp_c[512] + posscale + posoffset
  * (514 vec4 = 8224 B) rounded up to D3D12's 256-byte CBV alignment.
  * Constants are snapshotted at RECORD time -- wave's passes each set their
@@ -226,6 +226,7 @@ typedef struct {
     ID3D12Resource*       readback_buf;
     u32                   readback_pitch;
     int                   dump_frames_left;
+    int                   dump_skip_left;   /* CELLMARK_DUMP_SKIP: presents to ignore first */
 
     /* Textured pipeline (dbgfont / 2D atlas quads). The font atlas is an 8-bit
      * coverage texture uploaded as R8_UNORM and sampled in the pixel shader. */
@@ -2075,15 +2076,33 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
             }
         }
     } else if (argb) {
-        /* guest big-endian A8R8G8B8 (bytes A,R,G,B) -> DXGI R8G8B8A8 (R,G,B,A) */
+        /* guest big-endian A8R8G8B8 (bytes A,R,G,B) -> DXGI R8G8B8A8 (R,G,B,A).
+         *
+         * TEX_RGBA=1: the source is already R,G,B,A, so copy straight through.
+         * PSGL uploads its converted textures as GL_RGBA/GL_UNSIGNED_INT_8_8_8_8,
+         * which on the big-endian PPU lays the bytes down R,G,B,A even though it
+         * declares the GCM format as A8R8G8B8 -- so the A,R,G,B reading rotates
+         * every channel by one. Measured: duck.tga averages (243,191,23) and its
+         * bound texture reads back (191,23,254) under the ARGB interpretation,
+         * i.e. exactly one channel over, with the 255 alpha landing in blue.
+         * ponytail: env-gated rather than unconditional -- other titles' textures
+         * really are A,R,G,B, and the GCM format field alone cannot tell them
+         * apart. */
+        static int rgba = -1;
+        if (rgba < 0) { const char* e = getenv("TEX_RGBA"); rgba = e ? atoi(e) : 0; }
         const u8* sbase = vm_base + off;
         for (u32 y = 0; y < h; y++) {
             u8* drow = (u8*)mapped + (u64)y * pitch;
             for (u32 x = 0; x < w; x++) {
                 const u8* s = sbase + (u64)(swz ? rsx_swz_off(x, y, l2w, l2h)
                                                 : y * w + x) * 4;
-                drow[x*4+0] = s[1]; drow[x*4+1] = s[2];
-                drow[x*4+2] = s[3]; drow[x*4+3] = s[0];
+                if (rgba) {
+                    drow[x*4+0] = s[0]; drow[x*4+1] = s[1];
+                    drow[x*4+2] = s[2]; drow[x*4+3] = s[3];
+                } else {
+                    drow[x*4+0] = s[1]; drow[x*4+1] = s[2];
+                    drow[x*4+2] = s[3]; drow[x*4+3] = s[0];
+                }
             }
         }
     } else if (swz) {
@@ -2248,6 +2267,78 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
             }
         }
     } }
+    /* TEX_AVGDBG=1: one line per distinct bound texture offset with its average
+     * source colour. duck.tga is overwhelmingly yellow (avg ~243,191,23), so this
+     * says whether the duck's image is bound at all -- and if it is, the duck is
+     * being drawn somewhere and the question is where, not whether. */
+    { static int avgd = -1;
+      if (avgd < 0) { const char* e = getenv("TEX_AVGDBG"); avgd = e ? atoi(e) : 0; }
+      if (avgd && !dxt && bpp == 4) {
+        static u32 seen[64]; static int nseen = 0;
+        int known = 0;
+        for (int i2 = 0; i2 < nseen; i2++) if (seen[i2] == off) { known = 1; break; }
+        if (!known && nseen < 64) {
+            seen[nseen++] = off;
+            u64 sr = 0, sg = 0, sb = 0; u32 cnt = 0;
+            for (u32 i2 = 0; i2 + 3 < w * h * 4u; i2 += 4 * 37) {
+                const u8* q = vm_base + off + i2;
+                sr += q[1]; sg += q[2]; sb += q[3]; cnt++;   /* guest ARGB */
+            }
+            if (cnt) fprintf(stderr, "[TEXAVG] off=0x%08X %4ux%-4u fmt=0x%02X avg=(%3u,%3u,%3u)%c",
+                             off, w, h, fmt, (u32)(sr/cnt), (u32)(sg/cnt), (u32)(sb/cnt), 10);
+        }
+      } }
+    /* TEX_HILITE=1: paint the duck's texture pure red. duck.tga is overwhelmingly
+     * yellow (avg 243,191,23); with the R,G,B,A source order that is bytes
+     * s[0] high, s[1] mid, s[2] low. Flooding it with an unmistakable colour
+     * answers "where on screen is the duck drawn" directly, which neither the
+     * vertex data nor a pixel count can. Diagnostic only. */
+    { static int hil = -1;
+      if (hil < 0) { const char* e = getenv("TEX_HILITE"); hil = e ? atoi(e) : 0; }
+      if (hil && !dxt && bpp == 4 && w == 512 && h == 512) {
+        u64 sr = 0, sg = 0, sb = 0; u32 cnt = 0;
+        for (u32 i2 = 0; i2 + 3 < w * h * 4u; i2 += 4 * 37) {
+            const u8* q = vm_base + off + i2;
+            sr += q[0]; sg += q[1]; sb += q[2]; cnt++;
+        }
+        if (cnt) {
+            u32 ar = (u32)(sr/cnt), ag = (u32)(sg/cnt), ab = (u32)(sb/cnt);
+            if (ar > 200 && ag > 140 && ab < 90) {
+                for (u32 y = 0; y < h; y++) {
+                    u8* drow = (u8*)mapped + (u64)y * pitch;
+                    for (u32 x = 0; x < w; x++) {
+                        drow[x*4+0] = 0xFF; drow[x*4+1] = 0x00;
+                        drow[x*4+2] = 0x00; drow[x*4+3] = 0xFF;
+                    }
+                }
+                { static int _n = 0; if (_n++ < 4)
+                    fprintf(stderr, "[TEXHILITE] duck texture off=0x%08X avg=(%u,%u,%u) -> red%c",
+                            off, ar, ag, ab, 10); }
+            }
+        }
+      } }
+    /* TEX_MARKEMPTY=1: paint any texture whose guest source is entirely zero a
+     * flat magenta instead of uploading the empty bytes. An unresolved texture
+     * and a legitimately black surface are indistinguishable on screen, so this
+     * says WHICH geometry is missing its image -- diagnostic only. */
+    { static int mark = -1;
+      if (mark < 0) { const char* e = getenv("TEX_MARKEMPTY"); mark = e ? atoi(e) : 0; }
+      if (mark && !dxt) {
+        u32 nz = 0, sz = w * h * bpp;
+        for (u32 i2 = 0; i2 < sz && i2 < 0x40000u; i2 += 61) if (vm_base[off + i2]) nz++;
+        if (!nz) {
+            for (u32 y = 0; y < h; y++) {
+                u8* drow = (u8*)mapped + (u64)y * pitch;
+                for (u32 x = 0; x < w; x++) {
+                    drow[x*4+0] = 0xFF; drow[x*4+1] = 0x00;
+                    drow[x*4+2] = 0xFF; drow[x*4+3] = 0xFF;
+                }
+            }
+            { static int _n = 0; if (_n++ < 8)
+                fprintf(stderr, "[TEXEMPTY] off=0x%08X %ux%u fmt=0x%02X -> magenta%c",
+                        off, w, h, fmt, 10); }
+        }
+      } }
     t->up->lpVtbl->Unmap(t->up, 0, NULL);
 
     if (!fresh) {   /* reused resource: PSR -> COPY_DEST first */
@@ -2836,6 +2927,46 @@ static void render_frame(void)
         s_d3d.draw_count = (cut < s_d3d.draw_count) ? cut : s_d3d.draw_count;
       } }
 
+    /* DRAW_LIMIT=<N>: keep only the first N recorded ops this frame. The duck's
+     * draws are ops 00..~03 of every frame, so a small limit shows the ducks
+     * alone -- separating "the ducks never rasterize" from "later geometry is
+     * painted over them". Diagnostic only. */
+    { static int lim = -1;
+      if (lim < 0) { const char* e = getenv("DRAW_LIMIT"); lim = e ? atoi(e) : 0; }
+      if (lim > 0 && s_d3d.draw_count > (u32)lim) s_d3d.draw_count = (u32)lim; }
+
+    /* DRAW_SKIP_TEX=<hex raw offset>: drop every op binding that texture on
+     * unit 0. The ducks sit behind the water's slab geometry, so removing the
+     * occluder is the way to see whether the duck itself renders. Diagnostic. */
+    { static const char* sk = (const char*)1; static u32 want = 0;
+      if (sk == (const char*)1) { sk = getenv("DRAW_SKIP_TEX");
+                                  want = sk ? (u32)strtoul(sk, NULL, 16) : 0; }
+      if (want) {
+        u32 keep = 0;
+        for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
+            if (!s_d3d.draws[_d].is_clear && s_d3d.draws[_d].tex[0].raw == want) continue;
+            if (keep != _d) s_d3d.draws[keep] = s_d3d.draws[_d];
+            keep++;
+        }
+        s_d3d.draw_count = keep;
+      } }
+
+    /* DRAW_KEEP_TEX=<hex raw offset>: the inverse -- keep only the ops binding
+     * that texture (plus clears). Isolates one object from everything drawn over
+     * it, which is what finally shows the duck on its own. Diagnostic. */
+    { static const char* kp = (const char*)1; static u32 want = 0;
+      if (kp == (const char*)1) { kp = getenv("DRAW_KEEP_TEX");
+                                  want = kp ? (u32)strtoul(kp, NULL, 16) : 0; }
+      if (want) {
+        u32 keep = 0;
+        for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
+            if (!s_d3d.draws[_d].is_clear && s_d3d.draws[_d].tex[0].raw != want) continue;
+            if (keep != _d) s_d3d.draws[keep] = s_d3d.draws[_d];
+            keep++;
+        }
+        s_d3d.draw_count = keep;
+      } }
+
     /* Render-to-texture pre-pass: make sure an offscreen RT resource exists for
      * every non-display surface targeted this frame (so draws binding it as a
      * texture can resolve to it below, whatever the op order). */
@@ -3282,7 +3413,18 @@ static void render_frame(void)
         }
       } }
 
-    int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf);
+    if (s_d3d.dump_skip_left > 0 && s_d3d.dump_frames_left > 0) s_d3d.dump_skip_left--;
+    int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
+                   && s_d3d.dump_skip_left == 0);
+    /* CELLMARK_DUMP_EVERY=N: after each dump, skip N-1 frames -- samples the whole
+     * run instead of one contiguous window, so a short burst of real content
+     * can't fall between the dumped frames. */
+    if (dumping) {
+        static int s_every = -1;
+        if (s_every < 0) { const char* e = getenv("CELLMARK_DUMP_EVERY");
+                           s_every = e ? atoi(e) : 0; }
+        if (s_every > 1) s_d3d.dump_skip_left = s_every - 1;
+    }
     if (dumping) {
         /* RT -> COPY_SOURCE, copy into the readback buffer, then -> PRESENT. */
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -3973,6 +4115,20 @@ static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
         + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     for (u32 k = 0; k < count; k++)
         read_vp_vertex(state, first + k, &out[k*16]);
+    /* DUCK_VTX=<hex tex0 offset>: dump attribute-0 positions for the draws that
+     * bind that texture. The duck's texture resolves and its 9960 draws all
+     * target the backbuffer, yet none of its texels reach the screen -- so the
+     * question is whether its vertices are where they should be. */
+    { static const char* dv = (const char*)1; static u32 want = 0; static int n = 0;
+      if (dv == (const char*)1) { dv = getenv("DUCK_VTX");
+                                  want = dv ? (u32)strtoul(dv, NULL, 16) : 0; }
+      if (want && s_d3d.cur_texs[0].raw == want && n < 6) { n++;
+        fprintf(stderr, "[DUCKVTX] first=%u count=%u", first, count);
+        for (u32 k = 0; k < count && k < 4; k++)
+            fprintf(stderr, "  v%u=(%.2f,%.2f,%.2f)", k,
+                    out[k*16].v[0], out[k*16].v[1], out[k*16].v[2]);
+        fprintf(stderr, "%c", 10);
+      } }
     if (getenv("VTX_DUMP") && state->surface_color_offset[0] == 0xCC0000) {
         static int _n=0; if (_n++ < 1) {
         FILE* f = fopen("vtx_dump.txt", "w");
@@ -4088,6 +4244,42 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
         + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     for (u32 k = 0; k < count; k++)
         read_vp_vertex(state, read_guest_index(state, first + k), &out[k*16]);
+    /* DUCK_SCALE=<f>: multiply attribute-0 positions for the draws binding
+     * DUCK_VTX's texture. The duck's object-space bbox is ~0.2 units and its
+     * draws rasterize only a few dozen pixels per frame -- sub-pixel. Growing it
+     * about its own origin tests the rest of the chain (index buffer, texture,
+     * per-draw transform): if a duck-shaped, duck-coloured object appears, only
+     * the scale is wrong. Diagnostic. */
+    { static const char* ds = (const char*)1; static float sc = 0.0f;
+      if (ds == (const char*)1) { ds = getenv("DUCK_SCALE");
+                                  sc = ds ? (float)atof(ds) : 0.0f; }
+      static const char* dv2 = (const char*)1; static u32 want2 = 0;
+      if (dv2 == (const char*)1) { dv2 = getenv("DUCK_VTX");
+                                   want2 = dv2 ? (u32)strtoul(dv2, NULL, 16) : 0; }
+      if (sc > 0.0f && want2 && s_d3d.cur_texs[0].raw == want2) {
+        for (u32 k = 0; k < count; k++) {
+            out[k*16].v[0] *= sc; out[k*16].v[1] *= sc; out[k*16].v[2] *= sc;
+        }
+      } }
+    /* DUCK_VTX=<hex tex0 offset>: attribute-0 positions for the draws binding
+     * that texture (see upload_tris_vp). The duck's meshes are indexed, so this
+     * is the copy that actually fires for it. */
+    { static const char* dv = (const char*)1; static u32 want = 0; static int n = 0;
+      if (dv == (const char*)1) { dv = getenv("DUCK_VTX");
+                                  want = dv ? (u32)strtoul(dv, NULL, 16) : 0; }
+      if (want && s_d3d.cur_texs[0].raw == want && n < 8) { n++;
+        float mnx=1e30f,mny=1e30f,mnz=1e30f,mxx=-1e30f,mxy=-1e30f,mxz=-1e30f;
+        for (u32 k = 0; k < count; k++) {
+            float x=out[k*16].v[0], y=out[k*16].v[1], z=out[k*16].v[2];
+            if (x<mnx)mnx=x; if (y<mny)mny=y; if (z<mnz)mnz=z;
+            if (x>mxx)mxx=x; if (y>mxy)mxy=y; if (z>mxz)mxz=z;
+        }
+        const rsx_vertex_attrib* _a0 = &state->vertex_attribs[0];
+        fprintf(stderr, "[DUCKVTX] first=%u count=%u a0(type=%u size=%u stride=%u off=0x%08X)"
+                        " obj-bbox x[%.3f,%.3f] y[%.3f,%.3f] z[%.3f,%.3f]%c",
+                first, count, _a0->type, _a0->size, _a0->stride, _a0->offset,
+                mnx,mxx, mny,mxy, mnz,mxz, 10);
+      } }
     /* IDX_DBG=<N>: the first indices and the position they resolve to. An index
      * buffer read with the wrong element size or base yields huge indices and
      * degenerate triangles -- an INDEXED mesh vanishes while non-indexed
@@ -4604,6 +4796,11 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
         const char* dv = getenv("CELLMARK_DUMP");
         int n = dv ? atoi(dv) : 0;
         s_d3d.dump_frames_left = dv ? (n > 1 ? n : 24) : 0;
+        /* CELLMARK_DUMP_SKIP=N: ignore the first N presents before dumping.
+         * The opening frames are the loading screen; the interesting content
+         * only appears once the sim SPUs have advanced the scene. */
+        { const char* sv = getenv("CELLMARK_DUMP_SKIP");
+          s_d3d.dump_skip_left = sv ? atoi(sv) : 0; }
     }
 
     /* Create window */
