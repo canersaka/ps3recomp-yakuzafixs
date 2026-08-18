@@ -3814,9 +3814,18 @@ static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
          * (vertices read as -7.992 => degenerate => empty G-buffer). Strip the
          * bit and resolve MAIN explicitly; local offsets keep the old path. */
         u32 off = (a->offset & 0x7FFFFFFFu) + ei * a->stride;
+        /* Bit 31 of the vertex-array OFFSET selects the context DMA: 0 = LOCAL
+         * (VRAM), 1 = MAIN. Resolve LOCAL as local -- routing it through
+         * cellGcmResolveOffset lets the IO table win for any offset whose page
+         * the IO region also covers. This title's vertex arrays sit at offsets
+         * like 0x4480, shadowed by its 1MB IO window at 0x11100000: the array
+         * was uploaded to VRAM 0xC0004480 but resolved to main 0x11104480,
+         * which is empty -- so every INDEXED mesh fetched zeros and collapsed
+         * to the origin, while non-indexed geometry whose arrays lie outside
+         * the shadowed pages drew fine. */
         const u8* p = vm_base + ((a->offset & 0x80000000u)
             ? cellGcmResolveLocated(0, off)   /* MAIN: IO offset table */
-            : cellGcmResolveOffset(off));     /* LOCAL/legacy path */
+            : cellGcmResolveLocated(1, off)); /* LOCAL: VRAM, never the IO table */
         u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
         switch (a->type) {
         case 2: /* CELL_GCM_VERTEX_F: float32 BE */
@@ -4037,6 +4046,24 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
         + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     for (u32 k = 0; k < count; k++)
         read_vp_vertex(state, read_guest_index(state, first + k), &out[k*16]);
+    /* IDX_DBG=<N>: the first indices and the position they resolve to. An index
+     * buffer read with the wrong element size or base yields huge indices and
+     * degenerate triangles -- an INDEXED mesh vanishes while non-indexed
+     * geometry in the same scene renders fine. */
+    { static int cap = -1, n = 0;
+      if (cap < 0) { const char* e = getenv("IDX_DBG"); cap = e ? atoi(e) : 0; }
+      if (cap && n < cap && count >= 3) { n++;
+        extern u32 cellGcmResolveOffset(u32);
+        const rsx_vertex_attrib* a0 = &state->vertex_attribs[0];
+        u32 vbase = cellGcmResolveOffset(a0->offset & 0x7FFFFFFFu);
+        u32 nz = 0; for (u32 q = 0; q < 0x1000u; q += 29) if (vm_base[vbase + q]) nz++;
+        fprintf(stderr, "[IDX] idxoff=0x%X idx: %u %u %u | a0 off=0x%08X(->0x%08X nz=%u/142)"
+                        " stride=%u size=%u type=%u  pos0=(%g %g %g)%c",
+                state->index_array_offset,
+                read_guest_index(state, first), read_guest_index(state, first+1),
+                read_guest_index(state, first+2),
+                a0->offset, vbase, nz, a0->stride, a0->size, a0->type,
+                out[0].v[0], out[0].v[1], out[0].v[2], 10); } }
     s_d3d.vp_vb_offset += count * VP_VERT_STRIDE;
     return count;
 }
