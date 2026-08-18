@@ -234,7 +234,12 @@ static void populate_offset_table(u32 ea, u32 io, u32 size)
      * ioAddress[ea >> 20] = io >> 20   (EA -> IO offset)
      * eaAddress[io >> 20] = ea >> 20   (IO offset -> EA)
      */
-    u32 pages = size >> 20;  /* number of 1MB pages */
+    /* Round UP: a mapping is described by whole 1MB table entries, so a size
+     * that is not a multiple of 1MB still needs its final partial page mapped.
+     * Truncating dropped that page -- and dropped the mapping ENTIRELY for any
+     * size below 1MB (pages == 0) -- after which cellGcmResolveOffset finds no
+     * IO entry and falls back to VRAM, where the guest never wrote anything. */
+    u32 pages = (size + 0xFFFFFu) >> 20;  /* number of 1MB pages, rounded up */
     u32 ea_page = ea >> 20;
     u32 io_page = io >> 20;
 
