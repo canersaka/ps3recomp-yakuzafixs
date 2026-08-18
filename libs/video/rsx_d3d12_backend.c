@@ -2564,6 +2564,12 @@ static void off_rt_transition(int slot, D3D12_RESOURCE_STATES to)
     r->st = to;
 }
 
+/* Set by the present entry point: 1 = this batch ends with a swapchain
+ * Present, 0 = execute the recorded draws only. An OFFSCREEN-only batch (a
+ * render-to-texture pass) must still run -- it is what fills the texture a
+ * later batch samples -- but presenting it would show a half-built frame. */
+static int s_present_this_frame = 1;
+
 static void render_frame(void)
 {
     u32 fi = s_d3d.frame_index;
@@ -3358,7 +3364,8 @@ static void render_frame(void)
       } }
 
     /* Present */
-    s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0); /* vsync */
+    if (s_present_this_frame)
+        s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0); /* vsync */   /* skipped for an offscreen-only batch */
 
     move_to_next_frame();
 
@@ -4609,8 +4616,16 @@ void rsx_d3d12_backend_present(void)
                 s_d3d.draw_count, onscreen, offscreen, clears, has_display,
                 s_seen_content, (s_d3d.initialized && has_display) ? "YES" : "SKIPPED"); } }
 
-    if (s_d3d.initialized && has_display)
+    /* Execute the batch whenever it has draws. Gating the whole call on
+     * has_display meant a render-to-texture pass -- every draw targeting an
+     * offscreen surface -- was DISCARDED rather than deferred, so the texture
+     * it produces was never written and whatever sampled it later read an
+     * empty resource. Only the Present needs onscreen content. */
+    if (s_d3d.initialized && (has_display || s_d3d.draw_count > 0)) {
+        s_present_this_frame = has_display;
         render_frame();
+        s_present_this_frame = 1;
+    }
 }
 
 #else /* !_WIN32 */
