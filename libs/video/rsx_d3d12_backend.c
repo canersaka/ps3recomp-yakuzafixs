@@ -50,7 +50,11 @@
 #define FRAME_COUNT         2   /* double buffering */
 #define MAX_VERTICES    262144  /* per-frame vertex buffer (dbgfont submits
                                  * ~7.5k verts/frame; leave generous headroom) */
-#define MAX_DRAWS        16384  /* per-frame draw records */
+#define MAX_DRAWS         2048  /* per-frame draw records. Sized from the
+                                 * measured worst case (~1841, FRAME_BUDGET);
+                                 * the per-draw constant buffer is
+                                 * VP_CB_STRIDE * MAX_DRAWS * 2 bytes, so 16384
+                                 * asked for a 264 MB upload allocation. */
 /* Per-draw VP constant-buffer slot: vp_c[512] + posscale + posoffset
  * (514 vec4 = 8224 B) rounded up to D3D12's 256-byte CBV alignment.
  * Constants are snapshotted at RECORD time -- wave's passes each set their
@@ -1000,6 +1004,11 @@ static int init_d3d12(u32 width, u32 height)
             s_d3d.vp_vb->lpVtbl->Map(s_d3d.vp_vb, 0, &nr, &s_d3d.vp_vb_mapped);
 
         bd.Width = (u64)VP_CB_STRIDE * MAX_DRAWS * 2;   /* per-draw constant slots, x2 parity */
+        /* A failure here is silent and catastrophic: vp_record_cb returns early,
+         * every draw loses its constants, and the whole scene transforms by
+         * zeros -- indistinguishable from a broken vertex program. Say so. */
+        fprintf(stderr, "[VPCB] per-draw constant buffer: %llu MB (%d draws)%c",
+                (unsigned long long)(bd.Width >> 20), MAX_DRAWS, 10);
         if (SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp,
                 D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                 &IID_ID3D12Resource, (void**)&s_d3d.vp_cb)))
@@ -1530,6 +1539,20 @@ static int vp_get_vs(const rsx_state* st)
     if (getenv("VP_DUMP")) { static int _d=0; if (_d++ < 4) {
         FILE* f = fopen("vp2_dump.hlsl", _d==1 ? "w" : "a");
         if (f) { fprintf(f, "/* per-draw VS hash pending, %d instrs */%s%s", ni, hlsl, "\n"); fclose(f); } } }
+    /* DUCK_VP=<hex tex0 offset>: write the vertex program belonging to the draws
+     * that bind that texture. vp2_dump.hlsl holds whichever four programs were
+     * compiled first, which need not include the one under investigation -- and
+     * reading the wrong program sends you chasing the wrong constants. */
+    { static const char* dp = (const char*)1; static u32 wantp = 0; static int done = 0;
+      if (dp == (const char*)1) { dp = getenv("DUCK_VP");
+                                  wantp = dp ? (u32)strtoul(dp, NULL, 16) : 0; }
+      if (wantp && !done && s_d3d.cur_texs[0].raw == wantp) {
+          done = 1;
+          FILE* f = fopen("duck_vp.hlsl", "w");
+          if (f) { fprintf(f, "/* duck VP, %d instrs, tex0=0x%X */%s", ni, wantp, hlsl);
+                   fclose(f); }
+          fprintf(stderr, "[DUCKVP] wrote duck_vp.hlsl (%d instrs)%c", ni, 10);
+      } }
     /* VP_BYPASS=1: replace the guest transform with a direct map of attribute 0
      * into clip space. If geometry appears with this on, everything from the
      * input layout through raster/depth/present is sound and the fault is the
@@ -2459,6 +2482,24 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
                 slot, last_nz,
                 c[260*4+0], c[260*4+1], c[260*4+2], c[260*4+3],
                 c[261*4+0], c[261*4+1], c[261*4+2], c[261*4+3]); } }
+    /* DUCK_CB=<hex tex0 offset>: the constants as they land in the per-draw
+     * constant buffer for that texture's draws -- i.e. exactly what the shader
+     * samples, not what the CPU-side rsx_state holds. Those two agreeing is an
+     * assumption worth checking directly when a draw transforms to nothing. */
+    const float* vpx_dbg = (const float*)(dst + RSX_MAX_VERTEX_CONSTANTS * 16);
+    { static const char* dc = (const char*)1; static u32 wantc = 0; static int n = 0;
+      if (dc == (const char*)1) { dc = getenv("DUCK_CB");
+                                  wantc = dc ? (u32)strtoul(dc, NULL, 16) : 0; }
+      if (wantc && dr && dr->tex[0].raw == wantc && n < 4) { n++;
+          const float* c = (const float*)dst;
+          fprintf(stderr, "[DUCKCB] slot=%u vs_idx=%d posscale=(%g %g %g) posoffset=(%g %g %g)%c",
+                  slot, vs_idx, vpx_dbg[0], vpx_dbg[1], vpx_dbg[2],
+                  vpx_dbg[4], vpx_dbg[5], vpx_dbg[6], 10);
+          for (int r = 256; r <= 259; r++)
+              fprintf(stderr, "[DUCKCB]   c%d=(%g %g %g %g)%c", r,
+                      c[r*4+0], c[r*4+1], c[r*4+2], c[r*4+3], 10);
+      } }
+
     /* Viewport epilogue (see the render_frame notes this logic came from):
      * x/y identity, z lane remaps GL clip z when the guest programs one. */
     float* vpx = (float*)(dst + RSX_MAX_VERTEX_CONSTANTS * 16);
@@ -2986,13 +3027,45 @@ static void render_frame(void)
     { static const char* kp = (const char*)1; static u32 want = 0;
       if (kp == (const char*)1) { kp = getenv("DRAW_KEEP_TEX");
                                   want = kp ? (u32)strtoul(kp, NULL, 16) : 0; }
+      /* DRAW_KEEP_NOCLEAR=1: also drop the clears. Keeping them preserves their
+       * ORIGINAL position in the batch, so a clear that originally ran after the
+       * kept draws still runs after them -- and wipes the very geometry being
+       * isolated. That makes an object that renders fine look like it renders
+       * nothing. */
+      static int noclr = -1;
+      if (noclr < 0) { const char* e = getenv("DRAW_KEEP_NOCLEAR"); noclr = e ? atoi(e) : 0; }
       if (want) {
         u32 keep = 0;
         for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
-            if (!s_d3d.draws[_d].is_clear && s_d3d.draws[_d].tex[0].raw != want) continue;
+            if (s_d3d.draws[_d].is_clear) { if (noclr) continue; }
+            else if (s_d3d.draws[_d].tex[0].raw != want) continue;
             if (keep != _d) s_d3d.draws[keep] = s_d3d.draws[_d];
             keep++;
         }
+        s_d3d.draw_count = keep;
+      } }
+
+    /* DRAW_LAST_TEX=<hex raw offset>: move the ops binding that texture to the
+     * END of the batch so nothing is drawn over them. The duck's draws are ops
+     * 00..03 of every frame and the tub wall is drawn afterwards across the same
+     * screen area, so anything that defeats the depth sort hides the duck
+     * completely. Reordering separates "occluded" from "not rendered". */
+    { static const char* lt = (const char*)1; static u32 want = 0;
+      if (lt == (const char*)1) { lt = getenv("DRAW_LAST_TEX");
+                                  want = lt ? (u32)strtoul(lt, NULL, 16) : 0; }
+      if (want && s_d3d.draw_count > 1) {
+        static D3D12DrawRecord moved[MAX_DRAWS];
+        u32 nm = 0, keep = 0;
+        for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
+            if (!s_d3d.draws[_d].is_clear && s_d3d.draws[_d].tex[0].raw == want) {
+                if (nm < MAX_DRAWS) moved[nm++] = s_d3d.draws[_d];
+                continue;
+            }
+            if (keep != _d) s_d3d.draws[keep] = s_d3d.draws[_d];
+            keep++;
+        }
+        for (u32 _m = 0; _m < nm && keep < MAX_DRAWS; _m++)
+            s_d3d.draws[keep++] = moved[_m];
         s_d3d.draw_count = keep;
       } }
 
