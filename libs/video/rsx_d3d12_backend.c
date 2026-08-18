@@ -141,6 +141,11 @@ typedef struct {
     ID3D12Resource* res;
     ID3D12Resource* up;
     u32 off, w, h, fmt; /* current contents (resource reused when dims match) */
+    u32 csum;           /* sparse checksum of the source bytes last uploaded */
+    u32 key;            /* the ORIGINAL bound offset -- the cache lookup key.
+                         * off is the RESOLVED source after TEX_OFF_BIAS/TEX_REMAP
+                         * shift it, so keying on off never matches the raw offset
+                         * a later draw arrives with, and every draw re-uploads. */
     int used;           /* referenced this frame */
 } VPTexSlot;
 /* Distinct textures uploadable per frame. Four was enough for a UI/atlas-style
@@ -183,7 +188,12 @@ typedef struct {
     u32 cmask;              /* colour write mask (PSO key) */
     ID3D12PipelineState* pso;
 } VPFPEntry;
-#define VP_FP_CACHE 16
+/* Guest-FP PSO cache. 16 entries thrashed badly: this title needs far more
+ * distinct (fp, vs, blend, rt, cmask, ucode-hash) combinations than that in a
+ * single frame, so the FIFO evicted entries that were needed again immediately
+ * and ~17 shaders were recompiled EVERY frame -- about half the frame's CPU
+ * time. Entries are small (a PSO pointer plus key fields). */
+#define VP_FP_CACHE 256
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -310,6 +320,26 @@ typedef struct {
 static D3D12State s_d3d;
 char g_rsx_title_base[128] = "ps3recomp";
 static u32 s_dbg_last_draws = 0;
+/* PERF=1: where a frame's CPU time actually goes. Guessing at this is how you
+ * spend an afternoon optimising the wrong loop. */
+static double s_perf_tex = 0.0, s_perf_frame = 0.0, s_perf_vtx = 0.0, s_perf_rf = 0.0;
+static double s_perf_gpu = 0.0, s_perf_pre = 0.0, s_perf_srv = 0.0, s_perf_pso = 0.0;
+static int s_perf_pso_calls = 0, s_perf_pso_miss = 0, s_perf_pso_hashbytes = 0;
+static u64    s_perf_nverts = 0;
+static u64    s_perf_texbytes = 0;
+static int    s_perf_ntex = 0;
+static double perf_now(void)
+{
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
+    return (double)c.QuadPart / (double)f.QuadPart;
+}
+static int perf_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PERF"); v = e ? atoi(e) : 0; }
+    return v;
+}
 /* DBG_LOCK: running clip-space centroid of the tracked mesh (DUCK_VTX's
  * texture), so the debug camera can follow it. The ducks are driven by the
  * physics sim and drift every frame, so a fixed DBG_CENTER loses them as soon
@@ -1715,17 +1745,21 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     {
         u32 usz = rsx_fp_program_size(vm_base + off, 4096);
         if (usz == 0) usz = 64;
+        s_perf_pso_hashbytes += (int)usz;
         const u8* up = vm_base + off;
         for (u32 i = 0; i < usz; i++) { uhash ^= up[i]; uhash *= 16777619u; }
     }
 
+    s_perf_pso_calls++;
     for (int i = 0; i < s_d3d.vp_fp_n; i++)
-        if (s_d3d.vp_fp[i].fp_addr == fp_addr && s_d3d.vp_fp[i].vs_idx == vs_idx &&
+        if (s_d3d.vp_fp[i].fp_addr != fp_addr) continue;   /* cheap reject first */
+        else if (s_d3d.vp_fp[i].vs_idx == vs_idx &&
             s_d3d.vp_fp[i].vs_hash == vs_hash && s_d3d.vp_fp[i].gen == s_d3d.vp_gen &&
             s_d3d.vp_fp[i].blend == blend && s_d3d.vp_fp[i].nrt == nrt &&
             s_d3d.vp_fp[i].rtfmt == (u32)rtfmt && s_d3d.vp_fp[i].exp32 == exp32 &&
             s_d3d.vp_fp[i].ucode_hash == uhash && s_d3d.vp_fp[i].cmask == cmask)
             return s_d3d.vp_fp[i].pso;
+    s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
     static char hlsl[32768];
     int n = rsx_fp_decompile(vm_base + off, 4096, hlsl, sizeof(hlsl), exp32);
     if (n <= 0) { static int _e=0; if(_e++<16) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
@@ -1939,6 +1973,7 @@ static inline u32 rsx_log2u(u32 v) { u32 l = 0; while ((1u << l) < v) l++; retur
 static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
 {
     extern uint8_t* vm_base;
+
     if (!off || !w || !h || !vm_base || !s_d3d.srv_heap) return -1;
     /* Format classes (base = fmt & 0x9F). The LBP loading screen uses:
      * 0x85 A8R8G8B8 (swizzled UI art), 0x8B G8B8 (the 1024x2048 linear FONT
@@ -1963,12 +1998,28 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
         blkrow  = ((w + 3) / 4) * bs;
         blkrows = (h + 3) / 4;
     }
+    const u32 key_off = off;         /* lookup key: the offset as bound */
+    /* Sparse checksum of a texture's source bytes -- enough to notice an
+     * animated surface changing, cheap enough to run on every bind. */
+    #define TEX_CSUM(base, nbytes) ({                                                u32 _h = 2166136261u; u32 _n = (nbytes);                                     u32 _step = _n > 4096u ? _n / 1024u : 4u;                                    for (u32 _i = 0; _i + 3 < _n; _i += _step) {                                     _h ^= *(const u32*)((base) + _i); _h *= 16777619u; }                     _h; })
     int slot = -1, freeslot = -1;
     for (int i = 0; i < VP_TEX_SLOTS; i++) {
-        if (s_d3d.vp_tex[i].used && s_d3d.vp_tex[i].off == off &&
-            s_d3d.vp_tex[i].w == w && s_d3d.vp_tex[i].h == h)
-            return i;                             /* already uploaded this frame */
-        if (!s_d3d.vp_tex[i].used && freeslot < 0) freeslot = i;
+        VPTexSlot* c = &s_d3d.vp_tex[i];
+        if (c->res && c->key == key_off && c->w == w && c->h == h && c->fmt == fmt) {
+            if (c->used) return i;                /* already bound this frame */
+            { static int nocache = -1;            /* TEX_NOCACHE=1: always re-upload */
+              if (nocache < 0) { const char* e = getenv("TEX_NOCACHE");
+                                 nocache = e ? atoi(e) : 0; }
+              if (nocache) { slot = i; break; } }
+            /* Held from an earlier frame: re-upload only if the guest bytes
+             * changed. Most of this scene's textures are static, and converting
+             * every one of them every frame was ~70% of the frame's CPU time. */
+            u32 nb = dxt ? (blkrow * blkrows) : (w * h * bpp);
+            u32 cs = TEX_CSUM(vm_base + c->off, nb);
+            if (cs == c->csum) { c->used = 1; return i; }
+            slot = i; break;                      /* stale: fall through and redo */
+        }
+        if (!c->used && freeslot < 0) freeslot = i;
     }
     /* TEX_OFF_BIAS=1: sample the image one whole level-0 BELOW the bound offset.
      * Measured on the Rubber Ducky demo: at the bind offset every texture reads
@@ -2020,7 +2071,10 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
                 off = alt;
             }
         } } }
-    if (freeslot < 0) return -1;                  /* out of slots this frame */
+    /* A stale cache entry (slot >= 0) re-uses its own slot; otherwise take a
+     * free one. Without this the stale path fell through to freeslot and either
+     * duplicated the texture into a second slot or bailed when none was free. */
+    if (slot < 0 && freeslot < 0) return -1;      /* out of slots this frame */
     /* TEX_SRCDBG=<N>: is the guest memory this slot uploads FROM actually
      * populated? An empty source and a broken sampler both render flat. */
     { static int cap = -1, n = 0;
@@ -2065,7 +2119,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
           }
           fprintf(stderr, "[TEXSRC]    data starts at off%+ld (level0=%u bytes)%c",
                   start_delta, w * h * bpp, 10); } } }
-    slot = freeslot;
+    if (slot < 0) slot = freeslot;
     VPTexSlot* t = &s_d3d.vp_tex[slot];
     u32 pitch = ((dxt ? blkrow : w * bpp) + 255) & ~255u;
     int fresh = 0;
@@ -2445,7 +2499,10 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
     sh.ptr += (u64)(1 + slot) * s_d3d.srv_inc;
     s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, t->res, &sv, sh);
 
-    t->off = off; t->w = w; t->h = h; t->fmt = fmt; t->used = 1;
+    t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt; t->used = 1;
+    { u32 nb = dxt ? (blkrow * blkrows) : (w * h * bpp);
+      t->csum = TEX_CSUM(vm_base + off, nb); }
+    #undef TEX_CSUM
     return slot;
 }
 
@@ -2852,6 +2909,7 @@ static int s_present_this_frame = 1;
 
 static void render_frame(void)
 {
+    double _rf0 = perf_on() ? perf_now() : 0.0;
     u32 fi = s_d3d.frame_index;
 
     /* Drain the GPU before touching shared upload resources (vp_vb vertices,
@@ -3128,13 +3186,15 @@ static void render_frame(void)
      * animates so contents re-upload every frame) and pre-build its FP PSO.
      * A texture whose offset matches an offscreen RT samples the RT directly
      * (tex_slot 1000+idx) -- no guest-memory upload. */
+    double _pre0 = perf_on() ? perf_now() : 0.0;
     for (int _i = 0; _i < VP_TEX_SLOTS; _i++) s_d3d.vp_tex[_i].used = 0;
     for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
         D3D12DrawRecord* dr = &s_d3d.draws[_d];
         if (!dr->is_vp || dr->is_clear) continue;
         /* Debug: RTT_VIEWRT=<hex raw offset> makes display draws sample that
          * offscreen RT at t0 (the composite blit then shows it fullscreen). */
-        { const char* vr = getenv("RTT_VIEWRT");
+        { static const char* vr = (const char*)1;     /* hoisted: this runs per DRAW */
+          if (vr == (const char*)1) vr = getenv("RTT_VIEWRT");
           if (vr && dr->rt_off == 0) {
               dr->tex[0].raw = (u32)strtoul(vr, NULL, 16);
               dr->tex[0].off = 0;
@@ -3143,6 +3203,7 @@ static void render_frame(void)
         /* Fill this draw's t0-t3 SRV window (DRAW_SRV_BASE + d*4): each unit
          * resolves to an offscreen RT (sampled directly), an uploaded guest
          * texture, or a null SRV. */
+        double _sv0 = perf_on() ? perf_now() : 0.0;
         for (int _u = 0; _u < 4; _u++) {
             u32 wslot = DRAW_SRV_BASE + _d * 4 + (u32)_u;
             dr->tex_rt[_u] = -1;
@@ -3158,8 +3219,11 @@ static void render_frame(void)
                 if (dr->tex[_u].off &&
                     (_bf == 0x81 || _bf == 0x85 || _bf == 0x8B ||
                      (_bf >= 0x86 && _bf <= 0x88))) {
+                    double _tt = perf_on() ? perf_now() : 0.0;
                     int ts = vp_upload_tex_slot(dr->tex[_u].off, dr->tex[_u].w,
                                                 dr->tex[_u].h, dr->tex[_u].fmt);
+                    if (perf_on()) { s_perf_tex += perf_now() - _tt; s_perf_ntex++;
+                        s_perf_texbytes += (u64)dr->tex[_u].w * dr->tex[_u].h * 4u; }
                     if (ts >= 0) {
                         DXGI_FORMAT sf =
                             (_bf == 0x85) ? DXGI_FORMAT_R8G8B8A8_UNORM :
@@ -3187,11 +3251,14 @@ static void render_frame(void)
             srv_write(wslot, NULL, DXGI_FORMAT_R8G8B8A8_UNORM,
                       D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
         }
+        if (perf_on()) s_perf_srv += perf_now() - _sv0;
+        double _ps0 = perf_on() ? perf_now() : 0.0;
         if (dr->fp_addr) vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
                                        dr_num_rts(dr),
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
                                        dr->fp_exp32, dr->cmask);
+        if (perf_on()) s_perf_pso += perf_now() - _ps0;
     }
 
     /* Transition render target to RENDER_TARGET state */
@@ -3212,6 +3279,7 @@ static void render_frame(void)
     D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
     s_d3d.dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.dsv_heap, &dsv_handle);
 
+    if (perf_on()) s_perf_pre += perf_now() - _pre0;
     /* Set render target + depth */
     s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);
 
@@ -3381,6 +3449,7 @@ static void render_frame(void)
             s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh_base);
             int cur_rt = -1;                       /* target A: -1 = backbuffer */
             int cur_m[3] = {-1, -1, -1};           /* MRT B/C/D: -1 = unbound   */
+            double _rec0 = perf_on() ? perf_now() : 0.0;
             for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
                 const D3D12DrawRecord* dr = &s_d3d.draws[d];
                 if (!dr->is_vp) continue;
@@ -3489,6 +3558,7 @@ static void render_frame(void)
                             dr->vp_w, dr->vp_h, dr->tex[0].raw, dr->tex[0].set,
                             dr->tex[1].raw, dr->tex_slot, dr->fp_addr, 10); } }
             }
+            if (perf_on()) s_perf_gpu += perf_now() - _rec0;   /* reuse: record time */
             /* Leave the backbuffer bound for the dump/present epilogue. */
             if (cur_rt >= 0) {
                 s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);
@@ -3500,6 +3570,33 @@ static void render_frame(void)
         }
     }
 
+    if (perf_on()) s_perf_rf += perf_now() - _rf0;
+    if (perf_on()) {
+        static double s_t_prev = 0.0; static int s_n = 0;
+        double now = perf_now();
+        if (s_t_prev > 0.0) s_perf_frame += now - s_t_prev;
+        s_t_prev = now;
+        if (++s_n % 20 == 0) {
+            double fr = s_perf_frame > 0 ? s_perf_frame : 1;
+            fprintf(stderr, "[PERF] %.2f fps | tex %.2fs (%.0f%%, %d calls) | vtx %.2fs"
+                            " (%.0f%%, %.0fk verts) | render_frame %.2fs (%.0f%%)"
+                            " | prepass %.2fs (%.0f%%) [srv %.2fs %.0f%% | pso %.2fs %.0f%% %d calls %d MISS %dKB hashed] | guest %.2fs (%.0f%%)%c",
+                    20.0 / fr,
+                    s_perf_tex, 100.0 * s_perf_tex / fr, s_perf_ntex,
+                    s_perf_vtx, 100.0 * s_perf_vtx / fr,
+                    (double)s_perf_nverts / 1000.0,
+                    s_perf_rf, 100.0 * s_perf_rf / fr,
+                    s_perf_pre, 100.0 * s_perf_pre / fr,
+                    s_perf_srv, 100.0 * s_perf_srv / fr,
+                    s_perf_pso, 100.0 * s_perf_pso / fr,
+                    s_perf_pso_calls, s_perf_pso_miss, s_perf_pso_hashbytes / 1024,
+                    fr - s_perf_rf, 100.0 * (fr - s_perf_rf) / fr, 10);
+            s_perf_frame = 0.0; s_perf_tex = 0.0; s_perf_vtx = 0.0; s_perf_rf = 0.0;
+            s_perf_gpu = 0.0; s_perf_pre = 0.0; s_perf_srv = 0.0; s_perf_pso = 0.0;
+            s_perf_pso_calls = 0; s_perf_pso_miss = 0; s_perf_pso_hashbytes = 0;
+            s_perf_ntex = 0; s_perf_texbytes = 0; s_perf_nverts = 0;
+        }
+    }
     if (s_lock_n) {                       /* publish this frame's centroid */
         s_lock_x = (float)(s_lock_sx / s_lock_n);
         s_lock_y = (float)(s_lock_sy / s_lock_n);
@@ -3663,7 +3760,9 @@ skip_dump_consider: ;
     }
 
     if (s_rtsave_state) {
-        if (!dumping) wait_for_gpu();
+        if (!dumping) { double _g = perf_on() ? perf_now() : 0.0;
+                        wait_for_gpu();
+                        if (perf_on()) s_perf_gpu += perf_now() - _g; }
         void* mp = NULL; D3D12_RANGE rr = {0, (SIZE_T)s_rtsave_pitch * s_rtsave_h};
         if (SUCCEEDED(s_rtsave_buf->lpVtbl->Map(s_rtsave_buf, 0, &rr, &mp)) && mp) {
             FILE* f = fopen("rt_save.bmp", "wb");
@@ -4300,8 +4399,10 @@ static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
     if (count > maxv) { s_drop_draws++; count = maxv - (maxv % 3); }
     VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
         + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
-    for (u32 k = 0; k < count; k++)
-        read_vp_vertex(state, first + k, &out[k*16]);
+    { double _tv = perf_on() ? perf_now() : 0.0;
+      for (u32 k = 0; k < count; k++)
+          read_vp_vertex(state, first + k, &out[k*16]);
+      if (perf_on()) { s_perf_vtx += perf_now() - _tv; s_perf_nverts += count; } }
     /* DUCK_VTX=<hex tex0 offset>: dump attribute-0 positions for the draws that
      * bind that texture. The duck's texture resolves and its 9960 draws all
      * target the backbuffer, yet none of its texels reach the screen -- so the
@@ -4436,8 +4537,10 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
     if (count > maxv) { s_drop_draws++; count = maxv - (maxv % 3); }
     VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
         + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
-    for (u32 k = 0; k < count; k++)
-        read_vp_vertex(state, read_guest_index(state, first + k), &out[k*16]);
+    { double _tv = perf_on() ? perf_now() : 0.0;
+      for (u32 k = 0; k < count; k++)
+          read_vp_vertex(state, read_guest_index(state, first + k), &out[k*16]);
+      if (perf_on()) { s_perf_vtx += perf_now() - _tv; s_perf_nverts += count; } }
     /* DBG_LOCK tracking: projected centroid of this mesh, updated every draw. */
     { static const char* dl = (const char*)1; static u32 wantl = 0; static int mvpb = 256;
       if (dl == (const char*)1) { dl = getenv("DUCK_VTX");
