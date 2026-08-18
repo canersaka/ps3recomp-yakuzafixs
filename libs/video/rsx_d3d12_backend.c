@@ -1905,13 +1905,23 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
     { static int bias = -1;
       if (bias < 0) { const char* e = getenv("TEX_OFF_BIAS"); bias = e ? atoi(e) : 0; }
       if (bias == 1) { u32 sz = w * h * bpp; if (off > sz) off -= sz; }
-      else if (bias == 2) {
+      else if (bias >= 2) {
           u32 chain = 0;
           for (u32 mw = w, mh = h; mw && mh; mw >>= 1, mh >>= 1) {
               chain += mw * mh * bpp;
               if (mw == 1 && mh == 1) break;
           }
-          off += chain;
+          /* bias 3: only shift when the bound offset really is empty, so a
+           * texture that IS bound correctly keeps its own data. Applying the
+           * chain unconditionally fixes the mis-bound majority but breaks any
+           * correctly-bound minority, which shows up as objects going black. */
+          int shift = 1;
+          if (bias >= 3) {
+              u32 nz = 0, sz = w * h * bpp;
+              for (u32 i = 0; i < sz && i < 0x20000u; i += 97) if (vm_base[off + i]) nz++;
+              shift = (nz == 0);
+          }
+          if (shift) off += chain;
       } }
     /* TEX_REMAP=1: if the bound offset holds nothing, look the image up by size
      * in the VRAM upload registry (cellGcmSys). For a title whose upload address
@@ -3609,6 +3619,14 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
         }
     }
 
+    /* RSX_ACCUM_FRAME=1: never present at a clear boundary, so every draw in a
+     * guest frame accumulates into one image. A title that clears several times
+     * per frame (render-to-texture passes) otherwise gets presented mid-scene,
+     * and each captured frame holds only a slice of the geometry -- the floor in
+     * one, a wall in the next -- which makes a single model impossible to see. */
+    { static int accum = -1;
+      if (accum < 0) { const char* e = getenv("RSX_ACCUM_FRAME"); accum = e ? atoi(e) : 0; }
+      if (accum) return; }
     if (s_d3d.initialized) {
         if (blink_dbg())
             printf("[CLEAR] presenting %u accumulated draws at frame boundary\n",
