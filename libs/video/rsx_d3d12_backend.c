@@ -3928,6 +3928,15 @@ static void render_frame(void)
             s_perf_ntex = 0; s_perf_texbytes = 0; s_perf_nverts = 0;
         }
     }
+    { static int dt = -1;
+      if (dt < 0) { const char* e = getenv("DUCKTRACK"); dt = e ? atoi(e) : 0; }
+      if (dt) { static int fr = 0; fr++;
+        if (s_lock_n)
+            fprintf(stderr, "[DUCKTRACK] frame %d: %u duck draws, ndc=(%.3f,%.3f)%c",
+                    fr, s_lock_n, (float)(s_lock_sx/s_lock_n), (float)(s_lock_sy/s_lock_n), 10);
+        else if (fr % 20 == 0)
+            fprintf(stderr, "[DUCKTRACK] frame %d: NO duck draws%c", fr, 10);
+      } }
     if (s_lock_n) {                       /* publish this frame's centroid */
         s_lock_x = (float)(s_lock_sx / s_lock_n);
         s_lock_y = (float)(s_lock_sy / s_lock_n);
@@ -4879,6 +4888,13 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
                                   wantl = dl ? (u32)strtoul(dl, NULL, 16) : 0;
                                   const char* mb = getenv("MVP_BASE");
                                   if (mb) mvpb = atoi(mb); }
+      /* DUCKTRACK=1 tracks the content-identified duck without needing its
+       * offset passed in (VRAM offsets move between runs). Re-read every call:
+       * s_duck_raw is filled by the texture upload, which happens AFTER the
+       * first draws, so caching it once left the tracker watching offset 0. */
+      { static int dtrk = -1;
+        if (dtrk < 0) { const char* e = getenv("DUCKTRACK"); dtrk = e ? atoi(e) : 0; }
+        if (dtrk && s_duck_raw) wantl = s_duck_raw; }
       /* DUCK_PICK=<first>: track ONLY the draw with that starting index. The
        * mesh is one big vertex buffer sliced into 256-index chunks, so averaging
        * across all of them converges on the centre of the whole field -- which is
