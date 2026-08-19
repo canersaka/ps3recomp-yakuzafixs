@@ -1796,9 +1796,45 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * everywhere -> the water sim must visibly radiate if it works). */
     { const char* f1 = getenv("FP_ONE");
       if (f1 && (u32)strtoul(f1, NULL, 16) == fp_addr) {
-          char* rp = strstr(hlsl, "PSOut _po; _po.c0 = r[0];");
-          if (rp) memcpy(rp, "PSOut _po; _po.c0=(1).xxxx;", 27);
+          /* Match the assignment, not one exact spelling of it: the final
+           * register is r[N] for some programs and h[N] for others, and the old
+           * fixed "= r[0];" anchor silently did nothing for every h[] shader --
+           * so this switch appeared to have no effect and was useless for
+           * identifying which program draws what. Rewrite the expression with a
+           * proper length-changing splice. */
+          char* rp = strstr(hlsl, "_po.c0 = ");
+          if (rp) {
+              char* semi = strchr(rp, ';');
+              if (semi) {
+                  static const char rep[] = "_po.c0 = (1.0).xxxx";
+                  size_t oldlen = (size_t)(semi - rp), newlen = sizeof(rep) - 1;
+                  size_t tail = strlen(semi) + 1;
+                  if ((rp - hlsl) + newlen + tail < sizeof(hlsl)) {
+                      memmove(rp + newlen, semi, tail);
+                      memcpy(rp, rep, newlen);
+                  }
+                  (void)oldlen;
+              }
+          }
       } }
+    /* FP_TEX=1: make every program output its unit-0 texture sample verbatim.
+     * Separates "the texture is wrong" from "the shading tints it" in one run,
+     * without having to identify which program draws which surface first. */
+    if (getenv("FP_TEX")) {
+        char* rp = strstr(hlsl, "_po.c0 = ");
+        if (rp) {
+            char* semi = strchr(rp, ';');
+            if (semi) {
+                static const char rep[] =
+                    "_po.c0 = rsx_tex0.Sample(rsx_samp0, input.tc0.xy * rsx_texscale[0].xy)";
+                size_t newlen = sizeof(rep) - 1, tail = strlen(semi) + 1;
+                if ((size_t)(rp - hlsl) + newlen + tail < sizeof(hlsl)) {
+                    memmove(rp + newlen, semi, tail);
+                    memcpy(rp, rep, newlen);
+                }
+            }
+        }
+    }
     /* FP_FORCE=1: replace the translated body with solid magenta -- isolates
      * geometry/transform problems from texture/blend problems. */
     if (getenv("FP_FORCE")) {

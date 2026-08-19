@@ -555,7 +555,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         state->vertex_data4f[idx][lane] = f;
         { static int _d = -1; if (_d < 0) _d = getenv("VDATA_DBG") ? 1 : 0;
           static int _n = 0;
-          if (_d && _n < 32) { _n++;
+          if (_d && _n < 400) { _n++;
             fprintf(stderr, "[VDATA4F] attr=%u lane=%u = %.4f%c", idx, lane, f, 10); } }
         return 0;
     }
