@@ -735,7 +735,16 @@ static void nv3089_blit(void)
                    out_w, out_h, f, src2, dst2, 10); } }
         return;
       } }
-    if (f != 7 /* A8R8G8B8 */ && f != 8 /* X8R8G8B8 */ && f != 0xD /* A8B8G8R8 */) {
+    /* 0x3 is A8R8G8B8 in the scaled-image format enum. This title uses it for
+     * two different things: the swizzled mip/blur pyramid handled above, and
+     * (with a LINEAR NV3062 destination) copies of the rendered scene surface
+     * into the textures its water and effects sample -- e.g.
+     * src=0xCE340000 (the scene) -> dst=0xC3746200, which is the single most
+     * sampled blended texture in the frame. Skipping those left every one of
+     * those textures empty. Same 4-byte pixel layout as the formats already
+     * handled. */
+    if (f != 3 /* A8R8G8B8 (scale-format enum) */ &&
+        f != 7 /* A8R8G8B8 */ && f != 8 /* X8R8G8B8 */ && f != 0xD /* A8B8G8R8 */) {
         /* Log the GEOMETRY of a skipped blit, not just the format: a full-screen
          * copy from the scene surface to a registered display buffer is the
          * composite this title needs, and is worth telling apart from some
