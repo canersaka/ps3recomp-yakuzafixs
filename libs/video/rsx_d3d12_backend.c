@@ -48,7 +48,7 @@
  * -----------------------------------------------------------------------*/
 
 #define FRAME_COUNT         2   /* double buffering */
-#define MAX_VERTICES    262144  /* per-frame vertex buffer (dbgfont submits
+#define MAX_VERTICES    393216  /* per-frame vertex buffer (dbgfont submits
                                  * ~7.5k verts/frame; leave generous headroom) */
 #define MAX_DRAWS         2048  /* per-frame draw records. Sized from the
                                  * measured worst case (~1841, FRAME_BUDGET);
@@ -320,6 +320,7 @@ typedef struct {
 static D3D12State s_d3d;
 char g_rsx_title_base[128] = "ps3recomp";
 static u32 s_dbg_last_draws = 0;
+static u64 s_req_verts = 0, s_req_draws = 0, s_drop_draws = 0;
 /* Raw bind offset of the duck's texture, identified by CONTENT (duck.tga is
  * overwhelmingly yellow, avg 243,191,23). VRAM offsets move between runs, so a
  * hard-coded offset in a filter silently matches nothing and the run looks like
@@ -1055,10 +1056,18 @@ static int init_d3d12(u32 width, u32 height)
                                           * vertices the in-flight GPU frame is
                                           * still reading (was: torn/missing
                                           * triangles mixing stale+new verts) */
+        /* Failure here leaves vp_vb_mapped NULL and every VP draw silently
+         * declines to upload -- the scene just does not render, with no error
+         * anywhere. Report the size too: this buffer is
+         * MAX_VERTICES * 256 * 2 bytes and grows fast. */
+        fprintf(stderr, "[VPVB] per-frame vertex buffer: %llu MB (%u verts, x2 parity)%c",
+                (unsigned long long)(bd.Width >> 20), (unsigned)MAX_VERTICES, 10);
         if (SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp,
                 D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                 &IID_ID3D12Resource, (void**)&s_d3d.vp_vb)))
             s_d3d.vp_vb->lpVtbl->Map(s_d3d.vp_vb, 0, &nr, &s_d3d.vp_vb_mapped);
+        else
+            fprintf(stderr, "[VPVB] ALLOCATION FAILED -- no VP geometry will render%c", 10);
 
         bd.Width = (u64)VP_CB_STRIDE * MAX_DRAWS * 2;   /* per-draw constant slots, x2 parity */
         /* A failure here is silent and catastrophic: vp_record_cb returns early,
@@ -3881,6 +3890,18 @@ static void render_frame(void)
     }
 
     if (perf_on()) s_perf_rf += perf_now() - _rf0;
+    /* FRAME_BUDGET=1: geometry a frame asked for vs what the batch can hold.
+     * Reported from render_frame so it works under RSX_ACCUM_FRAME too -- it
+     * used to live in the clear-boundary present path, which accum bypasses, so
+     * it silently produced nothing in exactly the configuration being used. */
+    { static int fb = -1;
+      if (fb < 0) { const char* e = getenv("FRAME_BUDGET"); fb = e ? atoi(e) : 0; }
+      if (fb && s_req_draws) { static int n = 0; if (n++ < 40)
+        fprintf(stderr, "[BUDGET] frame: requested %llu verts / %llu draws, "
+                        "buffer holds %u verts, %llu draws truncated%c",
+                (unsigned long long)s_req_verts, (unsigned long long)s_req_draws,
+                MAX_VERTICES, (unsigned long long)s_drop_draws, 10); }
+      s_req_verts = 0; s_req_draws = 0; s_drop_draws = 0; }
     if (perf_on()) {
         static double s_t_prev = 0.0; static int s_n = 0;
         double now = perf_now();
@@ -4248,7 +4269,6 @@ static u32 s_clear_presents = 0;   /* presents issued at clear (frame boundary) 
  * what the per-frame vertex buffer can hold. A frame that overflows is silently
  * truncated -- the tail of the scene never renders -- which reads as "the object
  * is missing" rather than "the batch is too small". */
-static u64 s_req_verts = 0, s_req_draws = 0, s_drop_draws = 0;
 
 static int blink_dbg(void)
 {
@@ -4387,14 +4407,6 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
         if (blink_dbg())
             printf("[CLEAR] presenting %u accumulated draws at frame boundary\n",
                    s_d3d.draw_count);
-        { static int fb = -1;
-          if (fb < 0) { const char* e = getenv("FRAME_BUDGET"); fb = e ? atoi(e) : 0; }
-          if (fb) { static int n = 0; if (n++ < 24)
-            fprintf(stderr, "[BUDGET] frame: requested %llu verts / %llu draws, "
-                            "buffer holds %u verts, %llu draws truncated%c",
-                    (unsigned long long)s_req_verts, (unsigned long long)s_req_draws,
-                    MAX_VERTICES, (unsigned long long)s_drop_draws, 10); } }
-        s_req_verts = 0; s_req_draws = 0; s_drop_draws = 0;
         render_frame();
         s_clear_presents++;
     }

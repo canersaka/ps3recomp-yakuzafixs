@@ -434,6 +434,12 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
          * Dropping it left .z holding log2(spec)*power -- a wrong, typically
          * negative, specular fed straight into the lighting sum. */
         case OP_LIF:
+            /* FP_LIT_OFF=1: emit nothing for LIT, reproducing the pre-fix
+             * behaviour. Lets "did implementing LIT introduce this?" be answered
+             * directly instead of inferred. */
+            { static int off = -1;
+              if (off < 0) { const char* e = getenv("FP_LIT_OFF"); off = e ? atoi(e) : 0; }
+              if (off) { handled = 0; break; } }
             /* Clamp the exponent. Hardware LIT bounds the specular power to
              * +/-128; here the compiler has already folded log2(NdotH)*power
              * into .z, so an NdotH that rounds above 1 makes that positive and
