@@ -9,6 +9,7 @@
  * below so this file is self-documenting.
  */
 
+#include <stdlib.h>   /* getenv, atoi */
 #include "rsx_fp_decompiler.h"
 #include <stdio.h>
 #include <string.h>
@@ -416,6 +417,12 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
         case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
         case OP_RSQ: snprintf(rhs, sizeof(rhs), "rsqrt((%s).x)", a); break;
         case OP_EX2: snprintf(rhs, sizeof(rhs), "exp2((%s).x)", a); break;
+        /* Screen-space derivatives. HLSL has these natively; dropping them left
+         * the destination holding a stale value, silently corrupting whatever
+         * effect differentiates a coordinate (edge/threshold and filtering work
+         * both do). 26 DDX + 24 DDY across this title's shaders. */
+        case OP_DDX: snprintf(rhs, sizeof(rhs), "ddx(%s)", a); break;
+        case OP_DDY: snprintf(rhs, sizeof(rhs), "ddy(%s)", a); break;
         /* LIF (0x3C) is NV40's LIT. Evidence from this title's shaders: the
          * write mask is always .yz -- LIT's x and w results are the constant
          * 1.0, so Cg masks them off -- and the source arrives swizzled .xyzz
@@ -427,8 +434,15 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
          * Dropping it left .z holding log2(spec)*power -- a wrong, typically
          * negative, specular fed straight into the lighting sum. */
         case OP_LIF:
+            /* Clamp the exponent. Hardware LIT bounds the specular power to
+             * +/-128; here the compiler has already folded log2(NdotH)*power
+             * into .z, so an NdotH that rounds above 1 makes that positive and
+             * exp2 explodes, saturating a channel. In this title's wall shader
+             * the power is 100, and the blown result was leaking into the
+             * colour sum as a magenta cast. */
             snprintf(rhs, sizeof(rhs),
-                     "float4(1.0, max((%s).x, 0.0), ((%s).x > 0.0) ? exp2((%s).z) : 0.0, 1.0)",
+                     "float4(1.0, max((%s).x, 0.0), ((%s).x > 0.0)"
+                     " ? exp2(clamp((%s).z, -128.0, 128.0)) : 0.0, 1.0)",
                      a, a, a);
             break;
         case OP_LG2: snprintf(rhs, sizeof(rhs), "log2((%s).x)", a); break;
@@ -475,6 +489,21 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
             /* Report the dst register/mask and the raw words too: "unhandled
              * opcode X" alone is not enough to implement it -- what it writes
              * and what it reads is what tells you the semantics. */
+            /* FP_CENSUS: tally unhandled opcodes across EVERY program compiled,
+             * not just whichever one is being dumped. A decode gap shows up as
+             * wrong shading on whatever happens to use it, so a census is how
+             * you find them all at once instead of one surface at a time. */
+            { static u32 cen[256]; static int reg = 0;
+              if (opcode < 256) cen[opcode]++;
+              if (!reg) { reg = 1; }
+              { static int cap = -1; static u32 n = 0;
+                if (cap < 0) { const char* e = getenv("FP_CENSUS"); cap = e ? atoi(e) : 0; }
+                if (cap && ++n % (u32)cap == 0) {
+                    fprintf(stderr, "[FPCENSUS] unhandled opcodes so far:");
+                    for (int i = 0; i < 256; i++) if (cen[i])
+                        fprintf(stderr, " %s(0x%02X)x%u", rsx_fp_opcode_name(i), i, cen[i]);
+                    fprintf(stderr, "%c", 10);
+                } } }
             { char _tb[256]; char _mm[5]; dest_mask(w0, _mm);
               snprintf(_tb, sizeof _tb,
                        "    /* TODO: unhandled FP opcode %s (0x%02X) dst=%s%u.%s"

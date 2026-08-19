@@ -1834,6 +1834,52 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     /* FP_TEX=1: make every program output its unit-0 texture sample verbatim.
      * Separates "the texture is wrong" from "the shading tints it" in one run,
      * without having to identify which program draws which surface first. */
+    /* FP_SHOW=<hlsl expr>: replace a program's colour output with an arbitrary
+     * expression (e.g. FP_SHOW=h[1]) so an intermediate register can be looked
+     * at directly. Restrict with FP_TEX_FP=<hex>. Reading a 69-instruction
+     * shader to guess which term carries a bad value is slower and less certain
+     * than displaying the terms. */
+    { const char* sh = getenv("FP_SHOW");
+      const char* only = getenv("FP_TEX_FP");
+      if (sh && (!only || (u32)strtoul(only, NULL, 16) == fp_addr)) {
+          char* rp = strstr(hlsl, "_po.c0 = ");
+          if (rp) { char* semi = strchr(rp, ';');
+            if (semi) {
+                char rep[256];
+                snprintf(rep, sizeof rep, "_po.c0 = float4((%s).xyz, 1.0)", sh);
+                size_t newlen = strlen(rep), tail = strlen(semi) + 1;
+                if ((size_t)(rp - hlsl) + newlen + tail < sizeof(hlsl)) {
+                    memmove(rp + newlen, semi, tail);
+                    memcpy(rp, rep, newlen);
+                    fprintf(stderr, "[FPSHOW] fp=0x%X output replaced with %s%c",
+                            fp_addr, sh, 10);
+                }
+            } }
+      } }
+    /* FP_IDCOLOR=1: give every fragment program a distinct flat colour derived
+     * from its address. One frame then shows which program paints which surface,
+     * instead of one run per candidate to test them by elimination. */
+    if (getenv("FP_IDCOLOR")) {
+        char* rp = strstr(hlsl, "_po.c0 = ");
+        if (rp) {
+            char* semi = strchr(rp, ';');
+            if (semi) {
+                u32 hsh = fp_addr * 2654435761u;
+                float cr = (float)((hsh >> 16) & 0xFF) / 255.0f;
+                float cg = (float)((hsh >>  8) & 0xFF) / 255.0f;
+                float cb = (float)((hsh      ) & 0xFF) / 255.0f;
+                char rep[128];
+                snprintf(rep, sizeof rep, "_po.c0 = float4(%.3f,%.3f,%.3f,1.0)", cr, cg, cb);
+                size_t newlen = strlen(rep), tail = strlen(semi) + 1;
+                if ((size_t)(rp - hlsl) + newlen + tail < sizeof(hlsl)) {
+                    memmove(rp + newlen, semi, tail);
+                    memcpy(rp, rep, newlen);
+                    fprintf(stderr, "[FPID] fp=0x%X -> rgb(%.0f,%.0f,%.0f)%c",
+                            fp_addr, cr*255, cg*255, cb*255, 10);
+                }
+            }
+        }
+    }
     /* FP_TEX=<unit>: output that unit's sample verbatim. FP_TEX_FP=<hex> limits
      * it to one program, so one surface can be inspected without repainting the
      * whole scene. FP_TEX_UV=1 samples with the same texcoord the program uses
@@ -2534,8 +2580,10 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
             for (u32 y = 0; y < h; y++) {
                 u8* drow = (u8*)mapped + (u64)y * pitch;
                 for (u32 x = 0; x < w; x++) {
+                    /* Pure RED. Magenta collided with this title's wall tint,
+                     * so the marker was indistinguishable from real geometry. */
                     drow[x*4+0] = 0xFF; drow[x*4+1] = 0x00;
-                    drow[x*4+2] = 0xFF; drow[x*4+3] = 0xFF;
+                    drow[x*4+2] = 0x00; drow[x*4+3] = 0xFF;
                 }
             }
             { static int _n = 0; if (_n++ < 8)
@@ -3393,6 +3441,28 @@ static void render_frame(void)
          * memory that sampler reads is never written and the texture comes back
          * empty. Finding which geometry does it is the first step to feeding it
          * the rendered image instead. */
+        /* EMPTYTEX=1: which geometry binds a texture whose source is all zero.
+         * An unresolved texture renders untextured, so this names the surfaces
+         * affected instead of leaving it to guesswork. */
+        { static int ed = -1;
+          if (ed < 0) { const char* e = getenv("EMPTYTEX"); ed = e ? atoi(e) : 0; }
+          extern uint8_t* vm_base;
+          if (ed && vm_base) for (int _u = 0; _u < 4; _u++) {
+              if (!dr->tex[_u].set || !dr->tex[_u].off) continue;
+              u32 nz = 0, sz = dr->tex[_u].w * dr->tex[_u].h * 4u;
+              for (u32 i2 = 0; i2 < sz && i2 < 0x20000u; i2 += 997)
+                  if (vm_base[dr->tex[_u].off + i2]) { nz = 1; break; }
+              if (!nz) {
+                  static u32 seen[24]; static int ns = 0; int known = 0;
+                  for (int k = 0; k < ns; k++) if (seen[k] == dr->fp_addr) known = 1;
+                  if (!known && ns < 24) { seen[ns++] = dr->fp_addr;
+                      fprintf(stderr, "[EMPTYTEX] fp=0x%X unit=%d raw=0x%08X %ux%u"
+                                      " fmt=0x%02X verts=%u vp=%u,%u %ux%u%c",
+                              dr->fp_addr, _u, dr->tex[_u].raw, dr->tex[_u].w,
+                              dr->tex[_u].h, dr->tex[_u].fmt, dr->vertex_count,
+                              dr->vp_x, dr->vp_y, dr->vp_w, dr->vp_h, 10); }
+              }
+          } }
         { static int sd = -1;
           if (sd < 0) { const char* e = getenv("SCREENTEX"); sd = e ? atoi(e) : 0; }
           if (sd) for (int _u = 0; _u < 4; _u++)
