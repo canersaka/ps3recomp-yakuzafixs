@@ -646,10 +646,39 @@ static struct {
     u32 ds_dx, dt_dy, in_sz, in_fmt, in_off, in_uv;
 } s_nv3089;
 
+/* NV309E "swizzled surface" -- the destination object for a scaled-image blit
+ * whose target is a swizzled (Morton-ordered) texture rather than a linear
+ * surface. Rubber Ducky binds it to the same subchannel this file previously
+ * assumed was always NV308A (image-from-CPU), so its SET_OFFSET was being read
+ * as an NV308A "point" and the blit destination was never picked up at all.
+ * The two are told apart by method 0x0300: NV308A has no such method. */
+static struct {
+    u32 fmt;        /* 0x0300: (log2h << 24) | (log2w << 16) | format */
+    u32 offset;     /* 0x0304: destination offset                     */
+    int active;
+    int subch;      /* which subchannel NV309E is bound to. Per-subchannel:
+                     * this title has NV309E on 4 and NV308A on 5, and a global
+                     * flag made 5's NV308A POINT (also 0x0304) be swallowed as
+                     * an NV309E offset, breaking every inline transfer. */
+} s_nv309e;
+
 /* Execute one NV3089 blit into the currently-bound NV3062 destination surface.
  * Point-sampled: ds/dx and dt/dy are 20.12 fixed point and are 0x100000 (1.0)
  * for the straight uploads this exists for; a scaled blit still lands, just
  * without filtering. */
+/* Morton/Z-order offset for an NV309E swizzled surface: interleave the low
+ * min(l2w,l2h) bits of x and y, then append the remaining bits of the larger
+ * dimension above them. */
+static u32 nv309e_swz(u32 x, u32 y, u32 l2w, u32 l2h)
+{
+    u32 n = l2w < l2h ? l2w : l2h, off = 0;
+    for (u32 i = 0; i < n; i++)
+        off |= (((x >> i) & 1u) << (2 * i)) | (((y >> i) & 1u) << (2 * i + 1));
+    if (l2w > l2h)      off |= (x >> n) << (2 * n);
+    else if (l2h > l2w) off |= (y >> n) << (2 * n);
+    return off;
+}
+
 static void nv3089_blit(void)
 {
     u32 out_w = s_nv3089.out_sz & 0xFFFF, out_h = s_nv3089.out_sz >> 16;
@@ -666,6 +695,46 @@ static void nv3089_blit(void)
      * as 4-byte A8R8G8B8 like 7/8/0xD is WRONG -- it floods the scene blue
      * (flat-blue coverage 17k -> 537k pixels), so its pixel layout differs.
      * Decode it properly before enabling; do not just add it to this list. */
+    /* NV309E swizzled destination. Colour format 0x3 is A8R8G8B8 in the
+     * scaled-image enum; this title uses it to build a mip/blur pyramid into a
+     * swizzled texture (1024x512 -> 1024x256 -> ... all through NV309E).
+     * Writing it LINEARLY into the NV3062 destination is what flooded the scene
+     * blue -- wrong destination and wrong layout. */
+    { u32 l2w = (s_nv309e.fmt >> 16) & 0xFF, l2h = (s_nv309e.fmt >> 24) & 0xFF;
+      static int en = -1;
+      /* On by default: this is the mip/blur pyramid. Without it textures have
+       * no mip levels, which shows up as aliased blocky tiles and a noise patch
+       * where a minified surface should be, and the shell that samples the
+       * pyramid draws untextured. NV309E_BLIT=0 disables. */
+      if (en < 0) { const char* e = getenv("NV309E_BLIT"); en = e ? atoi(e) : 1; }
+      if (en && f == 3 && s_nv309e.active && s_nv309e.offset &&
+          (1u << l2w) == out_w && (1u << l2h) == out_h) {
+        int sl = (s_nv3089.src_dma != 0xFEED0001u);
+        u32 src2 = cellGcmResolveLocated(sl, s_nv3089.in_off);
+        u32 dst2 = cellGcmResolveLocated(1, s_nv309e.offset);
+        u32 u0b = s_nv3089.in_uv & 0xFFFF, v0b = s_nv3089.in_uv >> 16;
+        /* Copy words verbatim through raw pointers rather than vm_read32/
+         * vm_write32: this moves ~500k pixels per blit and several blits run per
+         * frame, and the two byte swaps would cancel anyway. */
+        { extern u8* vm_base;
+          const u8* sbase = vm_base + src2;
+          u8* dbase = vm_base + dst2;
+          for (u32 y = 0; y < out_h; y++) {
+              u64 sv = ((u64)v0b << 8) + (u64)y * s_nv3089.dt_dy;
+              const u8* srow = sbase + (u32)(sv >> 20) * in_pitch;
+              for (u32 x = 0; x < out_w; x++) {
+                  u64 su = ((u64)u0b << 8) + (u64)x * s_nv3089.ds_dx;
+                  memcpy(dbase + (u64)nv309e_swz(x, y, l2w, l2h) * 4,
+                         srow + (u32)(su >> 20) * 4, 4);
+              }
+          } }
+        { static int _n = 0; static int cap = -1;
+          if (cap < 0) { const char* e = getenv("NV3089_DBG"); cap = e ? atoi(e) : 0; }
+          if (cap && _n < cap) { _n++;
+            printf("[NV3089] swizzled %ux%u fmt=0x%X src=0x%08X -> NV309E dst=0x%08X%c",
+                   out_w, out_h, f, src2, dst2, 10); } }
+        return;
+      } }
     if (f != 7 /* A8R8G8B8 */ && f != 8 /* X8R8G8B8 */ && f != 0xD /* A8B8G8R8 */) {
         /* Log the GEOMETRY of a skipped blit, not just the format: a full-screen
          * copy from the scene surface to a registered display buffer is the
@@ -707,6 +776,30 @@ static void nv3089_blit(void)
 
 static void gcm_2d_method(u32 subch, u32 method, u32 data)
 {
+    /* GCM2D_TRACE=1: histogram of (subchannel, method) actually seen. The
+     * subchannel a title binds each 2D object to is libgcm-version-specific and
+     * SET_OBJECT binds are not tracked, so state landing on an unexpected
+     * subchannel is silently dropped -- which looks like a blit using stale
+     * destination state rather than like missing state. */
+    { static int tr = -1;
+      if (tr < 0) { const char* e = getenv("GCM2D_TRACE"); tr = e ? atoi(e) : 0; }
+      if (tr) {
+          static u8 seen[8][1024]; static u64 n = 0;
+          u32 mi = (method >> 2) & 1023;
+          if (subch < 8 && !seen[subch][mi]) {
+              seen[subch][mi] = 1;
+              printf("[GCM2D-TRACE] subch=%u method=0x%04X (first, data=0x%08X)%c",
+                     subch, method, data, 10);
+          }
+          if (++n == 400000ull) {
+              printf("[GCM2D-TRACE] --- subchannels used: ");
+              for (u32 sc = 0; sc < 8; sc++) {
+                  u32 c = 0; for (u32 m = 0; m < 1024; m++) c += seen[sc][m];
+                  if (c) printf("%u(%u methods) ", sc, c);
+              }
+              printf("---%c", 10);
+          }
+      } }
     /* Subchannel bindings are libgcm-version-specific (SET_OBJECT binds are
      * not tracked): demosaic's SDK emits dest-surface on sub 3 and image-from-
      * CPU on sub 5 (cellGcmSetInlineTransfer: 0x4630C / 0xCA304 / 0xA400
@@ -720,7 +813,18 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
         }
         return;
     }
-    if (subch == 4 || subch == 5) {         /* NV308A image from CPU */
+    if (subch == 4 || subch == 5) {         /* NV308A image-from-CPU, or NV309E */
+        /* NV309E swizzled-surface state. SET_FORMAT (0x0300) does not exist on
+         * NV308A, so seeing it identifies the object bound here. */
+        if (method == 0x0300) { s_nv309e.fmt = data; s_nv309e.active = 1;
+                                s_nv309e.subch = (int)subch;
+            { static int _n = 0; if (_n++ < 4)
+                printf("[NV309E] format=0x%08X (log2 %ux%u fmt=0x%X)%c", data,
+                       1u << ((data >> 16) & 0xFF), 1u << ((data >> 24) & 0xFF),
+                       data & 0xFFFF, 10); }
+            return; }
+        if (method == 0x0304 && s_nv309e.active && s_nv309e.subch == (int)subch) {
+            s_nv309e.offset = data; return; }
         switch (method) {
         case 0x0304: s_gcm2d.point    = data; return;
         case 0x0308: s_gcm2d.size_out = data; return;
