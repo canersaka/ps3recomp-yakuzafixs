@@ -86,6 +86,9 @@ typedef struct {
         u32 raw;        /* raw RSX offset (offscreen-RT matching) */
         u32 w, h, fmt;  /* dims + RSX base format */
         u32 ctrl1;      /* NV4097 TEXTURE_CONTROL1: component remap crossbar */
+        u32 mips;       /* SET_TEXTURE_FORMAT bits 16..31: mipmap level count.
+                         * Cube faces sit one whole mip pyramid apart, so this
+                         * is what sets the face stride. */
         int cube;       /* SET_TEXTURE_FORMAT bit 2: a cube texture. Sampled
                          * with a 3-component direction, not a 2D uv -- treating
                          * one as 2D is what makes an environment-mapped chrome
@@ -298,7 +301,7 @@ typedef struct {
     int                   vp_fp_n;
     u32                   srv_inc;              /* CBV_SRV_UAV descriptor size   */
     /* VP path: latest texture bound per unit (t0-t3). */
-    struct { u32 off, raw, w, h, fmt, ctrl1; int cube; int set; } cur_texs[4];
+    struct { u32 off, raw, w, h, fmt, ctrl1, mips; int cube; int set; } cur_texs[4];
 
     /* Render-to-texture: offscreen RT pool + their RTV heap. */
     OffRT                 off_rt[MAX_OFF_RTS];
@@ -1776,16 +1779,14 @@ static void hlsl_replace_all(char* buf, size_t cap, const char* find, const char
 /* Which of a draw's texture units are cube textures, as a 4-bit mask. */
 static u32 dr_cube_mask(const D3D12DrawRecord* dr)
 {
-    /* CUBE_TEX=1 to enable. OFF by default: the mask is part of the pipeline
-     * cache key, and this title binds cube textures on varying units, so the
-     * number of pipeline variants multiplies and the cache thrashes -- measured
-     * 2262 PSO misses per 20 frames and 0.38 fps, against 8-12 fps with it off.
-     * The sampling path itself is correct (shaders compile, cube SRVs match the
-     * TextureCube declarations); what is missing is a cheaper keying scheme,
-     * e.g. keying on the units the program actually SAMPLES rather than on
-     * whatever happens to be bound. */
+    /* ON by default (CUBE_TEX=0 to disable). This was off while the cube path
+     * cost 2262 PSO misses per 20 frames and 0.38 fps -- both caused by inline
+     * fragment-program constants baking into the shader source. With those
+     * constants hoisted into b1 the cube path costs 0 PSO misses, and with the
+     * per-face stride fixed (each face is a whole mip pyramid, not one mip-0
+     * image) all six faces decode as clean environment art. */
     static int en = -1;
-    if (en < 0) { const char* e = getenv("CUBE_TEX"); en = e ? atoi(e) : 0; }
+    if (en < 0) { const char* e = getenv("CUBE_TEX"); en = e ? atoi(e) : 1; }
     if (!en) return 0;
     u32 m = 0;
     for (int u = 0; u < 4; u++) if (dr->tex[u].set && dr->tex[u].cube) m |= 1u << u;
@@ -2217,7 +2218,7 @@ static inline u32 rsx_swz_off(u32 x, u32 y, u32 log2w, u32 log2h)
 }
 static inline u32 rsx_log2u(u32 v) { u32 l = 0; while ((1u << l) < v) l++; return l; }
 
-static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube)
+static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips)
 {
     extern uint8_t* vm_base;
 
@@ -2431,11 +2432,30 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube)
      * slice of the upload buffer; the conversion below is unchanged and simply
      * runs once per face with off/mapped rebased. */
     const u32 _face_rows  = dxt ? blkrows : h;
-    const u32 _face_bytes = dxt ? (blkrow * blkrows) : (w * h * bpp);
+    /* The face stride is NOT one mip-0 image: RSX stores each cube face as its
+     * own complete mip pyramid, so face f starts a whole pyramid (128-byte
+     * aligned) in. Assuming mip-0-sized strides made face 1 land inside face 0's
+     * mip chain -- which is exactly what the dumps showed, every face after the
+     * first a progressively smaller copy of the first. */
+    u32 _face_bytes = dxt ? (blkrow * blkrows) : (w * h * bpp);
+    if (cube) {
+        u32 total = 0;
+        for (u32 lw = w, lh = h, l = 0; l < (mips ? mips : 1u); l++) {
+            total += dxt ? (((lw + 3) / 4) * (bpp == 8 ? 16u : 8u) * ((lh + 3) / 4))
+                         : (lw * lh * bpp);
+            if (lw > 1) lw >>= 1;
+            if (lh > 1) lh >>= 1;
+        }
+        _face_bytes = (total + 127u) & ~127u;
+    }
     const u32 _nfaces     = cube ? 6u : 1u;
     const u32 _off0 = off; u8* const _map0 = (u8*)mapped;
     for (u32 _f = 0; _f < _nfaces; _f++) {
     off    = _off0 + _f * _face_bytes;
+    if (cube && getenv("CUBEDBG")) { u32 _s=0; const u8* _p = vm_base + off;
+        for (u32 _i = 0; _i < _face_bytes; _i += 97) _s = _s*131 + _p[_i];
+        fprintf(stderr, "[CUBEFACE] f=%u off=0x%X bytes=%u bpp=%u swz=%d csum=%08X%c",
+                _f, off, _face_bytes, bpp, swz, _s, 10); }
     mapped = _map0 + (u64)_f * pitch * _face_rows;
     if (dxt) {
         /* DXT: linear rows of 4x4 blocks, copied straight into BC1/2/3. */
@@ -2618,10 +2638,17 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube)
     /* TEX_SAVE=1: dump the first few converted ARGB uploads as BMPs (rgb +
      * alpha channel separately) -- ground-truth for "is the guest texture
      * wrong or is the sampling wrong" questions (wave's hue palette). */
-    if (argb && getenv("TEX_SAVE")) { static int _ts = 0; if (_ts < 8) { _ts++;
+    if (argb && _f + 1 == _nfaces && getenv("TEX_SAVE")) { static int _ts = 0; if (_ts < 8) { _ts++;
+        /* For a cube, write every face: the point of the dump is to check the
+         * assumed 6-face layout against the game's cubemap art. */
+        for (u32 _face = 0; _face < _nfaces; _face++)
         for (int pass = 0; pass < 2; pass++) {
             char pn[128];
-            snprintf(pn, sizeof(pn), "tex_%08X_%ux%u_%s.bmp", off, w, h,
+            if (_nfaces > 1)
+                snprintf(pn, sizeof(pn), "cube_%08X_%ux%u_f%u_%s.bmp", _off0, w, h,
+                         _face, pass ? "a" : "rgb");
+            else
+                snprintf(pn, sizeof(pn), "tex_%08X_%ux%u_%s.bmp", off, w, h,
                      pass ? "a" : "rgb");
             FILE* f = fopen(pn, "wb");
             if (f) {
@@ -2634,7 +2661,8 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube)
                 hd[26]=1; hd[28]=24;
                 fwrite(hd, 1, 54, f);
                 for (int y = (int)h - 1; y >= 0; y--) {
-                    const u8* srow = (const u8*)mapped + (u64)y * pitch;
+                    const u8* srow = _map0 + (u64)_face * pitch * _face_rows
+                                     + (u64)y * pitch;
                     for (u32 x = 0; x < w; x++) {
                         u8 px[3];
                         if (pass) { px[0]=px[1]=px[2]=srow[x*4+3]; }
@@ -3706,7 +3734,7 @@ static void render_frame(void)
                     int _cube = dr->tex[_u].cube && (dr_cube_mask(dr) & (1u << _u));
                     int ts = vp_upload_tex_slot(dr->tex[_u].off, dr->tex[_u].w,
                                                 dr->tex[_u].h, dr->tex[_u].fmt,
-                                                _cube);
+                                                _cube, dr->tex[_u].mips);
                     if (perf_on()) { s_perf_tex += perf_now() - _tt; s_perf_ntex++;
                         s_perf_texbytes += (u64)dr->tex[_u].w * dr->tex[_u].h * 4u; }
                     /* Both forms of the offset are in hand here; the filters
@@ -5335,6 +5363,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
+                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
                     dr->tex[_u].set = s_d3d.cur_texs[_u].set;
                     dr->tex_rt[_u]  = -1;
                 }
@@ -5423,6 +5452,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
+                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
                 dr->tex[_u].set = s_d3d.cur_texs[_u].set;
                 dr->tex_rt[_u]  = -1;
             }
@@ -5534,6 +5564,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
+                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
             dr->tex[_u].set = s_d3d.cur_texs[_u].set;
             dr->tex_rt[_u]  = -1;
         }
@@ -5647,6 +5678,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         s_d3d.cur_texs[unit].fmt = format;   /* full byte: LN(0x20)/UN(0x40) kept */
         s_d3d.cur_texs[unit].ctrl1 = tex->control1;
         s_d3d.cur_texs[unit].cube  = (tex->format & 4) ? 1 : 0;
+        s_d3d.cur_texs[unit].mips  = (tex->format >> 16) & 0xFFFFu;
         s_d3d.cur_texs[unit].set = 1;
     }
     if (base_fmt == 0x81 /* B8 */) {
