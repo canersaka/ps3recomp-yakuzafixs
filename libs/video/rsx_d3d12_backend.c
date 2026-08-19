@@ -1835,6 +1835,51 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].cube_mask == cube_mask)
             return s_d3d.vp_fp[i].pso;
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
+    /* PSOMISSDBG=1: on a miss, name the key field that differs from an existing
+     * entry for the same program. "the cache misses" is not actionable; "it
+     * misses on ucode_hash" is. */
+    /* HASHDBG=1: how many DISTINCT ucode hashes each program produces. Inline
+     * constants are patched into the shader bytes, so a program whose constants
+     * animate yields a new hash -- and a new pipeline -- every time. */
+    { static int hd = -1;
+      if (hd < 0) { const char* e = getenv("HASHDBG"); hd = e ? atoi(e) : 0; }
+      if (hd) { static u32 fps[32]; static u32 cnt[32]; static int nf = 0;
+        int idx = -1;
+        for (int i = 0; i < nf; i++) if (fps[i] == fp_addr) idx = i;
+        if (idx < 0 && nf < 32) { idx = nf++; fps[idx] = fp_addr; cnt[idx] = 0; }
+        if (idx >= 0) { cnt[idx]++;
+          if ((cnt[idx] % 200) == 0)
+            fprintf(stderr, "[HASHDBG] fp=0x%X has produced %u distinct compiles%c",
+                    fp_addr, cnt[idx], 10); } } }
+    { static int md = -1;
+      if (md < 0) { const char* e = getenv("PSOMISSDBG"); md = e ? atoi(e) : 0; }
+      if (md) { static int n = 0;
+        for (int i = 0; i < s_d3d.vp_fp_n && n < 12; i++) {
+            VPFPEntry* q = &s_d3d.vp_fp[i];
+            if (q->fp_addr != fp_addr) continue;
+            n++;
+            fprintf(stderr, "[PSOMISS] fp=0x%X differs:%s%s%s%s%s%s%s%s%c", fp_addr,
+                    q->vs_idx != vs_idx        ? " vs_idx"     : "",
+                    q->vs_hash != vs_hash      ? " vs_hash"    : "",
+                    q->gen != s_d3d.vp_gen     ? " gen"        : "",
+                    q->blend != blend          ? " blend"      : "",
+                    q->nrt != nrt              ? " nrt"        : "",
+                    q->rtfmt != (u32)rtfmt     ? " rtfmt"      : "",
+                    q->ucode_hash != uhash     ? " ucode_hash" : "",
+                    q->cube_mask != cube_mask  ? " cube_mask"  : "", 10);
+            break;
+        } } }
+    /* CUBEKEYDBG=1: which (program, cube mask) pairs are being compiled. If one
+     * program shows several masks, the mask is unstable and is the reason the
+     * pipeline cache thrashes with cube support on. */
+    { static int ck = -1;
+      if (ck < 0) { const char* e = getenv("CUBEKEYDBG"); ck = e ? atoi(e) : 0; }
+      if (ck) { static u32 seen[64][2]; static int ns = 0; int known = 0;
+        for (int i = 0; i < ns; i++)
+            if (seen[i][0] == fp_addr && seen[i][1] == cube_mask) known = 1;
+        if (!known && ns < 64) { seen[ns][0] = fp_addr; seen[ns][1] = cube_mask; ns++;
+            fprintf(stderr, "[CUBEKEY] fp=0x%X cube_mask=0x%X (distinct pairs=%d)%c",
+                    fp_addr, cube_mask, ns, 10); } } }
     static char hlsl[32768];
     int n = rsx_fp_decompile(vm_base + off, 4096, hlsl, sizeof(hlsl), exp32);
     if (n <= 0) { static int _e=0; if(_e++<16) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
