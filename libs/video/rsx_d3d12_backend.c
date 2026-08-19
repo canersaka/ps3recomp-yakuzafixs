@@ -83,6 +83,10 @@ typedef struct {
         u32 raw;        /* raw RSX offset (offscreen-RT matching) */
         u32 w, h, fmt;  /* dims + RSX base format */
         u32 ctrl1;      /* NV4097 TEXTURE_CONTROL1: component remap crossbar */
+        int cube;       /* SET_TEXTURE_FORMAT bit 2: a cube texture. Sampled
+                         * with a 3-component direction, not a 2D uv -- treating
+                         * one as 2D is what makes an environment-mapped chrome
+                         * surface come out with black patches and banding. */
         int set;
     } tex[4];
     int tex_rt[4];      /* pre-pass: OffRT index sampled by unit, -1 = none */
@@ -142,6 +146,7 @@ typedef struct {
     ID3D12Resource* up;
     u32 off, w, h, fmt; /* current contents (resource reused when dims match) */
     u32 csum;           /* sparse checksum of the source bytes last uploaded */
+    int cube;           /* resource is a 6-face cube, sampled as TextureCube */
     u32 key;            /* the ORIGINAL bound offset -- the cache lookup key.
                          * off is the RESOLVED source after TEX_OFF_BIAS/TEX_REMAP
                          * shift it, so keying on off never matches the raw offset
@@ -186,6 +191,10 @@ typedef struct {
                              * amplitude) -- address-only keying served the
                              * stale compile forever. */
     u32 cmask;              /* colour write mask (PSO key) */
+    u32 cube_mask;          /* which units are cube textures (PSO key): the HLSL
+                             * declares those samplers as TextureCube, so a cube
+                             * and a 2D variant of the same program are different
+                             * pipelines and must not share a cache entry. */
     ID3D12PipelineState* pso;
 } VPFPEntry;
 /* Guest-FP PSO cache. 16 entries thrashed badly: this title needs far more
@@ -286,7 +295,7 @@ typedef struct {
     int                   vp_fp_n;
     u32                   srv_inc;              /* CBV_SRV_UAV descriptor size   */
     /* VP path: latest texture bound per unit (t0-t3). */
-    struct { u32 off, raw, w, h, fmt, ctrl1; int set; } cur_texs[4];
+    struct { u32 off, raw, w, h, fmt, ctrl1; int cube; int set; } cur_texs[4];
 
     /* Render-to-texture: offscreen RT pool + their RTV heap. */
     OffRT                 off_rt[MAX_OFF_RTS];
@@ -1745,8 +1754,44 @@ static int dr_num_rts(const D3D12DrawRecord* dr)
     return n;
 }
 
+/* Replace every occurrence of `find` with `repl` inside a NUL-terminated buffer,
+ * shifting the tail. Used to retarget generated HLSL (2D sampler -> cube). */
+static void hlsl_replace_all(char* buf, size_t cap, const char* find, const char* repl)
+{
+    size_t fl = strlen(find), rl = strlen(repl);
+    if (!fl) return;
+    char* at = buf;
+    while ((at = strstr(at, find)) != NULL) {
+        size_t used = strlen(buf) + 1;
+        if (used + rl - fl > cap) return;
+        memmove(at + rl, at + fl, used - (size_t)(at - buf) - fl);
+        memcpy(at, repl, rl);
+        at += rl;
+    }
+}
+
+/* Which of a draw's texture units are cube textures, as a 4-bit mask. */
+static u32 dr_cube_mask(const D3D12DrawRecord* dr)
+{
+    /* CUBE_TEX=1 to enable. OFF by default: the mask is part of the pipeline
+     * cache key, and this title binds cube textures on varying units, so the
+     * number of pipeline variants multiplies and the cache thrashes -- measured
+     * 2262 PSO misses per 20 frames and 0.38 fps, against 8-12 fps with it off.
+     * The sampling path itself is correct (shaders compile, cube SRVs match the
+     * TextureCube declarations); what is missing is a cheaper keying scheme,
+     * e.g. keying on the units the program actually SAMPLES rather than on
+     * whatever happens to be bound. */
+    static int en = -1;
+    if (en < 0) { const char* e = getenv("CUBE_TEX"); en = e ? atoi(e) : 0; }
+    if (!en) return 0;
+    u32 m = 0;
+    for (int u = 0; u < 4; u++) if (dr->tex[u].set && dr->tex[u].cube) m |= 1u << u;
+    return m;
+}
+
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
-                                          DXGI_FORMAT rtfmt, int exp32, u32 cmask)
+                                          DXGI_FORMAT rtfmt, int exp32, u32 cmask,
+                                          u32 cube_mask)
 {
     if (nrt < 1) nrt = 1; if (nrt > 4) nrt = 4;
     if (rtfmt == 0) rtfmt = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1786,7 +1831,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].vs_hash == vs_hash && s_d3d.vp_fp[i].gen == s_d3d.vp_gen &&
             s_d3d.vp_fp[i].blend == blend && s_d3d.vp_fp[i].nrt == nrt &&
             s_d3d.vp_fp[i].rtfmt == (u32)rtfmt && s_d3d.vp_fp[i].exp32 == exp32 &&
-            s_d3d.vp_fp[i].ucode_hash == uhash && s_d3d.vp_fp[i].cmask == cmask)
+            s_d3d.vp_fp[i].ucode_hash == uhash && s_d3d.vp_fp[i].cmask == cmask &&
+            s_d3d.vp_fp[i].cube_mask == cube_mask)
             return s_d3d.vp_fp[i].pso;
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
     static char hlsl[32768];
@@ -1865,6 +1911,28 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                 }
             } }
       } }
+    /* Retarget the samplers the guest bound as CUBE textures. The decompiler
+     * always emits 2D samplers; a cube is sampled with a 3-component direction
+     * and no texel-scale, and the emitted coordinate always ends in the fixed
+     * tail ".xy * rsx_texscale[N].xy", so both edits are exact replacements. */
+    if (cube_mask) {
+        for (int _u = 0; _u < 4; _u++) {
+            if (!(cube_mask & (1u << _u))) continue;
+            char f1[64], r1[64], f2[64], r2[64];
+            snprintf(f1, sizeof f1, "Texture2D    rsx_tex%d", _u);
+            snprintf(r1, sizeof r1, "TextureCube  rsx_tex%d", _u);
+            hlsl_replace_all(hlsl, sizeof hlsl, f1, r1);
+            snprintf(f1, sizeof f1, "Texture2D rsx_tex%d", _u);
+            snprintf(r1, sizeof r1, "TextureCube rsx_tex%d", _u);
+            hlsl_replace_all(hlsl, sizeof hlsl, f1, r1);
+            snprintf(f2, sizeof f2, ".xy * rsx_texscale[%d].xy", _u);
+            snprintf(r2, sizeof r2, ".xyz");
+            hlsl_replace_all(hlsl, sizeof hlsl, f2, r2);
+        }
+        { static int _n = 0; if (_n++ < 4)
+            fprintf(stderr, "[CUBE] fp=0x%X compiled with cube units mask 0x%X%c",
+                    fp_addr, cube_mask, 10); }
+    }
     /* FP_IDCOLOR=1: give every fragment program a distinct flat colour derived
      * from its address. One frame then shows which program paints which surface,
      * instead of one run per candidate to test them by elimination. */
@@ -2024,6 +2092,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     s_d3d.vp_fp[s_d3d.vp_fp_n].exp32   = exp32;
     s_d3d.vp_fp[s_d3d.vp_fp_n].ucode_hash = uhash;
     s_d3d.vp_fp[s_d3d.vp_fp_n].cmask   = cmask;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].cube_mask = cube_mask;
     s_d3d.vp_fp[s_d3d.vp_fp_n].pso     = pso;
     s_d3d.vp_fp_n++;
     return pso;
@@ -2092,7 +2161,7 @@ static inline u32 rsx_swz_off(u32 x, u32 y, u32 log2w, u32 log2h)
 }
 static inline u32 rsx_log2u(u32 v) { u32 l = 0; while ((1u << l) < v) l++; return l; }
 
-static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
+static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube)
 {
     extern uint8_t* vm_base;
 
@@ -2127,7 +2196,8 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
     int slot = -1, freeslot = -1;
     for (int i = 0; i < VP_TEX_SLOTS; i++) {
         VPTexSlot* c = &s_d3d.vp_tex[i];
-        if (c->res && c->key == key_off && c->w == w && c->h == h && c->fmt == fmt) {
+        if (c->res && c->key == key_off && c->w == w && c->h == h && c->fmt == fmt
+            && c->cube == cube) {
             if (c->used) return i;                /* already bound this frame */
             { static int nocache = -1;            /* TEX_NOCACHE=1: always re-upload */
               if (nocache < 0) { const char* e = getenv("TEX_NOCACHE");
@@ -2254,7 +2324,9 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
         D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC td = {0};
         td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        td.Width = w; td.Height = h; td.DepthOrArraySize = 1; td.MipLevels = 1;
+        td.Width = w; td.Height = h;
+        td.DepthOrArraySize = cube ? 6 : 1;   /* cube = 6 array slices */
+        td.MipLevels = 1;
         td.Format = dxfmt; td.SampleDesc.Count = 1;
         td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
         if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
@@ -2265,7 +2337,8 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
         D3D12_HEAP_PROPERTIES hu = {0}; hu.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC bd = {0};
         bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bd.Width = (u64)pitch * (dxt ? blkrows : h); bd.Height = 1; bd.DepthOrArraySize = 1;
+        bd.Width = (u64)pitch * (dxt ? blkrows : h) * (cube ? 6 : 1);
+        bd.Height = 1; bd.DepthOrArraySize = 1;
         bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
                 s_d3d.device, &hu, D3D12_HEAP_FLAG_NONE, &bd,
@@ -2294,6 +2367,16 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
      * only -- the hardware requires that for swizzled textures anyway. */
     int swz = !dxt && !(fmt & 0x20) && (w & (w - 1)) == 0 && (h & (h - 1)) == 0;
     u32 l2w = rsx_log2u(w), l2h = rsx_log2u(h);
+    /* Cube textures store their 6 faces consecutively. Convert each into its own
+     * slice of the upload buffer; the conversion below is unchanged and simply
+     * runs once per face with off/mapped rebased. */
+    const u32 _face_rows  = dxt ? blkrows : h;
+    const u32 _face_bytes = dxt ? (blkrow * blkrows) : (w * h * bpp);
+    const u32 _nfaces     = cube ? 6u : 1u;
+    const u32 _off0 = off; u8* const _map0 = (u8*)mapped;
+    for (u32 _f = 0; _f < _nfaces; _f++) {
+    off    = _off0 + _f * _face_bytes;
+    mapped = _map0 + (u64)_f * pitch * _face_rows;
     if (dxt) {
         /* DXT: linear rows of 4x4 blocks, copied straight into BC1/2/3. */
         for (u32 y = 0; y < blkrows; y++)
@@ -2600,6 +2683,8 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
                         off, w, h, fmt, 10); }
         }
       } }
+    }   /* end per-face conversion */
+    off = _off0; mapped = _map0;
     t->up->lpVtbl->Unmap(t->up, 0, NULL);
 
     if (!fresh) {   /* reused resource: PSR -> COPY_DEST first */
@@ -2619,7 +2704,11 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
     src.PlacedFootprint.Footprint.Height   = h;
     src.PlacedFootprint.Footprint.Depth    = 1;
     src.PlacedFootprint.Footprint.RowPitch = pitch;
-    s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
+    for (u32 _f = 0; _f < _nfaces; _f++) {
+        dst.SubresourceIndex        = _f;      /* cube face = array slice */
+        src.PlacedFootprint.Offset  = (u64)_f * pitch * _face_rows;
+        s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
+    }
     {
         D3D12_RESOURCE_BARRIER b = {0};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -2642,9 +2731,16 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
     D3D12_CPU_DESCRIPTOR_HANDLE sh;
     s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &sh);
     sh.ptr += (u64)(1 + slot) * s_d3d.srv_inc;
+    if (cube) {
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+        sv.TextureCube.MipLevels = 1;
+        sv.TextureCube.MostDetailedMip = 0;
+        sv.TextureCube.ResourceMinLODClamp = 0.0f;
+    }
     s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, t->res, &sv, sh);
 
-    t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt; t->used = 1;
+    t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
+    t->cube = cube; t->used = 1;
     { u32 nb = dxt ? (blkrow * blkrows) : (w * h * bpp);
       t->csum = TEX_CSUM(vm_base + off, nb); }
     #undef TEX_CSUM
@@ -3019,17 +3115,29 @@ static D3D12_CPU_DESCRIPTOR_HANDLE off_rt_rtv(int slot)
 
 /* Write a texture SRV (or a null SRV when res == NULL) at an absolute SRV
  * heap slot. Used to fill per-draw t0-t3 descriptor windows. */
-static void srv_write(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt, UINT mapping)
+static void srv_write_ex(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt,
+                         UINT mapping, int cube)
 {
     D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
     sv.Format = fmt;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     sv.Shader4ComponentMapping = mapping;
     sv.Texture2D.MipLevels = 1;
+    if (cube) {   /* must match the TextureCube declaration in the HLSL */
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+        sv.TextureCube.MipLevels = 1;
+        sv.TextureCube.MostDetailedMip = 0;
+        sv.TextureCube.ResourceMinLODClamp = 0.0f;
+    }
     D3D12_CPU_DESCRIPTOR_HANDLE h;
     s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &h);
     h.ptr += (u64)heap_slot * s_d3d.srv_inc;
     s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, res, &sv, h);
+}
+
+static void srv_write(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt, UINT mapping)
+{
+    srv_write_ex(heap_slot, res, fmt, mapping, 0);
 }
 
 static void off_rt_transition(int slot, D3D12_RESOURCE_STATES to)
@@ -3521,8 +3629,10 @@ static void render_frame(void)
                     (_bf == 0x81 || _bf == 0x85 || _bf == 0x8B ||
                      (_bf >= 0x86 && _bf <= 0x88))) {
                     double _tt = perf_on() ? perf_now() : 0.0;
+                    int _cube = dr->tex[_u].cube && (dr_cube_mask(dr) & (1u << _u));
                     int ts = vp_upload_tex_slot(dr->tex[_u].off, dr->tex[_u].w,
-                                                dr->tex[_u].h, dr->tex[_u].fmt);
+                                                dr->tex[_u].h, dr->tex[_u].fmt,
+                                                _cube);
                     if (perf_on()) { s_perf_tex += perf_now() - _tt; s_perf_ntex++;
                         s_perf_texbytes += (u64)dr->tex[_u].w * dr->tex[_u].h * 4u; }
                     /* Both forms of the offset are in hand here; the filters
@@ -3537,9 +3647,10 @@ static void render_frame(void)
                             (_bf == 0x87) ? DXGI_FORMAT_BC2_UNORM :
                             (_bf == 0x88) ? DXGI_FORMAT_BC3_UNORM :
                                             DXGI_FORMAT_R8_UNORM;
-                        srv_write(wslot, s_d3d.vp_tex[ts].res, sf,
+                        srv_write_ex(wslot, s_d3d.vp_tex[ts].res, sf,
                                   (_bf == 0x81) ? 0x1000
-                                                : rsx_remap_to_d3d(dr->tex[_u].ctrl1, _bf));
+                                                : rsx_remap_to_d3d(dr->tex[_u].ctrl1, _bf),
+                                  _cube);
                         continue;
                     }
                 }
@@ -3562,7 +3673,7 @@ static void render_frame(void)
                                        dr_num_rts(dr),
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                       dr->fp_exp32, dr->cmask);
+                                       dr->fp_exp32, dr->cmask, dr_cube_mask(dr));
         if (perf_on()) s_perf_pso += perf_now() - _ps0;
     }
 
@@ -3821,7 +3932,8 @@ static void render_frame(void)
                                                 dr_num_rts(dr),
                                                 dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                            : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                                dr->fp_exp32, dr->cmask) : NULL;
+                                                dr->fp_exp32, dr->cmask,
+                                                dr_cube_mask(dr)) : NULL;
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
                 /* Per-draw viewport: the guest rect when sane, else the
@@ -5148,6 +5260,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex[_u].h   = s_d3d.cur_texs[_u].h;
                     dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
+                    dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
                     dr->tex[_u].set = s_d3d.cur_texs[_u].set;
                     dr->tex_rt[_u]  = -1;
                 }
@@ -5235,6 +5348,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->tex[_u].h   = s_d3d.cur_texs[_u].h;
                 dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
+                    dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
                 dr->tex[_u].set = s_d3d.cur_texs[_u].set;
                 dr->tex_rt[_u]  = -1;
             }
@@ -5345,6 +5459,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             dr->tex[_u].h   = s_d3d.cur_texs[_u].h;
             dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
+                    dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
             dr->tex[_u].set = s_d3d.cur_texs[_u].set;
             dr->tex_rt[_u]  = -1;
         }
@@ -5377,6 +5492,21 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
     u32 height = tex->image_rect & 0xFFFF;
     u32 format = (tex->format >> 8) & 0xFF;
     u32 offset = tex->offset;
+    /* CUBEDBG=1: NV4097_SET_TEXTURE_FORMAT bit 2 is the cubemap flag, and the
+     * line above throws it away with the rest of the low byte. Nothing in this
+     * backend handles cube textures, so a cubemap bound for an environment
+     * reflection is sampled as a plain 2D image -- which is what the chrome
+     * faucet's black patches and banded escutcheons look like. */
+    { static int cd = -1;
+      if (cd < 0) { const char* e = getenv("CUBEDBG"); cd = e ? atoi(e) : 0; }
+      if (cd && (tex->format & 4)) {
+          static u32 seen[8]; static int ns = 0; int known = 0;
+          for (int k = 0; k < ns; k++) if (seen[k] == offset) known = 1;
+          if (!known && ns < 8) { seen[ns++] = offset;
+              fprintf(stderr, "[CUBE] unit=%u offset=0x%08X %ux%u fmt=0x%02X"
+                              " raw_format=0x%08X (cubemap bit SET)%c",
+                      unit, offset, width, height, format, tex->format, 10); }
+      } }
 
     static int log_count = 0;
     if (log_count < 10) {
@@ -5442,6 +5572,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         s_d3d.cur_texs[unit].w = width; s_d3d.cur_texs[unit].h = height;
         s_d3d.cur_texs[unit].fmt = format;   /* full byte: LN(0x20)/UN(0x40) kept */
         s_d3d.cur_texs[unit].ctrl1 = tex->control1;
+        s_d3d.cur_texs[unit].cube  = (tex->format & 4) ? 1 : 0;
         s_d3d.cur_texs[unit].set = 1;
     }
     if (base_fmt == 0x81 /* B8 */) {
