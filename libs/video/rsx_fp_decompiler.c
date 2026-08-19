@@ -185,8 +185,20 @@ static const char* input_expr(u32 input_src)
 }
 
 /* Build the swizzled/negated/abs'd HLSL for one source into `buf`. */
+/* FP_CONSTBUF=0 restores the old behaviour of compiling inline constants as
+ * HLSL literals. On (default) they become fp_k[] lookups in the per-draw
+ * constant buffer, which makes the compiled shader invariant under the guest
+ * re-patching those constants -- the thing that forced the pipeline cache to
+ * key on a hash of the ucode bytes. */
+static int fp_constbuf_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("FP_CONSTBUF"); v = (e && *e == '0') ? 0 : 1; }
+    return v;
+}
+
 static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
-                     char* buf, u32 bufsz)
+                     int k_idx, char* buf, u32 bufsz)
 {
     char base[96];
     if (s->type == FP_REG_TYPE_TEMP) {
@@ -201,7 +213,9 @@ static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
     } else if (s->type == FP_REG_TYPE_INPUT) {
         snprintf(base, sizeof(base), "%s", input_expr(input_src));
     } else { /* CONST */
-        if (has_k) {
+        if (has_k && fp_constbuf_on() && k_idx >= 0) {
+            snprintf(base, sizeof(base), "fp_k[%d]", k_idx);
+        } else if (has_k) {
             char c0[24], c1[24], c2[24], c3[24];
             fp_fmt_float(k[0], c0, sizeof c0); fp_fmt_float(k[1], c1, sizeof c1);
             fp_fmt_float(k[2], c2, sizeof c2); fp_fmt_float(k[3], c3, sizeof c3);
@@ -232,9 +246,78 @@ static void dest_mask(u32 op0, char* m)
     m[n] = '\0';
 }
 
+/* FNV-1a over a program's INSTRUCTION words only, skipping the inline constant
+ * slots. With constants hoisted into fp_k[] the compiled shader does not depend
+ * on their values, so including them in the pipeline key made it change every
+ * time the title re-patched a constant -- which is exactly what thrashed the
+ * cache. */
+u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes)
+{
+    u32 h = 2166136261u;
+    if (!ucode) return h;
+    u32 off = 0;
+    while (off + 16 <= max_bytes) {
+        u32 w0 = rsx_fp_read_word(ucode + off + 0);
+        u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        for (u32 i = 0; i < 16; i++) { h ^= ucode[off + i]; h *= 16777619u; }
+        off += 16;
+        int is_branch = (w2 & FP_BRANCH) != 0;
+        int has_k = !is_branch &&
+            ((((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
+             (((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
+             (((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST));
+        if (has_k) off += 16;            /* skip the constant, do not hash it */
+        if (w0 & FP_END) break;
+    }
+    return h;
+}
+
+/* Walk a program the same way the decompiler does and copy out its inline
+ * constants in the SAME order the decompiler assigns fp_k[] indices. The backend
+ * calls this per draw, so re-patched constants take effect without recompiling. */
+int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_out)
+{
+    if (!ucode || !out) return 0;
+    u32 off = 0; int n = 0;
+    while (off + 16 <= max_bytes) {
+        u32 w0 = rsx_fp_read_word(ucode + off + 0);
+        u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        off += 16;
+        int is_branch = (w2 & FP_BRANCH) != 0;
+        int has_k = !is_branch &&
+            ((((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
+             (((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
+             (((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST));
+        if (has_k) {
+            if (off + 16 <= max_bytes) {
+                for (int i = 0; i < 4; i++) {
+                    u32 cw = rsx_fp_read_word(ucode + off + i * 4);
+                    if (n < max_out) memcpy(&out[n * 4 + i], &cw, 4);
+                }
+                off += 16;
+            }
+            if (n < max_out) n++;
+        }
+        if (w0 & FP_END) break;
+    }
+    { static int dbg = -1;
+      if (dbg < 0) { const char* e = getenv("FP_KDBG"); dbg = e ? atoi(e) : 0; }
+      if (dbg) { static int m = 0; if (m++ < 6)
+        fprintf(stderr, "[FPK] extracted %d consts; k0=(%g %g %g %g) k1=(%g %g %g %g)%c",
+                n, out[0], out[1], out[2], out[3],
+                n > 1 ? out[4] : 0.0f, n > 1 ? out[5] : 0.0f,
+                n > 1 ? out[6] : 0.0f, n > 1 ? out[7] : 0.0f, 10); } }
+    return n;
+}
+
 int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
                      int exports32)
 {
+    int n_consts = 0;   /* fp_k[] slots assigned so far */
     if (!ucode || !out || out_size == 0) return -1;
 
     Out o = { out, out_size, 0, 1 };
@@ -258,7 +341,8 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
         /* Per-draw texcoord scale (b1): RSX textures with the UNnormalized
          * flag are sampled in texel space; the backend supplies 1/size for
          * those units and 1.0 for normalized ones. */
-        "cbuffer FPTex : register(b1) { float4 rsx_texscale[4]; float4 rsx_alphatest; };\n"
+        "cbuffer FPTex : register(b1) { float4 rsx_texscale[4]; float4 rsx_alphatest;"
+        " float4 fp_k[64]; };\n"
         "SamplerState rsx_samp0 : register(s0); SamplerState rsx_samp1 : register(s1);\n"
         "SamplerState rsx_samp2 : register(s2); SamplerState rsx_samp3 : register(s3);\n"
         "struct PSOut { float4 c0:SV_Target0; float4 c1:SV_Target1;\n"
@@ -367,10 +451,14 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
             has_k = 1;
         }
 
+        /* One inline constant slot per instruction; all three sources of that
+         * instruction reference the same slot. */
+        int k_idx = -1;
+        if (has_k) { k_idx = n_consts; if (n_consts < FP_MAX_CONSTS) n_consts++; }
         char a[200], b[200], c[200];
-        emit_src(&s0, input_src, k, has_k, a, sizeof(a));
-        emit_src(&s1, input_src, k, has_k, b, sizeof(b));
-        emit_src(&s2, input_src, k, has_k, c, sizeof(c));
+        emit_src(&s0, input_src, k, has_k, k_idx, a, sizeof(a));
+        emit_src(&s1, input_src, k, has_k, k_idx, b, sizeof(b));
+        emit_src(&s2, input_src, k, has_k, k_idx, c, sizeof(c));
 
         if (is_branch) {
             /* Branch opcodes live in a second table (base | 0x40): 0x42 = IFE

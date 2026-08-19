@@ -43,6 +43,17 @@ u32 rsx_fp_read_word(const u8* p);
  * the shader still compiles. */
 /* exports32: colour outputs come from r0/r2/r3/r4 (SET_SHADER_CONTROL bit
  * 0x40) instead of h0/h4/h6/h8 (half-precision programs). */
+/* Inline fragment constants hoisted into the per-draw constant buffer. 64 is
+ * comfortably above what this title's largest program uses; programs beyond it
+ * fall back to literals for the overflow. */
+#define FP_MAX_CONSTS 64
+
+/* Copy a program's inline constants out in fp_k[] index order (see
+ * rsx_fp_decompile). Returns the count. */
+u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes);
+
+int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_out);
+
 int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
                      int exports32);
 

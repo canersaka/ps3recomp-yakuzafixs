@@ -61,6 +61,9 @@
  * own texScale/offset uniforms, so one per-frame snapshot ran every pass
  * with the LAST pass's constants. */
 #define VP_CB_STRIDE      8448
+/* b1 per-draw FP slot: rsx_texscale[4] + rsx_alphatest + fp_k[64]
+ * = 69 float4 = 1104 B, rounded to D3D12's 256-byte CBV alignment. */
+#define VP_FPCB_STRIDE    1280
 #define VERTEX_STRIDE       36  /* bytes per host vertex: pos3 + col4 + uv2 */
 
 typedef struct {
@@ -1089,7 +1092,7 @@ static int init_d3d12(u32 width, u32 height)
                 &IID_ID3D12Resource, (void**)&s_d3d.vp_cb)))
             s_d3d.vp_cb->lpVtbl->Map(s_d3d.vp_cb, 0, &nr, &s_d3d.vp_cb_mapped);
 
-        bd.Width = (u64)256 * MAX_DRAWS * 2;   /* per-draw FP texscale slots (b1), x2 parity */
+        bd.Width = (u64)VP_FPCB_STRIDE * MAX_DRAWS * 2;  /* per-draw FP slots (b1), x2 parity */
         if (SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp,
                 D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                 &IID_ID3D12Resource, (void**)&s_d3d.vp_fpcb)))
@@ -1815,13 +1818,21 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
 
     /* Content hash: inline constants are patched in place per frame (wave's
      * stamp), so identity is the BYTES, not the address. */
-    u32 uhash = 2166136261u;
+    /* Hash the CODE, not the constants: with fp_k[] hoisted into the per-draw
+     * constant buffer the compiled shader is invariant under constant changes,
+     * so hashing them made the pipeline key move every draw. */
+    u32 uhash;
     {
         u32 usz = rsx_fp_program_size(vm_base + off, 4096);
         if (usz == 0) usz = 64;
         s_perf_pso_hashbytes += (int)usz;
-        const u8* up = vm_base + off;
-        for (u32 i = 0; i < usz; i++) { uhash ^= up[i]; uhash *= 16777619u; }
+        if (getenv("FP_CONSTBUF") && getenv("FP_CONSTBUF")[0] == '0') {
+            uhash = 2166136261u;
+            const u8* up = vm_base + off;
+            for (u32 i = 0; i < usz; i++) { uhash ^= up[i]; uhash *= 16777619u; }
+        } else {
+            uhash = rsx_fp_code_hash(vm_base + off, 4096);
+        }
     }
 
     s_perf_pso_calls++;
@@ -2361,7 +2372,11 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube)
     u32 pitch = ((dxt ? blkrow : w * bpp) + 255) & ~255u;
     int fresh = 0;
 
-    if (t->res && (t->w != w || t->h != h || t->fmt != fmt)) {
+    /* Also recreate when the CUBE-ness changes: a slot holding a 2D texture of
+     * the same dimensions would otherwise be reused with 1 array slice while the
+     * cube path copies 6 subresources and writes a 6x upload buffer -- which
+     * crashes. */
+    if (t->res && (t->w != w || t->h != h || t->fmt != fmt || t->cube != cube)) {
         t->res->lpVtbl->Release(t->res); t->res = NULL;
         if (t->up) { t->up->lpVtbl->Release(t->up); t->up = NULL; }
     }
@@ -2814,7 +2829,7 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
      * 0x40 -- wave samples everything in texel space), 1.0 otherwise. */
     if (s_d3d.vp_fpcb_mapped) {
         float* ts = (float*)((char*)s_d3d.vp_fpcb_mapped
-            + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * 256);
+            + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_FPCB_STRIDE);
         for (int _u = 0; _u < 4; _u++) {
             float sx = 1.0f, sy = 1.0f;
             if (dr && dr->tex[_u].set && (dr->tex[_u].fmt & 0x40) &&
@@ -2839,6 +2854,20 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
             ts[19] = 0.0f;
         } else {
             ts[16] = 0.0f; ts[17] = 0.0f; ts[18] = 7.0f; ts[19] = 0.0f;
+        }
+
+        /* fp_k[]: the program's inline fragment constants, re-read from the
+         * guest ucode every draw. The decompiler emits fp_k[i] lookups instead
+         * of baking these in as literals, so the compiled shader no longer
+         * changes when the title re-patches them -- which is what forced the
+         * pipeline cache to key on a hash of the ucode bytes. */
+        if (dr && dr->fp_addr) {
+            extern uint8_t* vm_base;
+            extern u32 cellGcmResolveLocated(int, u32);
+            u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1,
+                                             dr->fp_addr & ~0x3u);
+            if (vm_base && foff != 0xFFFFFFFFu)
+                rsx_fp_extract_consts(vm_base + foff, 4096, &ts[20], FP_MAX_CONSTS);
         }
     }
     char* dst = (char*)s_d3d.vp_cb_mapped
@@ -4020,7 +4049,7 @@ static void render_frame(void)
                 if (s_d3d.vp_fpcb)
                     s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 2,
                         s_d3d.vp_fpcb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_fpcb)
-                        + ((u64)s_d3d.vp_parity * MAX_DRAWS + dr->cb_slot) * 256);
+                        + ((u64)s_d3d.vp_parity * MAX_DRAWS + dr->cb_slot) * VP_FPCB_STRIDE);
                 s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list,
                     dr->vertex_count, 1, dr->vb_byte_offset / 256, 0);
                 /* VP_SUBMIT=<N>: prove the VP pass actually reaches the GPU.
