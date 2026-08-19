@@ -333,6 +333,7 @@ static u32 s_dbg_last_draws = 0;
  * reflection is not visible. */
 static ID3D12Resource* s_screen_copy = NULL;
 static void screen_copy_capture(u32 fi);   /* fwd */
+static int  s_sc_dump_pending = 0;
 static u32 s_duck_raw = 0;   /* as BOUND (what draw records carry) */
 static u32 s_duck_off = 0;   /* as RESOLVED (what the uploader sees)   */
 /* PERF=1: where a frame's CPU time actually goes. Guessing at this is how you
@@ -1152,6 +1153,10 @@ static void move_to_next_frame(void)
 
 /* Write the mapped readback buffer (R8G8B8A8, row pitch = readback_pitch) out
  * as a 24-bit bottom-up BMP. Debug-only. */
+/* Name prefix for the next readback dump: lets the same writer emit the
+ * backbuffer and the screen-copy texture under different filenames. */
+static const char* s_dump_name = NULL;
+
 static void dump_backbuffer_bmp(void)
 {
     if (!s_d3d.readback_buf) return;
@@ -1163,8 +1168,8 @@ static void dump_backbuffer_bmp(void)
     static int idx = 0;
     char path[512];
     const char* dir = getenv("CELLMARK_DUMP_DIR");   /* default: current dir */
-    snprintf(path, sizeof(path), "%s%sframe_%03d.bmp",
-             dir ? dir : "", dir ? "/" : "", idx++);
+    snprintf(path, sizeof(path), "%s%s%s_%03d.bmp",
+             dir ? dir : "", dir ? "/" : "", s_dump_name ? s_dump_name : "frame", idx++);
     FILE* f = fopen(path, "wb");
     if (f) {
         u32 w = s_d3d.width, h = s_d3d.height;
@@ -3045,6 +3050,38 @@ static void screen_copy_capture(u32 fi)
                 bb[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
                 bb[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
                 s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 2, bb);
+
+                /* SCREENCOPY_DUMP=1: stage the captured image into the readback
+                 * buffer so it can be written out and LOOKED AT. Claiming a
+                 * capture happened is not the same as showing what is in it. */
+                { static int sd = -1;
+                  if (sd < 0) { const char* e = getenv("SCREENCOPY_DUMP"); sd = e ? atoi(e) : 0; }
+                  if (sd && s_d3d.readback_buf) {
+                      D3D12_RESOURCE_BARRIER t = {0};
+                      t.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                      t.Transition.pResource   = s_screen_copy;
+                      t.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                      t.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                      t.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                      s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &t);
+
+                      D3D12_TEXTURE_COPY_LOCATION cd = {0}, cs = {0};
+                      cd.pResource = s_d3d.readback_buf;
+                      cd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                      cd.PlacedFootprint.Footprint.Format   = DXGI_FORMAT_R8G8B8A8_UNORM;
+                      cd.PlacedFootprint.Footprint.Width    = s_d3d.width;
+                      cd.PlacedFootprint.Footprint.Height   = s_d3d.height;
+                      cd.PlacedFootprint.Footprint.Depth    = 1;
+                      cd.PlacedFootprint.Footprint.RowPitch = s_d3d.readback_pitch;
+                      cs.pResource = s_screen_copy;
+                      cs.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                      s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &cd, 0, 0, 0, &cs, NULL);
+
+                      t.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                      t.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                      s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &t);
+                      s_sc_dump_pending = 1;
+                  } }
             }
 
 }
@@ -3959,6 +3996,13 @@ skip_dump_consider: ;
         }
       } }
 
+    if (s_sc_dump_pending) {
+        s_sc_dump_pending = 0;
+        wait_for_gpu();
+        s_dump_name = "screencopy";
+        dump_backbuffer_bmp();
+        s_dump_name = NULL;
+    }
     if (dumping) {
         wait_for_gpu();            /* ensure the copy finished before mapping */
         dump_backbuffer_bmp();
