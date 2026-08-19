@@ -324,6 +324,15 @@ static u32 s_dbg_last_draws = 0;
  * overwhelmingly yellow, avg 243,191,23). VRAM offsets move between runs, so a
  * hard-coded offset in a filter silently matches nothing and the run looks like
  * "renders nothing" -- which cost real time. DRAW_KEEP_TEX=duck resolves here. */
+/* Copy of the last completed frame, bound wherever a draw samples a
+ * DISPLAY-SIZED texture. On RSX this title renders its reflection into a corner
+ * of the render surface and then samples that surface as a texture; our backend
+ * renders into a D3D backbuffer, so the guest memory behind that sampler is
+ * never written and it reads empty -- which is why the water had no reflection.
+ * Feeding it the previous frame costs one frame of latency, which for a water
+ * reflection is not visible. */
+static ID3D12Resource* s_screen_copy = NULL;
+static void screen_copy_capture(u32 fi);   /* fwd */
 static u32 s_duck_raw = 0;   /* as BOUND (what draw records carry) */
 static u32 s_duck_off = 0;   /* as RESOLVED (what the uploader sees)   */
 /* PERF=1: where a frame's CPU time actually goes. Guessing at this is how you
@@ -1820,14 +1829,25 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     /* FP_TEX=1: make every program output its unit-0 texture sample verbatim.
      * Separates "the texture is wrong" from "the shading tints it" in one run,
      * without having to identify which program draws which surface first. */
-    if (getenv("FP_TEX")) {
+    /* FP_TEX=<unit>: output that unit's sample verbatim. FP_TEX_FP=<hex> limits
+     * it to one program, so one surface can be inspected without repainting the
+     * whole scene. FP_TEX_UV=1 samples with the same texcoord the program uses
+     * for that unit rather than tc0. */
+    if (getenv("FP_TEX") && (!getenv("FP_TEX_FP") ||
+        (u32)strtoul(getenv("FP_TEX_FP"), NULL, 16) == fp_addr)) {
+        int _un = atoi(getenv("FP_TEX"));
+        if (_un < 0 || _un > 3) _un = 0;
         char* rp = strstr(hlsl, "_po.c0 = ");
         if (rp) {
             char* semi = strchr(rp, ';');
             if (semi) {
-                static const char rep[] =
-                    "_po.c0 = rsx_tex0.Sample(rsx_samp0, input.tc0.xy * rsx_texscale[0].xy)";
-                size_t newlen = sizeof(rep) - 1, tail = strlen(semi) + 1;
+                char rep[160];
+                snprintf(rep, sizeof rep,
+                         "_po.c0 = rsx_tex%d.Sample(rsx_samp%d, input.tc0.xy * rsx_texscale[%d].xy)",
+                         _un, _un, _un);
+                size_t newlen = strlen(rep), tail = strlen(semi) + 1;
+                fprintf(stderr, "[FP_TEX] program 0x%X rewritten to sample unit %d%c",
+                        fp_addr, _un, 10);
                 if ((size_t)(rp - hlsl) + newlen + tail < sizeof(hlsl)) {
                     memmove(rp + newlen, semi, tail);
                     memcpy(rp, rep, newlen);
@@ -2979,6 +2999,56 @@ static u32 draw_filter_tex(const char* e)
     return (u32)strtoul(e, NULL, 16);
 }
 
+/* Copy the current backbuffer into s_screen_copy. Called mid-frame the moment
+ * the reduced-viewport passes finish -- this title renders its reflection into
+ * the TOP-LEFT REGION of the render target and the main scene then overwrites
+ * it, so a snapshot taken at end of frame contains the scene, not the
+ * reflection. Also called at end of frame as a fallback for frames with no
+ * reduced-viewport pass. */
+static void screen_copy_capture(u32 fi)
+{
+    static int en = -1;
+    if (en < 0) { const char* e = getenv("SCREEN_AS_TEX"); en = e ? atoi(e) : 1; }
+    if (!en || !s_d3d.device) return;
+            if (!s_screen_copy) {
+                D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+                D3D12_RESOURCE_DESC td = {0};
+                td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                td.Width = s_d3d.width; td.Height = s_d3d.height;
+                td.DepthOrArraySize = 1; td.MipLevels = 1;
+                td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
+                td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+                if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+                        s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, NULL,
+                        &IID_ID3D12Resource, (void**)&s_screen_copy)))
+                    s_screen_copy = NULL;
+            }
+            if (s_screen_copy) {
+                D3D12_RESOURCE_BARRIER bb[2] = {0};
+                bb[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                bb[0].Transition.pResource   = s_d3d.render_targets[fi];
+                bb[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                bb[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                bb[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                bb[1] = bb[0];
+                bb[1].Transition.pResource   = s_screen_copy;
+                bb[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                bb[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+                s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 2, bb);
+
+                s_d3d.cmd_list->lpVtbl->CopyResource(s_d3d.cmd_list,
+                    s_screen_copy, s_d3d.render_targets[fi]);
+
+                bb[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                bb[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                bb[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                bb[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 2, bb);
+            }
+
+}
+
 static void render_frame(void)
 {
     double _rf0 = perf_on() ? perf_now() : 0.0;
@@ -3280,6 +3350,26 @@ static void render_frame(void)
               dr->tex[0].off = 0;
               dr->tex[0].set = 1;
           } }
+        /* SCREENTEX=1: report draws that sample a DISPLAY-SIZED texture. On RSX
+         * a title renders a reflection/refraction into a surface and then
+         * samples it; our backend renders into a D3D backbuffer, so the guest
+         * memory that sampler reads is never written and the texture comes back
+         * empty. Finding which geometry does it is the first step to feeding it
+         * the rendered image instead. */
+        { static int sd = -1;
+          if (sd < 0) { const char* e = getenv("SCREENTEX"); sd = e ? atoi(e) : 0; }
+          if (sd) for (int _u = 0; _u < 4; _u++)
+              if (dr->tex[_u].set && dr->tex[_u].w == s_d3d.width &&
+                  dr->tex[_u].h == s_d3d.height) {
+                  static u32 seen[16]; static int ns = 0; int known = 0;
+                  for (int k = 0; k < ns; k++) if (seen[k] == dr->fp_addr) known = 1;
+                  if (!known && ns < 16) { seen[ns++] = dr->fp_addr;
+                      fprintf(stderr, "[SCREENTEX] unit=%d raw=0x%08X %ux%u fmt=0x%02X"
+                                      " fp=0x%X verts=%u vp=%u,%u %ux%u%c",
+                              _u, dr->tex[_u].raw, dr->tex[_u].w, dr->tex[_u].h,
+                              dr->tex[_u].fmt, dr->fp_addr, dr->vertex_count,
+                              dr->vp_x, dr->vp_y, dr->vp_w, dr->vp_h, 10); }
+              } }
         /* Fill this draw's t0-t3 SRV window (DRAW_SRV_BASE + d*4): each unit
          * resolves to an offscreen RT (sampled directly), an uploaded guest
          * texture, or a null SRV. */
@@ -3287,6 +3377,21 @@ static void render_frame(void)
         for (int _u = 0; _u < 4; _u++) {
             u32 wslot = DRAW_SRV_BASE + _d * 4 + (u32)_u;
             dr->tex_rt[_u] = -1;
+            /* Display-sized sampler source -> the rendered frame. */
+            if (dr->tex[_u].set && s_screen_copy &&
+                dr->tex[_u].w == s_d3d.width && dr->tex[_u].h == s_d3d.height) {
+                static int en = -1;
+                if (en < 0) { const char* e = getenv("SCREEN_AS_TEX"); en = e ? atoi(e) : 1; }
+                if (en) {
+                    { static int _n = 0; if (_n++ < 3)
+                        fprintf(stderr, "[SCREENTEX] bound frame copy at unit %d for"
+                                        " fp=0x%X (%ux%u)%c", _u, dr->fp_addr,
+                                dr->tex[_u].w, dr->tex[_u].h, 10); }
+                    srv_write(wslot, s_screen_copy, DXGI_FORMAT_R8G8B8A8_UNORM,
+                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                    continue;
+                }
+            }
             if (dr->tex[_u].set) {
                 int rt = off_rt_find(dr->tex[_u].raw);
                 if (rt >= 0) {
@@ -3534,9 +3639,23 @@ static void render_frame(void)
             int cur_rt = -1;                       /* target A: -1 = backbuffer */
             int cur_m[3] = {-1, -1, -1};           /* MRT B/C/D: -1 = unbound   */
             double _rec0 = perf_on() ? perf_now() : 0.0;
+            int seen_small_vp = 0, captured = 0;
             for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
                 const D3D12DrawRecord* dr = &s_d3d.draws[d];
                 if (!dr->is_vp) continue;
+                /* The reduced-viewport passes (this title's reflection, drawn
+                 * into a region of the same target) finish here -- snapshot
+                 * before the full-screen scene overwrites them. */
+                if (!dr->is_clear) {
+                    if (dr->vp_w && dr->vp_w < s_d3d.width) seen_small_vp = 1;
+                    else if (seen_small_vp && !captured &&
+                             dr->vp_w == s_d3d.width && dr->rt_off == 0) {
+                        captured = 1;
+                        screen_copy_capture(fi);
+                        s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(
+                            s_d3d.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);
+                    }
+                }
                 /* Render-to-texture: retarget when this op's surfaces differ.
                  * Depth is a single shared buffer, so clear it per switch. */
                 int want  = dr->rt_off  ? off_rt_find(dr->rt_off)  : -1;
@@ -3795,6 +3914,9 @@ skip_dump_consider: ;
         barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
         s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
     } else {
+        /* End-of-frame fallback snapshot: used when the frame never contained a
+         * reduced-viewport pass to capture mid-frame. */
+        screen_copy_capture(fi);
         /* Transition render target to PRESENT state */
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
