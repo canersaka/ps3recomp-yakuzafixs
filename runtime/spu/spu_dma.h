@@ -186,6 +186,19 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     /* SPU_PUTHIST=1: histogram of PUT destinations by 1 MB bucket. "the SPU
      * ran 112k instructions" does not say whether its results reached the
      * buffer the RSX reads; this says where they actually went. */
+    /* SPU_GETHIST=1: the same accounting for GETs, on the SOURCE side. A solver
+     * whose inputs read back as zeros produces zeros no matter how many
+     * instructions it runs. */
+    { static int s_gh = -1; if (s_gh < 0) s_gh = getenv("SPU_GETHIST") ? 1 : 0;
+      if (s_gh && mfc_is_get(cmd) && vm_base) {
+          static uint32_t seen[48]; static int ns = 0;
+          uint32_t k = (uint32_t)ea & ~0xFFFFu;
+          int f = 0; for (int i = 0; i < ns; i++) if (seen[i] == k) f = 1;
+          if (!f && ns < 48) { seen[ns++] = k;
+              uint32_t nzs = 0; const uint8_t* q = vm_base + (uint32_t)ea;
+              for (uint32_t i7 = 0; i7 < size && i7 < 0x4000u; i7 += 7) if (q[i7]) nzs++;
+              fprintf(stderr, "[getea] spu=0x%X 0x%08X size=%u srcNonZero=%u%c",
+                      spu->spu_id, (uint32_t)ea, size, nzs, 10); } } }
     { static int s_ph = -1; if (s_ph < 0) s_ph = getenv("SPU_PUTHIST") ? 1 : 0;
       if (s_ph) { static unsigned long long ngets, nputs, nother;
           if (mfc_is_get(cmd)) ngets++; else if (mfc_is_put(cmd)) nputs++; else nother++;
