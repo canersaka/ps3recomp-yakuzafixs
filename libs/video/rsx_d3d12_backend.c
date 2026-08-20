@@ -4356,6 +4356,48 @@ static void render_frame(void)
     }
 
     if (perf_on()) s_perf_rf += perf_now() - _rf0;
+    /* MEMPEEK=<hex addr>:<n>: n big-endian floats at a guest address each frame,
+     * with a min/max so a buffer of constants is distinguishable from real data. */
+    { const char* mp = getenv("MEMPEEK");
+      if (mp) { extern uint8_t* vm_base; static int _n = 0;
+        u32 addr = 0; int cnt = 8; sscanf(mp, "%x:%d", &addr, &cnt);
+        if (vm_base && addr && _n++ < 6) {
+            float lo = 1e30f, hi = -1e30f; u32 nz = 0;
+            for (int i = 0; i < cnt; i++) {
+                const u8* q = vm_base + addr + i * 4;
+                u32 bits = ((u32)q[0]<<24)|((u32)q[1]<<16)|((u32)q[2]<<8)|q[3];
+                float f; memcpy(&f, &bits, 4);
+                if (f == f && f < 1e30f && f > -1e30f) { if (f < lo) lo = f; if (f > hi) hi = f; }
+                if (bits) nz++;
+            }
+            fprintf(stderr, "[MEMPEEK] 0x%08X n=%d nonzero=%u range[%g..%g]%c",
+                    addr, cnt, nz, lo, hi, 10);
+        } } }
+    /* VRAMSCAN=1: which 64 KB blocks of guest memory change between frames.
+     * "nothing writes the buffer we read" is only half an answer -- this says
+     * where the producer IS writing, so the two can be matched up. */
+    { static int vs = -1; if (vs < 0) vs = getenv("VRAMSCAN") ? 1 : 0;
+      if (vs) { extern uint8_t* vm_base;
+        static u32 prev[512]; static int have = 0; static int reported = 0;
+        u32 base = 0xC6000000u; u32 nblk = 512;          /* 32 MB window */
+        const char* bs = getenv("VRAMSCAN_BASE");
+        if (bs) base = (u32)strtoul(bs, NULL, 0);
+        if (vm_base && reported < 6) {
+            u32 changed = 0; char list[512]; int ln = 0;
+            for (u32 b = 0; b < nblk; b++) {
+                const u8* p = vm_base + base + b * 0x10000u;
+                u32 h = 2166136261u;
+                for (u32 i = 0; i < 0x10000u; i += 61) h = (h ^ p[i]) * 16777619u;
+                if (have && h != prev[b]) { changed++;
+                    if (ln < 400) ln += snprintf(list + ln, sizeof(list) - ln,
+                                                 " +0x%X", b * 0x10000u); }
+                prev[b] = h;
+            }
+            if (have && changed) { reported++;
+                fprintf(stderr, "[VRAMSCAN] base=0x%08X %u/512 blocks changed:%s%c",
+                        base, changed, list, 10); }
+            have = 1;
+        } } }
     /* FRAME_BUDGET=1: geometry a frame asked for vs what the batch can hold.
      * Reported from render_frame so it works under RSX_ACCUM_FRAME too -- it
      * used to live in the clear-boundary present path, which accum bypasses, so
@@ -5210,9 +5252,12 @@ static void vp_attrs_dbg(const rsx_state* state)
           if (v == 0) {
               u32 la = cellGcmResolveLocated(1, aoff), ma = cellGcmResolveLocated(0, aoff);
               const u8* lp = vm_base + la; const u8* mp = vm_base + ma;
-              fprintf(stderr, "[VPDUMP] a%d off=0x%X  LOCAL@0x%X=(%g,%g,%g)  MAIN@0x%X=(%g,%g,%g)%c",
+              const u8* rp = vm_base + (a->offset & 0x7FFFFFFFu);   /* raw, unresolved */
+              fprintf(stderr, "[VPDUMP] a%d off=0x%X  LOCAL@0x%X=(%g,%g,%g)  MAIN@0x%X=(%g,%g,%g)"
+                              "  RAW@0x%X=(%g,%g,%g)%c",
                       ai, aoff, la, rd_bef(lp), rd_bef(lp+4), rd_bef(lp+8),
-                      ma, rd_bef(mp), rd_bef(mp+4), rd_bef(mp+8), 10);
+                      ma, rd_bef(mp), rd_bef(mp+4), rd_bef(mp+8),
+                      (a->offset & 0x7FFFFFFFu), rd_bef(rp), rd_bef(rp+4), rd_bef(rp+8), 10);
           }
           u32 nc = a->size ? a->size : 3; if (nc > 3) nc = 3;
           float f[3] = {0,0,0};

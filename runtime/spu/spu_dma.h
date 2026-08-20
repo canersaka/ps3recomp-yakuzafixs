@@ -205,6 +205,15 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                   fprintf(stderr, "[put] wrote spu_ls_nullput.bin (pc=0x%05X)%c",
                           (uint32_t)spu->pc & SPU_LS_MASK, 10); }
           }
+          { static u32 seen[48]; static int ns = 0;
+            u32 k = (uint32_t)ea & ~0xFFFFu;       /* 64 KB granularity */
+            int f = 0; for (int i = 0; i < ns; i++) if (seen[i] == k) f = 1;
+            if (!f && ns < 48) { seen[ns++] = k;
+                { u32 nzs = 0; const uint8_t* sp2 = &spu->ls[lsa & SPU_LS_MASK];
+                  for (uint32_t i6 = 0; i6 < size && i6 < 0x4000u; i6 += 7)
+                      if (sp2[i6]) nzs++;
+                  fprintf(stderr, "[putea] spu=0x%X 0x%08X size=%u srcNonZero=%u%c",
+                          spu->spu_id, (uint32_t)ea, size, nzs, 10); } } }
           if (tot <= 8)
               fprintf(stderr, "[put#%llu] img=%d pc=0x%05X ea=0x%08X lsa=0x%05X size=%u cmd=0x%X%c",
                       tot, spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK,

@@ -693,6 +693,25 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
          * a million PUTs into the zero page, no progress, and the fluid's vertex
          * buffer left untouched. Seeding only a real descriptor keeps the
          * completion handshake intact and gives the workers their input. */
+        /* RD_WORKDUMP=1: the work descriptor the PPU hands the worker. Its
+         * pointers are where the job DMAs from and to, so a job that writes
+         * only scratch is either reading the wrong descriptor or the descriptor
+         * does not name the buffer we expect. */
+        { static int _wd = -1; if (_wd < 0) _wd = getenv("RD_WORKDUMP") ? 1 : 0;
+          if (_wd && work_ea > 0x1000000u && vm_base) { static int _n = 0; if (_n++ < 3) {
+              fprintf(stderr, "[WORKDESC] tid=0x%X ea=0x%08X:%c", t->tid, work_ea, 10);
+              for (int r = 0; r < 16; r++) {
+                  fprintf(stderr, "  +0x%03X:", r * 16);
+                  for (int c = 0; c < 4; c++)
+                      fprintf(stderr, " %08X", vm_read_be32(work_ea + r*16 + c*4));
+                  fprintf(stderr, "%c", 10);
+              } } } }
+        { static int _wh = -1; if (_wh < 0) _wh = getenv("RD_WORKHDR") ? 1 : 0;
+          if (_wh && work_ea > 0x1000000u && vm_base) { static int _n = 0; if (_n++ < 40)
+              fprintf(stderr, "[WORKHDR] tid=0x%X ea=0x%08X w0=%u w1=%u f2=%g f3=%g%c",
+                      t->tid, work_ea, vm_read_be32(work_ea), vm_read_be32(work_ea+4),
+                      (double)*(const float*)&(const uint32_t){0}, 0.0, 10); }
+          if (_wh && work_ea > 0x1000000u && vm_base) { } }
         { static int _sd = -1; if (_sd < 0) _sd = getenv("RD_SEEDDBG") ? 1 : 0;
           if (_sd) { static int _n = 0; if (_n++ < 12)
               fprintf(stderr, "[SPU-SEED] tid=0x%X entry=0x%05X args=0x%08X seed=0x%08X%c",
