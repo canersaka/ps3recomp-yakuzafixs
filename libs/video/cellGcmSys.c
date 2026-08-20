@@ -1464,6 +1464,10 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
 
     printf("[cellGcmSys] WARNING: AddressToOffset failed for 0x%08X\n", address);
     vm_write32(off_ea, 0);
+    { static int _d = -1; if (_d < 0) _d = getenv("A2O_FAILDBG") ? 1 : 0;
+      if (_d) { static int _n = 0; if (_n++ < 12)
+          fprintf(stderr, "[A2O] FAILED ea=0x%08X (not in local or IO space)%c",
+                  address, 10); } }
     return CELL_GCM_ERROR_FAILURE;
 }
 
