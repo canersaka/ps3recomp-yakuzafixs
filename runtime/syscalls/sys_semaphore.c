@@ -300,7 +300,19 @@ int64_t sys_semaphore_destroy(ppu_context* ctx)
  * r3 = sem_id
  * r4 = timeout_usec (0 = infinite)
  * -----------------------------------------------------------------------*/
+/* SEM_ERRDBG=1: report non-OK returns. PSGL's PlatformDevice asserts on one of
+ * these once per frame, and naming the failing call beats inferring it. */
+static int64_t sys_semaphore_wait_impl(ppu_context* ctx);
 int64_t sys_semaphore_wait(ppu_context* ctx)
+{
+    int64_t r = sys_semaphore_wait_impl(ctx);
+    static int d = -1; if (d < 0) d = getenv("SEM_ERRDBG") ? 1 : 0;
+    if (d && r) { static int n = 0; if (n++ < 12)
+        fprintf(stderr, "[sem] wait(sem=%u) -> %lld%c",
+                (unsigned)ctx->gpr[3], (long long)r, 10); }
+    return r;
+}
+static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
 {
     uint32_t sem_id     = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
