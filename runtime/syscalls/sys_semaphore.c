@@ -314,6 +314,10 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
 }
 static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
 {
+    { static int _d = -1; if (_d < 0) _d = getenv("SEM_WAITDBG") ? 1 : 0;
+      if (_d) { static int _n = 0; if (_n++ < 20)
+          fprintf(stderr, "[sem] wait(id=%u) tid=%llu%c", (unsigned)ctx->gpr[3],
+                  (unsigned long long)ctx->thread_id, 10); } }
     uint32_t sem_id     = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
     /* LBP_HLE_JOBDONE: the JobManagerWorker spins on sys_semaphore_wait/trywait
@@ -422,8 +426,13 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
-    if (!s->active)
+    if (!s->active) {
+        static int _n = 0; if (_n++ < 6)
+            fprintf(stderr, "[sem] post(id=%u) -> ESRCH: slot inactive"
+                            " (value=%d max=%d)%c",
+                    sem_id, s->value, s->max_value, 10);
         return (int64_t)(int32_t)CELL_ESRCH;
+    }
 
 #ifdef _WIN32
     EnterCriticalSection(&s->value_lock);

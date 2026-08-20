@@ -1612,6 +1612,18 @@ int lv2_try_syscall(ppu_context* ctx)
      * why libsre asserts ESRCH in event_helper.c. Snapshot args BEFORE handler. */
     uint32_t _a3 = (uint32_t)ctx->gpr[3], _a4 = (uint32_t)ctx->gpr[4], _a5 = (uint32_t)ctx->gpr[5];
     ctx->gpr[3] = (uint64_t)h(ctx);
+    /* LV2_ERRDBG=1: every syscall that returns non-OK, deduped by (number,
+     * result). A guest that asserts on a result once per frame is easier to
+     * find from this side than by reading its lifted code. */
+    { static int _ed = -1; if (_ed < 0) _ed = getenv("LV2_ERRDBG") ? 1 : 0;
+      if (_ed && (int32_t)ctx->gpr[3] != 0) {
+          static uint64_t seen[64]; static int ns = 0;
+          uint64_t k = ((uint64_t)num << 32) | (uint32_t)ctx->gpr[3];
+          int f = 0; for (int i = 0; i < ns; i++) if (seen[i] == k) f = 1;
+          if (!f && ns < 64) { seen[ns++] = k;
+              fprintf(stderr, "[lv2err] syscall %u(r3=0x%08X r4=0x%08X r5=0x%08X)"
+                              " -> 0x%08X lr=0x%08X%c",
+                      num, _a3, _a4, _a5, (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr, 10); } } }
     if (getenv("YDKJ_GFXSCAN") && num >= 128 && num <= 141) {
         static int _e = 0; if (_e++ < 60)
             fprintf(stderr, "[EVT-SC] #%u(r3=0x%08X r4=0x%08X r5=0x%08X) -> 0x%08X lr=0x%08X\n",
