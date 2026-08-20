@@ -360,6 +360,93 @@ static u64 s_req_verts = 0, s_req_draws = 0, s_drop_draws = 0;
  * Feeding it the previous frame costs one frame of latency, which for a water
  * reflection is not visible. */
 static ID3D12Resource* s_screen_copy = NULL;
+/* Sub-viewport render-to-texture. This title renders its reflection/refraction
+ * pre-pass into a REGION of the same surface (vp 0,208 512x512 and 0,208
+ * 1024x512, cmask=F) and then samples a texture of exactly that size. On
+ * hardware the pass lands in the buffer that texture points at; our backend
+ * renders into D3D resources, so that guest buffer is never written and every
+ * fluid sampler reads zero. Capture each region into a matching resource and
+ * bind it for samplers whose guest source is empty and whose size matches.
+ *
+ * SUBVP_RTT=1 to enable. OFF by default because it cannot be validated on this
+ * title yet: the fluid draws that would consume these captures never rasterize
+ * (see below), so binding them changes nothing observable. The capture and
+ * binding themselves are confirmed working -- SUBVP_DBG shows the 512x512 and
+ * 256x256 regions captured and handed to fp 0x5DB81/0x5EA81/0x5EF81/0x5E381. */
+#define SUBVP_SLOTS 4
+static struct { ID3D12Resource* res; u32 x, y, w, h; } s_subvp[SUBVP_SLOTS];
+static int s_subvp_n = 0;
+
+static void subvp_note(u32 x, u32 y, u32 w, u32 h)
+{
+    if (!w || !h || w > s_d3d.width || h > s_d3d.height) return;
+    if (w == s_d3d.width && h == s_d3d.height) return;      /* full-screen pass */
+    for (int i = 0; i < s_subvp_n; i++)
+        if (s_subvp[i].w == w && s_subvp[i].h == h) { s_subvp[i].x = x; s_subvp[i].y = y; return; }
+    if (s_subvp_n >= SUBVP_SLOTS) return;
+    s_subvp[s_subvp_n].x = x; s_subvp[s_subvp_n].y = y;
+    s_subvp[s_subvp_n].w = w; s_subvp[s_subvp_n].h = h;
+    s_subvp[s_subvp_n].res = NULL;
+    s_subvp_n++;
+}
+
+/* Copy each noted region out of the backbuffer. Called at the same moment as
+ * screen_copy_capture -- after the reduced-viewport passes and before the
+ * full-screen scene overwrites them. */
+static void subvp_capture(u32 fi)
+{
+    static int en = -1;
+    if (en < 0) { const char* e = getenv("SUBVP_RTT"); en = e ? atoi(e) : 0; }
+    if (!en || !s_d3d.device || !s_subvp_n) return;
+    for (int i = 0; i < s_subvp_n; i++) {
+        if (!s_subvp[i].res) {
+            D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC td = {0};
+            td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            td.Width = s_subvp[i].w; td.Height = s_subvp[i].h;
+            td.DepthOrArraySize = 1; td.MipLevels = 1;
+            td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
+            td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+                    s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, NULL,
+                    &IID_ID3D12Resource, (void**)&s_subvp[i].res)))
+                { s_subvp[i].res = NULL; continue; }
+        }
+        D3D12_RESOURCE_BARRIER bb[2] = {0};
+        bb[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bb[0].Transition.pResource   = s_d3d.render_targets[fi];
+        bb[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        bb[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        bb[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        bb[1] = bb[0];
+        bb[1].Transition.pResource   = s_subvp[i].res;
+        bb[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        bb[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 2, bb);
+
+        D3D12_TEXTURE_COPY_LOCATION dstl = {0}, srcl = {0};
+        dstl.pResource = s_subvp[i].res;
+        dstl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dstl.SubresourceIndex = 0;
+        srcl.pResource = s_d3d.render_targets[fi];
+        srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; srcl.SubresourceIndex = 0;
+        D3D12_BOX box; box.left = s_subvp[i].x; box.top = s_subvp[i].y;
+        box.front = 0; box.right = s_subvp[i].x + s_subvp[i].w;
+        box.bottom = s_subvp[i].y + s_subvp[i].h; box.back = 1;
+        if (box.right > s_d3d.width)  box.right  = s_d3d.width;
+        if (box.bottom > s_d3d.height) box.bottom = s_d3d.height;
+        s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dstl, 0, 0, 0, &srcl, &box);
+
+        bb[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        bb[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        bb[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        bb[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 2, bb);
+        { static int _n = 0; if (getenv("SUBVP_DBG") && _n++ < 8)
+            fprintf(stderr, "[SUBVP] captured %ux%u from (%u,%u)%c",
+                    s_subvp[i].w, s_subvp[i].h, s_subvp[i].x, s_subvp[i].y, 10); }
+    }
+}
 static void screen_copy_capture(u32 fi);   /* fwd */
 static int  s_sc_dump_pending = 0;
 static u32 s_duck_raw = 0;   /* as BOUND (what draw records carry) */
@@ -3841,6 +3928,28 @@ static void render_frame(void)
                     continue;
                 }
             }
+            /* A sampler whose guest buffer was never written, at the size of a
+             * reduced-viewport pass we captured: that pass IS its producer. */
+            if (dr->tex[_u].set && dr->tex[_u].off && s_subvp_n) {
+                int hit = -1;
+                for (int i = 0; i < s_subvp_n; i++)
+                    if (s_subvp[i].res && s_subvp[i].w == dr->tex[_u].w &&
+                        s_subvp[i].h == dr->tex[_u].h) { hit = i; break; }
+                if (hit >= 0) {
+                    extern uint8_t* vm_base;
+                    u32 nz = 0, sz = dr->tex[_u].w * dr->tex[_u].h * 4u;
+                    for (u32 i5 = 0; i5 < sz && i5 < 0x20000u; i5 += 997)
+                        if (vm_base[dr->tex[_u].off + i5]) { nz = 1; break; }
+                    if (!nz) {
+                        { static int _n = 0; if (getenv("SUBVP_DBG") && _n++ < 8)
+                            fprintf(stderr, "[SUBVP] unit %d fp=0x%X <- captured %ux%u%c",
+                                    _u, dr->fp_addr, dr->tex[_u].w, dr->tex[_u].h, 10); }
+                        srv_write(wslot, s_subvp[hit].res, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                  D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                        continue;
+                    }
+                }
+            }
             if (dr->tex[_u].set) {
                 int rt = off_rt_find(dr->tex[_u].raw);
                 if (rt >= 0) {
@@ -4099,11 +4208,15 @@ static void render_frame(void)
                  * into a region of the same target) finish here -- snapshot
                  * before the full-screen scene overwrites them. */
                 if (!dr->is_clear) {
-                    if (dr->vp_w && dr->vp_w < s_d3d.width) seen_small_vp = 1;
+                    if (dr->vp_w && dr->vp_w < s_d3d.width) {
+                        seen_small_vp = 1;
+                        subvp_note(dr->vp_x, dr->vp_y, dr->vp_w, dr->vp_h);
+                    }
                     else if (seen_small_vp && !captured &&
                              dr->vp_w == s_d3d.width && dr->rt_off == 0) {
                         captured = 1;
                         screen_copy_capture(fi);
+                        subvp_capture(fi);
                         s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(
                             s_d3d.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);
                     }
@@ -5156,7 +5269,11 @@ static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
     if (!state->vertex_attribs[0].enabled) return 0;
     vp_attrs_dbg(state);
     u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
-    if (count > maxv) { s_drop_draws++; count = maxv - (maxv % 3); }
+    if (count > maxv) { s_drop_draws++;
+        { static int _n = 0; if (getenv("VBFULL") && _n++ < 12)
+            fprintf(stderr, "[VBFULL] fp=0x%X wanted %u verts, room for %u%c",
+                    state->shader_program, count, maxv, 10); }
+        count = maxv - (maxv % 3); }
     VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
         + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     { double _tv = perf_on() ? perf_now() : 0.0;
@@ -5303,7 +5420,11 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
     if (!state->vertex_attribs[0].enabled) return 0;
     vp_attrs_dbg(state);
     u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
-    if (count > maxv) { s_drop_draws++; count = maxv - (maxv % 3); }
+    if (count > maxv) { s_drop_draws++;
+        { static int _n = 0; if (getenv("VBFULL") && _n++ < 12)
+            fprintf(stderr, "[VBFULL] fp=0x%X wanted %u verts, room for %u%c",
+                    state->shader_program, count, maxv, 10); }
+        count = maxv - (maxv % 3); }
     VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
         + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     { double _tv = perf_on() ? perf_now() : 0.0;
