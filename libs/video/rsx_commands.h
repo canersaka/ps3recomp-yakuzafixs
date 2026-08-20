@@ -267,6 +267,11 @@ typedef struct rsx_state {
     /* Index array (SET_INDEX_ARRAY_ADDRESS/_DMA): offset is a raw RSX offset;
      * dma bits [3:0] = location context (0=local 1=main via CELL_GCM_DMA ids),
      * bits [7:4] = index type (0 = u32, 1 = u16). */
+    /* Incremented on every SET_BEGIN_END(begin). One primitive stream may be
+     * split across several DRAW_ARRAYS/DRAW_INDEX_ARRAY entries inside one
+     * BEGIN/END; the backend concatenates those and must not merge across a
+     * boundary, where the transform constants can change. */
+    u32 begin_epoch;
     u32 index_array_offset;
     u32 index_array_dma;
 

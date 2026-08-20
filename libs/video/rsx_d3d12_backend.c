@@ -76,6 +76,7 @@ typedef struct {
     u32 fp_addr;        /* SET_SHADER_PROGRAM value (guest FP ucode location)   */
     int fp_exp32;       /* SET_SHADER_CONTROL 32-bit-exports bit at draw time   */
     u32 alpha_ctl;      /* alpha test: enable<<16 | (func&0xFF)<<8 | ref */
+    u32 begin_epoch;    /* SET_BEGIN_END generation, for batch concatenation */
     u32 cull;           /* packed face culling: bit0 enable, bit1 cull FRONT
                          * (else BACK), bit2 front face is CCW. RSX culls back
                          * faces on most solid geometry; rendering everything
@@ -5499,6 +5500,8 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->fp_exp32 = s_d3d.current_rsx_state ?
                     ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
                 dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
+        dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
+            dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
                 dr->cmask = 0xF;
                 if (s_d3d.current_rsx_state) {
                     u32 _cm = s_d3d.current_rsx_state->color_mask;
@@ -5600,6 +5603,8 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                         ? s_d3d.current_rsx_state->shader_program : 0;
             if (pv->is_vp && pv->topology == D3D_TOPOLOGY_TRIANGLELIST &&
                 pv->fp_addr == fpnow && primitive == 5 &&
+                pv->begin_epoch == (s_d3d.current_rsx_state
+                                    ? s_d3d.current_rsx_state->begin_epoch : 0) &&
                 pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec) {
                 pv->vertex_count += emitted;
                 s_d3d.merge_first_end = first + count;
@@ -5617,6 +5622,8 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->fp_exp32 = s_d3d.current_rsx_state ?
                 ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
             dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
+        dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
+            dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->cmask = 0xF;
             if (s_d3d.current_rsx_state) {
                 u32 _cm = s_d3d.current_rsx_state->color_mask;
@@ -5723,6 +5730,24 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             printf("[D3D12] draw_indexed: skipping prim=%u (not wired)\n", primitive);
         return;
     }
+    /* Same BEGIN/END batch concatenation as the non-indexed path: this title's
+     * fluid arrives as ~3000 DRAW_INDEX_ARRAY batches of 256, and 256 is not a
+     * multiple of 3, so every batch after the first assembled out of phase. */
+    if (emitted && s_d3d.merge_prev_draw && s_d3d.draw_count > 0 &&
+        s_d3d.merge_first_end == first && primitive == 5) {
+        D3D12DrawRecord* pv = &s_d3d.draws[s_d3d.draw_count - 1];
+        u32 fpnow = s_d3d.current_rsx_state
+                    ? s_d3d.current_rsx_state->shader_program : 0;
+        if (pv->is_vp && pv->topology == D3D_TOPOLOGY_TRIANGLELIST &&
+            pv->fp_addr == fpnow &&
+            pv->begin_epoch == (s_d3d.current_rsx_state
+                                ? s_d3d.current_rsx_state->begin_epoch : 0) &&
+            pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec) {
+            pv->vertex_count += emitted;
+            s_d3d.merge_first_end = first + count;
+            return;
+        }
+    }
     if (emitted && s_d3d.draw_count < MAX_DRAWS) {
         D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
         dr->vb_byte_offset = rec;
@@ -5734,6 +5759,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->fp_exp32 = s_d3d.current_rsx_state ?
             ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
         dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
+        dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
         dr->cmask = 0xF;
         if (s_d3d.current_rsx_state) {
             u32 _cm = s_d3d.current_rsx_state->color_mask;
@@ -5775,6 +5801,9 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->cb_slot = s_d3d.draw_count;
                 vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
         s_d3d.draw_count++;
+        /* Anchor for merging the next batch of this indexed stream. */
+        s_d3d.merge_prev_draw = (primitive == 5);
+        s_d3d.merge_first_end = first + count;
     }
 }
 

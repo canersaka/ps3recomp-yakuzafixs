@@ -607,6 +607,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         if (data != 0) {
             state->primitive_type = data;
             state->in_begin_end = 1;
+            state->begin_epoch++;
 
             /* Flush dirty state to backend before drawing */
             if (s_backend) {
