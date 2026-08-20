@@ -212,6 +212,13 @@ typedef struct spu_context {
     /* Channels */
     spu_channel ch_out_mbox;        /* SPU -> PPU outbound mailbox */
     spu_channel ch_in_mbox;         /* PPU -> SPU inbound mailbox */
+    /* sys_spu_thread_receive_event (stop 0x110) replies with FOUR values --
+     * {CELL_OK, data1, data2, data3} -- and the worker reads them back with
+     * four rdch SPU_RdInMbox. spu_channel holds one, so queue the reply here
+     * and let the in-mailbox read drain it first. */
+    uint32_t rcv_evt[4];
+    int      rcv_evt_n;             /* remaining unread reply words */
+    int      rcv_evt_i;
     spu_channel ch_out_intr_mbox;   /* SPU -> PPU interrupt mailbox */
     spu_channel ch_sig_notify[2];   /* Signal notification 1 & 2 */
 

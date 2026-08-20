@@ -661,6 +661,18 @@ static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea,
 int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
 {
     if (!getenv("RD_SPU_INTERP")) return 0;
+    /* Two callers reach here: an event-port send, which carries the frame's
+     * work descriptor in data2, and the blocking-receive path, which has none
+     * and passes 0. A worker started without a descriptor reads an empty inbox,
+     * takes the 0 as its descriptor EA and DMAs its results to the zero page --
+     * hundreds of thousands of 128-byte PUTs to EA 0 and no output anywhere.
+     * Remember the last descriptor seen per queue and reuse it when the
+     * receive path re-runs the same worker. */
+    static uint32_t last_work[64];
+    if (comp_queue < 64) {
+        if (work_ea) last_work[comp_queue] = work_ea;
+        else         work_ea = last_work[comp_queue];
+    }
     for (uint32_t i = 0; i < MAX_SPU_THREADS; i++) {
         spu_thread_t* t = &s_spu_threads[i];
         if (!t->in_use || t->connected_queue != comp_queue || !t->img_ea) continue;
@@ -669,13 +681,26 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
         uint32_t entry = spu_load_image_to_ls(t->img_ea, ls);
         fprintf(stderr, "[SPU-FRAME] tid=0x%X q=%u work=0x%08X -> re-run\n",
                 t->tid, comp_queue, work_ea);
-        /* RD_SPU_FRAME_MBOX=1 restores seeding work_ea into the inbound mailbox.
-         * It is OFF by default because at least one sim image (the Rubber Ducky
-         * solver) uses `rchcnt SPU_RdInMbox` the other way round: its send-result
-         * helper at LS 0xC370 returns EBUSY when the inbox is NON-empty and only
-         * falls through to `wrch WrOutMbox; stop 0x110` when it is EMPTY. Seeding
-         * the mailbox made that check fail every pass, so the worker never
-         * signalled completion and spun (3M+ interpreted steps, no progress). */
+        /* Seed the inbound mailbox with the work descriptor when we HAVE one.
+         * spu_run_interp_job treats 0 as "do not seed", so the blocking-receive
+         * dispatch -- which is called with no descriptor -- behaves exactly as
+         * before, while an event-port send delivers its real data2.
+         *
+         * This used to be gated behind RD_SPU_FRAME_MBOX and passed 0 either
+         * way, because force-seeding had made a worker spin. That spin was the
+         * seed being 0: the receive path calls us with work_ea = 0, the solver
+         * took that as its descriptor EA and DMA'd results to address 0 -- half
+         * a million PUTs into the zero page, no progress, and the fluid's vertex
+         * buffer left untouched. Seeding only a real descriptor keeps the
+         * completion handshake intact and gives the workers their input. */
+        { static int _sd = -1; if (_sd < 0) _sd = getenv("RD_SEEDDBG") ? 1 : 0;
+          if (_sd) { static int _n = 0; if (_n++ < 12)
+              fprintf(stderr, "[SPU-SEED] tid=0x%X entry=0x%05X args=0x%08X seed=0x%08X%c",
+                      t->tid, entry, t->args_ea, work_ea, 10); } }
+        /* Do NOT seed the inbound mailbox. It is the reply channel for the
+         * SPU's own sys_spu_thread_receive_event (stop 0x110) service, and the
+         * worker's spu_printf helper treats a non-empty inbox as EBUSY. The
+         * work descriptor reaches the SPU through that service instead. */
         int32_t frc = spu_run_interp_job(ls, entry, t->args_ea, -1, t->tid, t->group_id,
                                          getenv("RD_SPU_FRAME_MBOX") ? work_ea : 0u);
         { extern uint32_t g_spu_interp_last_pc; extern uint64_t g_spu_interp_steps;

@@ -5033,6 +5033,17 @@ static void vp_attrs_dbg(const rsx_state* state)
           u32 aoff = (a->offset & 0x7FFFFFFFu) + (u32)v * a->stride;
           const u8* q = vm_base + ((a->offset & 0x80000000u)
                         ? cellGcmResolveLocated(0, aoff) : cellGcmResolveLocated(1, aoff));
+          /* Also read the same offset through the OTHER context-DMA. An array
+           * the guest put in main memory but whose offset we resolve as LOCAL
+           * reads as untouched VRAM, i.e. all zeros -- indistinguishable from
+           * "the producer never ran". */
+          if (v == 0) {
+              u32 la = cellGcmResolveLocated(1, aoff), ma = cellGcmResolveLocated(0, aoff);
+              const u8* lp = vm_base + la; const u8* mp = vm_base + ma;
+              fprintf(stderr, "[VPDUMP] a%d off=0x%X  LOCAL@0x%X=(%g,%g,%g)  MAIN@0x%X=(%g,%g,%g)%c",
+                      ai, aoff, la, rd_bef(lp), rd_bef(lp+4), rd_bef(lp+8),
+                      ma, rd_bef(mp), rd_bef(mp+4), rd_bef(mp+8), 10);
+          }
           u32 nc = a->size ? a->size : 3; if (nc > 3) nc = 3;
           float f[3] = {0,0,0};
           for (u32 k = 0; k < nc; k++) f[k] = rd_bef(q + k * 4);
@@ -5232,6 +5243,7 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
     s_req_verts += count; s_req_draws++;
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
+    vp_attrs_dbg(state);
     u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
     if (count > maxv) { s_drop_draws++; count = maxv - (maxv % 3); }
     VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped

@@ -412,6 +412,16 @@ static int channel_is_mfc(uint32_t ch)
  * ===========================================================================*/
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 {
+    /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
+     * worker that never issues an MFC command is either not being handed its
+     * work descriptor or is waiting on a channel we never satisfy; the channel
+     * mix distinguishes those. */
+    { static int s_c = -1; if (s_c < 0) s_c = getenv("SPU_CHHIST") ? 1 : 0;
+      if (s_c) { static unsigned long long w[128]; static unsigned long long n;
+          w[channel & 127]++;
+          if ((++n % 2000) == 0) { fprintf(stderr, "[chw] %llu writes:%c", n, 10);
+              for (int i = 0; i < 128; i++) if (w[i])
+                  fprintf(stderr, "   wrch ch%-3d %llu%c", i, w[i], 10); } } }
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
 
     if (channel_is_mfc(channel)) {
@@ -487,7 +497,7 @@ static int yz_ch_block(void)
 static int spu_ch_ready(spu_context* ctx, uint32_t channel)
 {
     switch (channel) {
-    case SPU_RdInMbox:      return ctx->ch_in_mbox.count != 0;
+    case SPU_RdInMbox:      return ctx->rcv_evt_n != 0 || ctx->ch_in_mbox.count != 0;
     case SPU_RdSigNotify1:  return ctx->ch_sig_notify[0].count != 0;
     case SPU_RdSigNotify2:  return ctx->ch_sig_notify[1].count != 0;
     case SPU_RdEventStat:   return (ctx->event_status & ctx->event_mask) != 0;
@@ -542,6 +552,12 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
  * ===========================================================================*/
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
+    { static int s_c = -1; if (s_c < 0) s_c = getenv("SPU_CHHIST") ? 1 : 0;
+      if (s_c) { static unsigned long long r[128]; static unsigned long long n;
+          r[channel & 127]++;
+          if ((++n % 2000) == 0) { fprintf(stderr, "[chr] %llu reads:%c", n, 10);
+              for (int i = 0; i < 128; i++) if (r[i])
+                  fprintf(stderr, "   rdch ch%-3d %llu%c", i, r[i], 10); } } }
     /* Block (never fabricate) on an empty producer-fed read channel (opt-in
      * YZ_CH_BLOCK). RdEventStat now has a producer (the MFC tag-status event
      * raise above), but only block it when the SPU has actually enabled events
@@ -572,7 +588,10 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     }
 
     switch (channel) {
-    case SPU_RdInMbox:      v = spu_channel_read(&ctx->ch_in_mbox);     break;
+    case SPU_RdInMbox:
+        if (ctx->rcv_evt_n > 0) { v = ctx->rcv_evt[ctx->rcv_evt_i++]; ctx->rcv_evt_n--; }
+        else v = spu_channel_read(&ctx->ch_in_mbox);
+        break;
     case SPU_RdSigNotify1:  v = spu_channel_read(&ctx->ch_sig_notify[0]); break;
     case SPU_RdSigNotify2:  v = spu_channel_read(&ctx->ch_sig_notify[1]); break;
     /* The decrementer must actually DECREMENT. Returning the latched WrDec
@@ -633,11 +652,16 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
         /* Synchronous persistent-worker park: after its handshake the SPU polls
          * the inbound mailbox for PPU commands; if empty and parking is armed,
          * halt (longjmp out of spu_run_with_halt) instead of spinning forever. */
-        if (ctx->park_on_empty_inmbox && ctx->ch_in_mbox.count == 0) {
+        /* A pending sys_spu_thread_receive_event reply counts as readable
+         * mailbox words: the worker checks rchcnt to decide whether its reply
+         * has arrived, and parking on an "empty" inbox that actually holds the
+         * reply strands it. */
+        if (ctx->park_on_empty_inmbox && ctx->rcv_evt_n == 0 &&
+            ctx->ch_in_mbox.count == 0) {
             extern void spu_halt(spu_context*);
             spu_halt(ctx);
         }
-        return ctx->ch_in_mbox.count;                                      /* readable */
+        return (uint32_t)ctx->rcv_evt_n + ctx->ch_in_mbox.count;           /* readable */
     case SPU_WrOutMbox:      return SPU_MBOX_DEPTH - ctx->ch_out_mbox.count; /* free slots */
     case SPU_WrOutIntrMbox:  return SPU_INTR_MBOX_DEPTH - ctx->ch_out_intr_mbox.count;
     case SPU_RdSigNotify1:   return ctx->ch_sig_notify[0].count;

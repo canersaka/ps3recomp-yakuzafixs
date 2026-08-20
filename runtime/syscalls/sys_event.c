@@ -810,8 +810,18 @@ int64_t sys_event_port_send(ppu_context* ctx)
      * The queue then fills after ~190 frames and event_queue_push returns EBUSY,
      * which the guest asserts on (SpuThreadGroup.cpp:315 ret == CELL_OK). */
     { extern int spu_dispatch_frame_by_queue(uint32_t, uint32_t);
+      /* Stage the full event for the SPU's sys_spu_thread_receive_event
+       * (stop 0x110): the worker reads back {CELL_OK, data1, data2, data3} and
+       * takes its work-descriptor EA from those, so data2 alone is not enough. */
+      extern uint32_t g_spu_pending_evt[3];
+      extern int      g_spu_pending_evt_valid;
+      g_spu_pending_evt[0] = (uint32_t)data1;
+      g_spu_pending_evt[1] = (uint32_t)data2;
+      g_spu_pending_evt[2] = (uint32_t)data3;
+      g_spu_pending_evt_valid = 1;
       if (spu_dispatch_frame_by_queue((uint32_t)qidx + 1, (uint32_t)data2))
-          return CELL_OK; }
+          return CELL_OK;
+      g_spu_pending_evt_valid = 0; }
 
     if (event_queue_push(q, &evt) < 0) {
         fprintf(stderr, "[evt] port_send(port=%u): queue %d FULL -> EBUSY%c",
