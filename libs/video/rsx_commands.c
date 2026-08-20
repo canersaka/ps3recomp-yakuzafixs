@@ -126,6 +126,11 @@ static int process_surface_method(rsx_state* state, u32 method, u32 data)
         return 0;
     case NV4097_SET_SURFACE_COLOR_AOFFSET:
         state->surface_color_offset[0] = data;
+        { static int _s = -1; if (_s < 0) _s = getenv("SURFDBG") ? 1 : 0;
+          static unsigned _seen[32]; static int _n = 0;
+          if (_s) { int f = 0; for (int k = 0; k < _n; k++) if (_seen[k] == data) f = 1;
+              if (!f && _n < 32) { _seen[_n++] = data;
+                  fprintf(stderr, "[SURF] color offset -> 0x%08X%c", data, 10); } } }
         state->surface_dirty = 1;
         return 0;
     case NV4097_SET_SURFACE_COLOR_BOFFSET:

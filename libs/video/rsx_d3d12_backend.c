@@ -1985,6 +1985,22 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * at directly. Restrict with FP_TEX_FP=<hex>. Reading a 69-instruction
      * shader to guess which term carries a bad value is slower and less certain
      * than displaying the terms. */
+    /* FP_KILL=<hex fp_addr>: make that program discard every fragment, so what
+     * it covers becomes visible. Distinguishes "this surface shades black" from
+     * "this surface is correct and something else is missing behind it". */
+    { const char* kf = getenv("FP_KILL");
+      if (kf && (u32)strtoul(kf, NULL, 16) == fp_addr) {
+          char* rp = strstr(hlsl, "PSOut _po;");
+          if (rp) {
+              const char* ins = "discard; ";
+              size_t nl = strlen(ins), tail = strlen(rp) + 1;
+              if ((size_t)(rp - hlsl) + nl + tail < sizeof(hlsl)) {
+                  memmove(rp + nl, rp, tail);
+                  memcpy(rp, ins, nl);
+                  fprintf(stderr, "[FPKILL] fp=0x%X discards%c", fp_addr, 10);
+              }
+          }
+      } }
     { const char* sh = getenv("FP_SHOW");
       const char* only = getenv("FP_TEX_FP");
       if (sh && (!only || (u32)strtoul(only, NULL, 16) == fp_addr)) {
@@ -3757,9 +3773,21 @@ static void render_frame(void)
                   static u32 seen[24]; static int ns = 0; int known = 0;
                   for (int k = 0; k < ns; k++) if (seen[k] == dr->fp_addr) known = 1;
                   if (!known && ns < 24) { seen[ns++] = dr->fp_addr;
-                      fprintf(stderr, "[EMPTYTEX] fp=0x%X unit=%d raw=0x%08X %ux%u"
+                      /* Scan a window around the resolved address: if the pass
+                       * that fills this surface ran but landed elsewhere, the
+                       * data is nearby; if the whole window is zero it was never
+                       * produced. */
+                      { u32 base = dr->tex[_u].off & ~0xFFFFFu;
+                        for (u32 w = 0; w < 0x400000u; w += 0x100000u) {
+                            u32 nzc = 0;
+                            for (u32 i3 = 0; i3 < 0x100000u; i3 += 1021)
+                                if (vm_base[base + w + i3]) nzc++;
+                            fprintf(stderr, "[EMPTYSCAN] 0x%08X..+1MB nonzero %u/1027%c",
+                                    base + w, nzc, 10);
+                        } }
+                      fprintf(stderr, "[EMPTYTEX] fp=0x%X unit=%d raw=0x%08X res=0x%08X %ux%u"
                                       " fmt=0x%02X verts=%u vp=%u,%u %ux%u%c",
-                              dr->fp_addr, _u, dr->tex[_u].raw, dr->tex[_u].w,
+                              dr->fp_addr, _u, dr->tex[_u].raw, dr->tex[_u].off, dr->tex[_u].w,
                               dr->tex[_u].h, dr->tex[_u].fmt, dr->vertex_count,
                               dr->vp_x, dr->vp_y, dr->vp_w, dr->vp_h, 10); }
               }

@@ -701,8 +701,17 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
          * SPU's own sys_spu_thread_receive_event (stop 0x110) service, and the
          * worker's spu_printf helper treats a non-empty inbox as EBUSY. The
          * work descriptor reaches the SPU through that service instead. */
+        LARGE_INTEGER _t0, _t1, _fq; QueryPerformanceCounter(&_t0);
         int32_t frc = spu_run_interp_job(ls, entry, t->args_ea, -1, t->tid, t->group_id,
                                          getenv("RD_SPU_FRAME_MBOX") ? work_ea : 0u);
+        { static int _sp = -1; if (_sp < 0) _sp = getenv("SPU_SPEED") ? 1 : 0;
+          if (_sp) { QueryPerformanceCounter(&_t1); QueryPerformanceFrequency(&_fq);
+              extern uint64_t g_spu_interp_steps;
+              double sec = (double)(_t1.QuadPart - _t0.QuadPart) / (double)_fq.QuadPart;
+              static int _n = 0; if (_n++ < 20)
+                  fprintf(stderr, "[spu-speed] tid=0x%X %llu insns in %.3f s = %.1f M/s%c",
+                          t->tid, (unsigned long long)g_spu_interp_steps, sec,
+                          sec > 0 ? g_spu_interp_steps / sec / 1e6 : 0.0, 10); } }
         { extern uint32_t g_spu_interp_last_pc; extern uint64_t g_spu_interp_steps;
           fprintf(stderr, "[SPU-FRAME] tid=0x%X done (stop=0x%X, %llu insns, last pc=0x%05X)\n",
                   t->tid, frc, (unsigned long long)g_spu_interp_steps, g_spu_interp_last_pc); }

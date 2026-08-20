@@ -263,6 +263,7 @@ static int spu_step(spu_context* ctx) {
     /* rotate / shift extras */
     case SPU_rothm:    DST = spu_rothm(A,B); break;
     case SPU_rotqmbi:  DST = spu_rotqmbi(A,B); break;
+    case SPU_rotqmbii: DST = spu_rotqmbii(A,(int)I); break;
     case SPU_rotqbybi: DST = spu_rotqbybi(A,B); break;
     case SPU_rotqmbybi:DST = spu_rotqmbybi(A,B); break;
     case SPU_shlqbybi: DST = spu_shlqbybi(A,B); break;
