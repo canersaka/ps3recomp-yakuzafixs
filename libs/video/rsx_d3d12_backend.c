@@ -3777,6 +3777,19 @@ static void render_frame(void)
                        * that fills this surface ran but landed elsewhere, the
                        * data is nearby; if the whole window is zero it was never
                        * produced. */
+                      /* Same offset through BOTH context DMAs: a texture the
+                       * guest put in main memory but that we resolve as LOCAL
+                       * reads as untouched VRAM, i.e. all zeros. */
+                      { extern u32 cellGcmResolveLocated(int, u32);
+                        u32 la = cellGcmResolveLocated(1, dr->tex[_u].raw);
+                        u32 ma = cellGcmResolveLocated(0, dr->tex[_u].raw);
+                        u32 ln = 0, mn = 0;
+                        for (u32 i4 = 0; i4 < 0x20000u; i4 += 997) {
+                            if (vm_base[la + i4]) ln++;
+                            if (vm_base[ma + i4]) mn++;
+                        }
+                        fprintf(stderr, "[TEXLOC] raw=0x%08X LOCAL@0x%08X nz=%u  MAIN@0x%08X nz=%u%c",
+                                dr->tex[_u].raw, la, ln, ma, mn, 10); }
                       { u32 base = dr->tex[_u].off & ~0xFFFFFu;
                         for (u32 w = 0; w < 0x400000u; w += 0x100000u) {
                             u32 nzc = 0;
@@ -5082,7 +5095,24 @@ static void vp_attrs_dbg(const rsx_state* state)
           else if (f[2] < -0.9f && f[0] > -0.1f && f[0] < 0.1f) nbad++;
       }
       fprintf(stderr, "[VPDUMP] a%d over %d verts: %u zero, %u near (0,0,-1)%c",
-              ai, cnt, nzero, nbad, 10); }
+              ai, cnt, nzero, nbad, 10);
+      /* How many entries differ from the first? An all-identical position array
+       * is a degenerate mesh: it rasterizes nothing, which looks the same as
+       * "the draw never happened". */
+      { float f0[3]; u32 o0 = (a->offset & 0x7FFFFFFFu);
+        const u8* q0 = vm_base + ((a->offset & 0x80000000u)
+                       ? cellGcmResolveLocated(0, o0) : cellGcmResolveLocated(1, o0));
+        for (int k = 0; k < 3; k++) f0[k] = rd_bef(q0 + k * 4);
+        u32 diff = 0;
+        for (int v = 1; v < cnt; v++) {
+            u32 ao = o0 + (u32)v * a->stride;
+            const u8* q = vm_base + ((a->offset & 0x80000000u)
+                          ? cellGcmResolveLocated(0, ao) : cellGcmResolveLocated(1, ao));
+            for (int k = 0; k < 3; k++)
+                if (rd_bef(q + k * 4) != f0[k]) { diff++; break; }
+        }
+        fprintf(stderr, "[VPDUMP] a%d: %u/%d entries differ from entry 0 (%g,%g,%g)%c",
+                ai, diff, cnt, f0[0], f0[1], f0[2], 10); } }
 }
 
 static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
