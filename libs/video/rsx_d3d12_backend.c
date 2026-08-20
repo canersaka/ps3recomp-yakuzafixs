@@ -76,6 +76,11 @@ typedef struct {
     u32 fp_addr;        /* SET_SHADER_PROGRAM value (guest FP ucode location)   */
     int fp_exp32;       /* SET_SHADER_CONTROL 32-bit-exports bit at draw time   */
     u32 alpha_ctl;      /* alpha test: enable<<16 | (func&0xFF)<<8 | ref */
+    u32 cull;           /* packed face culling: bit0 enable, bit1 cull FRONT
+                         * (else BACK), bit2 front face is CCW. RSX culls back
+                         * faces on most solid geometry; rendering everything
+                         * double-sided lets a shell's interior faces show
+                         * through and shade unlit (black). */
     u32 cmask;          /* D3D write mask from SET_COLOR_MASK at draw time
                          * (wave's sim passes write single lanes of the height
                          * maps; ignoring the mask stomped persistent state) */
@@ -197,6 +202,7 @@ typedef struct {
                              * amplitude) -- address-only keying served the
                              * stale compile forever. */
     u32 cmask;              /* colour write mask (PSO key) */
+    u32 cull;               /* packed face culling (PSO key) */
     u32 cube_mask;          /* which units are cube textures (PSO key): the HLSL
                              * declares those samplers as TextureCube, so a cube
                              * and a 2D variant of the same program are different
@@ -305,6 +311,11 @@ typedef struct {
 
     /* Render-to-texture: offscreen RT pool + their RTV heap. */
     OffRT                 off_rt[MAX_OFF_RTS];
+    /* DRAW_ARRAYS batch merging (see d3d12_draw_arrays): the vertex index one
+     * past the last batch, and whether the current BEGIN/END may still be
+     * extended. */
+    u32                   merge_first_end;
+    int                   merge_prev_draw;
     ID3D12DescriptorHeap* rt_rtv_heap;          /* MAX_OFF_RTS RTVs (CPU only)   */
 
     /* Frame-parity double buffering for the per-draw upload streams (vp_vb
@@ -1730,6 +1741,20 @@ static u8 gl_blend_op_d3d(u32 e)
     default:     return D3D12_BLEND_OP_ADD;   /* 0x8006 FUNC_ADD / unset */
     }
 }
+/* Pack the guest's face-culling state for the PSO key.
+ * bit0 = cull enabled, bit1 = cull FRONT (else BACK), bit2 = front face is CCW.
+ * RSX/GL enums: CULL_FACE FRONT=0x0404 BACK=0x0405 FRONT_AND_BACK=0x0408;
+ * FRONT_FACE CW=0x0900 CCW=0x0901. rsx_commands seeds cull_face/front_face with
+ * plain 1/0 before any register arrives, so treat those defaults as BACK/CW. */
+static u32 rsx_cull_key(const rsx_state* st)
+{
+    if (!st || !st->cull_face_enable) return 0;
+    u32 k = 1u;
+    if (st->cull_face == 0x0404u || st->cull_face == 0x0408u) k |= 2u;  /* FRONT */
+    if (st->front_face == 0x0901u) k |= 4u;                             /* CCW */
+    return k;
+}
+
 static u32 rsx_blend_key(const rsx_state* st, int enable)
 {
     { static int _bd = -1; if (_bd < 0) _bd = getenv("BLENDDBG") ? 1 : 0;
@@ -1801,7 +1826,7 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
 }
 
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
-                                          DXGI_FORMAT rtfmt, int exp32, u32 cmask,
+                                          DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
                                           u32 cube_mask)
 {
     if (nrt < 1) nrt = 1; if (nrt > 4) nrt = 4;
@@ -1851,6 +1876,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].blend == blend && s_d3d.vp_fp[i].nrt == nrt &&
             s_d3d.vp_fp[i].rtfmt == (u32)rtfmt && s_d3d.vp_fp[i].exp32 == exp32 &&
             s_d3d.vp_fp[i].ucode_hash == uhash && s_d3d.vp_fp[i].cmask == cmask &&
+            s_d3d.vp_fp[i].cull == cull &&
             s_d3d.vp_fp[i].cube_mask == cube_mask)
             return s_d3d.vp_fp[i].pso;
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
@@ -2005,7 +2031,12 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         if (rp) {
             char* semi = strchr(rp, ';');
             if (semi) {
+                /* Mix properly: every fp address in a title tends to share low
+                 * bits (they all end 0x01/0x81 here), so a single multiply left
+                 * one channel constant across all programs and made distinct
+                 * shaders look like the same colour. */
                 u32 hsh = fp_addr * 2654435761u;
+                hsh ^= hsh >> 13; hsh *= 0x5BD1E995u; hsh ^= hsh >> 15;
                 /* Force the top bit on in each channel: a hash that happens to
                  * land near black is indistinguishable from "this surface was
                  * never painted", which is the exact question the mode exists
@@ -2085,7 +2116,19 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     pd.PS.BytecodeLength  = pb->lpVtbl->GetBufferSize(pb);
     pd.InputLayout.pInputElementDescs = il; pd.InputLayout.NumElements = 16;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    /* Guest face culling. CULL_OFF=1 forces double-sided, the old
+     * unconditional behaviour -- geometry that vanishes under culling is a
+     * winding/front-face problem, not a missing draw. */
+    { static int _co = -1; if (_co < 0) _co = getenv("CULL_OFF") ? 1 : 0;
+      pd.RasterizerState.CullMode = (!_co && (cull & 1u))
+          ? ((cull & 2u) ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK)
+          : D3D12_CULL_MODE_NONE;
+      /* CULL_FLIP=1: invert the front-face convention. Our VP path may hand
+       * D3D the opposite winding from the guest's, in which case honouring
+       * CULL_FACE culls exactly the faces it should keep. */
+      static int _cfl = -1; if (_cfl < 0) _cfl = getenv("CULL_FLIP") ? 1 : 0;
+      pd.RasterizerState.FrontCounterClockwise =
+          (((cull & 4u) ? 1 : 0) ^ _cfl) ? TRUE : FALSE; }
     /* Blend per the guest's packed key (see rsx_blend_key): dbgfont text needs
      * straight alpha; demosaic's effect passes blend OFF; DeferredShading's
      * light accumulation is additive ONE,ONE. */
@@ -2160,6 +2203,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     s_d3d.vp_fp[s_d3d.vp_fp_n].exp32   = exp32;
     s_d3d.vp_fp[s_d3d.vp_fp_n].ucode_hash = uhash;
     s_d3d.vp_fp[s_d3d.vp_fp_n].cmask   = cmask;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].cull    = cull;
     s_d3d.vp_fp[s_d3d.vp_fp_n].cube_mask = cube_mask;
     s_d3d.vp_fp[s_d3d.vp_fp_n].pso     = pso;
     s_d3d.vp_fp_n++;
@@ -3812,7 +3856,7 @@ static void render_frame(void)
                                        dr_num_rts(dr),
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                       dr->fp_exp32, dr->cmask, dr_cube_mask(dr));
+                                       dr->fp_exp32, dr->cmask, dr->cull, dr_cube_mask(dr));
         if (perf_on()) s_perf_pso += perf_now() - _ps0;
     }
 
@@ -4071,7 +4115,7 @@ static void render_frame(void)
                                                 dr_num_rts(dr),
                                                 dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                            : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                                dr->fp_exp32, dr->cmask,
+                                                dr->fp_exp32, dr->cmask, dr->cull,
                                                 dr_cube_mask(dr)) : NULL;
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
@@ -4950,13 +4994,55 @@ void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n)
 static void vp_attrs_dbg(const rsx_state* state)
 {
     if (!getenv("VP_ATTRS")) return;
-    static int _a = 0; if (_a++ >= 6) return;
+    /* VP_ATTRS_FP=<hex shader_program>: dump only the draws that use one
+     * fragment program. Without it the first six draws are whatever the frame
+     * happens to start with, which is never the mesh being investigated. */
+    { static const char* e = (const char*)1; static u32 want = 0;
+      if (e == (const char*)1) { e = getenv("VP_ATTRS_FP");
+          want = e ? (u32)strtoul(e, NULL, 0) : 0; }
+      if (want && (!state || state->shader_program != want)) return; }
+    /* Dedupe by the set of enabled attributes rather than printing the first
+     * few draws: one fragment program can be used by meshes with different
+     * vertex layouts, and a mesh missing an attribute takes the constant
+     * register instead -- which is exactly the case worth seeing. */
+    { u32 mask = 0;
+      for (int i = 0; i < 16; i++) if (state->vertex_attribs[i].enabled) mask |= 1u << i;
+      static u32 seen[16]; static int ns = 0;
+      for (int i = 0; i < ns; i++) if (seen[i] == mask) return;
+      if (ns >= 16) return;
+      seen[ns++] = mask; }
+    fprintf(stderr, "[VPATTR] --- fp=0x%X ---%c", state->shader_program, 10);
     fprintf(stderr, "[VPATTR] divider_op=0x%08X\n", state->frequency_divider_op);
     for (int i = 0; i < 16; i++) {
         const rsx_vertex_attrib* a = &state->vertex_attribs[i];
         if (a->enabled) fprintf(stderr, "[VPATTR] a%d off=0x%X stride=%u size=%u type=%u freq=%u fmt=0x%08X\n",
                                 i, a->offset, a->stride, a->size, a->type, a->frequency, a->format);
     }
+    /* VP_ATTRS_DUMP=<attr>:<n>: read n entries of that attribute straight out of
+     * guest memory. Answers "did the guest write these values, or did our fetch
+     * mangle them" without inferring it from the rendered image. */
+    { const char* e = getenv("VP_ATTRS_DUMP"); if (!e) return;
+      int ai = 0, cnt = 8; sscanf(e, "%d:%d", &ai, &cnt);
+      const rsx_vertex_attrib* a = &state->vertex_attribs[ai];
+      if (!a->enabled || !a->stride) return;
+      extern uint8_t* vm_base;
+      extern u32 cellGcmResolveLocated(int, u32);
+      u32 nbad = 0, nzero = 0;
+      for (int v = 0; v < cnt; v++) {
+          u32 aoff = (a->offset & 0x7FFFFFFFu) + (u32)v * a->stride;
+          const u8* q = vm_base + ((a->offset & 0x80000000u)
+                        ? cellGcmResolveLocated(0, aoff) : cellGcmResolveLocated(1, aoff));
+          u32 nc = a->size ? a->size : 3; if (nc > 3) nc = 3;
+          float f[3] = {0,0,0};
+          for (u32 k = 0; k < nc; k++) f[k] = rd_bef(q + k * 4);
+          if (v < 12)
+              fprintf(stderr, "[VPDUMP] a%d[%d] = (%g, %g, %g)%c", ai, v, f[0], f[1], f[2], 10);
+          int allz = 1; for (u32 k = 0; k < nc; k++) if (f[k] != 0.f) allz = 0;
+          if (allz) nzero++;
+          else if (f[2] < -0.9f && f[0] > -0.1f && f[0] < 0.1f) nbad++;
+      }
+      fprintf(stderr, "[VPDUMP] a%d over %d verts: %u zero, %u near (0,0,-1)%c",
+              ai, cnt, nzero, nbad, 10); }
 }
 
 static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
@@ -5007,6 +5093,14 @@ static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
       for (u32 k = 0; k < count; k++)
           read_vp_vertex(state, first + k, &out[k*16]);
       if (perf_on()) { s_perf_vtx += perf_now() - _tv; s_perf_nverts += count; } }
+    /* IDXDBG=<hex shader_program>: vertex range for that program's draws. */
+    { static const char* ie = (const char*)1; static u32 iw = 0;
+      if (ie == (const char*)1) { ie = getenv("IDXDBG");
+          iw = ie ? (u32)strtoul(ie, NULL, 16) : 0; }
+      if (iw && state->shader_program == iw) { static int _n = 0; if (_n++ < 12)
+          fprintf(stderr, "[IDXDBG] tris first=%u count=%u a0off=0x%X stride=%u%c",
+                  first, count, state->vertex_attribs[0].offset,
+                  state->vertex_attribs[0].stride, 10); } }
     /* DUCK_VTX=<hex tex0 offset>: dump attribute-0 positions for the draws that
      * bind that texture. The duck's texture resolves and its 9960 draws all
      * target the backbuffer, yet none of its texels reach the screen -- so the
@@ -5145,6 +5239,19 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
       for (u32 k = 0; k < count; k++)
           read_vp_vertex(state, read_guest_index(state, first + k), &out[k*16]);
       if (perf_on()) { s_perf_vtx += perf_now() - _tv; s_perf_nverts += count; } }
+    /* IDXDBG=<hex shader_program>: index range for that program's draws. An
+     * index past the vertex array reads unmapped guest memory as zero, which
+     * shows up as a spike triangle with a zero texcoord, not as a missing draw. */
+    { static const char* ie = (const char*)1; static u32 iw = 0;
+      if (ie == (const char*)1) { ie = getenv("IDXDBG");
+          iw = ie ? (u32)strtoul(ie, NULL, 16) : 0; }
+      if (iw && state->shader_program == iw) { static int _n = 0; if (_n++ < 12) {
+          u32 lo = 0xFFFFFFFFu, hi = 0;
+          for (u32 k = 0; k < count; k++) { u32 ix = read_guest_index(state, first + k);
+              if (ix < lo) lo = ix; if (ix > hi) hi = ix; }
+          fprintf(stderr, "[IDXDBG] first=%u count=%u idx=[%u..%u] dma=0x%X a0off=0x%X stride=%u%c",
+                  first, count, lo, hi, state->index_array_dma,
+                  state->vertex_attribs[0].offset, state->vertex_attribs[0].stride, 10); } } }
     /* DBG_LOCK tracking: projected centroid of this mesh, updated every draw. */
     { static const char* dl = (const char*)1; static u32 wantl = 0; static int mvpb = 256;
       if (dl == (const char*)1) { dl = getenv("DUCK_VTX");
@@ -5391,6 +5498,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
                 dr->fp_exp32 = s_d3d.current_rsx_state ?
                     ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
+                dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
                 dr->cmask = 0xF;
                 if (s_d3d.current_rsx_state) {
                     u32 _cm = s_d3d.current_rsx_state->color_mask;
@@ -5476,6 +5584,28 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         u32 emitted = (primitive == 5)
             ? upload_tris_vp(s_d3d.current_rsx_state, first, count)
             : upload_strip_vp(s_d3d.current_rsx_state, first, count, primitive == 7);
+        /* RSX splits one primitive stream across several DRAW_ARRAYS entries
+         * inside a single BEGIN/END (each carries at most 256 vertices), and the
+         * hardware concatenates them before assembling primitives. Recording a
+         * draw per batch instead regroups the triangles: this title's tub mesh
+         * arrives as 128 then 256,256,..., neither a multiple of 3, so every
+         * batch after the first was assembled one vertex out of phase -- which
+         * rendered as spike triangles with a zero texcoord along the tub rim.
+         * The batches land contiguously in the vertex buffer, so extending the
+         * previous record is all that is needed to restore the stream. */
+        if (emitted && s_d3d.merge_prev_draw && s_d3d.draw_count > 0 &&
+            s_d3d.merge_first_end == first) {
+            D3D12DrawRecord* pv = &s_d3d.draws[s_d3d.draw_count - 1];
+            u32 fpnow = s_d3d.current_rsx_state
+                        ? s_d3d.current_rsx_state->shader_program : 0;
+            if (pv->is_vp && pv->topology == D3D_TOPOLOGY_TRIANGLELIST &&
+                pv->fp_addr == fpnow && primitive == 5 &&
+                pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec) {
+                pv->vertex_count += emitted;
+                s_d3d.merge_first_end = first + count;
+                return;
+            }
+        }
         if (emitted && s_d3d.draw_count < MAX_DRAWS) {
             D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
             dr->vb_byte_offset = rec;
@@ -5486,6 +5616,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
             dr->fp_exp32 = s_d3d.current_rsx_state ?
                 ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
+            dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
             dr->cmask = 0xF;
             if (s_d3d.current_rsx_state) {
                 u32 _cm = s_d3d.current_rsx_state->color_mask;
@@ -5527,9 +5658,13 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->cb_slot = s_d3d.draw_count;
                 vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
             s_d3d.draw_count++;
+            /* Anchor for merging the next DRAW_ARRAYS batch of this stream. */
+            s_d3d.merge_prev_draw  = (primitive == 5);
+            s_d3d.merge_first_end  = first + count;
         }
         return;
     }
+    s_d3d.merge_prev_draw = 0;   /* any other primitive breaks the stream */
 
     u32 topo = rsx_to_d3d12_topology(primitive);
     if (topo == D3D_TOPOLOGY_UNDEFINED) {
@@ -5598,6 +5733,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
         dr->fp_exp32 = s_d3d.current_rsx_state ?
             ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
+        dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
         dr->cmask = 0xF;
         if (s_d3d.current_rsx_state) {
             u32 _cm = s_d3d.current_rsx_state->color_mask;
