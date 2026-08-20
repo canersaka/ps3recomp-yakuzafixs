@@ -1732,6 +1732,13 @@ static u8 gl_blend_op_d3d(u32 e)
 }
 static u32 rsx_blend_key(const rsx_state* st, int enable)
 {
+    { static int _bd = -1; if (_bd < 0) _bd = getenv("BLENDDBG") ? 1 : 0;
+      if (_bd) { static u32 seen[32]; static int ns=0;
+        u32 sk = (enable?0x80000000u:0u) | (st ? (st->blend_sfactor & 0xFFFFu) : 0u);
+        int f=0; for (int k2=0;k2<ns;k2++) if (seen[k2]==sk) f=1;
+        if (!f && ns<32) { seen[ns++]=sk;
+            fprintf(stderr, "[BLEND] enable=%d sfactor=0x%X dfactor=0x%X%c", enable,
+                    st?st->blend_sfactor:0, st?st->blend_dfactor:0, 10); } } }
     if (!enable) return 0;
     /* Factors never programmed: keep the legacy straight-alpha behaviour
      * (dbgfont-style text enables blending without setting factors). */
@@ -2166,22 +2173,26 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
  * Our uploaded resource holds guest R,G,B,A at comps 0,1,2,3. */
 static u32 rsx_remap_to_d3d(u32 c1, u32 basef)
 {
-    /* Crossbar field order LSB->MSB is B,G,R,A; source codes index the
-     * format's PHYSICAL sampled lanes (identity words differ per format:
-     * LBP uses 0xAA1B on A8R8G8B8 but 0xAAE4 on DXT). Measured lane orders:
-     *   A8R8G8B8: lanes A,R,G,B (memory byte order)  -> res comps {3,0,1,2}
-     *   DXT1/2/3: lanes B,G,R,A (decoded BGRA)       -> res comps {2,1,0,3}
-     *   G8B8:     presented vector {G,R,G,R} (RPCS3) -> res comps {1,0,1,0}
+    /* Crossbar field order LSB->MSB is A,R,G,B -- the order the header
+     * describes, and the one that makes RSX's documented identity word 0xAAE4
+     * actually decode to an identity mapping. The body used to run the fields
+     * backwards (B,G,R,A), which made 0xAAE4 a channel rotation and 0xAA1B the
+     * "identity"; lanes_dxt was then bent to {2,1,0,3} to cancel the reversal
+     * on DXT, so DXT looked right while every A8R8G8B8 texture sampled a
+     * permuted vector. Rubber Ducky sets 0xAAE4 on its lightmaps and 0xAA93 on
+     * its bump maps: the wall's normal map came back as (R,A,A), which is what
+     * drove the green channel to an extreme and gave the scene its magenta and
+     * green casts.
+     *
+     * Source codes index the presented vector {A,R,G,B}; our uploaded resource
+     * holds guest R,G,B,A at comps 0,1,2,3, and BC decodes to RGBA the same
+     * way, so both use {3,0,1,2}.
      * Ops byte (same field order): 0 = force ZERO, 1 = force ONE, 2 = remap. */
     static const u8 lanes_argb[4] = {3, 0, 1, 2};
-    static const u8 lanes_dxt[4]  = {2, 1, 0, 3};
     static const u8 lanes_g8b8[4] = {1, 0, 1, 0};
-    const u8* src2res = (basef == 0x8B) ? lanes_g8b8
-                      : (basef >= 0x86 && basef <= 0x88) ? lanes_dxt
-                      : lanes_argb;
-    if (!(c1 & 0xFFFF))                            /* unset -> identity */
-        c1 = (basef >= 0x86 && basef <= 0x88) ? 0xAAE4 : 0xAA1B;
-    u32 out[4];                                    /* outputs in field order B,G,R,A */
+    const u8* src2res = (basef == 0x8B) ? lanes_g8b8 : lanes_argb;
+    if (!(c1 & 0xFFFF)) c1 = 0xAAE4;               /* unset -> identity */
+    u32 out[4];                                    /* outputs in field order A,R,G,B */
     for (int i = 0; i < 4; i++) {
         u32 s = (c1 >> (i * 2)) & 3, op = (c1 >> (8 + i * 2)) & 3;
         out[i] = (op == 0) ? 4u : (op == 1) ? 5u : (u32)src2res[s];
@@ -2197,7 +2208,14 @@ static u32 rsx_remap_to_d3d(u32 c1, u32 basef)
       if (fixed == 2) return 1u | (2u<<3) | (3u<<6) | (0u<<9) | (1u<<12);
       if (fixed == 3) return 2u | (1u<<3) | (0u<<6) | (3u<<9) | (1u<<12); }
     /* D3D12 mapping: destR | destG<<3 | destB<<6 | destA<<9 | valid bit */
-    return out[2] | (out[1] << 3) | (out[0] << 6) | (out[3] << 9) | (1u << 12);
+    { static int _rd = -1; if (_rd < 0) _rd = getenv("REMAPDBG") ? 1 : 0;
+      if (_rd) { static u32 seen[32]; static int ns=0;
+        u32 k = (basef << 16) | (c1 & 0xFFFFu); int f=0;
+        for (int i2=0;i2<ns;i2++) if (seen[i2]==k) f=1;
+        if (!f && ns<32) { seen[ns++]=k;
+            fprintf(stderr, "[REMAP] basef=0x%02X c1=0x%04X -> destR=%u destG=%u destB=%u destA=%u%c",
+                    basef, c1 & 0xFFFFu, out[1], out[2], out[3], out[0], 10); } } }
+    return out[1] | (out[2] << 3) | (out[3] << 6) | (out[0] << 9) | (1u << 12);
 }
 
 /* Morton/Z-order texel offset for RSX swizzled textures (LN bit clear).
@@ -2486,9 +2504,14 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
          * every channel by one. Measured: duck.tga averages (243,191,23) and its
          * bound texture reads back (191,23,254) under the ARGB interpretation,
          * i.e. exactly one channel over, with the 255 alpha landing in blue.
-         * ponytail: env-gated rather than unconditional -- other titles' textures
-         * really are A,R,G,B, and the GCM format field alone cannot tell them
-         * apart. */
+         * SUPERSEDED: that measurement was the reversed TEXTURE_CONTROL1 crossbar
+         * (see rsx_remap_to_d3d), not the upload. PSGL asks for the rotation
+         * with a crossbar word of its own; with the crossbar decoded correctly
+         * this option applies it a SECOND time. Leave it off unless a title is
+         * shown to need it.
+         * ponytail: env-gated rather than unconditional -- other titles'
+         * textures really are A,R,G,B, and the GCM format field alone cannot
+         * tell them apart. */
         static int rgba = -1;
         if (rgba < 0) { const char* e = getenv("TEX_RGBA"); rgba = e ? atoi(e) : 0; }
         const u8* sbase = vm_base + off;
@@ -3007,8 +3030,8 @@ static u32 current_rt_off(u32* out_w, u32* out_h, u32 out_mrt[3])
         if (st->color_target >= 0x1F) out_mrt[2] = st->surface_color_offset[3];
     }
     if (getenv("RT_OFFDBG")) { static int _n=0; if (_n++ < 240)
-        fprintf(stderr, "[RTOFF] tgt=0x%X off[0]=0x%X off[1]=0x%X zeta=0x%X clip=%ux%u disp=%d -> 0x%X\n",
-                st->color_target, st->surface_color_offset[0], st->surface_color_offset[1],
+        fprintf(stderr, "[RTOFF] fmt=0x%X tgt=0x%X off[0]=0x%X off[1]=0x%X zeta=0x%X clip=%ux%u disp=%d -> 0x%X\n",
+                st->surface_format, st->color_target, st->surface_color_offset[0], st->surface_color_offset[1],
                 st->surface_zeta_offset, st->surface_clip_w, st->surface_clip_h,
                 cellGcmOffsetIsDisplay(raw), cellGcmOffsetIsDisplay(raw) ? 0 : raw); }
     if (cellGcmOffsetIsDisplay(raw)) return 0;
@@ -5372,6 +5395,12 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->is_clear = 0;
                 dr->blend = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->blend_enable : 1;
                 dr->blend_key = rsx_blend_key(s_d3d.current_rsx_state, dr->blend);
+                if (getenv("BLENDDBG")) { static u32 seen[32]; static int ns=0;
+                    u32 k = (dr->blend ? 0x80000000u : 0u) | dr->blend_key;
+                    int f=0; for (int i=0;i<ns;i++) if (seen[i]==k) f=1;
+                    if (!f && ns<32) { seen[ns++]=k;
+                        fprintf(stderr, "[BLEND] enable=%d key=0x%X%c",
+                                dr->blend, dr->blend_key, 10); } }
                 dr->rt_off = current_rt_off(&dr->rt_w, &dr->rt_h, dr->rt_mrt);
                 dr->rt_fmt = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->surface_format : 0;
                 if (s_d3d.current_rsx_state) {
@@ -5679,6 +5708,13 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         s_d3d.cur_texs[unit].ctrl1 = tex->control1;
         s_d3d.cur_texs[unit].cube  = (tex->format & 4) ? 1 : 0;
         s_d3d.cur_texs[unit].mips  = (tex->format >> 16) & 0xFFFFu;
+        if (getenv("TEXFMTDBG")) { static u32 seen[64]; static int ns=0;
+            u32 k = (unit<<24) | (((tex->format>>8) & 0xFFu)<<16) | (width & 0xFFFFu);
+            int f=0; for (int i=0;i<ns;i++) if (seen[i]==k) f=1;
+            if (!f && ns < 64) { seen[ns++]=k;
+                fprintf(stderr, "[TEXFMT] unit=%u fmt=0x%02X %ux%u mips=%u cube=%d off=0x%X%c",
+                        unit, (tex->format >> 8) & 0xFFu, width, height,
+                        (tex->format>>16)&0xFFFFu, (tex->format&4)?1:0, offset, 10); } }
         s_d3d.cur_texs[unit].set = 1;
     }
     if (base_fmt == 0x81 /* B8 */) {
