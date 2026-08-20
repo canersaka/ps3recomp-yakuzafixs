@@ -424,6 +424,12 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
         default: break;
         }
 
+        /* FP_CC_OFF=1: treat every predicated write as unconditional. Isolates
+         * "the condition register is wrong / its inputs are garbage" from "the
+         * gate itself is mis-decoded" -- both show up as unlit black geometry. */
+        { static int _cc = -1; if (_cc < 0) { const char* e = getenv("FP_CC_OFF");
+              _cc = e ? atoi(e) : 0; }
+          if (_cc && exec_cond != 0) exec_cond = 7; }
         const char* cmp = NULL;   /* NULL = unconditional */
         switch (exec_cond) {
         case 1: cmp = "< 0";  break;

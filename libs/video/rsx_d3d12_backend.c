@@ -2006,9 +2006,13 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             char* semi = strchr(rp, ';');
             if (semi) {
                 u32 hsh = fp_addr * 2654435761u;
-                float cr = (float)((hsh >> 16) & 0xFF) / 255.0f;
-                float cg = (float)((hsh >>  8) & 0xFF) / 255.0f;
-                float cb = (float)((hsh      ) & 0xFF) / 255.0f;
+                /* Force the top bit on in each channel: a hash that happens to
+                 * land near black is indistinguishable from "this surface was
+                 * never painted", which is the exact question the mode exists
+                 * to answer. */
+                float cr = (float)(((hsh >> 16) & 0x7F) | 0x80) / 255.0f;
+                float cg = (float)(((hsh >>  8) & 0x7F) | 0x80) / 255.0f;
+                float cb = (float)(((hsh      ) & 0x7F) | 0x80) / 255.0f;
                 char rep[128];
                 snprintf(rep, sizeof rep, "_po.c0 = float4(%.3f,%.3f,%.3f,1.0)", cr, cg, cb);
                 size_t newlen = strlen(rep), tail = strlen(semi) + 1;
@@ -3029,11 +3033,21 @@ static u32 current_rt_off(u32* out_w, u32* out_h, u32 out_mrt[3])
         if (st->color_target >= 0x17) out_mrt[1] = st->surface_color_offset[2];
         if (st->color_target >= 0x1F) out_mrt[2] = st->surface_color_offset[3];
     }
-    if (getenv("RT_OFFDBG")) { static int _n=0; if (_n++ < 240)
+    { static int _rs = -1; if (_rs < 0) _rs = getenv("RT_SEQDBG") ? 1 : 0;
+      static u32 _last = 0; static int _n2 = 0;
+      if (_rs && st->surface_color_offset[0] != _last && _n2 < 400000) {
+          _last = st->surface_color_offset[0]; _n2++;
+          fprintf(stderr, "[RTSEQ] #%d -> 0x%X%c", _n2, _last, 10); } }
+    { static int _ro = -1; if (_ro < 0) _ro = getenv("RT_OFFDBG") ? 1 : 0;
+      static u32 _seen[32]; static int _ns = 0;
+      if (_ro) { u32 _k = st->surface_color_offset[0] ^ (st->color_target << 24)
+                        ^ (st->surface_clip_w << 8) ^ st->surface_format;
+        int _f = 0; for (int _i = 0; _i < _ns; _i++) if (_seen[_i] == _k) _f = 1;
+        if (!_f && _ns < 32) { _seen[_ns++] = _k;
         fprintf(stderr, "[RTOFF] fmt=0x%X tgt=0x%X off[0]=0x%X off[1]=0x%X zeta=0x%X clip=%ux%u disp=%d -> 0x%X\n",
                 st->surface_format, st->color_target, st->surface_color_offset[0], st->surface_color_offset[1],
                 st->surface_zeta_offset, st->surface_clip_w, st->surface_clip_h,
-                cellGcmOffsetIsDisplay(raw), cellGcmOffsetIsDisplay(raw) ? 0 : raw); }
+                cellGcmOffsetIsDisplay(raw), cellGcmOffsetIsDisplay(raw) ? 0 : raw); } } }
     if (cellGcmOffsetIsDisplay(raw)) return 0;
     /* RT_DISPLAY_BY_SIZE=1: also treat a single-target surface whose clip
      * exactly matches the display resolution as the backbuffer.
@@ -4570,6 +4584,13 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
     cc[1] = ((color >> 8) & 0xFF) / 255.0f;  /* G */
     cc[2] = (color & 0xFF) / 255.0f;          /* B */
     cc[3] = ((color >> 24) & 0xFF) / 255.0f;  /* A */
+    /* CLEAR_RGB=r,g,b: override the guest clear colour. Black holes (geometry
+     * that never rasterized) and black pixels a shader really wrote look
+     * identical against a black clear; this separates them in one run. */
+    { static int _cinit = 0; static float _co[3]; static int _con = 0;
+      if (!_cinit) { _cinit = 1; const char* e = getenv("CLEAR_RGB");
+          if (e && sscanf(e, "%f,%f,%f", &_co[0], &_co[1], &_co[2]) == 3) _con = 1; }
+      if (_con) { cc[0] = _co[0]; cc[1] = _co[1]; cc[2] = _co[2]; } }
 
     u32 rt_w = 0, rt_h = 0, mrt[3] = {0, 0, 0};
     u32 rt = current_rt_off(&rt_w, &rt_h, mrt);
@@ -4898,6 +4919,11 @@ static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
             for (u32 k = 0; k < n; k++) o->v[k] = (float)p[k];
             break;
         default:
+            { static int _t = -1; if (_t < 0) _t = getenv("VTX_TYPEDBG") ? 1 : 0;
+              if (_t) { static u32 seen = 0;
+                  if (!(seen & (1u << (a->type & 31)))) { seen |= 1u << (a->type & 31);
+                      fprintf(stderr, "[VTXTYPE] UNHANDLED type=%u attr=%d size=%u stride=%u%c",
+                              a->type, i, a->size, a->stride, 10); } } }
             for (u32 k = 0; k < n; k++) o->v[k] = rd_bef(p + k * 4);
             break;
         }
