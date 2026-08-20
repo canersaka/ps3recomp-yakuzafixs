@@ -5241,7 +5241,18 @@ static void vp_attrs_dbg(const rsx_state* state)
                 if (rd_bef(q + k * 4) != f0[k]) { diff++; break; }
         }
         fprintf(stderr, "[VPDUMP] a%d: %u/%d entries differ from entry 0 (%g,%g,%g)%c",
-                ai, diff, cnt, f0[0], f0[1], f0[2], 10); } }
+                ai, diff, cnt, f0[0], f0[1], f0[2], 10);
+        /* Extent: an isosurface with little fluid is a speck, and a speck that
+         * rasterizes nothing is correct, not a bug. */
+        { float lo[3] = {1e30f,1e30f,1e30f}, hi[3] = {-1e30f,-1e30f,-1e30f};
+          for (int v = 0; v < cnt; v++) {
+              u32 ao = o0 + (u32)v * a->stride;
+              const u8* q = vm_base + ((a->offset & 0x80000000u)
+                            ? cellGcmResolveLocated(0, ao) : cellGcmResolveLocated(1, ao));
+              for (int k = 0; k < 3; k++) { float f = rd_bef(q + k * 4);
+                  if (f < lo[k]) lo[k] = f; if (f > hi[k]) hi[k] = f; } }
+          fprintf(stderr, "[VPDUMP] a%d extent x[%g..%g] y[%g..%g] z[%g..%g]%c",
+                  ai, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], 10); } } }
 }
 
 static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
