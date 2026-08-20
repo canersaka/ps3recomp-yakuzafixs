@@ -1713,12 +1713,25 @@ static int vp_get_vs(const rsx_state* st)
 {
     extern int rsx_vp_decompile(const uint8_t*, u32, char*, u32);
     if (!st || st->vp_ucode_bytes < 16) return -1;
-    u32 hash = vp_hash_ucode(st->vp_ucode, st->vp_ucode_bytes);
+    /* Start at the instruction SET_TRANSFORM_PROGRAM_START selects, not at 0.
+     * The microcode store holds every resident program -- this title keeps its
+     * scene, fluid, caustics and droplet programs in it at once -- so
+     * decompiling from 0 ran the scene's transform for every draw. That is why
+     * the fluid's 114300 vertices rasterized nothing: they were being pushed
+     * through the wrong program.
+     * VP_START_OFF=1 restores the old always-from-zero behaviour. */
+    u32 vstart = 0;
+    { static int off = -1; if (off < 0) off = getenv("VP_START_OFF") ? 1 : 0;
+      if (!off) vstart = st->transform_program_start * 16u; }
+    if (vstart >= st->vp_ucode_bytes) vstart = 0;
+    const u8* vuc = st->vp_ucode + vstart;
+    u32 vlen = st->vp_ucode_bytes - vstart;
+    u32 hash = vp_hash_ucode(vuc, vlen);
     for (int i = 0; i < s_d3d.vp_vs_n; i++)
         if (s_d3d.vp_vs[i].hash == hash) return i;
 
     static char hlsl[262144];
-    int ni = rsx_vp_decompile(st->vp_ucode, st->vp_ucode_bytes, hlsl, sizeof hlsl);
+    int ni = rsx_vp_decompile(vuc, vlen, hlsl, sizeof hlsl);
     if (ni <= 0) return -1;
     if (getenv("VP_DUMP")) { static int _d=0; if (_d++ < 4) {
         FILE* f = fopen("vp2_dump.hlsl", _d==1 ? "w" : "a");
@@ -4325,7 +4338,10 @@ static void render_frame(void)
                     fprintf(stderr, "[VPSUBMIT] draw[%u] verts=%u pso=%s vp=%ux%u tex0=0x%X(set=%d) tex1=0x%X slot=%d fp=0x%X%c",
                             d, dr->vertex_count, dpso ? "guest-fp" : "fallback",
                             dr->vp_w, dr->vp_h, dr->tex[0].raw, dr->tex[0].set,
-                            dr->tex[1].raw, dr->tex_slot, dr->fp_addr, 10); } }
+                            dr->tex[1].raw, dr->tex_slot, dr->fp_addr, 10);
+                    fprintf(stderr, "            vs_idx=%d cb_slot=%u vbofs=%u cull=%u blend=%d%c",
+                            dr->vs_idx, dr->cb_slot, dr->vb_byte_offset / 256,
+                            dr->cull, dr->blend, 10); } }
             }
             if (perf_on()) s_perf_gpu += perf_now() - _rec0;   /* reuse: record time */
             /* Leave the backbuffer bound for the dump/present epilogue. */

@@ -521,6 +521,13 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
 
+    if (method == NV4097_SET_TRANSFORM_PROGRAM_START) {
+        if (state->transform_program_start != data) state->vp_dirty = 1;
+        state->transform_program_start = data;
+        state->shader_dirty = 1;
+        return 0;
+    }
+
     /* NV4097_SET_TRANSFORM_PROGRAM[0..31] — a run of 32-bit vertex-program
      * microcode words appended at the current write cursor. Capture them so the
      * backend can decompile the real VP (4 words = one NV40 instruction). */

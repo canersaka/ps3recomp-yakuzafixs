@@ -109,6 +109,12 @@ extern "C" {
 #define CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS 0x00000040
 #define NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK    0x00001FF4
 #define NV4097_SET_TRANSFORM_PROGRAM_LOAD       0x00001E9C
+/* Which INSTRUCTION the vertex program starts executing at. Separate from
+ * _LOAD, which only says where following microcode words are written. A title
+ * that keeps several programs resident in the 512-instruction store selects
+ * between them with this, so ignoring it runs whichever program happens to sit
+ * at instruction 0 for every draw. */
+#define NV4097_SET_TRANSFORM_PROGRAM_START      0x00001EA0
 #define NV4097_SET_TRANSFORM_PROGRAM            0x00000B80
 #define NV4097_SET_TRANSFORM_CONSTANT_LOAD      0x00001EFC
 /* Vertex constants are written as up to 64 dwords (16 vec4s) per command,
@@ -284,7 +290,8 @@ typedef struct rsx_state {
     u32 shader_control;       /* SET_SHADER_CONTROL (0x40 = 32-bit colour exports) */
     u32 fragment_program_addr;
     u32 vertex_attrib_output_mask;
-    u32 transform_program_load; /* vertex program load slot index */
+    u32 transform_program_load;
+    u32 transform_program_start; /* vertex program load slot index */
     u32 transform_constant_load;
     int shader_dirty;
 
