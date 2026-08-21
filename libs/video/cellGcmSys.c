@@ -1853,7 +1853,14 @@ void* cellGcmGetNotifyDataAddress(u32 index)
 /* Timestamp location — returns CELL_GCM_LOCATION_LOCAL or MAIN */
 u32 cellGcmGetTimeStampLocation(u32 index, u32* location)
 {
-    if (location) *location = CELL_GCM_LOCATION_LOCAL;
+    /* `location` is a GUEST address (see cellGcmGetConfiguration): the HLE
+     * ABI adapter passes pointer parameters through as guest values, so
+     * dereferencing one writes to whatever host address shares that number
+     * -- an access violation. Tokyo Jungle calls this during display setup,
+     * which is how it turned up. */
+    uint32_t loc_ea = (uint32_t)(uintptr_t)location;
+    (void)index;
+    if (loc_ea) vm_write32(loc_ea, CELL_GCM_LOCATION_LOCAL);
     return 0;
 }
 
@@ -1919,11 +1926,12 @@ s32 cellGcmMapLocalMemory(u32* address, u32* size)
     if (!address || !size)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    *address = s_config.localAddress;
-    *size    = s_config.localSize;
+    /* Guest out-params, like every other pointer parameter in this file. */
+    vm_write32((uint32_t)(uintptr_t)address, s_config.localAddress);
+    vm_write32((uint32_t)(uintptr_t)size,    s_config.localSize);
 
     printf("[cellGcmSys] MapLocalMemory(address=0x%08X, size=0x%X)\n",
-           *address, *size);
+           s_config.localAddress, s_config.localSize);
     return CELL_OK;
 }
 
