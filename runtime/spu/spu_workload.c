@@ -684,6 +684,30 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
     if (!fn) {
         fprintf(stderr, "[spurs-job] dispatch MISS fp=0x%016llX size=%u job=0x%08X\n",
                 (unsigned long long)fp, image_size, job_ea);
+        /* SPU_DUMP_MISS=<dir>: write the unrecognised image out so it can be
+         * lifted and registered. SPURS job binaries are raw code+data blobs
+         * the title loads from its own data files -- unlike sys_spu_image
+         * programs they are NOT embedded ELFs in the EBOOT, so
+         * tools/extract_spu_images.py cannot find them and this is the only
+         * place the bytes exist. One file per fingerprint. */
+        { const char* _dir = getenv("SPU_DUMP_MISS");
+          if (_dir && *_dir) {
+              static uint64_t _seen[64]; static unsigned _nseen = 0;
+              unsigned _k = 0;
+              for (; _k < _nseen; _k++) if (_seen[_k] == fp) break;
+              if (_k == _nseen && _nseen < 64) {
+                  char _path[512];
+                  _seen[_nseen++] = fp;
+                  snprintf(_path, sizeof(_path), "%s/spujob_%016llX_%u.bin",
+                           _dir, (unsigned long long)fp, image_size);
+                  FILE* _f = fopen(_path, "wb");
+                  if (_f) {
+                      fwrite(image, 1, image_size, _f);
+                      fclose(_f);
+                      fprintf(stderr, "[spurs-job] dumped -> %s\n", _path);
+                  }
+              }
+          } }
         return 0;
     }
     fprintf(stderr, "[spurs-job] dispatch HIT fp=0x%016llX image=%d job=0x%08X\n",
