@@ -214,6 +214,19 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
               out_ls, size_out, s_ls, size_scr, stack_top, size_stk, n_cache,
               ctx_ls, desc_ls, dsz); }
 
+    /* SPURS_JOB_DESCDUMP=1: hexdump the guest job descriptor. The SPU derives
+     * its DMA and atomic EAs from these words, so when a job spins on a
+     * lock-line address that is not backed, this is what to read first. */
+    { static int _d = 0;
+      if (getenv("SPURS_JOB_DESCDUMP") && _d++ < 4) {
+          fprintf(stderr, "[spurs-job] desc @0x%08X (%u bytes):", job_ea, dsz);
+          for (uint32_t o = 0; o < dsz && o < 128; o += 4) {
+              if ((o & 31) == 0) fprintf(stderr, "\n    +%02X:", o);
+              fprintf(stderr, " %08X", g32(job_ea + o));
+          }
+          fprintf(stderr, "\n");
+      } }
+
     /* LBP job protocol probe (LBP_JOB_DUMP): the game's one shared job binary
      * ("JOBCRT Ver13" crt + main @0x1570) reads a be u64 EA out of the
      * descriptor's USER DATA at +0x30, GETs a 128-byte command block from it,
