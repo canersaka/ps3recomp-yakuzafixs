@@ -2002,9 +2002,20 @@ static DWORD WINAPI jc_thread(LPVOID p)
 #endif
 
 /* cellSpursRunJobChain -- start job chain execution (async, like the real one). */
-s32 cellSpursRunJobChain(u64 spurs_ea, u64 jc_ea)
+/* cellSpursRunJobChain(const CellSpursJobChain* jobChain) -- ONE argument.
+ *
+ * This was declared (spurs, jobChain), so the ABI adapter fed it r3=spurs,
+ * r4=<whatever>, and the chain it looked up was r4 -- never the handle
+ * CreateJobChainWithAttribute registered. Every run logged
+ * "UNKNOWN chain (no Create seen)" and returned CELL_OK without walking
+ * anything, so the title sat in event_queue_receive waiting for SPU work that
+ * was never started. Tokyo Jungle blocks its whole boot there.
+ *
+ * Verified against the guest: Create takes the chain in r4 (r3 is the CellSpurs)
+ * and passes 0x02932A80; Run then arrives with r3=0x02932A80. Join and Shutdown
+ * are the same one-argument shape. */
+s32 cellSpursRunJobChain(u64 jc_ea)
 {
-    (void)spurs_ea;
     static int s_off = -1;
     if (s_off < 0) s_off = getenv("PS3_NO_JOBCHAIN") ? 1 : 0;
 
@@ -2031,9 +2042,9 @@ s32 cellSpursRunJobChain(u64 spurs_ea, u64 jc_ea)
     return CELL_OK;
 }
 
-s32 cellSpursJoinJobChain(u64 spurs_ea, u64 jc_ea)
+/* cellSpursJoinJobChain(const CellSpursJobChain*) -- one argument, as above. */
+s32 cellSpursJoinJobChain(u64 jc_ea)
 {
-    (void)spurs_ea;
     static int _n = 0;
     if (_n++ < 8) printf("[cellSpurs] JoinJobChain(jc=0x%08X)\n", (u32)jc_ea);
     return CELL_OK;
