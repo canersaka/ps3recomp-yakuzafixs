@@ -354,6 +354,65 @@ class FunctionFinder:
         lo, hi = min(self.seeds), max(self.seeds)
         return lambda addr: lo <= addr <= hi
 
+    def find_call_target_functions(self) -> None:
+        """Promote `bl` targets that no other pass found.
+
+        A `bl` from inside a detected function is a CALL, and its target is by
+        definition a function entry -- a stronger signal than any prologue
+        heuristic. The branch-target pass deliberately skips `bl` (it hunts
+        basic blocks, and uses call targets only as a gate), so a function that
+        is reached solely by call and has no recognizable prologue was never
+        promoted at all.
+
+        PLT/import stubs are exactly that shape:
+
+            li r12,0 ; oris r12,r12,hi ; lwz r12,lo(r12)
+            std r2,40(r1) ; lwz r0,0(r12) ; lwz r2,4(r12) ; mtctr r0 ; bctr
+
+        No mflr, no stdu, not in .opd, never a `b` target. Tokyo Jungle has 318
+        of them behind 854 call sites; without this pass the lifter emits
+        `/* bl -> non-code 0x... */` for every one and the guest silently
+        skips every library call it makes.
+
+        Sources are filtered to covered addresses for the same reason the
+        branch-target pass does it: executable segments carry read-only data,
+        and data decoded as instructions yields phantom call targets.
+        """
+        covered = self._coverage_fn()
+
+        targets: set[int] = set()
+        for insn in self.instructions:
+            if not _is_bl(insn) or not covered(insn.addr):
+                continue
+            t = _bl_target(insn)
+            if t is not None and not covered(t) and t not in self.functions:
+                targets.add(t)
+
+        for target in sorted(targets):
+            end = self._basic_block_end(target)
+            if end > target:
+                self.functions[target] = Function(start=target, end=end)
+
+    def _basic_block_end(self, addr: int) -> int:
+        """End of the straight-line run starting at addr, stopping after the
+        first unconditional transfer (blr/bctr/b/rfid) or at the next known
+        function start. Used to size a call target no other pass bounded."""
+        idx = self._addr_to_idx.get(addr)
+        if idx is None:
+            return addr
+        starts = self.functions
+        limit = len(self.instructions)
+        i = idx
+        while i < limit:
+            insn = self.instructions[i]
+            if i > idx and insn.addr in starts:
+                return insn.addr
+            mn = insn.mnemonic
+            if mn in ("blr", "bctr", "b", "blrl", "rfid"):
+                return insn.addr + 4
+            i += 1
+        return self.instructions[limit - 1].addr + 4
+
     def find_branch_target_functions(self) -> None:
         """Third pass: find branch targets that fall outside known function boundaries.
 
@@ -630,6 +689,13 @@ class FunctionFinder:
         t = time.time()
         grown = self.extend_function_extents()
         _note(f"extent pass: {grown} functions grown over their basic blocks "
+              f"({time.time() - t:.1f}s)")
+
+        t = time.time()
+        before = len(self.functions)
+        self.find_call_target_functions()
+        _note(f"call-target pass: +{len(self.functions) - before} bl targets "
+              f"no other pass found -> {len(self.functions)} "
               f"({time.time() - t:.1f}s)")
 
         t = time.time()
