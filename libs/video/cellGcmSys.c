@@ -135,6 +135,16 @@ static int s_io_mapping_count = 0;
  * recompiled game, not host function pointers. Stored as uint32_t and
  * invoked through g_ps3_guest_caller (see ps3emu/guest_call.h). */
 static u32 s_flip_handler_opd     = 0;
+
+/* GCM_FLIPCB_ONTICK=1: fire the guest flip handler only when the flip
+ * completes (cellGcmTickFlip), not also when it is requested. */
+static int gcm_flipcb_on_tick_only(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("GCM_FLIPCB_ONTICK") ? 1 : 0;
+    return v;
+}
+
 static u32 s_vblank_handler_opd   = 0;
 static u32 s_user_handler_opd     = 0;
 static u32 s_second_v_handler_opd = 0;
@@ -1273,8 +1283,16 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
     s_flip_request_count++;
     s_last_flip_time = get_timestamp_ns();
 
-    /* Invoke via OPD resolution, not a raw call into guest code. */
-    if (s_flip_handler_opd && g_ps3_guest_caller)
+    /* Invoke via OPD resolution, not a raw call into guest code.
+     *
+     * On hardware this callback fires when the flip COMPLETES, at vsync --
+     * which is what cellGcmTickFlip does. Calling it again here, at request
+     * time, is a compatibility wart: some titles need the early edge, but a
+     * title that issues its first flip while still initialising then runs its
+     * handler against half-built state. Tokyo Jungle faults that way, in
+     * func_001F2D3C, dereferencing a singleton it has not constructed yet.
+     * GCM_FLIPCB_ONTICK=1 leaves the callback to the tick alone. */
+    if (s_flip_handler_opd && g_ps3_guest_caller && !gcm_flipcb_on_tick_only())
         g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);  /* head 0 = primary display */
 
     return CELL_OK;
@@ -1322,8 +1340,9 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 
     /* Invoke the guest flip handler via OPD resolution -- s_flip_handler holds
      * the raw guest OPD (e.g. 0x530D70); calling it as a host function pointer
-     * jumps into guest code and crashes. */
-    if (s_flip_handler_opd && g_ps3_guest_caller)
+     * jumps into guest code and crashes. See cellGcmSetFlipCommand for why
+     * GCM_FLIPCB_ONTICK exists. */
+    if (s_flip_handler_opd && g_ps3_guest_caller && !gcm_flipcb_on_tick_only())
         g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);
 
     return CELL_OK;
