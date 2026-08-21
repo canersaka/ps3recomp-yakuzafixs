@@ -477,8 +477,22 @@ s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPat
     if (!init_ea)
         return CELL_GAME_ERROR_PARAM;
 
+    /* Create the directory the title ASKED for, not s_title_id.
+     *
+     * The install handshake is: cellGameDataCheck(type=GAMEDATA, dirName) ->
+     * CELL_GAME_RET_NONE ("no data yet") -> the title calls
+     * cellGameCreateGameData -> it checks again and expects to find it. This
+     * created <content>/s_title_id instead, and s_title_id is the placeholder
+     * "BLES00000" unless a PARAM.SFO set it -- so DataCheck kept looking for
+     * <content>/NPUA80523, never found it, and Tokyo Jungle's installer span
+     * DataCheck/CreateGameData forever.
+     *
+     * s_check_dir is the dirName from the check session that immediately
+     * precedes this call, which is exactly what firmware creates. */
+    const char* create_dir = s_check_dir[0] ? s_check_dir : s_title_id;
+
     char path[CELL_GAME_PATH_MAX];
-    snprintf(path, sizeof(path), "%s/%s", s_content_path, s_title_id);
+    snprintf(path, sizeof(path), "%s/%s", s_content_path, create_dir);
 
     ensure_dirs(path);
 

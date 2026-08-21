@@ -513,29 +513,33 @@ s32 cellFsFstat(CellFsFd fd, CellFsStat* sb)
     if (!sb)
         return CELL_EFAULT;
 
+    /* `sb` is a guest address; work through the host alias. */
+    CellFsStat* sbh = (CellFsStat*)gptr(sb);
+    if (!sbh) return CELL_EFAULT;
+
     if (s_files[fd].host_fp) {
 #ifdef _WIN32
         int file_no = _fileno(s_files[fd].host_fp);
         HOST_STAT_T hst;
         if (HOST_FSTAT(file_no, &hst) == 0) {
-            fill_cellfs_stat(sb, &hst);
+            fill_cellfs_stat(sbh, &hst);
             return CELL_OK;
         }
 #else
         int file_no = fileno(s_files[fd].host_fp);
         HOST_STAT_T hst;
         if (HOST_FSTAT(file_no, &hst) == 0) {
-            fill_cellfs_stat(sb, &hst);
+            fill_cellfs_stat(sbh, &hst);
             return CELL_OK;
         }
 #endif
     }
 
     /* Fallback */
-    memset(sb, 0, sizeof(CellFsStat));
-    sb->st_mode = CELL_FS_S_IFREG | CELL_FS_S_IRUSR | CELL_FS_S_IWUSR;
-    sb->st_blksize = 4096;
-    cellfs_stat_to_be(sb);
+    memset(sbh, 0, sizeof(CellFsStat));
+    sbh->st_mode = CELL_FS_S_IFREG | CELL_FS_S_IRUSR | CELL_FS_S_IWUSR;
+    sbh->st_blksize = 4096;
+    cellfs_stat_to_be(sbh);
     return CELL_OK;
 }
 
@@ -557,7 +561,16 @@ s32 cellFsStat(const char* path, CellFsStat* sb)
         return (s32)CELL_ENOENT;
     }
 
-    fill_cellfs_stat(sb, &hst);
+    /* Fill a host-local struct, then copy into guest memory: `sb` is a guest
+     * address, so fill_cellfs_stat writing through it directly faults. */
+    {
+        CellFsStat tmp;
+        memset(&tmp, 0, sizeof(tmp));
+        fill_cellfs_stat(&tmp, &hst);
+        CellFsStat* dst = (CellFsStat*)gptr(sb);
+        if (!dst) return CELL_EFAULT;
+        memcpy(dst, &tmp, sizeof(tmp));
+    }
     return CELL_OK;
 }
 
