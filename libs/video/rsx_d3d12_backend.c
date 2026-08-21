@@ -2401,6 +2401,22 @@ static inline u32 rsx_swz_off(u32 x, u32 y, u32 log2w, u32 log2h)
 }
 static inline u32 rsx_log2u(u32 v) { u32 l = 0; while ((1u << l) < v) l++; return l; }
 
+/* Sparse FNV-1a over a texture's source bytes -- enough to notice an animated
+ * surface changing, cheap enough to run on every bind. Kept a function rather
+ * than a statement-expression macro so the file still compiles under MSVC;
+ * ps3recomp builds with clang-cl, but titles like Tokyo Jungle drive the build
+ * through the Visual Studio generator. */
+static u32 tex_csum(const u8* base, u32 nbytes)
+{
+    u32 h = 2166136261u;
+    u32 step = nbytes > 4096u ? nbytes / 1024u : 4u;
+    for (u32 i = 0; i + 3 < nbytes; i += step) {
+        u32 w32; memcpy(&w32, base + i, sizeof w32);
+        h ^= w32; h *= 16777619u;
+    }
+    return h;
+}
+
 static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips)
 {
     extern uint8_t* vm_base;
@@ -2432,7 +2448,9 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     const u32 key_off = off;         /* lookup key: the offset as bound */
     /* Sparse checksum of a texture's source bytes -- enough to notice an
      * animated surface changing, cheap enough to run on every bind. */
-    #define TEX_CSUM(base, nbytes) ({                                                u32 _h = 2166136261u; u32 _n = (nbytes);                                     u32 _step = _n > 4096u ? _n / 1024u : 4u;                                    for (u32 _i = 0; _i + 3 < _n; _i += _step) {                                     _h ^= *(const u32*)((base) + _i); _h *= 16777619u; }                     _h; })
+    /* (portable helper tex_csum() -- see above; a statement-expression macro
+     * here was a GCC/Clang extension MSVC rejects.) */
+    #define TEX_CSUM(base, nbytes) tex_csum((base), (nbytes))
     int slot = -1, freeslot = -1;
     for (int i = 0; i < VP_TEX_SLOTS; i++) {
         VPTexSlot* c = &s_d3d.vp_tex[i];
