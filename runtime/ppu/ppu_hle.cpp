@@ -52,6 +52,19 @@ extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn 
     if (g_ctx_count < HLE_CTX_CAP) { g_ctx[g_ctx_count].nid = nid; g_ctx[g_ctx_count].fn = fn; g_ctx_count++; }
 }
 
+/* Is this NID implemented here? Lets a host boot harness that owns its own
+ * import table decide, per import, whether to dispatch into these libraries or
+ * fall back to its own stub -- without calling ps3_hle_call and getting an
+ * "unresolved NID" error it cannot distinguish from a real failure. */
+extern "C" int ps3_hle_has(uint32_t nid)
+{
+    for (uint32_t i = 0; i < g_ctx_count; i++)
+        if (g_ctx[i].nid == nid) return 1;
+    if (!g_hle_inited) return 0;
+    ps3_nid_entry* e = ps3_nid_table_find(&g_hle_nids, nid);
+    return (e && e->handler) ? 1 : 0;
+}
+
 /* Generic PPC integer/pointer ABI adapter. */
 typedef uint64_t (*hle_generic)(uint64_t, uint64_t, uint64_t, uint64_t,
                                 uint64_t, uint64_t, uint64_t, uint64_t);
