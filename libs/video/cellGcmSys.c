@@ -593,7 +593,23 @@ void ppu_gcm_pump(void)
 /* Back-compat: the old direct entry points now just mark a tick pending (so any
  * caller other than the ticker still works) -- delivery stays on the main thread. */
 void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
-void cellGcmTickFlip(void)   { GCM_PENDING_SET(2); }
+/* Only deliver a flip completion when a flip is actually outstanding.
+ *
+ * Ticking unconditionally at 60 Hz fires the guest's flip handler even when
+ * the guest never asked for a flip. A title whose handler touches the flip
+ * status then livelocks: Tokyo Jungle's main loop is
+ *
+ *     do { usleep(100); } while (cellGcmGetFlipStatus() != DONE);
+ *     cellGcmResetFlipStatus();
+ *
+ * and its handler runs code that puts the status back to WAITING, so the
+ * poll never saw DONE and the game never rendered another frame. On hardware
+ * the callback IS the flip interrupt -- no flip, no callback. */
+void cellGcmTickFlip(void)
+{
+    if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING)
+        GCM_PENDING_SET(2);
+}
 
 /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread
  * (boot_main vblank_ticker). Not yet active: s_control.put stays 0 because

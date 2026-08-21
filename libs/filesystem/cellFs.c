@@ -150,6 +150,32 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
 }
 
 /* Public wrapper for translate_path, usable by other modules (e.g. codec libs). */
+/* Pointer parameters that come from the guest are GUEST addresses: the HLE ABI
+ * adapter passes them straight through. Dereferencing one as a host char*
+ * faults on whatever host address happens to share the number. cellFsOpen and
+ * friends did exactly that -- it went unnoticed because titles that reach the
+ * filesystem through the sys_fs SYSCALLS (which do translate) never exercise
+ * these entry points. Tokyo Jungle's installer calls cellFsOpendir directly.
+ *
+ * cellfs_translate_path below stays a host-string API: other modules call it
+ * with paths they built themselves. */
+extern uint8_t* vm_base;
+
+/* Same story for non-string pointer parameters: out-params and structs the
+ * guest hands us are guest addresses. Translate once, then use the host alias.
+ * The existing ps3_bswap calls stay correct -- only the pointer was wrong. */
+static void* gptr(const void* guest)
+{
+    uint32_t ea = (uint32_t)(uintptr_t)guest;
+    return (ea && vm_base) ? (void*)(vm_base + ea) : (void*)0;
+}
+
+static const char* gpath(const char* guest)
+{
+    uint32_t ea = (uint32_t)(uintptr_t)guest;
+    return (ea && vm_base) ? (const char*)(vm_base + ea) : (const char*)0;
+}
+
 int cellfs_translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
 {
     return translate_path(ps3_path, host_buf, buf_size);
@@ -342,13 +368,13 @@ static void ensure_parent_dirs(const char* path)
 /* NID: 0x718BF5F8 */
 s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 size)
 {
-    printf("[cellFs] Open(path='%s', flags=0x%X)\n", path ? path : "<null>", flags);
+    printf("[cellFs] Open(path='%s', flags=0x%X)\n", gpath(path) ? gpath(path) : "<null>", flags);
 
     if (!path || !fd)
         return CELL_EFAULT;
 
     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
-    if (translate_path(path, host_path, sizeof(host_path)) != 0) {
+    if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0) {
         printf("[cellFs] Open: no path mapping for '%s'\n", path);
         return (s32)CELL_ENOENT;
     }
@@ -384,7 +410,7 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
     s_files[slot].flags   = flags;
     s_files[slot].host_fp = fp;
 
-    *fd = (CellFsFd)ps3_bswap32((u32)slot);   /* guest reads the fd big-endian */
+    *(CellFsFd*)gptr(fd) = (CellFsFd)ps3_bswap32((u32)slot);   /* guest reads the fd big-endian */
     printf("[cellFs] Open: fd=%d -> '%s'\n", slot, host_path);
     return CELL_OK;
 }
@@ -422,7 +448,7 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
     }
 
     if (nread)
-        *nread = ps3_bswap64(bytes_read);
+        *(u64*)gptr(nread) = ps3_bswap64(bytes_read);
 
     return CELL_OK;
 }
@@ -444,7 +470,7 @@ s32 cellFsWrite(CellFsFd fd, const void* buf, u64 nbytes, u64* nwrite)
     }
 
     if (nwrite)
-        *nwrite = ps3_bswap64(bytes_written);
+        *(u64*)gptr(nwrite) = ps3_bswap64(bytes_written);
 
     return CELL_OK;
 }
@@ -468,10 +494,10 @@ s32 cellFsLseek(CellFsFd fd, s64 offset, s32 whence, u64* pos)
         s64 cur = (s64)ftello(s_files[fd].host_fp);
 #endif
         if (pos)
-            *pos = ps3_bswap64((u64)cur);
+            *(u64*)gptr(pos) = ps3_bswap64((u64)cur);
     } else {
         if (pos)
-            *pos = 0;
+            *(u64*)gptr(pos) = 0;
     }
 
     return CELL_OK;
@@ -516,13 +542,13 @@ s32 cellFsFstat(CellFsFd fd, CellFsStat* sb)
 /* NID: 0x2CB51F0D */
 s32 cellFsStat(const char* path, CellFsStat* sb)
 {
-    printf("[cellFs] Stat(path='%s')\n", path ? path : "<null>");
+    printf("[cellFs] Stat(path='%s')\n", gpath(path) ? gpath(path) : "<null>");
 
     if (!path || !sb)
         return CELL_EFAULT;
 
     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
-    if (translate_path(path, host_path, sizeof(host_path)) != 0)
+    if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0)
         return (s32)CELL_ENOENT;
 
     HOST_STAT_T hst;
@@ -538,14 +564,14 @@ s32 cellFsStat(const char* path, CellFsStat* sb)
 /* NID: 0x6D3BB15B */
 s32 cellFsTruncate(const char* path, u64 size)
 {
-    printf("[cellFs] Truncate(path='%s', size=%llu)\n", path ? path : "<null>",
+    printf("[cellFs] Truncate(path='%s', size=%llu)\n", gpath(path) ? gpath(path) : "<null>",
            (unsigned long long)size);
 
     if (!path)
         return CELL_EFAULT;
 
     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
-    if (translate_path(path, host_path, sizeof(host_path)) != 0)
+    if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0)
         return (s32)CELL_ENOENT;
 
 #ifdef _WIN32
@@ -592,7 +618,7 @@ s32 cellFsFtruncate(CellFsFd fd, u64 size)
 /* NID: 0xC1C507E7 */
 s32 cellFsGetBlockSize(const char* path, u64* sector_size, u64* block_size)
 {
-    printf("[cellFs] GetBlockSize(path='%s')\n", path ? path : "<null>");
+    printf("[cellFs] GetBlockSize(path='%s')\n", gpath(path) ? gpath(path) : "<null>");
 
     if (!path)
         return CELL_EFAULT;
@@ -606,7 +632,7 @@ s32 cellFsGetBlockSize(const char* path, u64* sector_size, u64* block_size)
 /* NID: 0x2C2C5F71 */
 s32 cellFsGetFreeSize(const char* path, u32* block_size, u64* free_block_count)
 {
-    printf("[cellFs] GetFreeSize(path='%s')\n", path ? path : "<null>");
+    printf("[cellFs] GetFreeSize(path='%s')\n", gpath(path) ? gpath(path) : "<null>");
 
     if (!path)
         return CELL_EFAULT;
@@ -619,7 +645,7 @@ s32 cellFsGetFreeSize(const char* path, u32* block_size, u64* free_block_count)
 #ifdef _WIN32
     {
         char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
-        if (translate_path(path, host_path, sizeof(host_path)) == 0) {
+        if (translate_path(gpath(path), host_path, sizeof(host_path)) == 0) {
             ULARGE_INTEGER free_bytes;
             if (GetDiskFreeSpaceExA(host_path, &free_bytes, NULL, NULL)) {
                 free_blocks = (u64)(free_bytes.QuadPart / 4096);
@@ -636,7 +662,7 @@ s32 cellFsGetFreeSize(const char* path, u32* block_size, u64* free_block_count)
 /* NID: 0x3F61245C */
 s32 cellFsChmod(const char* path, s32 mode)
 {
-    printf("[cellFs] Chmod(path='%s', mode=0%o)\n", path ? path : "<null>", mode);
+    printf("[cellFs] Chmod(path='%s', mode=0%o)\n", gpath(path) ? gpath(path) : "<null>", mode);
 
     if (!path)
         return CELL_EFAULT;
@@ -652,13 +678,13 @@ s32 cellFsChmod(const char* path, s32 mode)
 /* NID: 0x5C74903D */
 s32 cellFsOpendir(const char* path, CellFsDir* fd)
 {
-    printf("[cellFs] Opendir(path='%s')\n", path ? path : "<null>");
+    printf("[cellFs] Opendir(path='%s')\n", gpath(path) ? gpath(path) : "<null>");
 
     if (!path || !fd)
         return CELL_EFAULT;
 
     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
-    if (translate_path(path, host_path, sizeof(host_path)) != 0)
+    if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0)
         return (s32)CELL_ENOENT;
 
     CellFsDir slot = alloc_dir();
@@ -690,7 +716,7 @@ s32 cellFsOpendir(const char* path, CellFsDir* fd)
     }
 #endif
 
-    *fd = (CellFsDir)ps3_bswap32((u32)slot);   /* guest reads the dir fd big-endian */
+    *(CellFsDir*)gptr(fd) = (CellFsDir)ps3_bswap32((u32)slot);   /* guest reads the dir fd big-endian */
     printf("[cellFs] Opendir: dir_fd=%d -> '%s'\n", slot, host_path);
     return CELL_OK;
 }
@@ -704,50 +730,54 @@ s32 cellFsReaddir(CellFsDir fd, CellFsDirent* entry, u64* nread)
     if (!entry || !nread)
         return CELL_EFAULT;
 
+    /* Guest struct pointer: write the fields through the host alias. */
+    CellFsDirent* ent = (CellFsDirent*)gptr(entry);
+    if (!ent) return CELL_EFAULT;
+
 #ifdef _WIN32
     if (s_dirs[fd].done) {
-        *nread = 0;
+        *(u64*)gptr(nread) = 0;
         return CELL_OK;
     }
 
     if (!s_dirs[fd].first_read) {
         if (!FindNextFileA(s_dirs[fd].find_handle, &s_dirs[fd].find_data)) {
             s_dirs[fd].done = 1;
-            *nread = 0;
+            *(u64*)gptr(nread) = 0;
             return CELL_OK;
         }
     }
     s_dirs[fd].first_read = 0;
 
-    memset(entry, 0, sizeof(*entry));
-    entry->d_type = (s_dirs[fd].find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+    memset(ent, 0, sizeof(*ent));
+    ent->d_type = (s_dirs[fd].find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
         ? CELL_FS_TYPE_DIRECTORY : CELL_FS_TYPE_REGULAR;
-    strncpy(entry->d_name, s_dirs[fd].find_data.cFileName,
+    strncpy(ent->d_name, s_dirs[fd].find_data.cFileName,
             CELL_FS_MAX_FS_FILE_NAME_LENGTH - 1);
-    entry->d_name[CELL_FS_MAX_FS_FILE_NAME_LENGTH - 1] = '\0';
-    entry->d_namlen = (u8)strlen(entry->d_name);
+    ent->d_name[CELL_FS_MAX_FS_FILE_NAME_LENGTH - 1] = '\0';
+    ent->d_namlen = (u8)strlen(ent->d_name);
 
-    *nread = ps3_bswap64(sizeof(*entry));
+    *(u64*)gptr(nread) = ps3_bswap64(sizeof(CellFsDirent));
 #else
     struct dirent* de = readdir(s_dirs[fd].host_dir);
     if (!de) {
-        *nread = 0;
+        *(u64*)gptr(nread) = 0;
         return CELL_OK;
     }
 
-    memset(entry, 0, sizeof(*entry));
+    memset(ent, 0, sizeof(*ent));
     char full_path[CELL_FS_MAX_FS_PATH_LENGTH];
     snprintf(full_path, sizeof(full_path), "%s/%s", s_dirs[fd].host_path, de->d_name);
     HOST_STAT_T hst;
     if (HOST_STAT(full_path, &hst) == 0 && (hst.st_mode & S_IFDIR))
-        entry->d_type = CELL_FS_TYPE_DIRECTORY;
+        ent->d_type = CELL_FS_TYPE_DIRECTORY;
     else
-        entry->d_type = CELL_FS_TYPE_REGULAR;
-    strncpy(entry->d_name, de->d_name, CELL_FS_MAX_FS_FILE_NAME_LENGTH - 1);
-    entry->d_name[CELL_FS_MAX_FS_FILE_NAME_LENGTH - 1] = '\0';
-    entry->d_namlen = (u8)strlen(entry->d_name);
+        ent->d_type = CELL_FS_TYPE_REGULAR;
+    strncpy(ent->d_name, de->d_name, CELL_FS_MAX_FS_FILE_NAME_LENGTH - 1);
+    ent->d_name[CELL_FS_MAX_FS_FILE_NAME_LENGTH - 1] = '\0';
+    ent->d_namlen = (u8)strlen(ent->d_name);
 
-    *nread = ps3_bswap64(sizeof(*entry));
+    *(u64*)gptr(nread) = ps3_bswap64(sizeof(CellFsDirent));
 #endif
 
     return CELL_OK;
@@ -780,13 +810,13 @@ s32 cellFsClosedir(CellFsDir fd)
 /* NID: 0x7C1B2FCC */
 s32 cellFsMkdir(const char* path, s32 mode)
 {
-    printf("[cellFs] Mkdir(path='%s', mode=0%o)\n", path ? path : "<null>", mode);
+    printf("[cellFs] Mkdir(path='%s', mode=0%o)\n", gpath(path) ? gpath(path) : "<null>", mode);
 
     if (!path)
         return CELL_EFAULT;
 
     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
-    if (translate_path(path, host_path, sizeof(host_path)) != 0)
+    if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0)
         return (s32)CELL_ENOENT;
 
     ensure_parent_dirs(host_path);
@@ -807,7 +837,7 @@ s32 cellFsMkdir(const char* path, s32 mode)
 s32 cellFsRename(const char* from, const char* to)
 {
     printf("[cellFs] Rename(from='%s', to='%s')\n",
-           from ? from : "<null>", to ? to : "<null>");
+           gpath(from) ? gpath(from) : "<null>", gpath(to) ? gpath(to) : "<null>");
 
     if (!from || !to)
         return CELL_EFAULT;
@@ -815,9 +845,9 @@ s32 cellFsRename(const char* from, const char* to)
     char host_from[CELL_FS_MAX_FS_PATH_LENGTH];
     char host_to[CELL_FS_MAX_FS_PATH_LENGTH];
 
-    if (translate_path(from, host_from, sizeof(host_from)) != 0)
+    if (translate_path(gpath(from), host_from, sizeof(host_from)) != 0)
         return (s32)CELL_ENOENT;
-    if (translate_path(to, host_to, sizeof(host_to)) != 0)
+    if (translate_path(gpath(to), host_to, sizeof(host_to)) != 0)
         return (s32)CELL_ENOENT;
 
     ensure_parent_dirs(host_to);
@@ -834,13 +864,13 @@ s32 cellFsRename(const char* from, const char* to)
 /* NID: 0x196CE171 */
 s32 cellFsUnlink(const char* path)
 {
-    printf("[cellFs] Unlink(path='%s')\n", path ? path : "<null>");
+    printf("[cellFs] Unlink(path='%s')\n", gpath(path) ? gpath(path) : "<null>");
 
     if (!path)
         return CELL_EFAULT;
 
     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
-    if (translate_path(path, host_path, sizeof(host_path)) != 0)
+    if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0)
         return (s32)CELL_ENOENT;
 
     if (remove(host_path) != 0) {

@@ -1624,6 +1624,21 @@ static void ppu_thread_entry_trampoline(ppu_context* ctx)
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(ctx); }
 }
 
+/* Install that trampoline without going through ppu_run().
+ *
+ * ppu_run() sets it as a side effect of dispatching the guest entry point. A
+ * host harness that dispatches the entry itself (Tokyo Jungle calls the lifted
+ * _start directly) never runs that line, so g_ppu_thread_entry_trampoline
+ * stays NULL -- and then every sys_ppu_thread_create'd thread spawns, finds no
+ * trampoline, logs "[THREAD n] g_ppu_thread_entry_trampoline is NULL -- thread
+ * is a no-op" and exits without executing a single guest instruction. The
+ * threads all report FINISHED, so nothing looks wrong; the title just never
+ * gets whatever those threads were supposed to do. */
+extern "C" void ppu_install_thread_trampoline(void)
+{
+    g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
+}
+
 /* Call a guest function by OPD with up to 4 integer args, on a private scratch
  * stack, and return r3. Used by the HLE runtime to deliver callbacks into
  * recompiled code (cellSysutil events, GCM vblank/flip handlers, ...) -- the

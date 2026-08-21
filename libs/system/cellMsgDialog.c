@@ -6,8 +6,34 @@
  */
 
 #include "cellMsgDialog.h"
+#include "ps3emu/guest_call.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+
+/* Pointer parameters here are GUEST addresses, and the dialog callback is a
+ * guest OPD -- the HLE ABI adapter passes both straight through as guest
+ * values. Printing msgString as a host char* faulted the moment Tokyo Jungle
+ * opened its data-install prompt, and calling s_callback as a host function
+ * pointer would jump into the middle of guest memory. */
+extern uint8_t* vm_base;
+
+static const char* guest_str(const void* p)
+{
+    uint32_t ea = (uint32_t)(uintptr_t)p;
+    return (ea && vm_base) ? (const char*)(vm_base + ea) : "<null>";
+}
+
+/* The callback is a guest OPD; dispatch it the way every other guest callback
+ * in the runtime is dispatched. */
+static void invoke_dialog_callback(CellMsgDialogCallback cb, int32_t result,
+                                   void* userdata)
+{
+    uint32_t opd = (uint32_t)(uintptr_t)cb;
+    if (!opd || !g_ps3_guest_caller) return;
+    g_ps3_guest_caller(opd, (uint64_t)(int64_t)result,
+                       (uint64_t)(uintptr_t)userdata, 0, 0, 0, 0, 0, 0);
+}
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -37,7 +63,7 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
                         void* extParam)
 {
     printf("[cellMsgDialog] Open2(type=0x%08X, msg='%s')\n",
-           type, msgString ? msgString : "<null>");
+           type, guest_str(msgString));
 
     if (s_dialog_open) {
         printf("[cellMsgDialog] WARNING: dialog already open, closing previous\n");
@@ -52,7 +78,7 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
     /* Print the message so developers can see it */
     if (msgString) {
         printf("========================================\n");
-        printf("[DIALOG] %s\n", msgString);
+        printf("[DIALOG] %s\n", guest_str(msgString));
         printf("========================================\n");
     }
 
@@ -78,7 +104,7 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
         /* Close and invoke callback */
         s_dialog_open = 0;
         if (s_callback) {
-            s_callback(result, s_userdata);
+            invoke_dialog_callback(s_callback, result, s_userdata);
         }
     } else {
         printf("[cellMsgDialog] Progress bar dialog opened (will close on explicit Close/Abort)\n");
@@ -98,7 +124,7 @@ s32 cellMsgDialogClose(float delayMs)
     s_dialog_open = 0;
 
     if (s_callback) {
-        s_callback(CELL_MSGDIALOG_BUTTON_NONE, s_userdata);
+        invoke_dialog_callback(s_callback, CELL_MSGDIALOG_BUTTON_NONE, s_userdata);
         s_callback = NULL;
     }
 
@@ -116,7 +142,7 @@ s32 cellMsgDialogAbort(void)
     s_dialog_open = 0;
 
     if (s_callback) {
-        s_callback(CELL_MSGDIALOG_BUTTON_ESCAPE, s_userdata);
+        invoke_dialog_callback(s_callback, CELL_MSGDIALOG_BUTTON_ESCAPE, s_userdata);
         s_callback = NULL;
     }
 
@@ -135,7 +161,7 @@ s32 cellMsgDialogProgressBarSetMsg(u32 progressBarIndex, const char* msgString)
         strncpy(s_progress[progressBarIndex].message, msgString,
                 sizeof(s_progress[progressBarIndex].message) - 1);
         s_progress[progressBarIndex].message[sizeof(s_progress[progressBarIndex].message) - 1] = '\0';
-        printf("[cellMsgDialog] ProgressBar[%u] msg='%s'\n", progressBarIndex, msgString);
+        printf("[cellMsgDialog] ProgressBar[%u] msg='%s'\n", progressBarIndex, guest_str(msgString));
     }
 
     return CELL_OK;

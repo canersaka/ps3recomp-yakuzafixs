@@ -8,6 +8,9 @@
 #include "sceNp.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+
+extern void vm_write32(uint64_t addr, uint32_t val);
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -206,7 +209,11 @@ s32 sceNpManagerGetStatus(s32* status)
         return SCE_NP_ERROR_NOT_INITIALIZED;
     if (!status)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
-    *status = SCE_NP_MANAGER_STATUS_OFFLINE;   /* -1, endian-safe */
+    /* `status` is a GUEST address -- the HLE ABI adapter passes pointer
+     * parameters straight through as guest values, so dereferencing one
+     * writes to whatever host address shares that number. Same trap as
+     * cellGcmSys had. Tokyo Jungle calls this during its online init. */
+    vm_write32((uint32_t)(uintptr_t)status, (uint32_t)SCE_NP_MANAGER_STATUS_OFFLINE);
     printf("[sceNp] ManagerGetStatus() -> OFFLINE\n");
     return CELL_OK;
 }
