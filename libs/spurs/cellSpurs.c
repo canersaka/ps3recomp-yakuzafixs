@@ -515,10 +515,30 @@ s32 cellSpursSetPriorities(CellSpurs* spurs, CellSpursWorkloadId wid,
     return CELL_OK;
 }
 
+/* The lv2 event queues the app attached to SPURS, and the port we handed back.
+ * A title may attach more than one (Tokyo Jungle attaches two), so keep them
+ * all -- storing a single id let the second attach hide the first. */
+#define MAX_SPURS_QUEUES 8
+static u32 s_spurs_event_queue[MAX_SPURS_QUEUES];
+static int s_spurs_event_queue_n = 0;
+#define SPURS_EVENT_PORT 0u
+extern int sys_event_queue_push_by_id(uint32_t queue_id, uint64_t source,
+                                      uint64_t data1, uint64_t data2, uint64_t data3);
+
 s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port,
                                  s32 isDynamic)
 {
-    (void)queue; (void)isDynamic;
+    (void)isDynamic;
+    /* KEEP the queue id. SPURS signals the application through the queue it
+     * attaches here, and this discarded it -- so nothing SPURS ever did could
+     * wake a thread sitting in sys_event_queue_receive on it. Tokyo Jungle
+     * kicks its job chain and then blocks on exactly that receive. */
+    if (queue && s_spurs_event_queue_n < MAX_SPURS_QUEUES) {
+        int dup = 0;
+        for (int i = 0; i < s_spurs_event_queue_n; i++)
+            if (s_spurs_event_queue[i] == queue) dup = 1;
+        if (!dup) s_spurs_event_queue[s_spurs_event_queue_n++] = queue;
+    }
 
     if (!spurs || !port) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     u8* port_h = GUEST_PTR(port, u8*);
@@ -2128,6 +2148,14 @@ static DWORD WINAPI jc_thread(LPVOID p)
     jc_execute(s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
                s_jobchains[slot].size_desc);
     s_jobchains[slot].running = 0;
+    /* Tell the application the chain is done. Without this the walk finishes
+     * in silence and a thread waiting on the attached queue never runs again. */
+    for (int i = 0; i < s_spurs_event_queue_n; i++) {
+        int rc = sys_event_queue_push_by_id(s_spurs_event_queue[i], SPURS_EVENT_PORT,
+                                            s_jobchains[slot].jc_ea, 0, 0);
+        printf("[cellSpurs] chain 0x%08X finished -> event queue %u (rc=%d)\n",
+               s_jobchains[slot].jc_ea, s_spurs_event_queue[i], rc);
+    }
     return 0;
 }
 #endif

@@ -19,6 +19,7 @@
  */
 
 #include "ppu_recomp.h"     /* ppu_context, func decls, ppu_recomp_register */
+#include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 #include <stdint.h>
 #include <stdio.h>
@@ -1409,6 +1410,14 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         if (!size) size = 0x100000u;
         uint32_t va = s_map_next;
         s_map_next = (s_map_next + size + 0xFFFFFu) & ~0xFFFFFu;
+        /* MAP the block, don't just name it. This handed back an address into
+         * MEM_RESERVE, so the page only ever came into existence if the PPU
+         * happened to touch it first (the boot harness commits on fault; a
+         * port with its own main() does not even do that). An SPU-written
+         * output buffer is the case that breaks: the SPU is the FIRST writer,
+         * its DMA guard sees an uncommitted EA and skips the transfer, and the
+         * job's results are silently dropped. */
+        vm_commit(va, size);
         if (outp) vm_write32(outp, va);
         ctx->gpr[3] = 0;
         return;

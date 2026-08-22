@@ -316,9 +316,42 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     if (!mfc_ea_range_committed(ea, size)) {
         static int s_warned = 0;
         if (s_warned++ < 32)
-            fprintf(stderr, "[spu-dma] SKIP %s lsa=0x%05X ea=0x%08X size=%u "
-                    "(EA not committed -- bad/garbage DMA target)\n",
-                    mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size);
+            fprintf(stderr, "[spu-dma] SKIP %s img=%d pc=0x%05X lsa=0x%05X ea=0x%08X "
+                    "size=%u%s (EA not committed -- bad/garbage DMA target)\n",
+                    mfc_is_get(cmd) ? "GET" : "PUT", spu->image_id,
+                    (uint32_t)spu->pc & SPU_LS_MASK, lsa, (uint32_t)ea, size,
+                    (size <= 8 && ((uint32_t)ea & (size - 1))) ? " MISALIGNED" : "");
+        /* SPU_DMA_SKIP_DUMP=1: show the LS payload a skipped PUT was carrying.
+         * A job that DMAs a small buffer to a garbage EA in a tight loop is
+         * usually an SPU-side assert/print path, and the payload names the
+         * actual complaint -- far more useful than the address it failed at. */
+        { static int s_d = -1; if (s_d < 0) s_d = getenv("SPU_DMA_SKIP_DUMP") ? 1 : 0;
+          if (s_d && s_warned <= 2) {
+            const uint8_t* q = spu->ls + (lsa & SPU_LS_MASK);
+            fprintf(stderr, "  LS[0x%05X] ascii: ", lsa);
+            for (uint32_t i = 0; i < 128; i++)
+                fputc((q[i] >= 32 && q[i] < 127) ? q[i] : 46, stderr);
+            fputc(10, stderr); fflush(stderr); } }
+        /* A job that re-issues the SAME impossible transfer forever is wedged,
+         * not slow: nothing about its state can change, because the DMA is the
+         * only thing it is doing. Tokyo Jungle hit this a million times in 45 s
+         * on one EA, pinning a core and leaving the PPU thread that kicked the
+         * job waiting for a completion that could never arrive. Stop the SPU
+         * instead, so the failure is a reported halt at a known pc rather than
+         * a silent hang. */
+        { static uint32_t s_last_ea, s_last_lsa, s_rep;
+          if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
+              if (++s_rep >= 4096) {
+                  s_rep = 0;   /* re-arm: the chain may run this job again */
+                  extern void spu_halt(spu_context*);
+                  fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: 4096 identical "
+                          "failed DMAs to ea=0x%08X -- halting the SPU\n",
+                          spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK,
+                          (uint32_t)ea);
+                  fflush(stderr);
+                  spu_halt(spu);
+              }
+          } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; } }
         return -1;
     }
 

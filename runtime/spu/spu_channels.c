@@ -240,6 +240,15 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
+    /* Classify FIRST. Every MFC_Cmd write lands here, and only the switch at
+     * the bottom used to filter -- so the uncommitted-EA guard below reported
+     * ORDINARY DMA as `[spu-atomic]`. A plain put (0x20) to a garbage EA read
+     * as an atomic spin, which is a genuinely misleading place to start
+     * debugging from. Non-atomic commands belong to the DMA engine. */
+    if (cmd != MFC_GETLLAR_CMD && cmd != MFC_PUTLLC_CMD &&
+        cmd != MFC_PUTLLUC_CMD && cmd != MFC_PUTQLLUC_CMD)
+        return 0;
+
     uint32_t ea  = ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1);
     uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK;
     uint8_t* ls  = &ctx->ls[lsa];
