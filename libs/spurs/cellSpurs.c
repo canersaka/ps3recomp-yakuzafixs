@@ -1945,6 +1945,132 @@ static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
 
 /* Walk one chain's command stream. Bounded: a malformed or self-looping stream
  * must not spin a host thread forever. */
+/* ---------------------------------------------------------------------------
+ * Job guards
+ *
+ * A job chain can begin with a GUARD command (op 7, ext 7|(1<<3)), whose EA is
+ * the CellSpursJobGuard. The chain BLOCKS there until the guard's notify count
+ * reaches zero; the PPU releases it with cellSpursJobGuardNotify once the job's
+ * parameters are ready. With autoReset the count is restored afterwards, so a
+ * looping chain waits again on the next pass.
+ *
+ * These were unimplemented, and the walker fell through the GUARD command into
+ * the default (ignore) case. Tokyo Jungle's "soc-job" chain is
+ *
+ *     [0] GUARD 0x02932C00      [1] JOB 0x02932D00
+ *     [2] SYNC                  [3] NEXT -> [0]        (a loop)
+ *
+ * so the job ran immediately, on the first pass, against a parameter block the
+ * game had not filled in yet -- 0x02937580 read back as all zeroes -- and the
+ * SPU went on to compute a wild DMA address from it. Honouring the guard is
+ * what makes "run this job when I say so" mean anything.
+ * -----------------------------------------------------------------------*/
+
+#define MAX_JOBGUARDS 32
+static struct {
+    u32 ea;          /* guest CellSpursJobGuard address (128-byte aligned) */
+    u32 count;       /* notifications still outstanding                    */
+    u32 reset;       /* value to restore when autoReset is set             */
+    u32 auto_reset;
+    int active;
+} s_jobguards[MAX_JOBGUARDS];
+
+static int jg_find(u32 ea)
+{
+    for (int i = 0; i < MAX_JOBGUARDS; i++)
+        if (s_jobguards[i].active && s_jobguards[i].ea == ea) return i;
+    return -1;
+}
+
+/* cellSpursJobGuardInitialize(CellSpursJobChain* jobChain,
+ *                             CellSpursJobGuard* jobGuard,
+ *                             u32 notifyCount, u8 requestSpuCount, u8 autoReset)
+ * Argument order confirmed against the guest: r3 is the chain (0x02932A80,
+ * the handle CreateJobChainWithAttribute registered) and r4 is the guard
+ * (0x02932C00, the EA the chain's GUARD command carries). */
+s32 cellSpursJobGuardInitialize(u64 jc_ea, u64 guard_ea, u32 notify_count,
+                                u32 request_spu_count, u32 auto_reset)
+{
+    (void)jc_ea; (void)request_spu_count;
+    u32 ea = (u32)guard_ea;
+    if (!ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+
+    int i = jg_find(ea);
+    if (i < 0)
+        for (i = 0; i < MAX_JOBGUARDS; i++) if (!s_jobguards[i].active) break;
+    if (i >= MAX_JOBGUARDS) return CELL_SPURS_TASK_ERROR_AGAIN;
+
+    s_jobguards[i].ea         = ea;
+    s_jobguards[i].count      = notify_count;
+    s_jobguards[i].reset      = notify_count;
+    s_jobguards[i].auto_reset = auto_reset;
+    s_jobguards[i].active     = 1;
+
+    /* Mirror the count into guest memory. The SPU side reads the guard on
+     * hardware; keeping the two consistent costs nothing and makes a guest-side
+     * peek meaningful. */
+    vm_write32(ea, notify_count);
+
+    printf("[cellSpurs] JobGuardInitialize(guard=0x%08X chain=0x%08X notify=%u "
+           "autoReset=%u)\n", ea, (u32)jc_ea, notify_count, auto_reset);
+    return CELL_OK;
+}
+
+/* cellSpursJobGuardNotify(CellSpursJobGuard* jobGuard) -- one argument. */
+s32 cellSpursJobGuardNotify(u64 guard_ea)
+{
+    u32 ea = (u32)guard_ea;
+    int i = jg_find(ea);
+    if (i < 0) {
+        printf("[cellSpurs] JobGuardNotify(0x%08X) -- unknown guard\n", ea);
+        return CELL_SPURS_TASK_ERROR_INVAL;
+    }
+    if (s_jobguards[i].count) s_jobguards[i].count--;
+    vm_write32(ea, s_jobguards[i].count);
+    { static int _n = 0;
+      if (_n++ < 8)
+          printf("[cellSpurs] JobGuardNotify(0x%08X) -> %u remaining\n",
+                 ea, s_jobguards[i].count); }
+    return CELL_OK;
+}
+
+/* cellSpursJobGuardReset(CellSpursJobGuard*) -- restore the initial count. */
+s32 cellSpursJobGuardReset(u64 guard_ea)
+{
+    u32 ea = (u32)guard_ea;
+    int i = jg_find(ea);
+    if (i < 0) return CELL_SPURS_TASK_ERROR_INVAL;
+    s_jobguards[i].count = s_jobguards[i].reset;
+    vm_write32(ea, s_jobguards[i].count);
+    return CELL_OK;
+}
+
+/* Wait for a guard to be released. Returns 1 if it opened, 0 on timeout (the
+ * chain then gives up this pass rather than spinning the walker thread
+ * forever). An unknown guard opens immediately -- a chain guarded by something
+ * we never saw initialised must not deadlock the walker. */
+static int jg_wait(u32 ea)
+{
+    int i = jg_find(ea);
+    if (i < 0) return 1;
+    for (int spin = 0; spin < 20000; spin++) {     /* ~20 s at 1 ms */
+        if (s_jobguards[i].count == 0) {
+            if (s_jobguards[i].auto_reset) {
+                s_jobguards[i].count = s_jobguards[i].reset;
+                vm_write32(ea, s_jobguards[i].count);
+            }
+            return 1;
+        }
+#ifdef _WIN32
+        Sleep(1);
+#else
+        usleep(1000);
+#endif
+    }
+    printf("[cellSpurs] guard 0x%08X still closed after 20 s -- chain gives up\n", ea);
+    return 0;
+}
+
 static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
 {
     u32 pc = entry_ea, ret_pc = 0;
@@ -1975,8 +2101,13 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
                 return;
             }
         }
+        if (op == 7 && ext == (7 | (1 << 3))) {           /* GUARD */
+            u32 g_ea = (u32)(cmd & ~127ull);
+            if (!jg_wait(g_ea)) return;                  /* still closed */
+            pc += 8; continue;
+        }
         /* NOP(0) / SYNC+LWSYNC(2, one virtual SPU: nothing to wait for) /
-         * FLUSH(5) / JOBLIST(6, nested arrays TODO) / GUARD / SET_LABEL */
+         * FLUSH(5) / JOBLIST(6, nested arrays TODO) / SET_LABEL */
         pc += 8;
     }
     printf("[cellSpurs] chain 0x%08X: hit the 4096-step bound after %d job(s) -- malformed?\n",

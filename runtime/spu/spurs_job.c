@@ -225,6 +225,20 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
               fprintf(stderr, " %08X", g32(job_ea + o));
           }
           fprintf(stderr, "\n");
+          /* SPURS_JOB_DESCDUMP=2: follow plausible guest EAs in the job user
+           * data (past JH_SIZE) and dump what they point at. The job reads its
+           * parameters from there, so a wild DMA/atomic address usually
+           * originates in one of these blocks. */
+          if (atoi(getenv("SPURS_JOB_DESCDUMP")) >= 2) {
+              for (uint32_t o = JH_SIZE; o < dsz && o < 128; o += 4) {
+                  uint32_t v = g32(job_ea + o);
+                  if (v < 0x10000u || v >= 0xD0000000u) continue;
+                  fprintf(stderr, "[spurs-job]   user+0x%02X -> 0x%08X:", o, v);
+                  for (uint32_t q = 0; q < 8; q++)
+                      fprintf(stderr, " %08X", g32(v + q * 4));
+                  fprintf(stderr, "\n");
+              }
+          }
       } }
 
     /* LBP job protocol probe (LBP_JOB_DUMP): the game's one shared job binary

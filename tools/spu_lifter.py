@@ -847,7 +847,8 @@ class SPULifter:
             tgt = self._branch_target(insn)
             cond = self._cond(mn, _reg(ops[0]))
             if tgt is None:
-                return f"/* TODO spu: {mn} {insn.operands} */;"
+                return (f'/* TODO spu: {mn} {insn.operands} */ '
+                        f'spu_unsupported(0x{insn.addr:X}, "{mn}");')
             if func.start_addr <= tgt < func.end_addr:
                 return f"if ({cond}) goto loc_{tgt:08X};"
             self.branch_targets.add(tgt)
@@ -932,7 +933,8 @@ class SPULifter:
 
         # ---- fallthrough: unsupported ----
         self.unsupported[mn] = self.unsupported.get(mn, 0) + 1
-        return f"/* TODO spu: {mn} {insn.operands} */;"
+        return (f'/* TODO spu: {mn} {insn.operands} */ '
+                f'spu_unsupported(0x{insn.addr:X}, "{mn}");')
 
     # ------------------------------------------------------------------ #
     def _cond(self, mn: str, reg: str) -> str:

@@ -35,8 +35,7 @@ static inline int spu_clz32(uint32_t x) { return x ? __builtin_clz(x) : 32; }
 
 /* Architectural SPU barrier -- the lifted `sync`/`dsync`/`syncc` emission.
  * SPU ISA v1.2 §13 (+ the per-instruction pages): order all earlier LS and
- * channel accesses before later ones; LS must be consistent "if it were
- * observed by another entity" (Table 13-6 is exactly this runtime's
+ * channel accesses before later ones; LS must be consistent "if it were\n * observed by another entity" (Table 13-6 is exactly this runtime's
  * host-thread producer -> SPU consumer handoff). A no-op is neither a
  * compiler nor a CPU barrier -- MSVC at /O2 may reorder plain LS accesses
  * across an empty statement (the PPU twin of this bug is LESSONS #11d). A
@@ -65,6 +64,23 @@ static inline u128 spu_splat_u32(uint32_t v) {
  * into the PREFERRED word (word 0) and ZEROS the other three slots (matches
  * RPCS3 v128::from32r, SPUInterpreter.cpp BRSL). Splatting it (the old bug)
  * corrupts any code that saves/reloads/operates on the full 128-bit link. */
+/* An SPU instruction the lifter could not translate. It emits a bare comment,
+ * so an unsupported opcode on a live path silently does NOTHING and the guest
+ * computes garbage from there on -- which surfaces much later as a wild DMA or
+ * atomic address with no hint of where it came from. Most of these are data
+ * embedded in .text that never executes; this fires only if one actually runs.
+ * One line per site. */
+static inline void spu_unsupported(uint32_t pc, const char* mnemonic)
+{
+    static int warned;
+    if (warned < 64) {
+        warned++;
+        fprintf(stderr, "[spu] UNSUPPORTED %s at LS 0x%05X -- executed, "
+                        "result is wrong from here\n", mnemonic, pc);
+        fflush(stderr);
+    }
+}
+
 static inline u128 spu_link(uint32_t addr) {
     u128 r; r._u32[0]=addr; r._u32[1]=0; r._u32[2]=0; r._u32[3]=0; return r;
 }
