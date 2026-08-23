@@ -757,10 +757,27 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * whether its source EA holds valid work-queue data. Env YDKJ_DMATRACE. */
     {
         static int64_t dt=-2; if (dt==-2){ const char* e=getenv("YDKJ_DMATRACE"); dt=e?1:0; }
-        if (dt && (spu->image_id==22 || spu->image_id==23)) {
+        /* SPU_DMATRACE=<img> traces one image; YDKJ_DMATRACE keeps the old
+         * hardcoded pair. Seeing a job's FIRST transfers is how you tell a bad
+         * parameter block from a bad address computed later. */
+        static int64_t only=-2;
+        if (only==-2){ const char* e=getenv("SPU_DMATRACE"); only = e ? strtol(e,0,0) : -1; }
+        if ((dt && (spu->image_id==22 || spu->image_id==23)) ||
+            (only >= 0 && spu->image_id == only)) {
             static int _n=0; if (_n++ < 160)
                 fprintf(stderr, "[DMA] img%d cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u\n",
                         spu->image_id, cmd, lsa, (unsigned long long)ea, size, tag);
+            /* Show what a GET actually delivered. A job that reads its parameter
+             * block and then computes a nonsense address is telling you the block
+             * was empty, not that its arithmetic is wrong -- but only if you can
+             * see the bytes. */
+            if (_n <= 160 && mfc_is_get(cmd) && size <= 64 && vm_base &&
+                mfc_ea_range_committed(ea, size)) {
+                const uint8_t* s = vm_base + (uint32_t)ea;
+                fprintf(stderr, "        got:");
+                for (uint32_t k = 0; k < size; k++) fprintf(stderr, " %02X", s[k]);
+                fputc(10, stderr);
+            }
             /* YDKJ_CRI_R4 diag: when the policy issues the mis-computed context
              * DMA (img23, lsa=0x2780, garbage high EA), dump the loaded
              * SpursTasksetContext (LS 0x2700..0x27E0) so we can see which field

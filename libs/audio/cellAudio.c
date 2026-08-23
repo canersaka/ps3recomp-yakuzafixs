@@ -598,6 +598,14 @@ static void audio_stop_mix_thread(void)
 
 s32 cellAudioInit(void)
 {
+    /* PS3_NO_AUDIO=1: report that the audio library is unavailable. Middleware
+     * that drives its mixer through SPU jobs will otherwise block the whole boot
+     * waiting on work we cannot yet complete; failing here lets a title take its
+     * silent path and keep going. Diagnostic first, workaround second. */
+    if (getenv("PS3_NO_AUDIO")) {
+        printf("[cellAudio] PS3_NO_AUDIO -- reporting audio unavailable\n");
+        return (s32)CELL_AUDIO_ERROR_NOT_INIT;
+    }
     printf("[cellAudio] Init()\n");
 
     if (s_audio_initialized)
