@@ -389,6 +389,26 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
+    /* SPU_LS_LOWREAD=1: a job that reads its OWN first bytes as data is
+     * dereferencing a null base -- the job binary loads at LS 0, so [NULL+off]
+     * returns its own instruction words. Report each distinct low address once,
+     * with the pc, to find which pointer was never filled in. */
+    { static int s_lw = -1;
+      if (s_lw < 0) s_lw = getenv("SPU_LS_LOWREAD") ? 1 : 0;
+      if (s_lw && lsa < 0x200u && ctx->image_id > 0 && !ctx->policy_mode) {
+          static uint32_t seen[24]; static int n = 0; int known = 0;
+          uint32_t key = (uint32_t)ctx->image_id << 24 | (lsa & 0x1F0);
+          for (int i = 0; i < n; i++) if (seen[i] == key) { known = 1; break; }
+          if (!known && n < 24) {
+              seen[n++] = key;
+              fprintf(stderr, "[spu-lowread] img=%d read LS 0x%03X at pc=0x%05X "
+                      "ctx=%p r1=0x%05X r2=0x%08X r3=0x%08X r4=0x%08X\n",
+                      ctx->image_id, lsa, (uint32_t)ctx->pc & SPU_LS_MASK,
+                      (const void*)ctx,                      ctx->gpr[1]._u32[0], ctx->gpr[2]._u32[0],
+                      ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0]);
+              fflush(stderr);
+          }
+      } }
     /* WWS buffer-resolution probe: GetLogicalBuffer reads bufferSetArray at
      * 0xDF0 + (jobNum<<6) + (logBufSet<<2), so the raw address encodes both.
      * Log them (capped) to see which set each command -- especially RunJob --

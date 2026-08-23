@@ -141,8 +141,15 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
 
     /* ---- regions, following _cellSpursCheckJob's own arithmetic --------- */
     uint32_t p         = ALIGN1024(size_bin);
-    uint32_t io_ls     = size_io  ? p : 0;  p += ALIGN1024(size_io);
-    uint32_t out_ls    = size_out ? p : 0;  p += ALIGN1024(size_out);
+    /* Same rule as the scratch pointer: these are REGION BASES and stay valid
+     * when the region is empty. NULL invites the job to dereference 0 -- and
+     * since the job binary loads at LS 0, reading through a null base returns
+     * the job's OWN INSTRUCTION WORDS. That is exactly what Tokyo Jungle's
+     * wedged jobs were doing: each spun DMAing to the word at offset 0x64 of
+     * its own image, which is why the addresses were misaligned and looked
+     * like floats -- they were opcodes. */
+    uint32_t io_ls     = p;                p += ALIGN1024(size_io);
+    uint32_t out_ls    = p;                p += ALIGN1024(size_out);
     if (use_io && !out_ls) out_ls = io_ls;    /* in-out: output shares ioBuffer */
     uint32_t ss_size   = ALIGN1024(size_scr + size_stk);
     /* The scratch pointer is the BASE OF THE SCRATCH+STACK BLOCK, and it is
