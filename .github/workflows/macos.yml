@@ -43,3 +43,10 @@ jobs:
           clang -std=gnu17 -I include -I runtime/spu \
                 -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c
           /tmp/test_spu_helpers
+
+      # Drives a real NV4097 command buffer through cellGcm -> RSX -> the Metal
+      # backend and asserts the presented pixel matches the guest clear colour.
+      # Headless, so it needs no display: exit 0 means the whole graphics bridge
+      # is intact, not merely that it compiled.
+      - name: Run the POSIX host (headless Metal end-to-end)
+        run: PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host
