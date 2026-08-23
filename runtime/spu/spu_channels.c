@@ -13,6 +13,7 @@
  */
 
 #include "spu_dma.h"
+#include "../platform/win32_compat.h"
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
@@ -224,11 +225,19 @@ static mfc_engine* mfc_for(spu_context* ctx)
 extern uint8_t* vm_base;
 
 /* Global spinlock guarding all atomic line ops. _InterlockedExchange is a
- * clang-cl/MSVC intrinsic (no runtime library symbol needed). */
+ * clang-cl/MSVC intrinsic (no runtime library symbol needed); elsewhere use the
+ * C11 equivalent, which lowers to the same LL/SC or lock-xchg on every target. */
+#if defined(_MSC_VER)
 #include <intrin.h>
 static volatile long g_resv_lock = 0;
 static void resv_lock(void)   { while (_InterlockedExchange(&g_resv_lock, 1)) { } }
 static void resv_unlock(void) { _InterlockedExchange(&g_resv_lock, 0); }
+#else
+#include <stdatomic.h>
+static atomic_flag g_resv_lock = ATOMIC_FLAG_INIT;
+static void resv_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_resv_lock, memory_order_acquire)) { } }
+static void resv_unlock(void) { atomic_flag_clear_explicit(&g_resv_lock, memory_order_release); }
+#endif
 
 /* Total PUTLLC attempts (all SPUs). The PM flow trace (spurs_policy.c) reads
  * the delta across one policy run to find the run that performed a claim. */

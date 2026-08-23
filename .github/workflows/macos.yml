@@ -1,0 +1,45 @@
+# Builds the runtime library on Apple Silicon.
+#
+# ps3recomp had no CI of any kind, and docs/BUILDING.md advertised macOS as
+# "Full support" while the tree did not compile there at all. This job exists so
+# that stays fixed: it is the only thing preventing the next Windows-only commit
+# from silently re-breaking the POSIX paths.
+name: macOS
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: macOS arm64 (${{ matrix.build_type }})
+    runs-on: macos-14          # Apple Silicon runner
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: brew install ninja sdl2
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Verify architecture
+        run: |
+          lipo -info build/libps3recomp_runtime.a
+          lipo -info build/libps3recomp_runtime.a | grep -q arm64
+
+      - name: Run self-contained SPU helper tests
+        run: |
+          clang -std=gnu17 -I include -I runtime/spu \
+                -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c
+          /tmp/test_spu_helpers

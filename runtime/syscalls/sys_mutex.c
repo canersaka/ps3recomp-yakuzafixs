@@ -3,6 +3,7 @@
  */
 
 #include "sys_mutex.h"
+#include "../platform/darwin_compat.h"
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include <string.h>

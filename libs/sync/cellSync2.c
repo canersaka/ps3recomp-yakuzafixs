@@ -7,6 +7,7 @@
  */
 
 #include "cellSync2.h"
+#include "../../runtime/platform/darwin_compat.h"
 #include <stdio.h>
 #include <string.h>
 

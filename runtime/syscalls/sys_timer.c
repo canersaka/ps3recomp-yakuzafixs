@@ -6,6 +6,7 @@
 #include "sys_event.h"
 #include "../memory/vm.h"
 #include <string.h>
+#include <stdlib.h>
 
 /* ---------------------------------------------------------------------------
  * Globals

@@ -376,6 +376,11 @@ static u32 enumerate_save_files(const char* save_path,
                 fileList[count].st_atime = (s64)st.st_atime;
                 fileList[count].st_mtime = (s64)st.st_mtime;
                 fileList[count].st_ctime = (s64)st.st_ctime;
+#elif defined(__APPLE__)
+/* Darwin names the sub-second stat fields st_*timespec, not glibc's st_*tim. */
+                fileList[count].st_atime = (s64)st.st_atimespec.tv_sec;
+                fileList[count].st_mtime = (s64)st.st_mtimespec.tv_sec;
+                fileList[count].st_ctime = (s64)st.st_ctimespec.tv_sec;
 #else
                 fileList[count].st_atime = (s64)st.st_atim.tv_sec;
                 fileList[count].st_mtime = (s64)st.st_mtim.tv_sec;
@@ -576,6 +581,11 @@ static s32 savedata_execute(const char* dirName, int is_save,
             statGet.dir.st_atime = (s64)hst.st_atime;
             statGet.dir.st_mtime = (s64)hst.st_mtime;
             statGet.dir.st_ctime = (s64)hst.st_ctime;
+#elif defined(__APPLE__)
+/* Darwin names the sub-second stat fields st_*timespec, not glibc's st_*tim. */
+            statGet.dir.st_atime = (s64)hst.st_atimespec.tv_sec;
+            statGet.dir.st_mtime = (s64)hst.st_mtimespec.tv_sec;
+            statGet.dir.st_ctime = (s64)hst.st_ctimespec.tv_sec;
 #else
             statGet.dir.st_atime = (s64)hst.st_atim.tv_sec;
             statGet.dir.st_mtime = (s64)hst.st_mtim.tv_sec;

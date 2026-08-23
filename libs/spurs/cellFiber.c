@@ -14,6 +14,11 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
+/* Darwin marks the ucontext routines deprecated and hides them unless
+ * _XOPEN_SOURCE is defined before the header is pulled in. */
+#if defined(__APPLE__) && !defined(_XOPEN_SOURCE)
+#  define _XOPEN_SOURCE 600
+#endif
 #include <ucontext.h>
 #endif
 

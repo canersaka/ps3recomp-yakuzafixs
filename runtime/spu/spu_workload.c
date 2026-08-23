@@ -418,7 +418,6 @@ static void spu_async_run(spu_async_job* j)
                 fprintf(stderr, "[cri] YDKJ_CRI_TASKSET: loaded taskset policy@0xA00, LS[0x1C0]=inst, running policy entry (img23)\n");
                 fflush(stderr);
                 /* Run the taskset policy entry instead of the cri task entry. */
-                extern int32_t spu_run_lifted_job_abi(void(*)(spu_context*), uint8_t*, uint32_t, int, int, uint32_t*);
                 int32_t prc = spu_run_lifted_job_abi(tsp_spu_func_00000A00, ls,
                                                      j->args_ea, 23, 1, j->have_r3 ? j->r3 : 0);
                 fprintf(stderr, "[cri] taskset policy RETURNED rc=%d\n", prc);

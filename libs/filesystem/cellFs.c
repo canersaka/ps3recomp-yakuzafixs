@@ -216,6 +216,11 @@ static void fill_cellfs_stat(CellFsStat* sb, const HOST_STAT_T* hst)
     sb->st_atime = (s64)hst->st_atime;
     sb->st_mtime = (s64)hst->st_mtime;
     sb->st_ctime = (s64)hst->st_ctime;
+#elif defined(__APPLE__)
+/* Darwin names the sub-second stat fields st_*timespec, not glibc's st_*tim. */
+    sb->st_atime = (s64)hst->st_atimespec.tv_sec;
+    sb->st_mtime = (s64)hst->st_mtimespec.tv_sec;
+    sb->st_ctime = (s64)hst->st_ctimespec.tv_sec;
 #else
     sb->st_atime = (s64)hst->st_atim.tv_sec;
     sb->st_mtime = (s64)hst->st_mtim.tv_sec;

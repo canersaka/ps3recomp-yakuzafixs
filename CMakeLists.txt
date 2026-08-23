@@ -91,6 +91,31 @@ if(WIN32)
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
     )
+else()
+    # cellPad and cellAudio select their SDL2 backends unconditionally off
+    # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required
+    # here -- docs/BUILDING.md already lists it as the Linux/macOS dependency.
+    find_package(SDL2 QUIET)
+    if(SDL2_FOUND)
+        if(TARGET SDL2::SDL2)
+            target_link_libraries(ps3recomp_runtime PRIVATE SDL2::SDL2)
+        else()
+            target_include_directories(ps3recomp_runtime PRIVATE ${SDL2_INCLUDE_DIRS})
+            target_link_libraries(ps3recomp_runtime PRIVATE ${SDL2_LIBRARIES})
+        endif()
+        message(STATUS "  SDL2:         found (input + audio backends enabled)")
+    else()
+        message(FATAL_ERROR
+            "SDL2 not found. It provides the cellPad and cellAudio backends on "
+            "non-Windows hosts.\n"
+            "  macOS:  brew install sdl2\n"
+            "  Debian: apt install libsdl2-dev\n"
+            "If SDL2 is installed in a non-standard prefix, pass "
+            "-DCMAKE_PREFIX_PATH=<prefix>.")
+    endif()
+
+    find_package(Threads REQUIRED)
+    target_link_libraries(ps3recomp_runtime PRIVATE Threads::Threads)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -117,7 +142,16 @@ endif()
 # ---------------------------------------------------------------------------
 if(PS3RECOMP_BUILD_TESTS)
     include(CTest)
-    add_subdirectory(tests/sync_stress)
+    # sync_stress is written directly against the Win32 threading API
+    # (WaitForMultipleObjects, joinable HANDLEs, Interlocked*, CRITICAL_SECTION).
+    # runtime/platform/win32_compat.h covers the subset the runtime itself needs,
+    # but not joinable handles or multi-object waits -- porting this test needs a
+    # real handle table and is left as follow-up work.
+    if(WIN32)
+        add_subdirectory(tests/sync_stress)
+    else()
+        message(STATUS "  sync_stress:  skipped (Win32-only threading API)")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
