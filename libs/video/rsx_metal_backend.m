@@ -40,6 +40,43 @@ static int                 s_ready;
 static u32                 s_width  = 1280;
 static u32                 s_height = 720;
 
+/* ---- draw recording -------------------------------------------------------
+ * RSX draws arrive while the guest builds its frame; the flip comes later. So
+ * draws are recorded with their vertices already fetched out of guest memory,
+ * then replayed inside a single render pass at present time. This mirrors the
+ * D3D12 backend's D3D12DrawRecord / render_frame split.
+ * --------------------------------------------------------------------------*/
+
+#define MTL_MAX_DRAWS      4096
+#define MTL_MAX_VERTS      (256u * 1024u)
+#define MTL_VB_INDEX       30      /* buffer(0) is the constant buffer */
+
+/* Matches the built-in shader's stage_in layout. */
+typedef struct { float pos[4]; float col[4]; float tc[4]; } MtlVertex;
+
+typedef struct {
+    u32 base;        /* first vertex in s_verts               */
+    u32 count;       /* vertex count after primitive expansion */
+    MTLPrimitiveType topology;
+    int blend_enable;
+    u32 blend_sfactor, blend_dfactor, blend_equation;
+    float mvp[16];   /* 4 rows of the RSX vertex-constant matrix */
+} MtlDraw;
+
+static MtlVertex* s_verts;
+static u32        s_vert_count;
+static MtlDraw    s_draws[MTL_MAX_DRAWS];
+static u32        s_draw_count;
+static u32        s_dropped_draws;
+
+static id<MTLLibrary> s_shader_lib;
+
+/* PSO cache. Keyed on the blend state, which is all the built-in shader path
+ * varies; a guest-shader key (vp/fp ucode hash) joins it when that lands. */
+typedef struct { u32 key; id<MTLRenderPipelineState> pso; } MtlPsoEntry;
+static MtlPsoEntry s_pso_cache[64];
+static u32         s_pso_count;
+
 /* RSX clear colour, ARGB8888, as written by NV4097_SET_COLOR_CLEAR_VALUE. */
 static u32 s_clear_argb = 0xFF000000u;
 static u32 s_last_present_bgra;
@@ -53,9 +90,15 @@ static void mtl_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
     if (flags & 0xF0u) s_clear_argb = color;
 }
 
+/* The draw callbacks are not handed the state, so it is latched here. Every
+ * state setter caches it; set_vertex_attribs in particular always fires before
+ * a draw. The D3D12 backend does the same via s_d3d.current_rsx_state. */
+static const rsx_state* s_state;
+
 static void mtl_set_render_target(void* ud, const rsx_state* state)
 {
     (void)ud;
+    if (state) s_state = state;
     if (!state) return;
     u32 w = state->surface_clip_w, h = state->surface_clip_h;
     if (!w || !h || (w == s_width && h == s_height)) return;
@@ -63,10 +106,27 @@ static void mtl_set_render_target(void* ud, const rsx_state* state)
     if (s_layer) s_layer.drawableSize = CGSizeMake((CGFloat)w, (CGFloat)h);
 }
 
+static void mtl_set_vertex_attribs(void* ud, const rsx_state* state)
+{ (void)ud; if (state) s_state = state; }
+
+static void mtl_set_blend(void* ud, const rsx_state* state)
+{ (void)ud; if (state) s_state = state; }
+
+static void mtl_set_viewport(void* ud, const rsx_state* state)
+{ (void)ud; if (state) s_state = state; }
+
+static void mtl_draw_arrays(void*, u32, u32, u32);
+static void mtl_draw_indexed(void*, u32, u32, u32);
+
 static rsx_backend s_backend_vtable = {
     .userdata          = NULL,
     .clear             = mtl_clear,
     .set_render_target = mtl_set_render_target,
+    .set_vertex_attribs = mtl_set_vertex_attribs,
+    .set_blend          = mtl_set_blend,
+    .set_viewport       = mtl_set_viewport,
+    .draw_arrays       = mtl_draw_arrays,
+    .draw_indexed      = mtl_draw_indexed,
 };
 
 /* ---- helpers ------------------------------------------------------------- */
@@ -129,6 +189,304 @@ static int create_window(const char* title)
 }
 #endif
 
+/* ---- guest vertex fetch --------------------------------------------------
+ * Ported from the D3D12 backend's read_vp_vertex: every RSX component is
+ * big-endian, and the vertex-array OFFSET register carries the context-DMA
+ * location in bit 31 (0 = LOCAL/VRAM, 1 = MAIN/IO-mapped).
+ * --------------------------------------------------------------------------*/
+
+extern uint8_t* vm_base;
+extern u32 cellGcmResolveOffset(u32);
+extern u32 cellGcmResolveLocated(int, u32);
+
+static float rd_bef(const u8* p)
+{
+    u32 w; memcpy(&w, p, 4);
+    w = ((w >> 24) & 0xFFu) | ((w >> 8) & 0xFF00u) |
+        ((w << 8) & 0xFF0000u) | ((w << 24) & 0xFF000000u);
+    float f; memcpy(&f, &w, 4); return f;
+}
+
+static float rd_half_be(const u8* p)
+{
+    u16 h = (u16)((p[0] << 8) | p[1]);
+    u32 sgn = (h >> 15) & 1u, exp = (h >> 10) & 0x1Fu, man = h & 0x3FFu, f;
+    if (exp == 0)        f = sgn << 31;
+    else if (exp == 31)  f = (sgn << 31) | 0x7F800000u | (man << 13);
+    else                 f = (sgn << 31) | ((exp - 15u + 127u) << 23) | (man << 13);
+    float o; memcpy(&o, &f, 4); return o;
+}
+
+/* Read one attribute of one vertex as float4. */
+static void fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4],
+                         float d0, float d1, float d2, float d3)
+{
+    out[0] = d0; out[1] = d1; out[2] = d2; out[3] = d3;
+    const rsx_vertex_attrib* a = &st->vertex_attribs[idx];
+    if (!a->enabled || a->stride == 0 || !vm_base) return;
+
+    u32 ei = vi;
+    if (a->frequency > 1)
+        ei = (st->frequency_divider_op & (1u << idx)) ? (vi % a->frequency)
+                                                      : (vi / a->frequency);
+
+    u32 off = (a->offset & 0x7FFFFFFFu) + ei * a->stride;
+    u32 ea  = (a->offset & 0x80000000u) ? cellGcmResolveLocated(0, off)
+                                        : cellGcmResolveOffset(off);
+    const u8* p = vm_base + ea;
+    u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
+
+    switch (a->type) {
+    case 2: for (u32 k = 0; k < n; k++) out[k] = rd_bef(p + k * 4);            break;
+    case 3: for (u32 k = 0; k < n; k++) out[k] = rd_half_be(p + k * 2);        break;
+    case 4: for (u32 k = 0; k < n; k++) out[k] = (float)p[k] / 255.0f;         break;  /* UB norm */
+    case 1: for (u32 k = 0; k < n; k++) {                                              /* S16 norm */
+                s16 v = (s16)((p[k*2] << 8) | p[k*2+1]);
+                out[k] = (float)v / 32767.0f;
+            } break;
+    default: break;
+    }
+}
+
+/* Position is attrib 0, diffuse colour attrib 3, texcoord0 attrib 8 -- the same
+ * slots the D3D12 fallback path assumes. */
+static void fetch_vertex(const rsx_state* st, u32 vi, MtlVertex* out)
+{
+    fetch_attrib(st, 0, vi, out->pos, 0.0f, 0.0f, 0.0f, 1.0f);
+    fetch_attrib(st, 3, vi, out->col, 1.0f, 1.0f, 1.0f, 1.0f);
+    fetch_attrib(st, 8, vi, out->tc,  0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+/* ---- primitive conversion -------------------------------------------------
+ * Metal, like D3D12, has no quads, quad strips, triangle fans or polygons, so
+ * those are expanded to triangle lists on the CPU while the vertices are being
+ * fetched. Everything else maps directly.
+ * --------------------------------------------------------------------------*/
+
+static int prim_needs_expansion(u32 prim)
+{
+    return prim == RSX_PRIMITIVE_QUADS      || prim == RSX_PRIMITIVE_QUAD_STRIP ||
+           prim == RSX_PRIMITIVE_TRIANGLE_FAN || prim == RSX_PRIMITIVE_POLYGON;
+}
+
+static MTLPrimitiveType prim_to_metal(u32 prim)
+{
+    switch (prim) {
+    case RSX_PRIMITIVE_POINTS:         return MTLPrimitiveTypePoint;
+    case RSX_PRIMITIVE_LINES:          return MTLPrimitiveTypeLine;
+    case RSX_PRIMITIVE_LINE_LOOP:      /* approximated as a strip */
+    case RSX_PRIMITIVE_LINE_STRIP:     return MTLPrimitiveTypeLineStrip;
+    case RSX_PRIMITIVE_TRIANGLE_STRIP: return MTLPrimitiveTypeTriangleStrip;
+    default:                           return MTLPrimitiveTypeTriangle;
+    }
+}
+
+/* Emit `count` vertices starting at `first`, expanding fans/quads/polygons.
+ * `resolve` maps a sequence position to a guest vertex index, so the same code
+ * serves both array and indexed draws. Returns vertices written. */
+typedef u32 (*IndexResolver)(const rsx_state*, u32 /*seq*/, void* /*ctx*/);
+
+static u32 emit_vertices(const rsx_state* st, u32 prim, u32 count,
+                         IndexResolver resolve, void* ctx)
+{
+    u32 wrote = 0;
+    #define PUSH(seq) do {                                                     \
+        if (s_vert_count >= MTL_MAX_VERTS) return wrote;                       \
+        fetch_vertex(st, resolve(st, (seq), ctx), &s_verts[s_vert_count++]);   \
+        wrote++;                                                               \
+    } while (0)
+
+    if (prim == RSX_PRIMITIVE_QUADS) {
+        for (u32 q = 0; q + 3 < count; q += 4) {
+            PUSH(q); PUSH(q+1); PUSH(q+2);
+            PUSH(q); PUSH(q+2); PUSH(q+3);
+        }
+    } else if (prim == RSX_PRIMITIVE_QUAD_STRIP) {
+        for (u32 q = 0; q + 3 < count; q += 2) {
+            PUSH(q); PUSH(q+1); PUSH(q+2);
+            PUSH(q+1); PUSH(q+3); PUSH(q+2);
+        }
+    } else if (prim == RSX_PRIMITIVE_TRIANGLE_FAN || prim == RSX_PRIMITIVE_POLYGON) {
+        for (u32 t = 1; t + 1 < count; t++) { PUSH(0); PUSH(t); PUSH(t+1); }
+    } else {
+        for (u32 v = 0; v < count; v++) PUSH(v);
+    }
+    #undef PUSH
+    return wrote;
+}
+
+static u32 resolve_linear(const rsx_state* st, u32 seq, void* ctx)
+{
+    (void)st; return *(u32*)ctx + seq;
+}
+
+static u32 resolve_indexed(const rsx_state* st, u32 seq, void* ctx)
+{
+    u32 base = *(u32*)ctx;
+    /* index_array_offset bits [7:4] select the type: 0 = u32, 1 = u16. */
+    int u16type = ((st->index_array_offset >> 4) & 0xFu) == 1;
+    u32 off = st->index_array_offset & ~0xFFu;
+    u32 ea  = cellGcmResolveOffset(off) + (base + seq) * (u16type ? 2u : 4u);
+    if (!vm_base) return 0;
+    const u8* p = vm_base + ea;
+    return u16type ? (u32)((p[0] << 8) | p[1])
+                   : (u32)((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]);
+}
+
+/* ---- draw recording ------------------------------------------------------ */
+
+static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
+                        IndexResolver resolve)
+{
+    if (!s_ready || !s_verts || !st || count == 0) return;
+    if (s_draw_count >= MTL_MAX_DRAWS) { s_dropped_draws++; return; }
+
+    u32 first_vert = s_vert_count;
+    u32 wrote = emit_vertices(st, prim, count, resolve, &base);
+    if (wrote == 0) { s_dropped_draws++; return; }
+
+    MtlDraw* d = &s_draws[s_draw_count++];
+    d->base  = first_vert;
+    d->count = wrote;
+    /* Expanded primitives always come out as a triangle list. */
+    d->topology = prim_needs_expansion(prim) ? MTLPrimitiveTypeTriangle
+                                             : prim_to_metal(prim);
+    d->blend_enable   = st->blend_enable;
+    d->blend_sfactor  = st->blend_sfactor;
+    d->blend_dfactor  = st->blend_dfactor;
+    d->blend_equation = st->blend_equation;
+
+    /* RSX vertex constant slots 0..3 hold the MVP rows when no vertex program
+     * has been translated. An all-zero matrix would collapse every vertex to
+     * the origin, so fall back to identity. */
+    int nonzero = 0;
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) {
+            float v = st->vertex_constants[r][c];
+            d->mvp[r * 4 + c] = v;
+            if (v != 0.0f) nonzero = 1;
+        }
+    if (!nonzero) {
+        memset(d->mvp, 0, sizeof(d->mvp));
+        d->mvp[0] = d->mvp[5] = d->mvp[10] = d->mvp[15] = 1.0f;
+    }
+}
+
+static void mtl_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
+{
+    (void)ud;
+    record_draw(s_state, primitive, first, count, resolve_linear);
+}
+
+static void mtl_draw_indexed(void* ud, u32 primitive, u32 index_offset, u32 count)
+{
+    (void)ud;
+    record_draw(s_state, primitive, index_offset, count, resolve_indexed);
+}
+
+/* ---- pipeline state ------------------------------------------------------ */
+
+static MTLBlendFactor blend_factor_to_metal(u32 f)
+{
+    switch (f) {
+    case 0x0000: return MTLBlendFactorZero;
+    case 0x0001: return MTLBlendFactorOne;
+    case 0x0300: return MTLBlendFactorSourceColor;
+    case 0x0301: return MTLBlendFactorOneMinusSourceColor;
+    case 0x0302: return MTLBlendFactorSourceAlpha;
+    case 0x0303: return MTLBlendFactorOneMinusSourceAlpha;
+    case 0x0304: return MTLBlendFactorDestinationAlpha;
+    case 0x0305: return MTLBlendFactorOneMinusDestinationAlpha;
+    case 0x0306: return MTLBlendFactorDestinationColor;
+    case 0x0307: return MTLBlendFactorOneMinusDestinationColor;
+    case 0x0308: return MTLBlendFactorSourceAlphaSaturated;
+    default:     return MTLBlendFactorOne;
+    }
+}
+
+static MTLBlendOperation blend_equation_to_metal(u32 e)
+{
+    switch (e) {
+    case 0x8007: return MTLBlendOperationMin;
+    case 0x8008: return MTLBlendOperationMax;
+    case 0x800A: return MTLBlendOperationSubtract;
+    case 0x800B: return MTLBlendOperationReverseSubtract;
+    default:     return MTLBlendOperationAdd;
+    }
+}
+
+/* Built-in shaders: transform by the RSX vertex-constant matrix and interpolate
+ * the diffuse colour. The rows are dotted explicitly rather than using float4x4
+ * so there is no column-major/row-major ambiguity with the guest's layout.
+ * The translated-guest-shader path replaces this, it does not extend it. */
+static NSString* const kBuiltinMSL = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct VIn  { float4 pos [[attribute(0)]]; float4 col [[attribute(1)]]; float4 tc [[attribute(2)]]; };\n"
+"struct VOut { float4 pos [[position]]; float4 col; float4 tc; };\n"
+"struct VU   { float4 mvp[4]; };\n"
+"vertex VOut vs_main(VIn v [[stage_in]], constant VU& u [[buffer(0)]]) {\n"
+"    VOut o;\n"
+"    o.pos = float4(dot(u.mvp[0], v.pos), dot(u.mvp[1], v.pos),\n"
+"                   dot(u.mvp[2], v.pos), dot(u.mvp[3], v.pos));\n"
+"    o.col = v.col; o.tc = v.tc;\n"
+"    return o;\n"
+"}\n"
+"fragment float4 fs_main(VOut in [[stage_in]]) { return in.col; }\n";
+
+static u32 pso_key(const MtlDraw* d)
+{
+    if (!d->blend_enable) return 0u;
+    return 1u | ((d->blend_sfactor & 0xFFFu) << 1)
+              | ((d->blend_dfactor & 0xFFFu) << 13)
+              | ((d->blend_equation & 0x7u) << 25);
+}
+
+static id<MTLRenderPipelineState> pso_for(const MtlDraw* d)
+{
+    u32 key = pso_key(d);
+    for (u32 i = 0; i < s_pso_count; i++)
+        if (s_pso_cache[i].key == key) return s_pso_cache[i].pso;
+    if (s_pso_count >= (u32)(sizeof(s_pso_cache) / sizeof(s_pso_cache[0]))) return nil;
+
+    MTLVertexDescriptor* vd = [MTLVertexDescriptor vertexDescriptor];
+    for (int i = 0; i < 3; i++) {
+        vd.attributes[i].format      = MTLVertexFormatFloat4;
+        vd.attributes[i].offset      = (NSUInteger)(i * 16);
+        vd.attributes[i].bufferIndex = MTL_VB_INDEX;
+    }
+    vd.layouts[MTL_VB_INDEX].stride = sizeof(MtlVertex);
+
+    MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction   = [s_shader_lib newFunctionWithName:@"vs_main"];
+    pd.fragmentFunction = [s_shader_lib newFunctionWithName:@"fs_main"];
+    pd.vertexDescriptor = vd;
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    if (d->blend_enable) {
+        MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[0];
+        ca.blendingEnabled             = YES;
+        ca.sourceRGBBlendFactor        = blend_factor_to_metal(d->blend_sfactor);
+        ca.destinationRGBBlendFactor   = blend_factor_to_metal(d->blend_dfactor);
+        ca.sourceAlphaBlendFactor      = blend_factor_to_metal(d->blend_sfactor);
+        ca.destinationAlphaBlendFactor = blend_factor_to_metal(d->blend_dfactor);
+        ca.rgbBlendOperation           = blend_equation_to_metal(d->blend_equation);
+        ca.alphaBlendOperation         = blend_equation_to_metal(d->blend_equation);
+    }
+
+    NSError* err = nil;
+    id<MTLRenderPipelineState> pso =
+        [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!pso) {
+        fprintf(stderr, "[RSX metal] pipeline state failed: %s\n",
+                [[err localizedDescription] UTF8String]);
+        return nil;
+    }
+    s_pso_cache[s_pso_count].key = key;
+    s_pso_cache[s_pso_count].pso = pso;
+    s_pso_count++;
+    return pso;
+}
+
 /* ---- public API ---------------------------------------------------------- */
 
 int rsx_metal_backend_init(u32 width, u32 height, const char* title)
@@ -163,6 +521,20 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
             return -1;
         }
 
+        s_verts = (MtlVertex*)malloc(sizeof(MtlVertex) * MTL_MAX_VERTS);
+        if (!s_verts) {
+            fprintf(stderr, "[RSX metal] vertex staging alloc failed\n");
+            return -1;
+        }
+
+        NSError* serr = nil;
+        s_shader_lib = [s_dev newLibraryWithSource:kBuiltinMSL options:nil error:&serr];
+        if (!s_shader_lib) {
+            fprintf(stderr, "[RSX metal] built-in shader compile failed: %s\n",
+                    [[serr localizedDescription] UTF8String]);
+            return -1;
+        }
+
         rsx_set_backend(&s_backend_vtable);
         s_ready  = 1;
         s_closed = 0;
@@ -180,6 +552,11 @@ void rsx_metal_backend_shutdown(void)
 #if !TARGET_OS_IPHONE
         if (s_window) { [s_window close]; s_window = nil; }
 #endif
+        free(s_verts); s_verts = NULL;
+        s_vert_count = s_draw_count = s_pso_count = 0;
+        for (u32 i = 0; i < (u32)(sizeof(s_pso_cache)/sizeof(s_pso_cache[0])); i++)
+            s_pso_cache[i].pso = nil;
+        s_shader_lib = nil;
         s_layer     = nil;
         s_offscreen = nil;
         s_queue     = nil;
@@ -231,13 +608,37 @@ void rsx_metal_backend_present(void)
 
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
-        /* Draw calls land here once the PSO/shader path is wired; the clear
-         * alone is what the guest flip loop needs today. */
+
+        if (s_draw_count > 0 && s_vert_count > 0) {
+            id<MTLBuffer> vb = [s_dev newBufferWithBytes:s_verts
+                                                  length:sizeof(MtlVertex) * s_vert_count
+                                                 options:MTLResourceStorageModeShared];
+            [enc setVertexBuffer:vb offset:0 atIndex:MTL_VB_INDEX];
+            MTLViewport vp = { 0.0, 0.0, (double)s_width, (double)s_height, 0.0, 1.0 };
+            [enc setViewport:vp];
+
+            for (u32 i = 0; i < s_draw_count; i++) {
+                MtlDraw* d = &s_draws[i];
+                id<MTLRenderPipelineState> pso = pso_for(d);
+                if (!pso) continue;
+                [enc setRenderPipelineState:pso];
+                [enc setVertexBytes:d->mvp length:sizeof(d->mvp) atIndex:0];
+                [enc drawPrimitives:d->topology vertexStart:d->base vertexCount:d->count];
+            }
+        }
         [enc endEncoding];
 
         if (drawable) [cb presentDrawable:drawable];
         [cb commit];
         [cb waitUntilCompleted];
+
+        if (s_dropped_draws) {
+            fprintf(stderr, "[RSX metal] dropped %u draw(s) this frame (cap %d draws / %u verts)\n",
+                    s_dropped_draws, MTL_MAX_DRAWS, MTL_MAX_VERTS);
+            s_dropped_draws = 0;
+        }
+        s_draw_count = 0;
+        s_vert_count = 0;
 
         if (s_headless && s_offscreen) {
             u32 px = 0;

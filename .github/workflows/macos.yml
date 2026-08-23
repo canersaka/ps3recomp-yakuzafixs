@@ -49,4 +49,11 @@ jobs:
       # Headless, so it needs no display: exit 0 means the whole graphics bridge
       # is intact, not merely that it compiled.
       - name: Run the POSIX host (headless Metal end-to-end)
-        run: PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host
+        run: |
+          # Clear + flip: asserts the guest clear colour reaches the drawable.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host
+          # Clear + a real NV4097 draw: asserts the triangle covers the centre
+          # pixel, which exercises guest vertex fetch, the pipeline-state cache
+          # and the draw path, not just the clear.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw --frames=60
