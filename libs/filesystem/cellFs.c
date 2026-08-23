@@ -84,6 +84,13 @@ void cellfs_set_root_path(const char* root)
 void cellfs_add_path_mapping(const char* ps3_prefix, const char* host_path)
 {
     if (!ps3_prefix || !host_path) return;
+    /* Establish the defaults FIRST. They were installed lazily on the first
+     * translate_path, i.e. AFTER a port had registered its own mappings -- and
+     * since adding an existing prefix overwrites it, the defaults silently
+     * replaced the port's configuration for all five device roots. Tokyo
+     * Jungle's /dev_hdd0 and /app_home mappings were both being discarded this
+     * way. Seeding them here means an explicit mapping always wins. */
+    init_default_mappings();
 
     /* Try to find existing mapping for this prefix */
     for (int i = 0; i < MAX_PATH_MAPPINGS; i++) {
@@ -127,6 +134,20 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
         if (plen > best_len && strncmp(ps3_path, s_path_mappings[i].ps3_prefix, plen) == 0) {
             best = i;
             best_len = plen;
+            continue;
+        }
+        /* Every mapping prefix ends in '/', so a bare device root never matched
+         * its own mapping: "/dev_hdd0" is not a prefix-match for "/dev_hdd0/".
+         * A title that stats the device to check it exists therefore got a
+         * failure and, in Tokyo Jungle's case, retried forever. Accept the
+         * prefix with its trailing slash removed, mapping to the directory
+         * itself. */
+        if (plen > 1 && s_path_mappings[i].ps3_prefix[plen - 1] == '/' &&
+            plen - 1 > best_len &&
+            strncmp(ps3_path, s_path_mappings[i].ps3_prefix, plen - 1) == 0 &&
+            ps3_path[plen - 1] == '\0') {
+            best = i;
+            best_len = plen - 1;
         }
     }
 
@@ -136,6 +157,15 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
     const char* remainder = ps3_path + best_len;
     snprintf(host_buf, buf_size, "%s/%s%s", s_root_path,
              s_path_mappings[best].host_path, remainder);
+
+    /* A mapped path with an empty remainder ends in a separator ("…/dev_hdd0/"),
+     * and stat() rejects that on Windows -- so the directory a game asks about
+     * reads as missing even when it is right there. Trim it. */
+    { size_t hl = strlen(host_buf);
+      while (hl > 1 && (host_buf[hl-1] == '/' ||
+                        host_buf[hl-1] == '\\')) {
+          host_buf[hl-1] = '\0'; hl--;
+      } }
 
     /* Normalize slashes */
     for (char* p = host_buf; *p; p++) {
@@ -375,7 +405,10 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
 
     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
     if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0) {
-        printf("[cellFs] Open: no path mapping for '%s'\n", path);
+        /* gpath(), not the raw parameter: `path` is a GUEST address, and
+         * printing it as a host string faults. The failure path was
+         * crashing the moment any lookup missed. */
+        printf("[cellFs] Open: no path mapping for '%s'\n", gpath(path));
         return (s32)CELL_ENOENT;
     }
 
@@ -405,7 +438,11 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
         return CELL_FS_ERROR_EMFILE;
     }
 
-    strncpy(s_files[slot].path, path, CELL_FS_MAX_FS_PATH_LENGTH - 1);
+    /* gpath(path), not path: a GUEST address handed to strncpy is read as a
+     * host string and faults. Note the audit does not catch this shape --
+     * it looks for *p and p->, not a pointer parameter passed bare
+      * to a string or memory function. */
+    strncpy(s_files[slot].path, gpath(path), CELL_FS_MAX_FS_PATH_LENGTH - 1);
     s_files[slot].path[CELL_FS_MAX_FS_PATH_LENGTH - 1] = '\0';
     s_files[slot].flags   = flags;
     s_files[slot].host_fp = fp;

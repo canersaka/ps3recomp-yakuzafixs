@@ -83,8 +83,15 @@ def suspects_in(path):
             # p-> or *p, but not when the line also converts it safely
             uses = re.findall(r'^.*(?:\*\s*%s\b|\b%s\s*->).*$' % (p, p), body, re.M)
             uses = [u for u in uses if not SAFE_USE.search(u)]
-            # a declaration like "CellFsStat* sb" inside the body is not a use
-            uses = [u for u in uses if not re.search(r'\*\s*%s\s*=\s*\(' % p, u)]
+            # A declaration like "CellFsStat* sb = (...)" inside the body is not
+            # a use. Require a TYPE NAME before the star: the old pattern also
+            # matched a bare "*out = (u32)x", which is a real deref through a
+            # parameter and the single most common form of this bug. cellSail's
+            # "*handle = (u32)i" was invisible because of it, and so was every
+            # other out-param write of that shape -- the audit reported 0
+            # suspects for a file full of them.
+            uses = [u for u in uses
+                    if not re.search(r'[A-Za-z_][A-Za-z0-9_]*\s*\*+\s*%s\s*=' % p, u)]
             if uses:
                 bad.append(p)
         if bad:
