@@ -957,6 +957,20 @@ int cellGcm_take_flip_pending_synced(void)
 static u32 s_ref_q[GCM_REF_QLEN];
 static volatile u32 s_ref_qhead = 0, s_ref_qtail = 0;   /* single producer+consumer: the ticker */
 
+/* A JUMP/CALL whose target has no IO mapping must not be taken. Taking one
+ * teleports the walker into unmapped space, where it can never reach `put`
+ * again: the FIFO silently stops being processed, no fences are published, and
+ * a title spinning on ctrl->ref waits forever with no indication why. Tokyo
+ * Jungle did exactly this -- get left the 1 MB ring for IO 0x00F00000, which it
+ * never mapped, while put sat at 0x604. Stop at the bad word and say so. */
+static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
+{
+    static int n = 0;
+    if (n++ < 8)
+        fprintf(stderr, "[cellGcmSys] FIFO %s to unmapped IO 0x%08X (word 0x%08X) "
+                "-- not taken, drain stops here\n", kind, target, word);
+}
+
 static void gcm_ref_push_at(u32 v, u32 getoff)
 {
     { static int _d = -1; if (_d < 0) _d = getenv("GCM_REFLOG") ? 1 : 0;
@@ -1112,12 +1126,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
             { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
               if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
                                s_fifo_getoff, w & 0x1FFFFFFCu, put); }
-            s_fifo_getoff = w & 0x1FFFFFFCu;
+            { u32 tgt = w & 0x1FFFFFFCu;
+              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); break; }
+              s_fifo_getoff = tgt; }
             continue;
         }
         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
-            s_fifo_calloff = s_fifo_getoff + 4;
-            s_fifo_getoff  = w & 0x1FFFFFFCu;
+            { u32 tgt = w & 0x1FFFFFFCu;
+              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); break; }
+              s_fifo_calloff = s_fifo_getoff + 4;
+              s_fifo_getoff  = tgt; }
             continue;
         }
         if (w == 0x00020000u) {                /* RET */
