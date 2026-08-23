@@ -131,6 +131,8 @@ static void submit_frame(int with_draw)
 
 int main(int argc, char** argv)
 {
+    /* frames = 0 runs until the window is closed, which is what the .app
+     * bundle uses; a fixed count keeps the CI runs bounded. */
     int frames = 3, do_draw = 0;
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--frames=", 9) == 0) frames = atoi(argv[i] + 9);
@@ -164,7 +166,7 @@ int main(int argc, char** argv)
     /* Flip loop, as cellGcmSetFlipCommand + the vblank ticker drive it. */
     cellGcmSetFlipCommand(0);
     int presented = 0;
-    for (int i = 0; i < frames; i++) {
+    for (int i = 0; frames == 0 || i < frames; i++) {
         if (rsx_metal_backend_pump_messages() < 0) { printf("[host] window closed\n"); break; }
         /* Re-submit every frame, as a title does: the backend records draws
          * per frame and clears the record when it presents. */
