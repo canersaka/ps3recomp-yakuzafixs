@@ -145,7 +145,13 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     uint32_t out_ls    = size_out ? p : 0;  p += ALIGN1024(size_out);
     if (use_io && !out_ls) out_ls = io_ls;    /* in-out: output shares ioBuffer */
     uint32_t ss_size   = ALIGN1024(size_scr + size_stk);
-    uint32_t s_ls      = size_scr ? p : 0;
+    /* The scratch pointer is the BASE OF THE SCRATCH+STACK BLOCK, and it is
+     * valid even when sizeScratch is 0 -- a zero-length buffer still has an
+     * address. Handing the job a NULL here meant it dereferenced 0 and read
+     * ITS OWN CODE as data: every wedged job in Tokyo Jungle was loading a
+     * word from LS 0x64 and using that SPU instruction word as a DMA address,
+     * which is why the addresses looked like misaligned floats. */
+    uint32_t s_ls      = p;
     uint32_t stack_top = p + ss_size;
     p += ss_size;
 
