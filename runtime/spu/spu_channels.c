@@ -253,6 +253,12 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
  * lifted code is a call into the resident manager. */
 #define SPU_JM2_KERNEL_BASE 0x15000u
 
+/* Link-register value handed to a SPURS job so its final `bi $r0` lands
+ * somewhere we recognise. The real job manager passes a return address into
+ * itself; we have no manager, so we pass this and treat arriving here as job
+ * completion. Chosen above the context/descriptor we park near the top of LS. */
+#define SPU_JOB_RETURN_LS   0x3FF00u
+
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
@@ -1188,6 +1194,20 @@ void spu_indirect_branch(spu_context* ctx)
      * addresses may also be registered (historical junk lifts) and must lose. */
     spu_fn fn = ctx->resident_ovl ? spu_lookup(ctx->pc, ctx->resident_ovl) : NULL;
     if (!fn) fn = spu_lookup(ctx->pc, ctx->image_id);
+    /* The job returned through the link register we planted: it is finished.
+     * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
+     * return landed on LS 0, which is the job's OWN entry, and it ran a second
+     * lap with dead registers: re-reading its parameters through a now-zero
+     * context pointer and spinning on a DMA to what were really its own
+     * opcodes. The work is already done by the time it returns. */
+    if (!ctx->policy_mode && ctx->pc == SPU_JOB_RETURN_LS) {
+        static int _n = 0;
+        if (_n++ < 4)
+            fprintf(stderr, "[spurs-job] img=%d returned to the job manager \n",
+                    ctx->image_id);
+        spu_halt(ctx);
+        return;
+    }
     /* jm2 KERNEL SERVICE CALL.
      *
      * A SPURS *job* is linked against the resident job manager and reaches it
@@ -1428,6 +1448,29 @@ void spu_indirect_branch(spu_context* ctx)
                     "resuming PM at link 0x%05X\n", ctx->gpr[0]._u32[0] & SPU_LS_MASK);
         ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
         spu_indirect_branch(ctx);      /* re-dispatch at the rewritten pc */
+        return;
+    }
+
+    /* A SPURS *job* that branches back to LS 0 has RETURNED TO THE JOB MANAGER.
+     * That is how a jm2 job signals completion: its crt tail-jumps to the
+     * resident manager, which on hardware loads the next job and sets up r3/r4
+     * afresh. We load the job at LS 0 and have no manager, so the jump lands on
+     * the job's OWN entry and it runs a second lap -- with dead registers.
+     *
+     * Tokyo Jungle showed exactly that: lap one is correct at every step and
+     * does the real work, then the crt jumps to 0 and lap two re-reads its
+     * parameters through a now-zero context pointer (hence the reads of LS 0x20
+     * and the DMA addresses that were really its own opcodes) and spins forever.
+     * The work was already finished before the jump; the second lap is noise.
+     *
+     * The initial entry is called directly, not through here, so any arrival at
+     * LS 0 in this path is a re-entry. Treat it as job end. */
+    if (!ctx->policy_mode && ctx->pc == 0 && ctx->image_id > 0) {
+        static int _n = 0;
+        if (_n++ < 8)
+            fprintf(stderr, "[spurs-job] img=%d returned to the job manager "
+                    "(branch to LS 0) -- job complete\n", ctx->image_id);
+        spu_halt(ctx);
         return;
     }
     if (ctx->image_id == 2 &&

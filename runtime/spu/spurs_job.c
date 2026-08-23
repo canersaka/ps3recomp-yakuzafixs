@@ -301,6 +301,10 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     ctx.image_id = image_id;
     memcpy(ctx.ls, ls, SPU_LS_SIZE);
     ctx.gpr[1]._u32[0] = (stack_top - 16u) & ~15u;   /* SPU stack grows down */
+    /* Link register: where the job returns when it is done. The job manager
+     * would pass an address inside itself; 0 makes the job re-enter its own
+     * entry at LS 0 and run a bogus second lap. */
+    ctx.gpr[0]._u32[0] = 0x3FF00u;                   /* SPU_JOB_RETURN_LS */
     ctx.gpr[3]._u32[0] = ctx_ls;                     /* CellSpursJobContext2* */
     ctx.gpr[4]._u32[0] = desc_ls;                    /* CellSpursJob256*      */
 

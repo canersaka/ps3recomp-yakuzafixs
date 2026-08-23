@@ -42,9 +42,15 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
      * view of a register file changing under a running job. */
     { static int64_t s_t = -2;
       if (s_t == -2) { const char* e = getenv("SPU_STEPTRACE"); s_t = e ? strtol(e,0,0) : -1; }
+      static int64_t s_from = -2;
+      if (s_from == -2) { const char* e = getenv("SPU_STEPTRACE_FROM");
+                          s_from = e ? strtol(e,0,16) : -1; }
+      static int s_armed = 0;
       if (s_t >= 0 && ctx->image_id == s_t) {
+          if (s_from >= 0 && !s_armed &&
+              ((uint32_t)ctx->pc & SPU_LS_MASK) == (uint32_t)s_from) s_armed = 1;
           static int n = 0;
-          if (n++ < 24) {
+          if ((s_from < 0 || s_armed) && n++ < 40) {
               fprintf(stderr, "[step] pc=0x%05X r1=0x%05X r2=0x%08X r3=0x%08X r4=0x%08X\n",
                       (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[1]._u32[0],
                       ctx->gpr[2]._u32[0], ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0]);
