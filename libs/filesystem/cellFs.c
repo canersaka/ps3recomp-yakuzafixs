@@ -481,7 +481,12 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
     u64 bytes_read = 0;
 
     if (s_files[fd].host_fp) {
-        bytes_read = (u64)fread(buf, 1, (size_t)nbytes, s_files[fd].host_fp);
+        /* gptr(buf): the DATA buffer is a guest address like every other
+         * pointer parameter. The nread out-param below was already translated,
+         * which made this look handled -- but the file contents were being read
+         * to a raw guest address interpreted as a host one, so nothing the
+         * title loaded ever landed in guest memory. */
+        bytes_read = (u64)fread(gptr(buf), 1, (size_t)nbytes, s_files[fd].host_fp);
     }
 
     if (nread)
@@ -502,7 +507,7 @@ s32 cellFsWrite(CellFsFd fd, const void* buf, u64 nbytes, u64* nwrite)
     u64 bytes_written = 0;
 
     if (s_files[fd].host_fp) {
-        bytes_written = (u64)fwrite(buf, 1, (size_t)nbytes, s_files[fd].host_fp);
+        bytes_written = (u64)fwrite(gptr((void*)buf), 1, (size_t)nbytes, s_files[fd].host_fp);
         fflush(s_files[fd].host_fp);
     }
 
