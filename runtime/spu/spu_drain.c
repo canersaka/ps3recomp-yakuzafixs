@@ -34,9 +34,25 @@ void* volatile    g_pm_flow_ctx = 0;
  * that bail spin, the in-flight loads HAVE in fact completed in our model, so
  * set the done bit on the pending records -- the faithful sync equivalent of
  * the completion interrupt. Env LBP_JOBDRAIN (default off while validating). */
+extern void spu_halt(spu_context*);
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
     (void)fn;
+    /* A SPURS job returning to LS 0 is finished -- its crt tail-jumps to the
+     * resident job manager, and with the job loaded at 0 that lands on its own
+     * entry. Planting a return address in r0 catches the jobs that get there
+     * via `bi $r0`, but some branch to 0 DIRECTLY, which the lifter turns into
+     * a plain trampoline that never reaches spu_indirect_branch. The drain sees
+     * every step, so catch it here too. Step 0 is the real entry. */
+    if (ctx->steps++ && (ctx->pc & SPU_LS_MASK) == 0 &&
+        !ctx->policy_mode && ctx->image_id > 0) {
+        static int _n = 0;
+        if (_n++ < 8)
+            fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete\n",
+                    ctx->image_id);
+        spu_halt(ctx);
+        return;
+    }
     /* SPU_STEPTRACE=<img>: pc and the argument registers at every trampoline
      * step. This runs on each drain iteration, so it is the finest-grained
      * view of a register file changing under a running job. */

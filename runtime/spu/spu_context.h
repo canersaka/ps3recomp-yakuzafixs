@@ -264,6 +264,11 @@ typedef struct spu_context {
      * persistent workload-module image adopted at LS 0xA00, re-applied at
      * dispatch after a call-bracket image restore. */
     uint32_t host_depth;
+
+    /* Trampoline steps taken since this context started running. Only needed
+     * to tell a job's INITIAL entry at LS 0 from a later return to LS 0, which
+     * means something quite different (see spu_task_launch_check). */
+    uint32_t steps;
     int      module_img_a00;
 
     /* SPU lockstep gate (spu_lockstep.c; env YZ_SPU_LOCKSTEP, default off).

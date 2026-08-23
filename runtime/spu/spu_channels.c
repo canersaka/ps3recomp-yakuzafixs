@@ -158,6 +158,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * contexts are stack locals, so the address recurs and a stale save from
      * an earlier run would be restored over this job's arguments. */
     { extern void spu_irq_regs_forget(spu_context*); spu_irq_regs_forget(ctx); }
+    ctx->steps = 0;   /* fresh run: step 0 is the entry */
     s_spu_halt_armed = 1;
     g_spu_trampoline_fn = 0;                        /* no stale transfer pending */
     /* Lockstep gate (env YZ_SPU_LOCKSTEP, default off): join the round-robin

@@ -1105,7 +1105,26 @@ static void gcm_rsx_process_fifo_unlocked(void)
     int budget = 0x100000;                    /* words per tick cap */
     while (s_fifo_getoff != put && budget-- > 0) {
         u32 ea = gcm_io2ea(s_fifo_getoff);
-        if (!ea) break;
+        if (!ea) {
+            /* get is sitting on an IO offset with no mapping -- the title
+             * branched into a region and then unmapped it, or the offset was
+             * never valid. Breaking silently (what this did) leaves get stuck
+             * there FOREVER: it can never reach put, the FIFO stops draining,
+             * no fences publish, and anything waiting on ctrl->ref hangs with
+             * nothing logged. Resynchronise to put instead. Commands between
+             * here and put are lost, which is bad, but a permanently dead FIFO
+             * is worse -- and now it says so. */
+            static u32 last_bad; static int n;
+            if (s_fifo_getoff != last_bad || n < 4) {
+                last_bad = s_fifo_getoff;
+                if (n++ < 16)
+                    fprintf(stderr, "[cellGcmSys] FIFO get=0x%08X has no IO "
+                            "mapping -- resyncing to put=0x%08X\n",
+                            s_fifo_getoff, put);
+            }
+            s_fifo_getoff = put;
+            break;
+        }
         u32 w = vm_read32(ea);
         u32 type = w >> 29;
 
