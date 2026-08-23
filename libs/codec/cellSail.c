@@ -351,6 +351,16 @@ s32 cellSailPlayerInitialize2(u32 pSelf, u32 pAllocator, u32 pCallback,
            pSelf, pAllocator, pCallback);
     if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
 
+    /* PS3_NO_SAIL=1: report that the player cannot be created. On hardware
+     * this call spawns the SAIL player's own worker threads, and a title that
+     * then waits for one of them to signal readiness will wait forever against
+     * a stub that spawns nothing. Failing cleanly lets a title take its
+     * "no video" path instead of deadlocking during setup. */
+    if (getenv("PS3_NO_SAIL")) {
+        printf("[cellSail] PS3_NO_SAIL -- reporting player creation failure\n");
+        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    }
+
     sail_zero_guest(pSelf, SAIL_PLAYER_CLEAR);
 
     for (int i = 0; i < CELL_SAIL_PLAYER_MAX; i++) {
