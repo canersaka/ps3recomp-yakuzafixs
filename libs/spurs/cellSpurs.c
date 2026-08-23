@@ -2127,13 +2127,23 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
 {
     u32 pc = entry_ea, ret_pc = 0;
     int jobs = 0;
-    for (int step = 0; step < 4096; step++) {
+    /* Bound IDLE steps, not total steps. A SPURS job chain is frequently a
+     * SERVICE LOOP -- guard, job, sync, next, repeat -- and is meant to run for
+     * the lifetime of the subsystem. A flat cap on total commands therefore
+     * kills a perfectly healthy chain: Tokyo Jungle's audio chain hit it after
+     * 1332 jobs and its sound pipeline simply stopped. What actually indicates
+     * a malformed chain is spinning through commands WITHOUT running a job, so
+     * count that instead and reset it whenever real work happens. */
+    int idle = 0;
+    for (;; idle++) {
+        if (idle > 4096) break;
         u64 cmd = vm_read64(pc);
         u32 op  = (u32)(cmd & 7);
         u32 ext = (u32)(cmd & 127);
 
         if (cmd != 0 && op == 0) {                    /* JOB */
             jc_run_one_job((u32)(cmd & ~7ull), jobs++, size_desc);
+            idle = 0;                    /* real work: the chain is healthy */
             /* Signal per JOB, not per lap. The application waits once for each
              * unit of work it queued -- this title notified the guard 7 times
              * and sat in event_queue_receive 30 times -- so batching the
@@ -2169,7 +2179,8 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
          * FLUSH(5) / JOBLIST(6, nested arrays TODO) / SET_LABEL */
         pc += 8;
     }
-    printf("[cellSpurs] chain 0x%08X: hit the 4096-step bound after %d job(s) -- malformed?\n",
+    printf("[cellSpurs] chain 0x%08X: 4096 commands with no job run after %d "
+           "job(s) -- malformed?\n",
            jc_ea, jobs);
 }
 
