@@ -22,6 +22,26 @@
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 
+/* Resolve the GUEST function on the host stack (closest lifted entry below
+ * each frame) -- the same trick the [BLOCK] profiler uses. */
+static void ppu_guest_caller(char* out, size_t n)
+{
+    snprintf(out, n, "?");
+    void* fr[24]; unsigned short cnt = RtlCaptureStackBackTrace(0, 24, fr, 0);
+    for (unsigned short i = 0; i < cnt; i++) {
+        uintptr_t tgt = (uintptr_t)fr[i], best_h = 0; uint32_t best_g = 0;
+        for (uint64_t k = 0; k < function_table_count; k++) {
+            uintptr_t h = (uintptr_t)function_table[k].func;
+            if (h <= tgt && h > best_h) { best_h = h; best_g = function_table[k].addr; }
+        }
+        if (best_g && tgt - best_h < 0x20000) {
+            snprintf(out, n, "func_%08X+0x%llX", best_g,
+                     (unsigned long long)(tgt - best_h));
+            return;
+        }
+    }
+}
+
 /* PS3_SCTRACE=1: every lv2 syscall with its arguments and RETURN VALUE.
  * An unimplemented syscall is loud (it logs "(stub)") but an IMPLEMENTED one
  * that returns an error is silent, and that is the harder failure to find:
@@ -36,10 +56,26 @@ static void sc_trace(uint64_t num, ppu_context* ctx, uint64_t a3, uint64_t a4,
     if (!mode) return;
     int64_t rv = (int64_t)ctx->gpr[3];
     if (mode == 2 && (rv == 0 || (uint64_t)rv < 0x80000000ull)) return;
-    fprintf(stderr, "[sc] %llu(0x%llX, 0x%llX, 0x%llX, 0x%llX) -> 0x%llX tid=%u\n",
+    /* Resolve the GUEST function that made the call: walk the host stack and
+     * find the lifted function whose entry is the closest one below each frame
+     * (same trick the [BLOCK] profiler uses). Without this a syscall trace says
+     * what happened but never who asked for it. */
+    char who[64] = "?";
+    { void* fr[24]; unsigned short n = RtlCaptureStackBackTrace(0, 24, fr, 0);
+      for (unsigned short i = 0; i < n && who[0] == 63; i++) {
+          uintptr_t tgt = (uintptr_t)fr[i], best_h = 0; uint32_t best_g = 0;
+          for (uint64_t k = 0; k < function_table_count; k++) {
+              uintptr_t h = (uintptr_t)function_table[k].func;
+              if (h <= tgt && h > best_h) { best_h = h; best_g = function_table[k].addr; }
+          }
+          if (best_g && tgt - best_h < 0x20000)
+              snprintf(who, sizeof who, "func_%08X+0x%llX", best_g,
+                       (unsigned long long)(tgt - best_h));
+      } }
+    fprintf(stderr, "[sc] %llu(0x%llX, 0x%llX, 0x%llX, 0x%llX) -> 0x%llX tid=%u from %s\n",
             (unsigned long long)num, (unsigned long long)a3, (unsigned long long)a4,
             (unsigned long long)a5, (unsigned long long)a6,
-            (unsigned long long)rv, (unsigned)ctx->thread_id);
+            (unsigned long long)rv, (unsigned)ctx->thread_id, who);
     fflush(stderr);
 }
 
@@ -1032,8 +1068,27 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
     /* Null / return-to-OS sentinel: a bctr to address 0 means the guest
      * unwound to the initial frame (or a not-yet-populated function pointer).
      * Don't treat it as an unresolved call -- just return to the caller. */
-    if (addr == 0)
+    if (addr == 0) {
+        /* Returning silently leaves r3 HOLDING THE FIRST ARGUMENT, so the guest
+         * reads its own input back as the return value and reports a nonsense
+         * error code. Tokyo Jungle: cellAudioSetNotifyEventQueue(key=0x23A0)
+         * "failed" with status 0x23A0 -- the key itself. Say so."*/
+        static int n = 0;
+        if (n++ < 400)
+        { char who[64]; ppu_guest_caller(who, sizeof who);
+          if (n <= 400) {
+            /* The lifted import thunk leaves the OPD address it loaded in r12,
+             * so we can tell a zero SLOT from a zeroed OPD -- i.e. whether the
+             * import was never resolved or was resolved and later clobbered. */
+            uint32_t opd = (uint32_t)ctx->gpr[12];
+            uint32_t o0 = (opd && vm_base) ? __builtin_bswap32(*(volatile uint32_t*)(vm_base+opd)) : 0;
+            fprintf(stderr, "[ppu] bctr to NULL from %s r12(opd)=0x%08X opd[0]=0x%08X "
+                    "(r3=0x%08X r4=0x%08X "
+                    "tid=%llu) -- returning with r3 untouched\n", who, opd, o0,
+                    (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
+                    (unsigned long long)ctx->thread_id); } }
         return;
+    }
 
     /* SPURS trace: log calls into libsre's cellSpurs export range so we can
      * identify the instance-init function (called with &spurs = 0x40009D00) and

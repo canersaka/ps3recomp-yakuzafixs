@@ -12,6 +12,7 @@
  * Define PS3RECOMP_AUDIO_USE_SDL2 to force SDL2 backend on Windows.
  */
 
+#include "../../runtime/memory/vm.h"   /* vm_commit */
 #include "cellAudio.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read64, vm_write32 */
 #include <stdio.h>
@@ -698,11 +699,23 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     u32 buf_samples = (u32)(nblk * CELL_AUDIO_BLOCK_SAMPLES * nch);
     port->buf_size = buf_samples * (u32)sizeof(float);
 
-    static u32 s_audio_guest = 0x01000000u;          /* 1 MB-aligned, free window */
+    /* Audio buffers live in GUEST memory, but the base must be a window NOTHING
+     * else claims. It used to be 0x01000000, commented "free window" -- it is not:
+     * that is where ports put their HLE OPD arena (Tokyo Jungle's HLE_OPD_BASE is
+     * exactly 0x01000000), and the memset below wiped 128 KB of it. Every import
+     * whose OPD lived there began dispatching to a NULL address the moment the
+     * game opened an audio port -- and a null bctr returns with r3 untouched, so
+     * the guest reads its own first argument back as a status code. That is why
+     * Tokyo Jungle reported "failed to set notify queue (23A0)": 0x23A0 was the
+     * key it had just passed in, echoed back by a call that never happened. */
+#define CELL_AUDIO_GUEST_BASE 0x60000000u   /* clear of HLE, heaps, RSX and libsre */
+    static u32 s_audio_guest = CELL_AUDIO_GUEST_BASE;
     u32 guest_buf  = s_audio_guest;
     s_audio_guest += (port->buf_size + 0xFFFFFu) & ~0xFFFFFu;
     u32 guest_ridx = s_audio_guest;
     s_audio_guest += 0x100000u;
+    /* Not part of the pre-committed main-memory map: commit before touching. */
+    vm_commit(guest_buf, (guest_ridx + 0x100000u) - guest_buf);
 
     port->buffer = (float*)(vm_base + guest_buf);     /* host view of guest buffer */
     memset(port->buffer, 0, port->buf_size);
