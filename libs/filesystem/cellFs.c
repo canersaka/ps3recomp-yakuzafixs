@@ -489,6 +489,11 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
         bytes_read = (u64)fread(gptr(buf), 1, (size_t)nbytes, s_files[fd].host_fp);
     }
 
+    { static int _n = 0;
+      if (_n++ < 32)
+          printf("[cellFs] Read(fd=%d, %llu bytes) -> %llu\n", fd,
+                 (unsigned long long)nbytes, (unsigned long long)bytes_read); }
+
     if (nread)
         *(u64*)gptr(nread) = ps3_bswap64(bytes_read);
 

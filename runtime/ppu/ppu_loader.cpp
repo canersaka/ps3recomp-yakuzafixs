@@ -498,7 +498,22 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
     /* Hot-poll detector: a thread spinning on the same address (e.g. a GCM FIFO
      * get-pointer / label waiting on RSX) reads it thousands of times in a row. */
     { static __declspec(thread) uint32_t last=0xFFFFFFFFu; static __declspec(thread) uint32_t n=0;
-      if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD] spinning on 0x%08X (=0x%08X) guest cia=0x%08X lr=0x%08X\n", (uint32_t)a, __builtin_bswap32(v),
+      if ((uint32_t)a==last) { if (++n==200000) { if (((uint32_t)a & ~0xFFFu) == 0x03002000u) {
+              /* A spin on the GCM control block is a fence/FIFO wait. Print the
+               * WHOLE block: put vs get says whether the RSX side is behind or
+               * whether the guest never submitted, which is the difference
+               * between a stalled pump and a command that never arrived. */
+              extern uint8_t* vm_base;
+              uint32_t pu = 0, ge = 0, rf = 0;
+              if (vm_base) {
+                  const uint8_t* c = vm_base + 0x03002000u;
+                  pu = ((uint32_t)c[0]<<24)|((uint32_t)c[1]<<16)|((uint32_t)c[2]<<8)|c[3];
+                  ge = ((uint32_t)c[4]<<24)|((uint32_t)c[5]<<16)|((uint32_t)c[6]<<8)|c[7];
+                  rf = ((uint32_t)c[8]<<24)|((uint32_t)c[9]<<16)|((uint32_t)c[10]<<8)|c[11];
+              }
+              fprintf(stderr, "[HOTREAD] GCM control spin: put=0x%08X get=0x%08X "
+                      "ref=0x%08X (addr 0x%08X)\n", pu, ge, rf, (uint32_t)a);
+          } else fprintf(stderr, "[HOTREAD] spinning on 0x%08X (=0x%08X) guest cia=0x%08X lr=0x%08X\n", (uint32_t)a, __builtin_bswap32(v),
           g_active_ctx?(uint32_t)g_active_ctx->cia:0, g_active_ctx?(uint32_t)g_active_ctx->lr:0); n=0;
 #ifdef _WIN32
         /* YDKJ_SPINBT=<addr>: one-shot host backtrace when the read32 hot spin
