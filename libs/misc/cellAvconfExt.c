@@ -6,6 +6,17 @@
  */
 
 #include "cellAvconfExt.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write32: translate + byte-swap */
+
+/* The HLE ABI adapter passes pointer parameters as raw guest addresses, so a
+ * bare deref here writes to whatever host address shares that number. These
+ * three out-params were dereferenced directly, and cellAudioOutGetDeviceInfo
+ * memset()s through one -- an access violation the moment a title reaches audio
+ * device setup, which is exactly where Tokyo Jungle crashed. Both device structs
+ * are all-u8, so translation alone is correct for them; the float needs a
+ * byte-swapped store. */
+extern u8* vm_base;
+#define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 #include <stdio.h>
 #include <string.h>
 
@@ -68,6 +79,7 @@ s32 cellAudioOutGetDeviceInfo(u32 audioOut, u32 deviceIndex,
 
     if (!info)
         return CELL_EINVAL;
+    info = GUEST_PTR(info, CellAudioOutDeviceInfo*);
 
     memset(info, 0, sizeof(CellAudioOutDeviceInfo));
 
@@ -104,6 +116,7 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
 
     if (!config)
         return CELL_EINVAL;
+    config = GUEST_PTR(config, CellAudioOutConfiguration*);
 
     memset(config, 0, sizeof(CellAudioOutConfiguration));
     config->channel = CELL_AUDIO_OUT_CHNUM_2;
@@ -129,7 +142,8 @@ s32 cellVideoOutGetGamma(u32 videoOut, float* gamma)
 {
     (void)videoOut;
     if (!gamma) return CELL_EINVAL;
-    *gamma = s_gamma;
+    { float g = s_gamma; uint32_t bits; memcpy(&bits, &g, 4);
+      vm_write32((uint32_t)(uintptr_t)gamma, bits); }
     return CELL_OK;
 }
 

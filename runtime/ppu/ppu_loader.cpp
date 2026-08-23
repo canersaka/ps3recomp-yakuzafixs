@@ -21,6 +21,29 @@
 #include "ppu_recomp.h"     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+
+/* PS3_SCTRACE=1: every lv2 syscall with its arguments and RETURN VALUE.
+ * An unimplemented syscall is loud (it logs "(stub)") but an IMPLEMENTED one
+ * that returns an error is silent, and that is the harder failure to find:
+ * middleware just prints its own complaint and tears down. Optionally filtered
+ * to failures only with PS3_SCTRACE=fail. */
+static void sc_trace(uint64_t num, ppu_context* ctx, uint64_t a3, uint64_t a4,
+                     uint64_t a5, uint64_t a6)
+{
+    static int mode = -1;
+    if (mode < 0) { const char* e = getenv("PS3_SCTRACE");
+        mode = !e ? 0 : (strcmp(e, "fail") == 0 ? 2 : 1); }
+    if (!mode) return;
+    int64_t rv = (int64_t)ctx->gpr[3];
+    if (mode == 2 && (rv == 0 || (uint64_t)rv < 0x80000000ull)) return;
+    fprintf(stderr, "[sc] %llu(0x%llX, 0x%llX, 0x%llX, 0x%llX) -> 0x%llX tid=%u\n",
+            (unsigned long long)num, (unsigned long long)a3, (unsigned long long)a4,
+            (unsigned long long)a5, (unsigned long long)a6,
+            (unsigned long long)rv, (unsigned)ctx->thread_id);
+    fflush(stderr);
+}
+
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1505,10 +1528,12 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                     fprintf(stderr,"[BLOCKSUM] syscall %d: %llums total over %u calls (last 2s)\n",n,(unsigned long long)s_acc[n],s_cnt[n]);
                 for (int n=0;n<1024;n++){s_acc[n]=0;s_cnt[n]=0;} s_win=_t0;
             }
-            if (_ok) return;
+            if (_ok) { sc_trace(num, ctx, _a3, _a4, _a5, 0); return; }
         } else {
-            if (lv2_try_syscall(ctx))
+            if (lv2_try_syscall(ctx)) {
+                sc_trace(num, ctx, ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6]);
                 return;
+            }
         }
         static int logged = 0;
         if (logged < 30) {

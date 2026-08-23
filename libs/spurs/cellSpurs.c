@@ -2091,6 +2091,26 @@ static int jg_wait(u32 ea)
     return 0;
 }
 
+/* Tell the application a lap of chain work is done.
+ *
+ * Timing is the whole point here. The obvious place is after the walk
+ * FINISHES, but a guarded chain never finishes: it loops back to its GUARD and
+ * blocks for the next notify. Tokyo Jungle notifies the guard, then waits on
+ * this queue, and would only notify again after the event arrives -- so
+ * signalling at walker exit deadlocks both sides. Signal when the WORK
+ * completes: at END, and on reaching a guard with jobs run this lap. */
+static void jc_signal_done(u32 jc_ea)
+{
+    for (int i = 0; i < s_spurs_event_queue_n; i++) {
+        int rc = sys_event_queue_push_by_id(s_spurs_event_queue[i],
+                                            SPURS_EVENT_PORT, jc_ea, 0, 0);
+        static int n = 0;
+        if (n++ < 8)
+            printf("[cellSpurs] chain 0x%08X work done -> event queue %u (rc=%d)\n",
+                   jc_ea, s_spurs_event_queue[i], rc);
+    }
+}
+
 static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
 {
     u32 pc = entry_ea, ret_pc = 0;
@@ -2110,6 +2130,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
         if (op == 7) {
             if (ext == (7 | (15 << 3))) {                     /* END */
                 printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs);
+                if (jobs) jc_signal_done(jc_ea);
                 return;
             }
             if (ext == (7 | (14 << 3))) {                     /* RET */
@@ -2123,6 +2144,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
         }
         if (op == 7 && ext == (7 | (1 << 3))) {           /* GUARD */
             u32 g_ea = (u32)(cmd & ~127ull);
+            if (jobs) { jc_signal_done(jc_ea); jobs = 0; }
             if (!jg_wait(g_ea)) return;                  /* still closed */
             pc += 8; continue;
         }
@@ -2150,12 +2172,7 @@ static DWORD WINAPI jc_thread(LPVOID p)
     s_jobchains[slot].running = 0;
     /* Tell the application the chain is done. Without this the walk finishes
      * in silence and a thread waiting on the attached queue never runs again. */
-    for (int i = 0; i < s_spurs_event_queue_n; i++) {
-        int rc = sys_event_queue_push_by_id(s_spurs_event_queue[i], SPURS_EVENT_PORT,
-                                            s_jobchains[slot].jc_ea, 0, 0);
-        printf("[cellSpurs] chain 0x%08X finished -> event queue %u (rc=%d)\n",
-               s_jobchains[slot].jc_ea, s_spurs_event_queue[i], rc);
-    }
+    jc_signal_done(s_jobchains[slot].jc_ea);
     return 0;
 }
 #endif
