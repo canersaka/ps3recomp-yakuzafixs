@@ -154,6 +154,10 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
                     (void*)entry);
             fflush(stderr); }
     }
+    /* Also discard any saved register file keyed to this context pointer:
+     * contexts are stack locals, so the address recurs and a stale save from
+     * an earlier run would be restored over this job's arguments. */
+    { extern void spu_irq_regs_forget(spu_context*); spu_irq_regs_forget(ctx); }
     s_spu_halt_armed = 1;
     g_spu_trampoline_fn = 0;                        /* no stale transfer pending */
     /* Lockstep gate (env YZ_SPU_LOCKSTEP, default off): join the round-robin

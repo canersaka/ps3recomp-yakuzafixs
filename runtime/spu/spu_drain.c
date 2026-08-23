@@ -37,6 +37,20 @@ void* volatile    g_pm_flow_ctx = 0;
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
     (void)fn;
+    /* SPU_STEPTRACE=<img>: pc and the argument registers at every trampoline
+     * step. This runs on each drain iteration, so it is the finest-grained
+     * view of a register file changing under a running job. */
+    { static int64_t s_t = -2;
+      if (s_t == -2) { const char* e = getenv("SPU_STEPTRACE"); s_t = e ? strtol(e,0,0) : -1; }
+      if (s_t >= 0 && ctx->image_id == s_t) {
+          static int n = 0;
+          if (n++ < 24) {
+              fprintf(stderr, "[step] pc=0x%05X r1=0x%05X r2=0x%08X r3=0x%08X r4=0x%08X\n",
+                      (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[1]._u32[0],
+                      ctx->gpr[2]._u32[0], ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0]);
+              fflush(stderr);
+          }
+      } }
     if (g_pm_flow_ctx == (void*)ctx && g_pm_flow_n < 8192)
         g_pm_flow_buf[g_pm_flow_n++] = ctx->pc;
 
@@ -165,6 +179,16 @@ static void spu_irq_regs_save(spu_context* ctx)
 
 /* Called from spu_indirect_branch on every dispatch. Restores + clears when
  * the iret lands. Returns 1 if a restore happened (diagnostic). */
+/* Drop any saved register file belonging to this context. The save slots are
+ * keyed by RAW POINTER, and an spu_context is typically a stack local -- so a
+ * later, unrelated run lands on the same address and inherits the earlier
+ * context's registers wholesale. A fresh run must never do that. */
+void spu_irq_regs_forget(spu_context* ctx)
+{
+    for (int i = 0; i < SPU_IRQ_SLOTS; i++)
+        if (g_irq_save[i].ctx == ctx) g_irq_save[i].ctx = 0;
+}
+
 int spu_irq_regs_maybe_restore(spu_context* ctx)
 {
     for (int i = 0; i < SPU_IRQ_SLOTS; i++) {
