@@ -68,8 +68,20 @@ static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
           MEMORY_BASIC_INFORMATION mbi;
           uint8_t* p = vm_base + ((uintptr_t)pg[i] << 16);
           if (VirtualQuery(p, &mbi, sizeof mbi) == 0) return 0;
-          if (mbi.State != MEM_COMMIT) return 0;
-          if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+          if (mbi.State != MEM_COMMIT) {
+              /* COMMIT it, do not refuse it. The PPU demand-commits guest
+               * pages on first touch; the SPU had no equivalent and simply
+               * dropped the transfer, so the two processors disagreed about
+               * which memory exists. An SPU-written output buffer is the case
+               * that breaks -- the SPU is the FIRST writer, so the page has
+               * never faulted, and the job's results vanish. Worse, a job that
+               * then polls for its own output spins forever: four of Tokyo
+               * Jungle's twelve images wedged this way, each burning 4096
+               * skipped transfers per run before the runaway guard stopped it. */
+              if (!VirtualAlloc(p, 0x10000, MEM_COMMIT, PAGE_READWRITE)) return 0;
+          } else if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) {
+              return 0;
+          }
           g_vm_page_bitmap[pg[i] >> 3] |= (uint8_t)(1u << (pg[i] & 7));
       }
     }
@@ -332,26 +344,6 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             for (uint32_t i = 0; i < 128; i++)
                 fputc((q[i] >= 32 && q[i] < 127) ? q[i] : 46, stderr);
             fputc(10, stderr); fflush(stderr); } }
-        /* A job that re-issues the SAME impossible transfer forever is wedged,
-         * not slow: nothing about its state can change, because the DMA is the
-         * only thing it is doing. Tokyo Jungle hit this a million times in 45 s
-         * on one EA, pinning a core and leaving the PPU thread that kicked the
-         * job waiting for a completion that could never arrive. Stop the SPU
-         * instead, so the failure is a reported halt at a known pc rather than
-         * a silent hang. */
-        { static uint32_t s_last_ea, s_last_lsa, s_rep;
-          if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
-              if (++s_rep >= 4096) {
-                  s_rep = 0;   /* re-arm: the chain may run this job again */
-                  extern void spu_halt(spu_context*);
-                  fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: 4096 identical "
-                          "failed DMAs to ea=0x%08X -- halting the SPU\n",
-                          spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK,
-                          (uint32_t)ea);
-                  fflush(stderr);
-                  spu_halt(spu);
-              }
-          } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; } }
         return -1;
     }
 
@@ -725,6 +717,29 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
             fflush(stderr);
         }
     }
+
+    /* A job re-issuing the SAME transfer forever is wedged, not slow: nothing
+     * about its state can change if the DMA is all it is doing. This used to
+     * count only REJECTED transfers, so once the EA check started committing
+     * pages on demand the counter never advanced and a spinning job simply hung
+     * the chain walker instead. Count repeats whether or not the transfer
+     * succeeds, and halt at a known pc rather than hanging silently. */
+    { static uint32_t s_last_ea, s_last_lsa, s_rep;
+      static uint32_t s_limit = 0;
+      if (!s_limit) { const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
+                      s_limit = e ? (uint32_t)strtoul(e, 0, 0) : 256u; }
+      if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
+          if (++s_rep >= s_limit) {
+              s_rep = 0;   /* re-arm: the chain may run this job again */
+              extern void spu_halt(spu_context*);
+              fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical "
+                      "transfers to ea=0x%08X -- halting the SPU\n",
+                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, s_limit,
+                      (uint32_t)ea);
+              fflush(stderr);
+              spu_halt(spu);
+          }
+      } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; } }
 
     /* Mark tag as in-progress */
     mfc->tag_completed &= ~(1u << tag);
