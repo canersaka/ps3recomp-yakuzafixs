@@ -1991,6 +1991,7 @@ static struct {
     u32 ea;          /* guest CellSpursJobGuard address (128-byte aligned) */
     u32 count;       /* notifications still outstanding                    */
     u32 reset;       /* value to restore when autoReset is set             */
+    u32 pending;     /* notifications received, not yet consumed        */
     u32 auto_reset;
     int active;
 } s_jobguards[MAX_JOBGUARDS];
@@ -2023,6 +2024,7 @@ s32 cellSpursJobGuardInitialize(u64 jc_ea, u64 guard_ea, u32 notify_count,
     s_jobguards[i].ea         = ea;
     s_jobguards[i].count      = notify_count;
     s_jobguards[i].reset      = notify_count;
+    s_jobguards[i].pending    = 0;
     s_jobguards[i].auto_reset = auto_reset;
     s_jobguards[i].active     = 1;
 
@@ -2045,8 +2047,16 @@ s32 cellSpursJobGuardNotify(u64 guard_ea)
         printf("[cellSpurs] JobGuardNotify(0x%08X) -- unknown guard\n", ea);
         return CELL_SPURS_TASK_ERROR_INVAL;
     }
-    if (s_jobguards[i].count) s_jobguards[i].count--;
-    vm_write32(ea, s_jobguards[i].count);
+    /* Count notifications as CREDITS rather than decrementing to a floor of
+     * zero. The guard used to reload its count at the moment the walker
+     * OBSERVED zero, which threw away any notify that arrived while the job
+     * was still running -- the title notified 6 times and the chain completed
+     * 2 laps, so the thread waiting on the other 4 completions never woke. */
+    s_jobguards[i].pending++;
+    { u32 remaining = (s_jobguards[i].pending >= s_jobguards[i].reset)
+                    ? 0u : s_jobguards[i].reset - s_jobguards[i].pending;
+      s_jobguards[i].count = remaining;
+      vm_write32(ea, remaining); }
     { static int _n = 0;
       if (_n++ < 8)
           printf("[cellSpurs] JobGuardNotify(0x%08X) -> %u remaining\n",
@@ -2074,11 +2084,13 @@ static int jg_wait(u32 ea)
     int i = jg_find(ea);
     if (i < 0) return 1;
     for (int spin = 0; spin < 20000; spin++) {     /* ~20 s at 1 ms */
-        if (s_jobguards[i].count == 0) {
-            if (s_jobguards[i].auto_reset) {
-                s_jobguards[i].count = s_jobguards[i].reset;
-                vm_write32(ea, s_jobguards[i].count);
-            }
+        if (s_jobguards[i].pending >= s_jobguards[i].reset) {
+            /* Consume exactly one release worth of credits, so notifies that
+             * arrived during the previous lap still count. */
+            s_jobguards[i].pending -= s_jobguards[i].reset;
+            if (!s_jobguards[i].auto_reset) s_jobguards[i].reset = 0;
+            s_jobguards[i].count = s_jobguards[i].reset;
+            vm_write32(ea, s_jobguards[i].count);
             return 1;
         }
 #ifdef _WIN32
@@ -2122,6 +2134,12 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
 
         if (cmd != 0 && op == 0) {                    /* JOB */
             jc_run_one_job((u32)(cmd & ~7ull), jobs++, size_desc);
+            /* Signal per JOB, not per lap. The application waits once for each
+             * unit of work it queued -- this title notified the guard 7 times
+             * and sat in event_queue_receive 30 times -- so batching the
+             * completion into one event per pass leaves it waiting for
+             * completions that, from its point of view, never arrive. */
+            jc_signal_done(jc_ea);
             pc += 8; continue;
         }
         if (op == 1) { pc = (u32)(cmd & ~7ull); continue; }   /* RESET_PC */
@@ -2144,7 +2162,6 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
         }
         if (op == 7 && ext == (7 | (1 << 3))) {           /* GUARD */
             u32 g_ea = (u32)(cmd & ~127ull);
-            if (jobs) { jc_signal_done(jc_ea); jobs = 0; }
             if (!jg_wait(g_ea)) return;                  /* still closed */
             pc += 8; continue;
         }
