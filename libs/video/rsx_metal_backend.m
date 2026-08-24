@@ -71,6 +71,21 @@ static u32        s_dropped_draws;
 
 static id<MTLLibrary> s_shader_lib;
 
+/* Frames the CPU may run ahead of the GPU.
+ *
+ * Presenting used to end in -waitUntilCompleted unconditionally, which is the
+ * one pattern where a translation layer or a driver cannot hide its encoding
+ * work: the CPU stalls on every frame instead of preparing the next one.
+ * Dolphin measured exactly this shape (their bounding-box path) as the single
+ * largest CPU-side penalty in their Metal/MoltenVK comparison.
+ *
+ * Windowed presents now bound in-flight frames with a semaphore released from
+ * the command buffer's completion handler, so the CPU keeps working while the
+ * GPU drains. Headless still waits, because the readback has to observe a
+ * finished frame -- there the stall is the point. */
+#define MTL_MAX_INFLIGHT 3
+static dispatch_semaphore_t s_inflight;
+
 /* PSO cache. Keyed on the blend state, which is all the built-in shader path
  * varies; a guest-shader key (vp/fp ucode hash) joins it when that lands. */
 typedef struct { u32 key; id<MTLRenderPipelineState> pso; } MtlPsoEntry;
@@ -535,6 +550,12 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
             return -1;
         }
 
+        s_inflight = dispatch_semaphore_create(MTL_MAX_INFLIGHT);
+        if (!s_inflight) {
+            fprintf(stderr, "[RSX metal] semaphore creation failed\n");
+            return -1;
+        }
+
         rsx_set_backend(&s_backend_vtable);
         s_ready  = 1;
         s_closed = 0;
@@ -549,6 +570,18 @@ void rsx_metal_backend_shutdown(void)
 {
     @autoreleasepool {
         if (s_ready) rsx_set_backend(NULL);
+        /* Reclaim every in-flight slot so no command buffer is still
+         * referencing the device, queue or textures when they are released,
+         * then hand the slots back. libdispatch traps if a semaphore is
+         * deallocated while its count is below the value it was created with,
+         * so draining without restoring is a crash, not a leak. */
+        if (s_inflight) {
+            for (int i = 0; i < MTL_MAX_INFLIGHT; i++)
+                dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+            for (int i = 0; i < MTL_MAX_INFLIGHT; i++)
+                dispatch_semaphore_signal(s_inflight);
+            s_inflight = nil;
+        }
 #if !TARGET_OS_IPHONE
         if (s_window) { [s_window close]; s_window = nil; }
 #endif
@@ -587,6 +620,8 @@ int rsx_metal_backend_pump_messages(void)
 void rsx_metal_backend_present(void)
 {
     if (!s_ready) return;
+    /* Block only when MTL_MAX_INFLIGHT frames are already queued. */
+    if (!s_headless) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
     @autoreleasepool {
         id<MTLTexture> target = nil;
         id<CAMetalDrawable> drawable = nil;
@@ -595,10 +630,16 @@ void rsx_metal_backend_present(void)
             target = s_offscreen;
         } else {
             drawable = [s_layer nextDrawable];
-            if (!drawable) return;      /* compositor is busy; skip this frame */
+            if (!drawable) {            /* compositor is busy; skip this frame */
+                dispatch_semaphore_signal(s_inflight);
+                return;
+            }
             target = [drawable texture];
         }
-        if (!target) return;
+        if (!target) {
+            if (!s_headless) dispatch_semaphore_signal(s_inflight);
+            return;
+        }
 
         MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
         rp.colorAttachments[0].texture     = target;
@@ -629,8 +670,19 @@ void rsx_metal_backend_present(void)
         [enc endEncoding];
 
         if (drawable) [cb presentDrawable:drawable];
-        [cb commit];
-        [cb waitUntilCompleted];
+
+        if (s_headless) {
+            /* The readback below must see a completed frame. */
+            [cb commit];
+            [cb waitUntilCompleted];
+        } else {
+            dispatch_semaphore_t sem = s_inflight;
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) {
+                (void)_unused;
+                dispatch_semaphore_signal(sem);
+            }];
+            [cb commit];        /* no wait: the CPU goes on to the next frame */
+        }
 
         if (s_dropped_draws) {
             fprintf(stderr, "[RSX metal] dropped %u draw(s) this frame (cap %d draws / %u verts)\n",
