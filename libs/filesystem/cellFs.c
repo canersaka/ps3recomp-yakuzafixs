@@ -491,8 +491,18 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
 
     { static int _n = 0;
       if (_n++ < 32)
-          printf("[cellFs] Read(fd=%d, %llu bytes) -> %llu\n", fd,
-                 (unsigned long long)nbytes, (unsigned long long)bytes_read); }
+          { printf("[cellFs] Read(fd=%d, %llu bytes) -> %llu", fd,
+                   (unsigned long long)nbytes, (unsigned long long)bytes_read);
+            /* First bytes as they landed in GUEST memory. Confirms the data
+             * really arrived where the title will parse it, which is not the
+             * same question as whether fread returned the right count. */
+            const unsigned char* g = (const unsigned char*)gptr(buf);
+            if (g && bytes_read) {
+                printf("  guest[0..15]:");
+                for (int k = 0; k < 16 && (u64)k < bytes_read; k++)
+                    printf(" %02X", g[k]);
+            }
+            printf("\n"); } }
 
     if (nread)
         *(u64*)gptr(nread) = ps3_bswap64(bytes_read);
