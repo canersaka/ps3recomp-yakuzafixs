@@ -1089,6 +1089,12 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
       /* PS3_CALLTRACE_FROM=<guest fn hex>: only calls made from inside this
        * lifted function, resolved off the host stack. The most reliable handle
        * when neither lr nor an argument is distinctive. */
+      /* PS3_CALLTRACE_TO=<hex>: only calls whose TARGET is this address --
+       * the way to catch an entry point that has no direct callers. */
+      static int64_t only_to = -2;
+      if (only_to == -2) { const char* e = getenv("PS3_CALLTRACE_TO");
+                           only_to = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+      if (only_to >= 0 && addr != (uint32_t)only_to) goto skip_calltrace;
       static int64_t only_from = -2;
       if (only_from == -2) { const char* e = getenv("PS3_CALLTRACE_FROM");
                              only_from = e ? (int64_t)strtoul(e, 0, 16) : -1; }
