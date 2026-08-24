@@ -1076,6 +1076,13 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
      * generic visibility into vtable/callback dispatch (e.g. which job body a
      * JobManager worker runs). */
     { static int64_t ctr_n=-2; if(ctr_n==-2){const char*e=getenv("PS3_CALLTRACE"); ctr_n=e?atoi(e):0;}
+      /* PS3_CALLTRACE_LR=<hex>: only calls returning to this guest address.
+       * An unfiltered trace is far too heavy to reach a late failure -- it
+       * changes the timing enough that the run never gets there. */
+      static int64_t only_lr = -2;
+      if (only_lr == -2) { const char* e = getenv("PS3_CALLTRACE_LR");
+                           only_lr = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+      if (only_lr >= 0 && (uint32_t)ctx->lr != (uint32_t)only_lr) { /* skip */ } else
       if(ctr_n>0){ ctr_n--;
         fprintf(stderr,"[CALL] -> 0x%08X r3=0x%08X r4=0x%08X tid=%llu\n",
                 addr,(uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],
@@ -1560,9 +1567,20 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                 fprintf(stderr, "%s\n", line); fflush(stderr);
             }
         }
-        for (uint32_t i = 0; i < wlen; i++) {
-            if (ppu_vm_size && buf + i >= ppu_vm_size) break;
-            fputc(vm_read8(buf + i), out);
+        /* Assemble the whole message and emit it in ONE call. Writing a byte at
+         * a time let other threads interleave INSIDE a guest message -- a title
+         * error would come out as "out of range b" + another thread's line +
+         * "us (1,1)". That is not just ugly: it silently defeats grep, so a
+         * message that IS in the log reads as absent, and several readings of
+         * this title's state were wrong because of it. */
+        {
+            char tty[0x4001];
+            uint32_t n = 0;
+            for (uint32_t i = 0; i < wlen && n < sizeof tty - 1; i++) {
+                if (ppu_vm_size && buf + i >= ppu_vm_size) break;
+                tty[n++] = (char)vm_read8(buf + i);
+            }
+            if (n) fwrite(tty, 1, n, out);
         }
         fflush(out);
         if (pwl) vm_write32(pwl, len);
