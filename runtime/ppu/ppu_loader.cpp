@@ -1082,11 +1082,33 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
       static int64_t only_lr = -2;
       if (only_lr == -2) { const char* e = getenv("PS3_CALLTRACE_LR");
                            only_lr = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+      /* PS3_CALLTRACE_R5=<n>: only calls with this selector in r5. Some lifted
+       * bctrl sites never set ctx->lr (the lifter uses a host call there), so
+       * filtering by return address silently matches nothing -- an argument
+       * value is the reliable handle on a specific call. */
+      /* PS3_CALLTRACE_FROM=<guest fn hex>: only calls made from inside this
+       * lifted function, resolved off the host stack. The most reliable handle
+       * when neither lr nor an argument is distinctive. */
+      static int64_t only_from = -2;
+      if (only_from == -2) { const char* e = getenv("PS3_CALLTRACE_FROM");
+                             only_from = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+      char cf[64];
+      if (only_from >= 0) {
+          ppu_guest_caller(cf, sizeof cf);
+          char want[32]; snprintf(want, sizeof want, "func_%08X", (uint32_t)only_from);
+          if (strncmp(cf, want, strlen(want)) != 0) goto skip_calltrace;
+      }
+      static int64_t only_r5 = -2;
+      if (only_r5 == -2) { const char* e = getenv("PS3_CALLTRACE_R5");
+                           only_r5 = e ? strtol(e, 0, 0) : -1; }
+      if (only_r5 >= 0 && (int64_t)(int32_t)ctx->gpr[5] != only_r5) { /* skip */ } else
       if (only_lr >= 0 && (uint32_t)ctx->lr != (uint32_t)only_lr) { /* skip */ } else
       if(ctr_n>0){ ctr_n--;
-        fprintf(stderr,"[CALL] -> 0x%08X r3=0x%08X r4=0x%08X tid=%llu\n",
+        fprintf(stderr,"[CALL] -> 0x%08X r3=0x%08X r4=0x%08X r5=%lld tid=%llu\n",
                 addr,(uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],
+                (long long)(int32_t)ctx->gpr[5],
                 (unsigned long long)ctx->thread_id); } }
+      skip_calltrace: ;
     /* Null / return-to-OS sentinel: a bctr to address 0 means the guest
      * unwound to the initial frame (or a not-yet-populated function pointer).
      * Don't treat it as an unresolved call -- just return to the caller. */
