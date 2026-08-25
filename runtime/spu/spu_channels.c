@@ -249,9 +249,9 @@ volatile unsigned g_spu_putllc_count = 0;
  * work-run on the stalled job queue from the dozen idle jobmanager instances. */
 volatile unsigned g_spu_putllc_sync_hit = 0;
 
-/* Lowest LS address the SPURS job-manager kernel occupies. Jobs load at 0 and
- * their stacks top out well below this; anything at or above it that has no
- * lifted code is a call into the resident manager. */
+/* Lowest LS address treated as "not job code". Jobs load at 0 and
+ * their stacks top out well below this; a branch at or above it with no
+ * lifted code is a runaway, not a service call. */
 #define SPU_JM2_KERNEL_BASE 0x15000u
 
 /* Link-register value handed to a SPURS job so its final `bi $r0` lands
@@ -1209,33 +1209,27 @@ void spu_indirect_branch(spu_context* ctx)
         spu_halt(ctx);
         return;
     }
-    /* jm2 KERNEL SERVICE CALL.
+    /* Branch into high LS with no lifted code there.
      *
-     * A SPURS *job* is linked against the resident job manager and reaches it
-     * with an ABSOLUTE branch (bra/brasl) to a fixed LS address well above its
-     * own image. Every one of Tokyo Jungle's twelve job images branches to
-     * 0x16100, and most also to 0x18160 / 0x18180 / 0x1A100 -- addresses far
-     * past their 9-72 KB of code.
+     * This was added believing the jobs called a resident SPURS job-manager
+     * kernel at 0x16100 / 0x18160 / 0x1A100. That was WRONG. Those "absolute
+     * branches" were the disassembler decoding ASCII as instructions: the
+     * bytes behind one of them are 30 2C 20 43, i.e. "0, C" from the string
+     * "ch0, F:0:400, 100, Channel 0 level, %". Every job embeds the same
+     * parameter-description text, which is why the same phantom target
+     * appeared in 9 of 12 unrelated images and looked like a shared ABI.
      *
-     * That kernel ships inside libsre, which is firmware we do not have, so
-     * those addresses are EMPTY local store. The job branched into whatever the
-     * previous job happened to leave there and computed garbage from it. That is
-     * the origin of the wild DMA addresses -- 0x411FC017, 0x3FE0020D,
-     * 0x7801C182 -- which are misaligned and, read as IEEE floats, ordinary
-     * magnitudes: leftover audio data being used as a pointer.
-     *
-     * Ending the job is the honest answer for a service we cannot perform, and
-     * it is also what most of these calls ARE (jobEnd/exit dominate the jm2 ABI).
-     * Name each distinct entry point so the common ones can be implemented
-     * rather than guessed at. */
+     * The guard is kept because branching into unlifted high local store is
+     * still an error worth stopping at rather than executing whatever is
+     * there -- but it is a backstop, not a kernel interface. */
     if (!fn && !ctx->policy_mode && ctx->pc >= SPU_JM2_KERNEL_BASE) {
         static uint32_t seen[16]; static int n_seen = 0;
         int known = 0;
         for (int i = 0; i < n_seen; i++) if (seen[i] == ctx->pc) { known = 1; break; }
         if (!known && n_seen < 16) {
             seen[n_seen++] = ctx->pc;
-            fprintf(stderr, "[spu-jm2] img=%d called kernel service at LS 0x%05X "
-                    "(lr=0x%05X) -- not resident, ending the job\n",
+            fprintf(stderr, "[spu] img=%d branched into unlifted LS 0x%05X "
+                    "(lr=0x%05X) -- ending the job\n",
                     ctx->image_id, ctx->pc, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
             fflush(stderr);
         }
