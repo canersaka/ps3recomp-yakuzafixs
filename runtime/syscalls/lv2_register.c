@@ -1194,6 +1194,11 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
     uint32_t ls_offset = (uint32_t)ctx->gpr[4];
     uint32_t value_ea  = (uint32_t)ctx->gpr[5];
     uint32_t type      = (uint32_t)ctx->gpr[6];
+    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_LSREAD_TRACE") ? 1 : 0;
+      static int n = 0;
+      if (s_t && n++ < 12)
+          fprintf(stderr, "[spu-readls] tid=%u off=0x%05X size=%u\n",
+                  tid, ls_offset, type); }
     spu_thread_t* t = spu_find_thread(tid);
     if (!t || !value_ea || !vm_base) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */

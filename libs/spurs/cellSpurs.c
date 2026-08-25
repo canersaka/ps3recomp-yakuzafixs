@@ -2111,8 +2111,21 @@ static int jg_wait(u32 ea)
  * this queue, and would only notify again after the event arrives -- so
  * signalling at walker exit deadlocks both sides. Signal when the WORK
  * completes: at END, and on reaching a guard with jobs run this lap. */
+extern uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr;
+extern int g_spurs_job_mbox_valid;
+
 static void jc_signal_done(u32 jc_ea)
 {
+    /* Carry the job's mailbox answer in the completion event. On hardware the
+     * SPU's outbound/interrupt mailbox is what the SPURS event delivers; a
+     * synthetic payload means the caller reads back zero for whatever it
+     * asked. Keep the chain EA in data1 for anything that used it. */
+    u64 d2 = 0, d3 = 0;
+    if (g_spurs_job_mbox_valid) {
+        d2 = g_spurs_job_mbox;
+        d3 = g_spurs_job_mbox_intr;
+        g_spurs_job_mbox_valid = 0;
+    }
     for (int i = 0; i < s_spurs_event_queue_n; i++) {
         int rc = sys_event_queue_push_by_id(s_spurs_event_queue[i],
                                             SPURS_EVENT_PORT, jc_ea, 0, 0);

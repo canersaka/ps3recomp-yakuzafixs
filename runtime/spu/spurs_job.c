@@ -109,6 +109,10 @@ enum {
 #define JOB_DMA_TAG   20u          /* "one of: {20,21}" — job_context_types.h */
 #define JOB_STACK_DEFAULT 8192u    /* _cellSpursCheckJob's sizeStack==0 default */
 
+/* Last outbound mailbox posted by a finished job (see below). */
+uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr;
+int g_spurs_job_mbox_valid;
+
 int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size)
 {
@@ -320,6 +324,23 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * HALT-ASSERT heqi 0x1650 seen once per jm2 job is NORMAL COMPLETION
      * noise, not a failure: the job's real work finished before the jump. */
     spu_run_with_halt(entry, &ctx);
+
+    /* A job answers a query by MAILBOX, not by writing memory: the sound job
+     * ends with wrch SPU_WrOutMbox / SPU_WrOutIntrMbox and returns. The context
+     * is a stack local, so without capturing them here the answer is discarded
+     * the moment this function returns -- the PPU then reads 0 for every
+     * property it asked for. Hand them to the chain walker so they can ride the
+     * completion event. */
+    g_spurs_job_mbox      = spu_channel_has_data(&ctx.ch_out_mbox)
+                          ? ctx.ch_out_mbox.value : 0;
+    g_spurs_job_mbox_intr = spu_channel_has_data(&ctx.ch_out_intr_mbox)
+                          ? ctx.ch_out_intr_mbox.value : 0;
+    g_spurs_job_mbox_valid = g_spurs_job_mbox || g_spurs_job_mbox_intr;
+    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_JOB_MBOX") ? 1 : 0;
+      static int n = 0;
+      if (s_t && n++ < 16 && g_spurs_job_mbox_valid)
+          fprintf(stderr, "[spurs-job] job 0x%08X posted mbox=0x%08X intr=0x%08X\n",
+                  job_ea, g_spurs_job_mbox, g_spurs_job_mbox_intr); }
 
     if (getenv("LBP_JOB_DUMP")) {
         fprintf(stderr, "[spurs-job] job 0x%08X exit: status=0x%X stop=0x%X pc=0x%05X\n",
