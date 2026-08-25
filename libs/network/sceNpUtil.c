@@ -11,6 +11,7 @@
 #include <string.h>
 #include <ctype.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+#include "../guest_struct.h"   /* GUEST_EA, vm_read/vm_write: guest EA -> host */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -37,9 +38,14 @@ s32 sceNpUtilBandwidthTestGetStatus(SceNpBandwidthTestResult* result)
         return (s32)SCE_NP_UTIL_ERROR_INVALID_ARGUMENT;
 
     /* Report a generous fake bandwidth (100 Mbps) */
-    result->uploadBps = 100000000.0;
-    result->downloadBps = 100000000.0;
-    result->result = 0; /* success / done */
+    /* two doubles then an s32; vm_write64 takes the bit pattern. */
+    u32 res_ea = GUEST_EA(result);
+    double bps = 100000000.0;
+    u64 bits;
+    memcpy(&bits, &bps, sizeof(bits));
+    vm_write64(res_ea + (u32)offsetof(SceNpBandwidthTestResult, uploadBps),   bits);
+    vm_write64(res_ea + (u32)offsetof(SceNpBandwidthTestResult, downloadBps), bits);
+    vm_write32(res_ea + (u32)offsetof(SceNpBandwidthTestResult, result), 0); /* success / done */
 
     s_bw_test_running = 0;
     return CELL_OK;
@@ -90,6 +96,7 @@ s32 sceNpUtilCheckOnlineId(const char* onlineId)
 
     /* PS3 online IDs: 3-16 chars, alphanumeric + dash + underscore,
        must start with a letter */
+    onlineId = GUEST_PTR(onlineId, const char*);
     size_t len = strlen(onlineId);
     if (len < 3 || len > 16)
         return (s32)SCE_NP_UTIL_ERROR_INVALID_ONLINE_ID;
@@ -128,7 +135,8 @@ s32 sceNpUtilCmpNpId(const void* npId1, const void* npId2)
     if (!npId1 || !npId2)
         return (s32)SCE_NP_UTIL_ERROR_INVALID_ARGUMENT;
 
-    return memcmp(npId1, npId2, 36) == 0 ? 0 : 1;
+    return memcmp(GUEST_PTR(npId1, const void*),
+                  GUEST_PTR(npId2, const void*), 36) == 0 ? 0 : 1;
 }
 
 s32 sceNpUtilCmpNpIdInOrder(const void* npId1, const void* npId2, s32* order)

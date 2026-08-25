@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include "ps3emu/endian.h"                   /* ps3_bswap64 -- guest is big-endian */
+#include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 /* HLE args arrive as guest effective addresses; translate before deref. */
 #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 
@@ -580,9 +581,10 @@ s32 sceNpTrophyGetGameProgress(SceNpTrophyContext context,
     u32 total = s_contexts[context].total_trophies;
     u32 unlocked = trophy_count_unlocked(&s_contexts[context]);
 
-    *percentage = total > 0 ? (s32)((unlocked * 100) / total) : 0;
+    s32 pct = total > 0 ? (s32)((unlocked * 100) / total) : 0;
+    vm_write32(GUEST_EA(percentage), (u32)pct);
 
     printf("[sceNpTrophy] GetGameProgress(ctx=%d) -> %d%%\n",
-           context, *percentage);
+           context, pct);
     return CELL_OK;
 }

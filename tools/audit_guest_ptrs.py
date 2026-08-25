@@ -38,7 +38,7 @@ PARAM_PTR_RE = re.compile(r'(?:const\s+)?[A-Za-z_][A-Za-z0-9_]*\s*\*+\s*([A-Za-z
 # Uses that are already correct: the parameter is converted, not dereferenced.
 SAFE_USE = re.compile(r'(?:uintptr_t\)\s*|vm_read\w*\(|vm_write\w*\(|gptr\(|gpath\(|guest_str\('
                       r'|g_ps3_guest_caller\(|yz_g2h\(|rtc_str\(|rtc_tick_read\(|rtc_tick_write\('
-                      r'|GUEST_PTR\()')
+                      r'|GUEST_PTR\(|GUEST_EA\()')
 
 
 def pointer_params(param_text):
@@ -93,7 +93,14 @@ def bare_deref_calls(body, param):
             nlpos = body.rfind(chr(10), 0, m.start()) + 1
             endpos = body.find(chr(10), m.start())
             line = body[nlpos:] if endpos < 0 else body[nlpos:endpos]
-            if not SAFE_USE.search(line):
+            # Check the WHOLE call for a safe use, not just the line the call
+            # starts on -- a translated argument frequently sits on a later
+            # line, e.g.
+            #     memcpy(s_data[slot].info.data,
+            #            vm_base + GUEST_EA(info) + offsetof(T, data),
+            # which is correct but reads as a bare `info` if you stop at the
+            # first line.
+            if not SAFE_USE.search(m.group(0)) and not SAFE_USE.search(line):
                 out.append(line)
     return out
 
