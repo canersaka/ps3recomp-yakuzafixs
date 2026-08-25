@@ -71,6 +71,30 @@ def function_bodies(src):
                src[brace:i])
 
 
+# Host functions that DEREFERENCE a pointer argument. Passing a guest pointer
+# bare to any of these is the same bug as *p, and is how cellFsRead shipped an
+# entire sound bank to an untranslated address -- fread(buf,...) reads no
+# differently from *buf, but the old checks only looked for *p and p->.
+DEREFERENCING = (
+    'strcpy strncpy strcat strncat strlen strcmp strncmp strchr strrchr strstr'
+    ' strdup sprintf snprintf sscanf atoi atol strtol strtoul strtod'
+    ' memcpy memmove memset memcmp memchr'
+    ' fopen freopen fread fwrite fputs fgets remove rename mkdir stat'
+).split()
+
+def bare_deref_calls(body, param):
+    """Lines calling a dereferencing host function with `param` passed bare."""
+    out = []
+    for fn in DEREFERENCING:
+        pat = re.escape(fn) + r"\s*\([^;]*?(?<![\w.>])" + re.escape(param) + r"\s*[,)]"
+        for m in re.finditer(pat, body):
+            nlpos = body.rfind(chr(10), 0, m.start()) + 1
+            endpos = body.find(chr(10), m.start())
+            line = body[nlpos:] if endpos < 0 else body[nlpos:endpos]
+            if not SAFE_USE.search(line):
+                out.append(line)
+    return out
+
 def suspects_in(path):
     src = open(path, 'rb').read().decode('utf-8', 'replace').replace('\r\n', '\n')
     found = []
@@ -92,6 +116,7 @@ def suspects_in(path):
             # suspects for a file full of them.
             uses = [u for u in uses
                     if not re.search(r'[A-Za-z_][A-Za-z0-9_]*\s*\*+\s*%s\s*=' % p, u)]
+            uses += bare_deref_calls(body, p)
             if uses:
                 bad.append(p)
         if bad:
