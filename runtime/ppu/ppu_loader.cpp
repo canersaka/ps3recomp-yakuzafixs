@@ -42,6 +42,68 @@ extern "C" void ppu_guest_caller(char* out, size_t n)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * Guest-pointer trap
+ *
+ * The HLE ABI hands a guest function's pointer arguments through as raw 32-bit
+ * GUEST addresses. An implementation that dereferences one directly -- instead
+ * of translating through vm_base -- reads or writes host address 0x00000000 to
+ * 0xFFFFFFFF. vm_base sits far above that, so those two worlds never overlap.
+ *
+ * That mistake has been the single most expensive bug class in this runtime.
+ * cellFsRead read an entire sound bank to an untranslated pointer, and the
+ * symptom was a title deadlocking in audio initialisation four subsystems away.
+ * cellAvconfExt, cellSail and cellFs cost similar hunts. Found by crashing, they
+ * are archaeology; found here, they are a one-line fix at a named function.
+ *
+ * Reserving the low 4 GB is what makes the report RELIABLE rather than lucky:
+ * unreserved address space faults today, but nothing stops the CRT or a DLL from
+ * allocating there later, at which point the same bug silently corrupts unrelated
+ * memory instead of faulting. Reserve it and the fault is guaranteed.
+ *
+ * Deliberately does NOT swallow the exception: it reports and lets the normal
+ * handling proceed, so a real bug still stops the run.
+ * -----------------------------------------------------------------------*/
+static LONG WINAPI ps3_guest_ptr_veh(EXCEPTION_POINTERS* ep)
+{
+    const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
+        er->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    uintptr_t at = (uintptr_t)er->ExceptionInformation[1];
+    if (at >= 0x100000000ull) return EXCEPTION_CONTINUE_SEARCH;   /* not a guest addr */
+    if (at < 0x10000u) return EXCEPTION_CONTINUE_SEARCH;          /* a plain NULL deref */
+
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) <= 32) {
+        char who[64]; ppu_guest_caller(who, sizeof who);
+        const char* how = er->ExceptionInformation[0] == 0 ? "read"
+                        : er->ExceptionInformation[0] == 1 ? "write" : "execute";
+        fprintf(stderr,
+                "\n[ps3] UNTRANSLATED GUEST POINTER: %s of guest 0x%08X as a host "
+                "address\n      (an HLE function dereferenced a pointer parameter without "
+                "vm_base)\n      guest caller: %s\n", how, (uint32_t)at, who);
+        fflush(stderr);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+extern "C" void ps3_install_guest_ptr_trap(void)
+{
+    if (getenv("PS3_NO_GUEST_PTR_TRAP")) return;
+    /* Reserve the low 4 GB in chunks; a chunk already in use just fails and is
+     * skipped, which is fine -- every chunk we do get is one the bug can no
+     * longer land in silently. */
+    size_t got = 0;
+    for (uintptr_t a = 0x10000u; a < 0x100000000ull; a += 0x10000000ull) {
+        SIZE_T len = 0x10000000u;
+        if (a == 0x10000u) len -= 0x10000u;
+        if (VirtualAlloc((void*)a, len, MEM_RESERVE, PAGE_NOACCESS)) got += len;
+    }
+    AddVectoredExceptionHandler(1, ps3_guest_ptr_veh);
+    fprintf(stderr, "[ps3] guest-pointer trap armed (%zu MB of the low 4 GB reserved)\n",
+            got >> 20);
+}
+
 /* PS3_SCTRACE=1: every lv2 syscall with its arguments and RETURN VALUE.
  * An unimplemented syscall is loud (it logs "(stub)") but an IMPLEMENTED one
  * that returns an error is silent, and that is the harder failure to find:
