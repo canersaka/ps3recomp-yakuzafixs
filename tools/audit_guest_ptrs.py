@@ -95,6 +95,16 @@ def bare_deref_calls(body, param):
                 out.append(line)
     return out
 
+# Only GUEST-FACING entry points take guest pointers. An internal helper
+# (rsx_process_method, rsx_fp_decompile, ...) is handed host pointers by its
+# caller and translating those would be the actual bug. The firmware naming
+# convention is the reliable discriminator: cell*/sce*/sys_*/_sys_* are reached
+# from the guest through the NID table, everything else is ours.
+ENTRY_PREFIXES = ('cell', 'sce', 'sys_', '_sys_', '_cell')
+
+def is_guest_entry(name):
+    return name.startswith(ENTRY_PREFIXES)
+
 def param_is_translated(body, param):
     """True if the function reassigns `param` through a translation helper.
 
@@ -107,13 +117,57 @@ def param_is_translated(body, param):
     for 30 of them while being entirely correct.
     """
     pat = (r"(?:^|[^\w])" + re.escape(param) + r"\s*=\s*"
-           r"(?:GUEST_PTR|gptr|gpath|guest_str|vm_to_host)\s*\(")
-    return re.search(pat, body) is not None
+           r"(?:GUEST_PTR|gptr|gpath|guest_str|vm_to_host|yz_g2h)\s*\(")
+    if re.search(pat, body):
+        return True
+    # An in-place translating MACRO reassigns the parameter just as much as an
+    # "=" does, e.g. sysPrxForUser's  YZ_XLAT(lwmutex, sys_lwmutex_t_hle*);
+    macro = r"(?:YZ_XLAT|GUEST_XLAT)\s*\(\s*" + re.escape(param) + r"\s*[,)]"
+    return re.search(macro, body) is not None
+
+def strip_comments(src):
+    """Blank out comment text, keeping every newline so line numbers still match.
+
+    Without this, a function whose comment EXPLAINS the bug reads as having it:
+    sys_prx_get_module_id_by_name translates both of its pointers correctly and
+    was reported anyway, on the strength of a comment saying "name/id arrive as
+    raw GUEST effective addresses".
+    """
+    out = []
+    i, n = 0, len(src)
+    while i < n:
+        two = src[i:i + 2]
+        if two == '/*':
+            j = src.find('*/', i + 2)
+            j = n if j < 0 else j + 2
+            out.append(''.join(c if c == '\n' else ' ' for c in src[i:j]))
+            i = j
+        elif two == '//':
+            j = src.find('\n', i)
+            j = n if j < 0 else j
+            out.append(' ' * (j - i))
+            i = j
+        elif src[i] == '"' or src[i] == "'":
+            q = src[i]
+            j = i + 1
+            while j < n and src[j] != q and src[j] != '\n':
+                j += 2 if src[j] == '\\' else 1
+            j = min(j + 1, n)
+            out.append(src[i:j])
+            i = j
+        else:
+            out.append(src[i])
+            i += 1
+    return ''.join(out)
+
 
 def suspects_in(path):
     src = open(path, 'rb').read().decode('utf-8', 'replace').replace('\r\n', '\n')
+    src = strip_comments(src)
     found = []
     for name, params, line, body in function_bodies(src):
+        if not is_guest_entry(name):
+            continue
         ptrs = pointer_params(params)
         if not ptrs:
             continue

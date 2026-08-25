@@ -33,6 +33,24 @@ extern uint8_t* vm_base;
 /* ---------------------------------------------------------------------------
  * Address translation
  * -----------------------------------------------------------------------*/
+/* Translate a guest pointer PARAMETER to a host pointer, preserving NULL.
+ *
+ * HLE entry points receive pointer arguments as raw 32-bit GUEST addresses
+ * (ppu_hle.cpp passes the PPC register through untouched), so dereferencing
+ * one directly hits whatever host address happens to share that number. That
+ * is the most common bug in libs/ -- cellFsRead read an entire sound bank to
+ * an untranslated address this way. Fifteen files had each pasted their own
+ * copy of this macro; this is the one definition.
+ *
+ * NOTE this gives you a host pointer to BIG-ENDIAN memory. It is right for
+ * byte buffers and for structs of u8, but a u32/u64/float field still needs
+ * the vm_read and vm_write accessors below (or an explicit swap) -- the cast
+ * alone does not fix endianness.
+ */
+#ifndef GUEST_PTR
+#define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
+#endif
+
 static inline void* vm_translate(uint32_t addr)
 {
     return (void*)(vm_base + addr);
