@@ -128,10 +128,14 @@ s32 cellSpursDestroyJobQueue(CellSpursJobQueue* jq)
     return CELL_OK;
 }
 
-s32 cellSpursJobQueuePush(CellSpursJobQueue* jq, const void* job,
-                          u32 jobSize, u32 tag, CellSpursJobId* id)
+/* Host-pointer core. cellSpursJobQueuePort2PushSync reads the queue id out of
+ * the port into a LOCAL and pushes with its address, so it cannot go through
+ * the entry point -- that translates its argument as a guest EA and would
+ * resolve a host stack address to a nonsense queue slot. Same shape as
+ * cellHttpUtil's escape core. */
+static s32 jq_push_host(const u32* jq, const void* job,
+                        u32 jobSize, u32 tag, u32* id_ea)
 {
-    jq = GUEST_PTR(jq, CellSpursJobQueue*);
     (void)job; (void)jobSize; (void)tag;
 
     if (!jq) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
@@ -149,7 +153,7 @@ s32 cellSpursJobQueuePush(CellSpursJobQueue* jq, const void* job,
     q->jobCount++;
     q->submitCount++;
 
-    if (id) vm_write32((u32)(uintptr_t)id, jobId);
+    if (id_ea) vm_write32((u32)(uintptr_t)id_ea, jobId);
 
     /*
      * Job is immediately "complete" since we don't execute SPU code,
@@ -158,6 +162,12 @@ s32 cellSpursJobQueuePush(CellSpursJobQueue* jq, const void* job,
     jq_mark_completed(q, jobId);
 
     return CELL_OK;
+}
+
+s32 cellSpursJobQueuePush(CellSpursJobQueue* jq, const void* job,
+                          u32 jobSize, u32 tag, CellSpursJobId* id)
+{
+    return jq_push_host(GUEST_PTR(jq, const u32*), job, jobSize, tag, id);
 }
 
 s32 cellSpursJobQueuePushJob(CellSpursJobQueue* jq, const CellSpursJob256* job,
@@ -188,7 +198,7 @@ s32 cellSpursJobQueuePort2PushSync(CellSpursJobQueuePort* port,
     port = GUEST_PTR(port, CellSpursJobQueuePort*);
     if (!port) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
     CellSpursJobQueue jq = *port;
-    return cellSpursJobQueuePush(&jq, job, jobSize, tag, id);
+    return jq_push_host((const u32*)&jq, job, jobSize, tag, id);
 }
 
 s32 cellSpursJobQueueSendSignal(CellSpursJobQueue* jq, CellSpursJobId id)

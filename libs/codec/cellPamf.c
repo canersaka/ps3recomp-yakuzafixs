@@ -282,7 +282,9 @@ s32 cellPamfReaderSetStreamWithType(CellPamfReader* reader, u8 streamType, u32 s
 
 s32 cellPamfReaderSetStreamWithTypeAndChannel(CellPamfReader* reader, u8 streamType, u32 channel)
 {
-    reader = pamf_host(reader);
+    /* Forward the GUEST pointer untouched: cellPamfReaderSetStreamWithType
+     * resolves it itself, and pamf_host keys on the guest EA -- handing it an
+     * already-resolved host pointer would key a second, empty slot. */
     return cellPamfReaderSetStreamWithType(reader, streamType, channel);
 }
 
