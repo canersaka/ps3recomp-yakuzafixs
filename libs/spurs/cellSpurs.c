@@ -2114,6 +2114,17 @@ static int jg_wait(u32 ea)
 extern uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr;
 extern int g_spurs_job_mbox_valid;
 
+/* SPURS_EVENT_D3=<n>: probe. The value a job query returns to the PPU is read
+ * from the completion event's data3 field (the guest stores r7 at sp+0xB8 and
+ * reads the count back from sp+0xBC). This lets that be confirmed by observing
+ * the returned count change, without having to guess the real value first. */
+static u64 spurs_event_data3_probe(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("SPURS_EVENT_D3"); v = e ? atoi(e) : 0; }
+    return (u64)(unsigned)v;
+}
+
 static void jc_signal_done(u32 jc_ea)
 {
     /* Carry the job's mailbox answer in the completion event. On hardware the
@@ -2128,7 +2139,8 @@ static void jc_signal_done(u32 jc_ea)
     }
     for (int i = 0; i < s_spurs_event_queue_n; i++) {
         int rc = sys_event_queue_push_by_id(s_spurs_event_queue[i],
-                                            SPURS_EVENT_PORT, jc_ea, 0, 0);
+                                            SPURS_EVENT_PORT, jc_ea, 0,
+                                            spurs_event_data3_probe());
         static int n = 0;
         if (n++ < 8)
             printf("[cellSpurs] chain 0x%08X work done -> event queue %u (rc=%d)\n",
