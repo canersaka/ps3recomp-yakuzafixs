@@ -95,6 +95,21 @@ def bare_deref_calls(body, param):
                 out.append(line)
     return out
 
+def param_is_translated(body, param):
+    """True if the function reassigns `param` through a translation helper.
+
+    The common correct idiom is a single conversion at the top:
+
+        mutex = GUEST_PTR(mutex, CellSyncMutex*);
+
+    after which every mutex->field is a HOST deref and perfectly fine. Flagging
+    those produced most of the reported candidates -- cellSync.c alone accounted
+    for 30 of them while being entirely correct.
+    """
+    pat = (r"(?:^|[^\w])" + re.escape(param) + r"\s*=\s*"
+           r"(?:GUEST_PTR|gptr|gpath|guest_str|vm_to_host)\s*\(")
+    return re.search(pat, body) is not None
+
 def suspects_in(path):
     src = open(path, 'rb').read().decode('utf-8', 'replace').replace('\r\n', '\n')
     found = []
@@ -104,6 +119,8 @@ def suspects_in(path):
             continue
         bad = []
         for p in ptrs:
+            if param_is_translated(body, p):
+                continue
             # p-> or *p, but not when the line also converts it safely
             uses = re.findall(r'^.*(?:\*\s*%s\b|\b%s\s*->).*$' % (p, p), body, re.M)
             uses = [u for u in uses if not SAFE_USE.search(u)]
@@ -127,7 +144,21 @@ def suspects_in(path):
 def main():
     roots = sys.argv[1:] or ['libs']
     total = 0
+    files = []
     for root in roots:
+        if os.path.isfile(root):
+            files.append(root.replace(chr(92), '/'))
+            continue
+        for dirpath, _dirs, fs in os.walk(root):
+            for fn in sorted(fs):
+                if fn.endswith('.c'):
+                    files.append(os.path.join(dirpath, fn).replace(chr(92), '/'))
+    for path in files:
+        for line, name, bad in suspects_in(path):
+            print('%s:%d  %s  derefs: %s' % (path, line, name, ', '.join(bad)))
+            total += 1
+    if False:
+      for root in roots:
         for dirpath, _dirs, files in os.walk(root):
             for fn in sorted(files):
                 if not fn.endswith('.c'):
