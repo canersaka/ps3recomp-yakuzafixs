@@ -109,6 +109,24 @@ enum {
 #define JOB_DMA_TAG   20u          /* "one of: {20,21}" — job_context_types.h */
 #define JOB_STACK_DEFAULT 8192u    /* _cellSpursCheckJob's sizeStack==0 default */
 
+/* Local store of the most recent job, kept alive past the run.
+ *
+ * A title can poll the SPU that runs a job chain with sys_spu_thread_read_LS,
+ * identifying it by the CHAIN HANDLE rather than an lv2 thread id -- Tokyo
+ * Jungle reads its bus counts that way, 45k polls of offset 0 in a 45 s run.
+ * The job context is a stack local, so by the time the PPU looks there is
+ * nothing to read and every poll fails. Retain the store and let the syscall
+ * resolve a chain handle to it. */
+static uint8_t  s_job_ls[SPU_LS_SIZE];
+static int      s_job_ls_valid;
+uint32_t        g_spurs_job_ls_handle;   /* set by the chain walker */
+
+const uint8_t* spurs_job_ls_for_handle(uint32_t handle)
+{
+    if (!s_job_ls_valid || !handle || handle != g_spurs_job_ls_handle) return 0;
+    return s_job_ls;
+}
+
 /* Last outbound mailbox posted by a finished job (see below). */
 uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr;
 int g_spurs_job_mbox_valid;
@@ -331,6 +349,9 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * the moment this function returns -- the PPU then reads 0 for every
      * property it asked for. Hand them to the chain walker so they can ride the
      * completion event. */
+    memcpy(s_job_ls, ctx.ls, SPU_LS_SIZE);   /* keep the store readable */
+    s_job_ls_valid = 1;
+
     g_spurs_job_mbox      = spu_channel_has_data(&ctx.ch_out_mbox)
                           ? ctx.ch_out_mbox.value : 0;
     g_spurs_job_mbox_intr = spu_channel_has_data(&ctx.ch_out_intr_mbox)

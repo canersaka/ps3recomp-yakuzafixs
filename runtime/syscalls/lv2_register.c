@@ -1197,8 +1197,29 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
     { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_LSREAD_TRACE") ? 1 : 0;
       static int n = 0;
       if (s_t && n++ < 12)
-          fprintf(stderr, "[spu-readls] tid=%u off=0x%05X size=%u\n",
-                  tid, ls_offset, type); }
+          { extern void ppu_guest_caller(char*, size_t);
+            char who[64]; ppu_guest_caller(who, sizeof who);
+            fprintf(stderr, "[spu-readls] tid=0x%08X off=0x%05X size=%u from %s\n",
+                    tid, ls_offset, type, who); } }
+    /* A SPURS job chain is polled by its CHAIN HANDLE, not an lv2 thread id --
+     * the title asks the SPU running the chain for its answer by reading local
+     * store directly. Resolve that before failing the lookup. */
+    { extern const uint8_t* spurs_job_ls_for_handle(uint32_t);
+      const uint8_t* jls = spurs_job_ls_for_handle(tid);
+      if (jls && value_ea && vm_base && ls_offset + type <= SPU_LS_SIZE) {
+          uint64_t v = 0;
+          for (uint32_t k = 0; k < type && k < 8; k++)
+              v = (v << 8) | jls[ls_offset + k];
+          for (int k = 0; k < 8; k++)
+              vm_base[value_ea + k] = (uint8_t)(v >> (56 - 8 * k));
+          { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_LSREAD_TRACE") ? 1 : 0;
+            static int n = 0;
+            if (s_t && n++ < 8)
+                fprintf(stderr, "[spu-readls] chain 0x%08X off=0x%05X -> 0x%llX\n",
+                        tid, ls_offset, (unsigned long long)v); }
+          ctx->gpr[3] = 0;
+          return 0;
+      } }
     spu_thread_t* t = spu_find_thread(tid);
     if (!t || !value_ea || !vm_base) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */

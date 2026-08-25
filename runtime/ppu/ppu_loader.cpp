@@ -24,7 +24,7 @@ extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 
 /* Resolve the GUEST function on the host stack (closest lifted entry below
  * each frame) -- the same trick the [BLOCK] profiler uses. */
-static void ppu_guest_caller(char* out, size_t n)
+extern "C" void ppu_guest_caller(char* out, size_t n)
 {
     snprintf(out, n, "?");
     void* fr[24]; unsigned short cnt = RtlCaptureStackBackTrace(0, 24, fr, 0);

@@ -2155,6 +2155,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
         u32 ext = (u32)(cmd & 127);
 
         if (cmd != 0 && op == 0) {                    /* JOB */
+            { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jc_ea; }
             jc_run_one_job((u32)(cmd & ~7ull), jobs++, size_desc);
             idle = 0;                    /* real work: the chain is healthy */
             /* Signal per JOB, not per lap. The application waits once for each
