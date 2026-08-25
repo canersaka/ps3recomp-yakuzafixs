@@ -44,7 +44,9 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
      * via `bi $r0`, but some branch to 0 DIRECTLY, which the lifter turns into
      * a plain trampoline that never reaches spu_indirect_branch. The drain sees
      * every step, so catch it here too. Step 0 is the real entry. */
-    if (ctx->steps++ && (ctx->pc & SPU_LS_MASK) == 0 &&
+    static int s_no_ls0 = -1;
+    if (s_no_ls0 < 0) s_no_ls0 = getenv("SPU_NO_LS0_END") ? 1 : 0;
+    if (!s_no_ls0 && ctx->steps++ && (ctx->pc & SPU_LS_MASK) == 0 &&
         !ctx->policy_mode && ctx->image_id > 0) {
         static int _n = 0;
         if (_n++ < 8)
