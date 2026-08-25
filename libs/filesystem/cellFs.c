@@ -491,7 +491,8 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
 
     { static int _n = 0;
       if (_n++ < 32)
-          { printf("[cellFs] Read(fd=%d, %llu bytes) -> %llu", fd,
+          { printf("[cellFs] Read(fd=%d, buf=0x%08X, %llu bytes) -> %llu", fd,
+                   (uint32_t)(uintptr_t)buf,
                    (unsigned long long)nbytes, (unsigned long long)bytes_read);
             /* First bytes as they landed in GUEST memory. Confirms the data
              * really arrived where the title will parse it, which is not the
