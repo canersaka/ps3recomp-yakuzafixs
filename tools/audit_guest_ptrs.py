@@ -37,7 +37,8 @@ PARAM_PTR_RE = re.compile(r'(?:const\s+)?[A-Za-z_][A-Za-z0-9_]*\s*\*+\s*([A-Za-z
 
 # Uses that are already correct: the parameter is converted, not dereferenced.
 SAFE_USE = re.compile(r'(?:uintptr_t\)\s*|vm_read\w*\(|vm_write\w*\(|gptr\(|gpath\(|guest_str\('
-                      r'|g_ps3_guest_caller\(|yz_g2h\(|rtc_str\(|rtc_tick_read\(|rtc_tick_write\()')
+                      r'|g_ps3_guest_caller\(|yz_g2h\(|rtc_str\(|rtc_tick_read\(|rtc_tick_write\('
+                      r'|GUEST_PTR\()')
 
 
 def pointer_params(param_text):
