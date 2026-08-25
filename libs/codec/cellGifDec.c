@@ -17,6 +17,7 @@
 #include <string.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 #include <stddef.h>   /* offsetof */
+#include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 
 /* vm_base: base pointer for the PS3 guest address space */
 extern uint8_t* vm_base;
@@ -361,16 +362,27 @@ s32 cellGifDecSetParameter(CellGifDecMainHandle mainHandle,
     GifDecSubState* sub = &s_gif_sub[subHandle];
     if (!sub->header_read) return CELL_GIFDEC_ERROR_SEQ;
 
+    /* CellGifDecInParam is three u32; CellGifDecOutParam leads with a u64,
+     * so it is published field by field -- a word-at-a-time copy would put
+     * the two halves of outputWidthByte the wrong way round. */
+    CellGifDecInParam host_in;
+    guest_struct_load(&host_in, GUEST_EA(inParam), (u32)sizeof(host_in));
+    inParam = &host_in;
+
     sub->in_param = *inParam;
     sub->param_set = 1;
 
     u32 out_comp = 4; /* GIF always decoded to 4-component (RGBA or ARGB) */
-    outParam->outputWidth      = sub->image_width;
-    outParam->outputHeight     = sub->image_height;
-    outParam->outputComponents = out_comp;
-    outParam->outputColorSpace = inParam->outputColorSpace ? inParam->outputColorSpace : CELL_GIFDEC_RGBA;
-    outParam->outputWidthByte  = (u64)(sub->image_width * out_comp);
-    outParam->useMemorySpace   = (u32)(outParam->outputWidthByte * sub->image_height);
+    u64 width_byte = (u64)(sub->image_width * out_comp);
+    u32 out_ea = GUEST_EA(outParam);
+    vm_write64(out_ea + (u32)offsetof(CellGifDecOutParam, outputWidthByte),  width_byte);
+    vm_write32(out_ea + (u32)offsetof(CellGifDecOutParam, outputWidth),      sub->image_width);
+    vm_write32(out_ea + (u32)offsetof(CellGifDecOutParam, outputHeight),     sub->image_height);
+    vm_write32(out_ea + (u32)offsetof(CellGifDecOutParam, outputComponents), out_comp);
+    vm_write32(out_ea + (u32)offsetof(CellGifDecOutParam, outputColorSpace),
+               inParam->outputColorSpace ? inParam->outputColorSpace : CELL_GIFDEC_RGBA);
+    vm_write32(out_ea + (u32)offsetof(CellGifDecOutParam, useMemorySpace),
+               (u32)(width_byte * sub->image_height));
 
     return CELL_OK;
 }
