@@ -1201,9 +1201,12 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
             char who[64]; ppu_guest_caller(who, sizeof who);
             fprintf(stderr, "[spu-readls] tid=0x%08X off=0x%05X size=%u from %s\n",
                     tid, ls_offset, type, who); } }
-    /* A SPURS job chain is polled by its CHAIN HANDLE, not an lv2 thread id --
-     * the title asks the SPU running the chain for its answer by reading local
-     * store directly. Resolve that before failing the lookup. */
+    /* A SPURS job chain is polled by its CHAIN HANDLE, not an lv2 thread id.
+     * This is the SPU PRINTF service: it reads a pointer from local store and
+     * then walks a format string byte by byte (func_00250A8C). Without this
+     * the lookup fails outright and the title reports
+     * "failed to SPURS printf server". It is debug output, not the path any
+     * query result travels. */
     { extern const uint8_t* spurs_job_ls_for_handle(uint32_t);
       const uint8_t* jls = spurs_job_ls_for_handle(tid);
       if (jls && value_ea && vm_base && ls_offset + type <= SPU_LS_SIZE) {

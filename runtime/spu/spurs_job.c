@@ -343,12 +343,12 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * noise, not a failure: the job's real work finished before the jump. */
     spu_run_with_halt(entry, &ctx);
 
-    /* A job answers a query by MAILBOX, not by writing memory: the sound job
-     * ends with wrch SPU_WrOutMbox / SPU_WrOutIntrMbox and returns. The context
-     * is a stack local, so without capturing them here the answer is discarded
-     * the moment this function returns -- the PPU then reads 0 for every
-     * property it asked for. Hand them to the chain walker so they can ride the
-     * completion event. */
+    /* Capture the job's outbound mailbox. These are LS POINTERS TO STRINGS for
+     * the SPU printf service, NOT query results -- value 0x83C0 from the sound
+     * job points at " compressor, 1/n..." inside its own image. An earlier
+     * comment here claimed they carried the title's bus counts; they do not,
+     * and feeding them into the completion event turned 0x40000000 into a 1 GB
+     * allocation request. Kept because the printf service needs them. */
     memcpy(s_job_ls, ctx.ls, SPU_LS_SIZE);   /* keep the store readable */
     s_job_ls_valid = 1;
 
