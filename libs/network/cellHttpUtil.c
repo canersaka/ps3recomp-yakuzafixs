@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* ---------------------------------------------------------------------------
  * Internal helpers
@@ -181,7 +182,7 @@ s32 cellHttpUtilBuildUri(char* urlBuf, u32 urlBufSize,
         n += snprintf(urlBuf + n, urlBufSize - n, "#%s", uri->fragment);
 
     if (written)
-        *written = (u32)n;
+        vm_write32((u32)(uintptr_t)written, (u32)n);
 
     return CELL_OK;
 }
@@ -215,7 +216,7 @@ s32 cellHttpUtilEscapeUri(char* out, u32 outSize,
         out[pos] = '\0';
 
     if (written)
-        *written = pos;
+        vm_write32((u32)(uintptr_t)written, (u32)pos);
 
     return CELL_OK;
 }
@@ -254,7 +255,7 @@ s32 cellHttpUtilUnescapeUri(u8* out, u32 outSize,
     }
 
     if (required)
-        *required = pos;
+        vm_write32((u32)(uintptr_t)required, (u32)pos);
 
     return CELL_OK;
 }
@@ -294,7 +295,7 @@ s32 cellHttpUtilFormUrlEncode(char* out, u32 outSize,
         out[pos] = '\0';
 
     if (written)
-        *written = pos;
+        vm_write32((u32)(uintptr_t)written, (u32)pos);
 
     return CELL_OK;
 }
@@ -330,7 +331,7 @@ s32 cellHttpUtilBase64Encode(char* out, u32 outSize,
 
     out[pos] = '\0';
     if (written)
-        *written = pos;
+        vm_write32((u32)(uintptr_t)written, (u32)pos);
 
     return CELL_OK;
 }
@@ -376,7 +377,7 @@ s32 cellHttpUtilBase64Decode(u8* out, u32 outSize,
     }
 
     if (written)
-        *written = pos;
+        vm_write32((u32)(uintptr_t)written, (u32)pos);
 
     return CELL_OK;
 }

@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* ---------------------------------------------------------------------------
  * Platform socket abstraction
@@ -423,7 +424,7 @@ s32 cellHttpCreateTransaction(CellHttpTransId* transId, CellHttpClientId clientI
                      uri->scheme   ? uri->scheme   : "http",
                      t->hostname, t->port, t->path);
 
-            *transId = i;
+            vm_write32((u32)(uintptr_t)transId, (u32)i);
             printf("[cellHttp] CreateTransaction(client=%u, %s %s) -> trans=%u\n",
                    clientId, method, t->url, i);
             return CELL_OK;
@@ -484,7 +485,7 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
     if (gai != 0 || !result) {
         printf("[cellHttp]   getaddrinfo failed for '%s': %d\n", t->hostname, gai);
         if (result) freeaddrinfo(result);
-        if (sent) *sent = 0;
+        if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
         return CELL_HTTP_ERROR_CONNECTION_FAILED;
     }
 
@@ -494,7 +495,7 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
     if (sock == HTTP_INVALID_SOCKET) {
         printf("[cellHttp]   socket() failed\n");
         freeaddrinfo(result);
-        if (sent) *sent = 0;
+        if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
         return CELL_HTTP_ERROR_CONNECTION_FAILED;
     }
 
@@ -507,7 +508,7 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
         printf("[cellHttp]   connect() failed to %s:%u\n", t->hostname, t->port);
         http_closesocket(sock);
         freeaddrinfo(result);
-        if (sent) *sent = 0;
+        if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
         return CELL_HTTP_ERROR_CONNECTION_FAILED;
     }
 
@@ -547,7 +548,7 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
     if (http_send_all(sock, req_buf, (u32)req_len) != 0) {
         printf("[cellHttp]   Failed to send request headers\n");
         http_closesocket(sock);
-        if (sent) *sent = 0;
+        if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
         return CELL_HTTP_ERROR_SEND_FAILED;
     }
 
@@ -556,7 +557,7 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
         if (http_send_all(sock, (const char*)buf, size) != 0) {
             printf("[cellHttp]   Failed to send request body\n");
             http_closesocket(sock);
-            if (sent) *sent = 0;
+            if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
             return CELL_HTTP_ERROR_SEND_FAILED;
         }
     }
@@ -574,7 +575,7 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
     t->body_overflow_len = 0;
 
     if (sent)
-        *sent = size;
+        vm_write32((u32)(uintptr_t)sent, (u32)size);
 
     return CELL_OK;
 }
@@ -592,14 +593,14 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
 
     if (t->aborted) {
         printf("[cellHttp] RecvResponse(trans=%u) - transaction aborted\n", transId);
-        if (received) *received = 0;
+        if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
         return CELL_HTTP_ERROR_ABORTED;
     }
 
     if (t->sock == HTTP_INVALID_SOCKET) {
         printf("[cellHttp] RecvResponse(trans=%u) - no socket (send first)\n",
                transId);
-        if (received) *received = 0;
+        if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
         return CELL_HTTP_ERROR_CONNECTION_FAILED;
     }
 
@@ -615,7 +616,7 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
             if (n <= 0) {
                 printf("[cellHttp]   recv() failed during header read (n=%d)\n", n);
                 http_close_slot_socket(t);
-                if (received) *received = 0;
+                if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
                 return (n == 0) ? CELL_HTTP_ERROR_RECV_FAILED
                                 : CELL_HTTP_ERROR_RECV_FAILED;
             }
@@ -626,7 +627,7 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
             if (hdr_end) {
                 if (http_parse_response_headers(t, hdr_end) != 0) {
                     http_close_slot_socket(t);
-                    if (received) *received = 0;
+                    if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
                     return CELL_HTTP_ERROR_RECV_FAILED;
                 }
                 break;
@@ -636,25 +637,25 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
         if (!t->headers_parsed) {
             printf("[cellHttp]   Header buffer overflow, no \\r\\n\\r\\n found\n");
             http_close_slot_socket(t);
-            if (received) *received = 0;
+            if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
             return CELL_HTTP_ERROR_RECV_FAILED;
         }
     }
 
     /* ---- Return body data ---- */
     if (!buf || size == 0) {
-        if (received) *received = 0;
+        if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
         return CELL_OK;
     }
 
     /* Check if we've already received all expected body bytes */
     if (t->content_length_known && t->body_received >= t->content_length) {
-        if (received) *received = 0;
+        if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
         return CELL_OK;
     }
 
     if (t->eof_reached) {
-        if (received) *received = 0;
+        if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
         return CELL_OK;
     }
 
@@ -702,7 +703,7 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
             if (filled > 0)
                 break;
             printf("[cellHttp]   recv() error during body read\n");
-            if (received) *received = 0;
+            if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
             return CELL_HTTP_ERROR_RECV_FAILED;
         }
         if (n == 0) {
@@ -721,7 +722,7 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
     }
 
     if (received)
-        *received = filled;
+        vm_write32((u32)(uintptr_t)received, (u32)filled);
 
     return CELL_OK;
 }
@@ -737,7 +738,7 @@ s32 cellHttpGetResponseContentLength(CellHttpTransId transId, u64* length)
     if (!length)
         return CELL_HTTP_ERROR_INVALID_PARAMETER;
 
-    *length = s_transactions[transId].content_length;
+    vm_write64((u32)(uintptr_t)length, (u64)s_transactions[transId].content_length);
     return CELL_OK;
 }
 
@@ -752,7 +753,7 @@ s32 cellHttpGetStatusCode(CellHttpTransId transId, s32* code)
     if (!code)
         return CELL_HTTP_ERROR_INVALID_PARAMETER;
 
-    *code = s_transactions[transId].status_code;
+    vm_write32((u32)(uintptr_t)code, (u32)s_transactions[transId].status_code);
     return CELL_OK;
 }
 

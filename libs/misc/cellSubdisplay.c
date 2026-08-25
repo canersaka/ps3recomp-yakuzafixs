@@ -8,6 +8,7 @@
 #include "cellSubdisplay.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* Internal state */
 
@@ -57,7 +58,7 @@ s32 cellSubdisplayGetRequiredMemory(u32* size)
 {
     if (!size) return (s32)CELL_SUBDISPLAY_ERROR_INVALID_ARGUMENT;
     /* Minimal buffer requirement */
-    *size = 1024 * 1024; /* 1 MB */
+    vm_write32((u32)(uintptr_t)size, (u32)1024 * 1024); /* 1 MB */
     return CELL_OK;
 }
 

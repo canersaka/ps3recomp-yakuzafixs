@@ -8,6 +8,7 @@
 #include "cellVpost.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* Internal state */
 
@@ -25,7 +26,7 @@ s32 cellVpostQuery(const CellVpostCfgParam* cfgParam, u32* memSize)
     (void)cfgParam;
     if (!memSize) return (s32)CELL_VPOST_ERROR_INVALID_ARGUMENT;
     /* Report a reasonable working buffer size */
-    *memSize = 1024 * 1024; /* 1 MB */
+    vm_write32((u32)(uintptr_t)memSize, (u32)1024 * 1024); /* 1 MB */
     return CELL_OK;
 }
 
@@ -44,7 +45,7 @@ s32 cellVpostInit(const CellVpostCfgParam* cfgParam,
             memset(&s_handles[i], 0, sizeof(VpostHandle));
             s_handles[i].in_use = 1;
             s_handles[i].cfg = *cfgParam;
-            *handle = (u32)i;
+            vm_write32((u32)(uintptr_t)handle, (u32)i);
             return CELL_OK;
         }
     }

@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* stb_image_write (declarations only — implementation in cellPngEnc.c) */
 #include "stb_image_write.h"
@@ -46,7 +47,7 @@ s32 cellJpgEncQueryAttr(const CellJpgEncParam* param, u32* workMemSize)
 {
     (void)param;
     if (!workMemSize) return (s32)CELL_JPGENC_ERROR_INVALID_ARGUMENT;
-    *workMemSize = 1024 * 1024;
+    vm_write32((u32)(uintptr_t)workMemSize, (u32)1024 * 1024);
     return CELL_OK;
 }
 
@@ -63,7 +64,7 @@ s32 cellJpgEncCreate(const CellJpgEncParam* param, CellJpgEncHandle* handle)
             s_handles[i].in_use = 1;
             s_handles[i].param = *param;
             if (s_handles[i].param.quality == 0) s_handles[i].param.quality = 85;
-            *handle = (u32)i;
+            vm_write32((u32)(uintptr_t)handle, (u32)i);
             return CELL_OK;
         }
     }

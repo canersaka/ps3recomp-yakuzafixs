@@ -9,6 +9,7 @@
 #include "cellAdec.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -49,7 +50,7 @@ s32 cellAdecOpen(const CellAdecType* type, const CellAdecResource* res,
             s_adec[i].codecType = type->audioCodecType;
             s_adec[i].cbFunc = cbFunc;
             s_adec[i].cbArg = cbArg;
-            *handle = (u32)i;
+            vm_write32((u32)(uintptr_t)handle, (u32)i);
             printf("[cellAdec] Open -> handle=%u\n", i);
             return CELL_OK;
         }

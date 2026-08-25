@@ -14,6 +14,7 @@
 #include "sceNpCommerce.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 s32 sceNpCommerce2GetCategoryInfo(SceNpCommerce2Ctx ctx,
                                     SceNpCommerce2CategoryInfo* info)
@@ -46,7 +47,7 @@ s32 sceNpCommerce2DoCheckoutStartAsync(SceNpCommerce2Ctx ctx,
 s32 sceNpCommerce2GetResult(SceNpCommerce2Ctx ctx, s32* result)
 {
     (void)ctx;
-    if (result) *result = (s32)SCE_NP_COMMERCE2_ERROR_NOT_CONNECTED;
+    if (result) vm_write32((u32)(uintptr_t)result, (s32)SCE_NP_COMMERCE2_ERROR_NOT_CONNECTED);
     return CELL_OK;
 }
 

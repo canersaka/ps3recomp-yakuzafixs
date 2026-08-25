@@ -8,6 +8,7 @@
 #include "cellSheap.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* Internal state */
 
@@ -55,7 +56,7 @@ s32 cellSheapInitialize(const CellSheapAttr* attr, CellSheapHandle* handle)
             s_heaps[i].totalSize = attr->heapSize;
             s_heaps[i].align = alignment;
             s_heaps[i].offset = 0;
-            *handle = (u32)i;
+            vm_write32((u32)(uintptr_t)handle, (u32)i);
             return CELL_OK;
         }
     }
@@ -122,7 +123,7 @@ s32 cellSheapQueryMax(CellSheapHandle handle, u32* maxFree)
 
     SheapState* h = &s_heaps[handle];
     u32 aligned_offset = align_up(h->offset, h->align);
-    *maxFree = (aligned_offset < h->totalSize) ? h->totalSize - aligned_offset : 0;
+    vm_write32((u32)(uintptr_t)maxFree, (aligned_offset < h->totalSize) ? h->totalSize - aligned_offset : 0);
     return CELL_OK;
 }
 

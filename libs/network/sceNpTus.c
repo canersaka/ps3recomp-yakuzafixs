@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -96,7 +97,7 @@ s32 sceNpTusCreateCtx(SceNpTusCtx* ctx)
     for (int i = 0; i < SCE_NP_TUS_MAX_CTX; i++) {
         if (!s_ctx[i].in_use) {
             s_ctx[i].in_use = 1;
-            *ctx = (u32)i;
+            vm_write32((u32)(uintptr_t)ctx, (u32)i);
             return CELL_OK;
         }
     }
@@ -258,7 +259,7 @@ s32 sceNpTusGetData(SceNpTusCtx ctx, const void* npId, u32 slotId,
         memcpy(data, s_data[slotId].data, copySize);
 
     if (outDataSize)
-        *outDataSize = s_data[slotId].dataSize;
+        vm_write32((u32)(uintptr_t)outDataSize, (u32)s_data[slotId].dataSize);
 
     if (outInfo)
         *outInfo = s_data[slotId].info;
@@ -291,14 +292,14 @@ s32 sceNpTusDeleteMultiSlotData(SceNpTusCtx ctx, const u32* slotIds,
 s32 sceNpTusPollAsync(SceNpTusRequestId reqId, s32* result)
 {
     (void)reqId;
-    if (result) *result = 0; /* always done */
+    if (result) vm_write32((u32)(uintptr_t)result, (u32)0); /* always done */
     return CELL_OK;
 }
 
 s32 sceNpTusWaitAsync(SceNpTusRequestId reqId, s32* result)
 {
     (void)reqId;
-    if (result) *result = 0;
+    if (result) vm_write32((u32)(uintptr_t)result, (u32)0);
     return CELL_OK;
 }
 

@@ -8,6 +8,7 @@
 #include "sceNpCommerce2.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 static int s_initialized = 0;
 
@@ -38,7 +39,7 @@ s32 sceNpCommerce2CreateCtx(u32 version, const void* npId,
     for (int i = 0; i < MAX_CTX; i++) {
         if (!s_ctx_in_use[i]) {
             s_ctx_in_use[i] = 1;
-            *ctx = (u32)i;
+            vm_write32((u32)(uintptr_t)ctx, (u32)i);
             return CELL_OK;
         }
     }

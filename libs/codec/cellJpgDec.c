@@ -155,7 +155,7 @@ s32 cellJpgDecCreate(CellJpgDecMainHandle* mainHandle,
     for (u32 i = 0; i < JPGDEC_MAX_HANDLES; i++) {
         if (!s_jpg_main[i].in_use) {
             s_jpg_main[i].in_use = 1;
-            *mainHandle = i;
+            vm_write32((u32)(uintptr_t)mainHandle, (u32)i);
             if (threadOutParam)
                 threadOutParam->jpgCodecVersion = 0x00010000;
             return CELL_OK;
@@ -203,7 +203,7 @@ s32 cellJpgDecOpen(CellJpgDecMainHandle mainHandle,
             s_jpg_sub[i].in_use = 1;
             s_jpg_sub[i].main_handle = mainHandle;
             s_jpg_sub[i].src = *src;
-            *subHandle = i;
+            vm_write32((u32)(uintptr_t)subHandle, (u32)i);
             if (openInfo) openInfo->initSpaceAllocated = 0;
 
             if (src->srcSelect == CELL_JPGDEC_FILE)

@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* vm_base: base pointer for the PS3 guest address space */
 extern uint8_t* vm_base;
@@ -153,7 +154,7 @@ s32 cellGifDecCreate(CellGifDecMainHandle* mainHandle,
     for (u32 i = 0; i < GIFDEC_MAX_HANDLES; i++) {
         if (!s_gif_main[i].in_use) {
             s_gif_main[i].in_use = 1;
-            *mainHandle = i;
+            vm_write32((u32)(uintptr_t)mainHandle, (u32)i);
             if (threadOutParam) threadOutParam->gifCodecVersion = 0x00010000;
             return CELL_OK;
         }
@@ -196,7 +197,7 @@ s32 cellGifDecOpen(CellGifDecMainHandle mainHandle,
             s_gif_sub[i].in_use = 1;
             s_gif_sub[i].main_handle = mainHandle;
             s_gif_sub[i].src = *src;
-            *subHandle = i;
+            vm_write32((u32)(uintptr_t)subHandle, (u32)i);
             if (openInfo) openInfo->initSpaceAllocated = 0;
 
             if (src->srcSelect == CELL_GIFDEC_FILE)

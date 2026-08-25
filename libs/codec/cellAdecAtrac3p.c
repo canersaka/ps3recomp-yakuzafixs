@@ -9,6 +9,7 @@
 #include "cellAdecAtrac3p.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* Internal state */
 
@@ -44,7 +45,7 @@ s32 cellAdecAtrac3pOpen(const CellAdecAtrac3pConfig* config, CellAdecAtrac3pHand
     s_slots[slot].channels = config ? config->channels : CELL_ADEC_ATRAC3P_CHANNELS_STEREO;
     s_slots[slot].sampleRate = config ? config->sampleRate : CELL_ADEC_ATRAC3P_SRATE_48000;
 
-    *handle = (CellAdecAtrac3pHandle)slot;
+    vm_write32((u32)(uintptr_t)handle, (CellAdecAtrac3pHandle)slot);
     return CELL_OK;
 }
 

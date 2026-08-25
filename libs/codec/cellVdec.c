@@ -9,6 +9,7 @@
 #include "cellVdec.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -51,7 +52,7 @@ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
             s_vdec[i].codecType = type->codecType;
             s_vdec[i].cbFunc = cbFunc;
             s_vdec[i].cbArg = cbArg;
-            *handle = (u32)i;
+            vm_write32((u32)(uintptr_t)handle, (u32)i);
             printf("[cellVdec] Open -> handle=%u\n", i);
             return CELL_OK;
         }

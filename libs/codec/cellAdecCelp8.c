@@ -8,6 +8,7 @@
 #include "cellAdecCelp8.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* Internal state */
 
@@ -41,7 +42,7 @@ s32 cellAdecCelp8Open(const CellAdecCelp8Config* config, CellAdecCelp8Handle* ha
     s_slots[slot].in_use = 1;
     s_slots[slot].bitRate = config ? config->bitRate : CELL_ADEC_CELP8_BITRATE_6200;
 
-    *handle = (CellAdecCelp8Handle)slot;
+    vm_write32((u32)(uintptr_t)handle, (CellAdecCelp8Handle)slot);
     return CELL_OK;
 }
 
@@ -66,7 +67,7 @@ s32 cellAdecCelp8Decode(CellAdecCelp8Handle handle, const void* frame, u32 frame
 
     /* Output silence: 160 samples of 16-bit mono */
     memset(pcmOut, 0, CELL_ADEC_CELP8_SAMPLES_PER_FRAME * sizeof(s16));
-    if (numSamples) *numSamples = CELL_ADEC_CELP8_SAMPLES_PER_FRAME;
+    if (numSamples) vm_write32((u32)(uintptr_t)numSamples, (u32)CELL_ADEC_CELP8_SAMPLES_PER_FRAME);
     return CELL_OK;
 }
 

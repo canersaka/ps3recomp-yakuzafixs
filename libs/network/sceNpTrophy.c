@@ -514,7 +514,7 @@ s32 sceNpTrophyUnlockTrophy(SceNpTrophyContext context,
 
     /* Check if all non-platinum trophies are unlocked -> platinum */
     if (platinumId) {
-        *platinumId = SCE_NP_TROPHY_INVALID_TROPHY_ID;
+        vm_write32((u32)(uintptr_t)platinumId, (u32)SCE_NP_TROPHY_INVALID_TROPHY_ID);
         /* Simplified: don't auto-award platinum without grade info */
     }
 
@@ -548,7 +548,7 @@ s32 sceNpTrophyGetTrophyUnlockState(SceNpTrophyContext context,
             flags->flag[i / 32] |= (1u << (i % 32));
     }
 
-    *count = s_contexts[context].total_trophies;
+    vm_write32((u32)(uintptr_t)count, (u32)s_contexts[context].total_trophies);
     return CELL_OK;
 }
 

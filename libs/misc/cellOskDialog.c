@@ -10,6 +10,7 @@
 #include "cellOskDialog.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -166,8 +167,8 @@ s32 cellOskDialogGetSize(u32* width, u32* height)
         return CELL_OSK_ERROR_INVALID_PARAMETER;
 
     /* Standard PS3 OSK dimensions */
-    *width  = 640;
-    *height = 240;
+    vm_write32((u32)(uintptr_t)width, (u32)640);
+    vm_write32((u32)(uintptr_t)height, (u32)240);
     return CELL_OK;
 }
 

@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -67,7 +68,7 @@ s32 sceNpUtilGetNpEnv(s32* env)
     if (!env)
         return (s32)SCE_NP_UTIL_ERROR_INVALID_ARGUMENT;
 
-    *env = s_np_env;
+    vm_write32((u32)(uintptr_t)env, (u32)s_np_env);
     return CELL_OK;
 }
 
@@ -112,9 +113,9 @@ s32 sceNpUtilCheckOnlineId(const char* onlineId)
 s32 sceNpUtilGetParentalControlInfo(s32* age, s32* chatRestriction)
 {
     if (age)
-        *age = 18; /* no restriction */
+        vm_write32((u32)(uintptr_t)age, (u32)18); /* no restriction */
     if (chatRestriction)
-        *chatRestriction = 0; /* chat allowed */
+        vm_write32((u32)(uintptr_t)chatRestriction, (u32)0); /* chat allowed */
     return CELL_OK;
 }
 
@@ -135,6 +136,6 @@ s32 sceNpUtilCmpNpIdInOrder(const void* npId1, const void* npId2, s32* order)
     if (!npId1 || !npId2 || !order)
         return (s32)SCE_NP_UTIL_ERROR_INVALID_ARGUMENT;
 
-    *order = memcmp(npId1, npId2, 36);
+    vm_write32((u32)(uintptr_t)order, (u32)memcmp(npId1, npId2, 36));
     return CELL_OK;
 }

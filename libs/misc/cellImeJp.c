@@ -9,6 +9,7 @@
 #include "cellImeJp.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* Internal state */
 
@@ -46,7 +47,7 @@ s32 cellImeJpOpen(const CellImeJpConfig* config, CellImeJpHandle* handle)
     s_slots[slot].inputLen = 0;
     memset(s_slots[slot].input, 0, sizeof(s_slots[slot].input));
 
-    *handle = (CellImeJpHandle)slot;
+    vm_write32((u32)(uintptr_t)handle, (CellImeJpHandle)slot);
     return CELL_OK;
 }
 
@@ -85,7 +86,7 @@ s32 cellImeJpGetInputMode(CellImeJpHandle handle, u32* mode)
         return (s32)CELL_IMEJP_ERROR_INVALID_ARGUMENT;
     if (!mode) return (s32)CELL_IMEJP_ERROR_INVALID_ARGUMENT;
 
-    *mode = s_slots[handle].inputMode;
+    vm_write32((u32)(uintptr_t)mode, (u32)s_slots[handle].inputMode);
     return CELL_OK;
 }
 

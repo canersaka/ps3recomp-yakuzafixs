@@ -9,8 +9,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
-extern void vm_write32(uint64_t addr, uint32_t val);
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -153,7 +153,7 @@ s32 sceNpGetAccountRegion(s32 userId, u32* region)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
     /* Region: US (SCEA) = 0x5553 ('US') */
-    *region = 0x5553;
+    vm_write32((u32)(uintptr_t)region, (u32)0x5553);
 
     printf("[sceNp] GetAccountRegion(user=%d) -> US\n", userId);
     return CELL_OK;

@@ -8,6 +8,7 @@
 #include "cellVdecDivx.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* Internal state */
 
@@ -43,7 +44,7 @@ s32 cellVdecDivxOpen(const CellVdecDivxConfig* config, CellVdecDivxHandle* handl
     s_slots[slot].maxWidth = config ? config->maxWidth : 1920;
     s_slots[slot].maxHeight = config ? config->maxHeight : 1080;
 
-    *handle = (CellVdecDivxHandle)slot;
+    vm_write32((u32)(uintptr_t)handle, (CellVdecDivxHandle)slot);
     return CELL_OK;
 }
 

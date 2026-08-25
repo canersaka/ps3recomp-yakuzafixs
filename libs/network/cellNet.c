@@ -8,6 +8,7 @@
 #include "cellNet.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -86,7 +87,7 @@ s32 cellNetResolverCreate(u32* resolver_id)
             s_resolvers[i].in_use = 1;
             s_resolvers[i].done = 0;
             s_resolvers[i].resolved_addr = 0;
-            *resolver_id = (u32)i;
+            vm_write32((u32)(uintptr_t)resolver_id, (u32)i);
             return CELL_OK;
         }
     }
@@ -147,7 +148,7 @@ s32 cellNetResolverPollDNS(u32 resolver_id, s32* result)
         return (s32)CELL_NET_ERROR_INVALID_ARG;
 
     if (result)
-        *result = s_resolvers[resolver_id].done ? 0 : 1;
+        vm_write32((u32)(uintptr_t)result, (u32)s_resolvers[resolver_id].done ? 0 : 1);
 
     return CELL_OK;
 }

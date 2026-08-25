@@ -9,6 +9,7 @@
 #include "sceNpBasic.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -108,7 +109,7 @@ s32 sceNpBasicGetFriendListEntryCount(u32* count)
     if (!count)
         return (s32)SCE_NP_BASIC_ERROR_INVALID_ARGUMENT;
 
-    *count = 0; /* offline -- no friends */
+    vm_write32((u32)(uintptr_t)count, (u32)0); /* offline -- no friends */
     return CELL_OK;
 }
 
@@ -206,7 +207,7 @@ s32 sceNpBasicRecvInGameInvitation(void* data, u32 dataMaxSize,
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     if (dataSize)
-        *dataSize = 0;
+        vm_write32((u32)(uintptr_t)dataSize, (u32)0);
 
     return (s32)SCE_NP_BASIC_ERROR_DATA_NOT_FOUND;
 }
@@ -219,7 +220,7 @@ s32 sceNpBasicGetBlockListEntryCount(u32* count)
     if (!count)
         return (s32)SCE_NP_BASIC_ERROR_INVALID_ARGUMENT;
 
-    *count = 0;
+    vm_write32((u32)(uintptr_t)count, (u32)0);
     return CELL_OK;
 }
 
