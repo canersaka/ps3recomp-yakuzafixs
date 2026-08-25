@@ -36,7 +36,8 @@ FUNC_RE = re.compile(
 PARAM_PTR_RE = re.compile(r'(?:const\s+)?[A-Za-z_][A-Za-z0-9_]*\s*\*+\s*([A-Za-z_][A-Za-z0-9_]*)\s*$')
 
 # Uses that are already correct: the parameter is converted, not dereferenced.
-SAFE_USE = re.compile(r'(?:uintptr_t\)\s*|vm_read\w*\(|vm_write\w*\(|gptr\(|gpath\(|guest_str\(|g_ps3_guest_caller\()')
+SAFE_USE = re.compile(r'(?:uintptr_t\)\s*|vm_read\w*\(|vm_write\w*\(|gptr\(|gpath\(|guest_str\('
+                      r'|g_ps3_guest_caller\(|yz_g2h\(|rtc_str\(|rtc_tick_read\(|rtc_tick_write\()')
 
 
 def pointer_params(param_text):
@@ -116,8 +117,11 @@ def param_is_translated(body, param):
     those produced most of the reported candidates -- cellSync.c alone accounted
     for 30 of them while being entirely correct.
     """
+    # A named translator, or any helper following the house naming convention
+    # (*_host / *_g2h / *_xlat / *_ptr), e.g. cellPamf's pamf_host().
     pat = (r"(?:^|[^\w])" + re.escape(param) + r"\s*=\s*"
-           r"(?:GUEST_PTR|gptr|gpath|guest_str|vm_to_host|yz_g2h)\s*\(")
+           r"(?:GUEST_PTR|gptr|gpath|guest_str|vm_to_host|yz_g2h"
+           r"|\w*_(?:host|g2h|xlat|ptr))\s*\(")
     if re.search(pat, body):
         return True
     # An in-place translating MACRO reassigns the parameter just as much as an

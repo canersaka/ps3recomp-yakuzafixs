@@ -8,6 +8,7 @@
  */
 
 #include "cellSpursJq.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host pointer */
 #include <stdio.h>
 #include <string.h>
 
@@ -65,6 +66,7 @@ static int jq_alloc(void)
 
 s32 cellSpursJobQueueAttributeInitialize(CellSpursJobQueueAttribute* attr)
 {
+    attr = GUEST_PTR(attr, CellSpursJobQueueAttribute*);
     if (!attr) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
 
     memset(attr, 0, sizeof(*attr));
@@ -79,6 +81,7 @@ s32 cellSpursJobQueueAttributeInitialize(CellSpursJobQueueAttribute* attr)
 
 s32 cellSpursJobQueueAttributeSetMaxGrab(CellSpursJobQueueAttribute* attr, u32 maxGrab)
 {
+    attr = GUEST_PTR(attr, CellSpursJobQueueAttribute*);
     if (!attr) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
     attr->maxGrab = maxGrab;
     return CELL_OK;
@@ -88,6 +91,8 @@ s32 cellSpursCreateJobQueue(void* spurs, CellSpursJobQueue* jq,
                             const CellSpursJobQueueAttribute* attr,
                             void* buffer, u32 bufferSize)
 {
+    attr = GUEST_PTR(attr, const CellSpursJobQueueAttribute*);
+    jq = GUEST_PTR(jq, CellSpursJobQueue*);
     (void)spurs; (void)buffer; (void)bufferSize;
     printf("[cellSpursJq] CreateJobQueue()\n");
 
@@ -111,6 +116,7 @@ s32 cellSpursCreateJobQueue(void* spurs, CellSpursJobQueue* jq,
 
 s32 cellSpursDestroyJobQueue(CellSpursJobQueue* jq)
 {
+    jq = GUEST_PTR(jq, CellSpursJobQueue*);
     if (!jq) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
 
     u32 slot = *jq;
@@ -125,6 +131,7 @@ s32 cellSpursDestroyJobQueue(CellSpursJobQueue* jq)
 s32 cellSpursJobQueuePush(CellSpursJobQueue* jq, const void* job,
                           u32 jobSize, u32 tag, CellSpursJobId* id)
 {
+    jq = GUEST_PTR(jq, CellSpursJobQueue*);
     (void)job; (void)jobSize; (void)tag;
 
     if (!jq) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
@@ -142,7 +149,7 @@ s32 cellSpursJobQueuePush(CellSpursJobQueue* jq, const void* job,
     q->jobCount++;
     q->submitCount++;
 
-    if (id) *id = jobId;
+    if (id) vm_write32((u32)(uintptr_t)id, jobId);
 
     /*
      * Job is immediately "complete" since we don't execute SPU code,
@@ -161,6 +168,8 @@ s32 cellSpursJobQueuePushJob(CellSpursJobQueue* jq, const CellSpursJob256* job,
 
 s32 cellSpursJobQueuePort2Create(CellSpursJobQueue* jq, CellSpursJobQueuePort* port)
 {
+    port = GUEST_PTR(port, CellSpursJobQueuePort*);
+    jq = GUEST_PTR(jq, CellSpursJobQueue*);
     if (!jq || !port) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
     *port = *jq; /* Port is just a reference to the queue */
     return CELL_OK;
@@ -176,6 +185,7 @@ s32 cellSpursJobQueuePort2PushSync(CellSpursJobQueuePort* port,
                                    const void* job, u32 jobSize,
                                    u32 tag, CellSpursJobId* id)
 {
+    port = GUEST_PTR(port, CellSpursJobQueuePort*);
     if (!port) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
     CellSpursJobQueue jq = *port;
     return cellSpursJobQueuePush(&jq, job, jobSize, tag, id);
@@ -190,6 +200,7 @@ s32 cellSpursJobQueueSendSignal(CellSpursJobQueue* jq, CellSpursJobId id)
 
 s32 cellSpursJobQueueWait(CellSpursJobQueue* jq, CellSpursJobId id)
 {
+    jq = GUEST_PTR(jq, CellSpursJobQueue*);
     if (!jq) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
 
     u32 slot = *jq;
@@ -213,6 +224,7 @@ s32 cellSpursJobQueueWait(CellSpursJobQueue* jq, CellSpursJobId id)
 
 s32 cellSpursJobQueueTryWait(CellSpursJobQueue* jq, CellSpursJobId id)
 {
+    jq = GUEST_PTR(jq, CellSpursJobQueue*);
     if (!jq) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
 
     u32 slot = *jq;
@@ -233,13 +245,14 @@ s32 cellSpursJobQueueTryWait(CellSpursJobQueue* jq, CellSpursJobId id)
 
 s32 cellSpursJobQueueGetCount(CellSpursJobQueue* jq, u32* count)
 {
+    jq = GUEST_PTR(jq, CellSpursJobQueue*);
     if (!jq || !count) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
 
     u32 slot = *jq;
     if (slot >= CELL_SPURS_JQ_MAX_QUEUES || !s_queues[slot].in_use)
         return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
 
-    *count = s_queues[slot].jobCount;
+    vm_write32((u32)(uintptr_t)count, s_queues[slot].jobCount);
     return CELL_OK;
 }
 
