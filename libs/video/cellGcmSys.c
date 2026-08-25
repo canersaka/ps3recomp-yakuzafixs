@@ -108,14 +108,25 @@ static u8 s_local_offset_page[1024];
 /* Command buffer control */
 static CellGcmControl s_control;
 
-/* Offset table storage */
+/* Offset table storage
+ *
+ * set_offset_table/clear_offset_table keep these two host arrays in step with
+ * the IO mappings, and that part was always fine. What was not: the tables
+ * cellGcmGetOffsetTable hands out are indexed BY THE GUEST --
+ * ioAddress[ea >> 20] and eaAddress[io >> 20] -- and it handed over 64-bit host
+ * pointers through a struct whose guest form is two 4-byte fields, so the title
+ * got two truncated addresses pointing at nothing it could read.
+ *
+ * The guest-visible copy lives in the reserved GCM window alongside the label
+ * and control blocks, published on each call. 4096 pages covers the 4 GiB
+ * address space at 1 MiB granularity, 8 KiB a side, and this is not a hot path.
+ * 0xFFFF means "not mapped", as it does in the host tables. */
 static u16 s_io_address_table[65536];
 static u16 s_ea_address_table[65536];
 
-static CellGcmOffsetTable s_offset_table = {
-    s_io_address_table,
-    s_ea_address_table,
-};
+#define GCM_OFFSET_TABLE_PAGES   4096u                 /* 4 GiB / 1 MiB       */
+#define GCM_OFFSET_TABLE_IO_ADDR 0x03003000u           /* ea >> 20  -> io>>20 */
+#define GCM_OFFSET_TABLE_EA_ADDR 0x03005000u           /* io >> 20  -> ea>>20 */
 
 /* Local memory bump allocator */
 static u32 s_local_mem_allocated = 0;  /* next free offset in local memory */
@@ -1463,12 +1474,26 @@ u64 cellGcmGetLastFlipTime(void)
  * -----------------------------------------------------------------------*/
 
 /* NID: 0x0E6B0DFF */
+/* Mirror the host tables into the guest window the title will index. */
+static void gcm_publish_offset_tables(void)
+{
+    for (u32 i = 0; i < GCM_OFFSET_TABLE_PAGES; i++) {
+        vm_write16(GCM_OFFSET_TABLE_IO_ADDR + i * 2, s_io_address_table[i]);
+        vm_write16(GCM_OFFSET_TABLE_EA_ADDR + i * 2, s_ea_address_table[i]);
+    }
+}
+
 s32 cellGcmGetOffsetTable(CellGcmOffsetTable* table)
 {
-    if (!table)
+    u32 ea = (u32)(uintptr_t)table;
+    if (!ea)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    *table = s_offset_table;
+    gcm_publish_offset_tables();
+
+    /* The guest struct is two 4-byte EAs, not two host pointers. */
+    vm_write32(ea + 0, GCM_OFFSET_TABLE_IO_ADDR);
+    vm_write32(ea + 4, GCM_OFFSET_TABLE_EA_ADDR);
     return CELL_OK;
 }
 

@@ -101,10 +101,20 @@ def bare_deref_calls(body, param):
 # caller and translating those would be the actual bug. The firmware naming
 # convention is the reliable discriminator: cell*/sce*/sys_*/_sys_* are reached
 # from the guest through the NID table, everything else is ours.
-ENTRY_PREFIXES = ('cell', 'sce', 'sys_', '_sys_', '_cell')
+ENTRY_PREFIXES = ('cell', 'sce', '_cell')
 
 def is_guest_entry(name):
-    return name.startswith(ENTRY_PREFIXES)
+    # sys_* / _sys_* are lowercase by convention.
+    if name.startswith('sys_') or name.startswith('_sys_'):
+        return True
+    # cell*/sce* are camelCase in the firmware: cellFsOpen, sceNpInit. A
+    # lowercase letter after the prefix means it is OURS -- cellfs_set_root_path
+    # is host-side configuration the port calls with host strings, and
+    # translating its argument would be the bug.
+    for p in ENTRY_PREFIXES:
+        if name.startswith(p) and len(name) > len(p):
+            return name[len(p)].isupper()
+    return False
 
 def param_is_translated(body, param):
     """True if the function reassigns `param` through a translation helper.

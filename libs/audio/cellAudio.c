@@ -908,11 +908,11 @@ s32 cellAudioPortGetStatus(u32 portNum, u32* status)
         return CELL_AUDIO_ERROR_PARAM;
 
     if (!s_ports[portNum].in_use) {
-        *status = CELL_AUDIO_STATUS_CLOSE;
+        vm_write32((u32)(uintptr_t)status, CELL_AUDIO_STATUS_CLOSE);
     } else if (s_ports[portNum].running) {
-        *status = CELL_AUDIO_STATUS_RUN;
+        vm_write32((u32)(uintptr_t)status, CELL_AUDIO_STATUS_RUN);
     } else {
-        *status = CELL_AUDIO_STATUS_READY;
+        vm_write32((u32)(uintptr_t)status, CELL_AUDIO_STATUS_READY);
     }
 
     return CELL_OK;

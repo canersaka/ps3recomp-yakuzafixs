@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 
 /* ---------------------------------------------------------------------------
  * Backend selection
@@ -373,12 +374,11 @@ void cellPad_poll(void)
     }
 }
 
-/* HLE args are GUEST effective addresses; guest structs are BIG-ENDIAN. These
- * runtime helpers translate + byte-swap. (cellPad was written for host pointers
- * and was never actually invoked until its NIDs were fixed.) */
-extern void vm_write8 (unsigned long long a, unsigned char  v);
-extern void vm_write16(unsigned long long a, unsigned short v);
-extern void vm_write32(unsigned long long a, unsigned int   v);
+/* HLE args are GUEST effective addresses; guest structs are BIG-ENDIAN. The
+ * vm_write helpers from ppu_memory.h translate + byte-swap. (cellPad was
+ * written for host pointers and was never actually invoked until its NIDs
+ * were fixed.) These used to be redeclared here with a 64-bit address
+ * parameter, which conflicts with the header now that it is included. */
 
 s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
 {
@@ -729,14 +729,16 @@ s32 cellPadGetCapabilityInfo(u32 port_no, CellPadCapabilityInfo* info)
     if (port_no >= CELL_PAD_MAX_PORT_NUM || !info)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
 
-    memset(info, 0, sizeof(CellPadCapabilityInfo));
+    u32 info_ea = (u32)(uintptr_t)info;
+    for (u32 i = 0; i < CELL_PAD_MAX_CODES; i++)
+        vm_write32(info_ea + i * 4, 0);
 
     /* Report standard DualShock 3 capabilities */
-    info->info[0] = CELL_PAD_CAPABILITY_PS3_CONFORMITY
-                   | CELL_PAD_CAPABILITY_PRESS_MODE
-                   | CELL_PAD_CAPABILITY_SENSOR_MODE
-                   | CELL_PAD_CAPABILITY_HP_ANALOG_STICK
-                   | CELL_PAD_CAPABILITY_ACTUATOR;
+    vm_write32(info_ea, CELL_PAD_CAPABILITY_PS3_CONFORMITY
+                        | CELL_PAD_CAPABILITY_PRESS_MODE
+                        | CELL_PAD_CAPABILITY_SENSOR_MODE
+                        | CELL_PAD_CAPABILITY_HP_ANALOG_STICK
+                        | CELL_PAD_CAPABILITY_ACTUATOR);
 
     return CELL_OK;
 }
@@ -748,6 +750,8 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
 
     if (port_no >= CELL_PAD_MAX_PORT_NUM || !param)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
+
+    param = GUEST_PTR(param, CellPadActParam*);
 
 #if PAD_BACKEND_XINPUT
     /* Map to XInput vibration */

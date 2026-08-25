@@ -1485,7 +1485,7 @@ s32 cellSpursReadyCountSwap(CellSpurs* spurs, CellSpursWorkloadId wid,
     if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
     if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
 
-    *old = s_workloads[wid].readyCount;
+    vm_write32((u32)(uintptr_t)old, s_workloads[wid].readyCount);
     s_workloads[wid].readyCount = value;
     return CELL_OK;
 }
@@ -1498,7 +1498,7 @@ s32 cellSpursReadyCountCompareAndSwap(CellSpurs* spurs,
     if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
     if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
 
-    *old = s_workloads[wid].readyCount;
+    vm_write32((u32)(uintptr_t)old, s_workloads[wid].readyCount);
     if (s_workloads[wid].readyCount == compare)
         s_workloads[wid].readyCount = value;
 

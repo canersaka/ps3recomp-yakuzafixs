@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 
 /* glibc's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as macros that expand
  * to st_atim.tv_sec etc.  They collide with the identically named members of the
@@ -694,8 +695,8 @@ s32 cellFsGetBlockSize(const char* path, u64* sector_size, u64* block_size)
     if (!path)
         return CELL_EFAULT;
 
-    if (sector_size) *sector_size = ps3_bswap64(512);
-    if (block_size)  *block_size  = ps3_bswap64(4096);
+    if (sector_size) vm_write64((u32)(uintptr_t)sector_size, 512);
+    if (block_size)  vm_write64((u32)(uintptr_t)block_size, 4096);
 
     return CELL_OK;
 }
@@ -708,7 +709,7 @@ s32 cellFsGetFreeSize(const char* path, u32* block_size, u64* free_block_count)
     if (!path)
         return CELL_EFAULT;
 
-    if (block_size) *block_size = ps3_bswap32(4096);
+    if (block_size) vm_write32((u32)(uintptr_t)block_size, 4096);
 
     /* Report ~1GB free by default */
     u64 free_blocks = (u64)(1024ULL * 1024 * 1024 / 4096);
@@ -725,7 +726,7 @@ s32 cellFsGetFreeSize(const char* path, u32* block_size, u64* free_block_count)
     }
 #endif
 
-    if (free_block_count) *free_block_count = ps3_bswap64(free_blocks);
+    if (free_block_count) vm_write64((u32)(uintptr_t)free_block_count, free_blocks);
 
     return CELL_OK;
 }
