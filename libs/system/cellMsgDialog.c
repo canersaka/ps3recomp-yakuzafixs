@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_read/vm_write: guest EA -> host */
 
 /* Pointer parameters here are GUEST addresses, and the dialog callback is a
  * guest OPD -- the HLE ABI adapter passes both straight through as guest
@@ -158,7 +159,7 @@ s32 cellMsgDialogProgressBarSetMsg(u32 progressBarIndex, const char* msgString)
         return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
 
     if (msgString) {
-        strncpy(s_progress[progressBarIndex].message, msgString,
+        strncpy(s_progress[progressBarIndex].message, GUEST_PTR(msgString, const char*),
                 sizeof(s_progress[progressBarIndex].message) - 1);
         s_progress[progressBarIndex].message[sizeof(s_progress[progressBarIndex].message) - 1] = '\0';
         printf("[cellMsgDialog] ProgressBar[%u] msg='%s'\n", progressBarIndex, guest_str(msgString));

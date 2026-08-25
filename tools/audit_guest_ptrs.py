@@ -107,13 +107,14 @@ def is_guest_entry(name):
     # sys_* / _sys_* are lowercase by convention.
     if name.startswith('sys_') or name.startswith('_sys_'):
         return True
-    # cell*/sce* are camelCase in the firmware: cellFsOpen, sceNpInit. A
-    # lowercase letter after the prefix means it is OURS -- cellfs_set_root_path
-    # is host-side configuration the port calls with host strings, and
-    # translating its argument would be the bug.
+    # cell*/sce* are camelCase in the firmware and never contain an underscore:
+    # cellFsOpen, sceNpInit. A lowercase letter after the prefix, or an
+    # underscore anywhere, means the function is OURS -- cellfs_set_root_path
+    # and cellGame_set_title_id are host-side configuration the port calls with
+    # host strings, and translating their arguments would be the bug.
     for p in ENTRY_PREFIXES:
         if name.startswith(p) and len(name) > len(p):
-            return name[len(p)].isupper()
+            return name[len(p)].isupper() and '_' not in name
     return False
 
 def param_is_translated(body, param):
@@ -131,7 +132,7 @@ def param_is_translated(body, param):
     # (*_host / *_g2h / *_xlat / *_ptr), e.g. cellPamf's pamf_host().
     pat = (r"(?:^|[^\w])" + re.escape(param) + r"\s*=\s*"
            r"(?:GUEST_PTR|gptr|gpath|guest_str|vm_to_host|yz_g2h"
-           r"|\w*_(?:host|g2h|xlat|ptr))\s*\(")
+           r"|\w*_(?:host|g2h|xlat|ptr|str)|\w*_host_\w+)\s*\(")
     if re.search(pat, body):
         return True
     # An in-place translating MACRO reassigns the parameter just as much as an

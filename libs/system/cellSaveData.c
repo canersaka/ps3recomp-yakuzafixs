@@ -679,12 +679,18 @@ s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
         return CELL_SAVEDATA_ERROR_PARAM;
 
     /* Enumerate existing save dirs */
-    u32 dir_max = setBuf->dirListMax;
+    /* CellSaveDataSetList is { u32 sortType; u32 sortOrder; char* dirNamePrefix; }
+     * and CellSaveDataSetBuf starts with u32 dirListMax -- guest layout, so the
+     * prefix EA is the word at +8 and needs translating before it is used as a
+     * host string. The host structs put dirNamePrefix at +8 as an 8-byte
+     * pointer, so a cast would have read half of it plus padding. */
+    u32 dir_max = vm_read32((u32)(uintptr_t)setBuf + 0);
     if (dir_max == 0) dir_max = CELL_SAVEDATA_DIRLIST_MAX;
     CellSaveDataDirList* dirList = (CellSaveDataDirList*)calloc(dir_max, sizeof(CellSaveDataDirList));
 
     u32 dirCount = enumerate_save_dirs(
-        setList->dirNamePrefix ? setList->dirNamePrefix : "",
+        savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) ?
+            savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) : "",
         dirList, dir_max);
 
     /* Call list callback */
@@ -739,12 +745,18 @@ s32 cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
     if (!setList || !setBuf || !funcList || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
 
-    u32 dir_max = setBuf->dirListMax;
+    /* CellSaveDataSetList is { u32 sortType; u32 sortOrder; char* dirNamePrefix; }
+     * and CellSaveDataSetBuf starts with u32 dirListMax -- guest layout, so the
+     * prefix EA is the word at +8 and needs translating before it is used as a
+     * host string. The host structs put dirNamePrefix at +8 as an 8-byte
+     * pointer, so a cast would have read half of it plus padding. */
+    u32 dir_max = vm_read32((u32)(uintptr_t)setBuf + 0);
     if (dir_max == 0) dir_max = CELL_SAVEDATA_DIRLIST_MAX;
     CellSaveDataDirList* dirList = (CellSaveDataDirList*)calloc(dir_max, sizeof(CellSaveDataDirList));
 
     u32 dirCount = enumerate_save_dirs(
-        setList->dirNamePrefix ? setList->dirNamePrefix : "",
+        savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) ?
+            savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) : "",
         dirList, dir_max);
 
     CellSaveDataCBResult cbResult;
@@ -797,12 +809,18 @@ s32 cellSaveDataFixedSave2(u32 version, CellSaveDataSetList* setList,
     if (!setList || !setBuf || !funcFixed || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
 
-    u32 dir_max = setBuf->dirListMax;
+    /* CellSaveDataSetList is { u32 sortType; u32 sortOrder; char* dirNamePrefix; }
+     * and CellSaveDataSetBuf starts with u32 dirListMax -- guest layout, so the
+     * prefix EA is the word at +8 and needs translating before it is used as a
+     * host string. The host structs put dirNamePrefix at +8 as an 8-byte
+     * pointer, so a cast would have read half of it plus padding. */
+    u32 dir_max = vm_read32((u32)(uintptr_t)setBuf + 0);
     if (dir_max == 0) dir_max = CELL_SAVEDATA_DIRLIST_MAX;
     CellSaveDataDirList* dirList = (CellSaveDataDirList*)calloc(dir_max, sizeof(CellSaveDataDirList));
 
     u32 dirCount = enumerate_save_dirs(
-        setList->dirNamePrefix ? setList->dirNamePrefix : "",
+        savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) ?
+            savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) : "",
         dirList, dir_max);
 
     CellSaveDataCBResult cbResult;
@@ -853,12 +871,18 @@ s32 cellSaveDataFixedLoad2(u32 version, CellSaveDataSetList* setList,
     if (!setList || !setBuf || !funcFixed || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
 
-    u32 dir_max = setBuf->dirListMax;
+    /* CellSaveDataSetList is { u32 sortType; u32 sortOrder; char* dirNamePrefix; }
+     * and CellSaveDataSetBuf starts with u32 dirListMax -- guest layout, so the
+     * prefix EA is the word at +8 and needs translating before it is used as a
+     * host string. The host structs put dirNamePrefix at +8 as an 8-byte
+     * pointer, so a cast would have read half of it plus padding. */
+    u32 dir_max = vm_read32((u32)(uintptr_t)setBuf + 0);
     if (dir_max == 0) dir_max = CELL_SAVEDATA_DIRLIST_MAX;
     CellSaveDataDirList* dirList = (CellSaveDataDirList*)calloc(dir_max, sizeof(CellSaveDataDirList));
 
     u32 dirCount = enumerate_save_dirs(
-        setList->dirNamePrefix ? setList->dirNamePrefix : "",
+        savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) ?
+            savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) : "",
         dirList, dir_max);
 
     CellSaveDataCBResult cbResult;

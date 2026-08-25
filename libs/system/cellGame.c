@@ -555,7 +555,7 @@ s32 cellGameGetLocalWebContentPath(char* path)
     if (!path)
         return CELL_GAME_ERROR_PARAM;
 
-    snprintf(path, CELL_GAME_PATH_MAX,
+    snprintf(GUEST_PTR(path, char*), CELL_GAME_PATH_MAX,
              "/dev_hdd0/game/%s/USRDIR/web", s_title_id);
 
     return CELL_OK;
