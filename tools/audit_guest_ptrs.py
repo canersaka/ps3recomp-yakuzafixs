@@ -139,7 +139,16 @@ def param_is_translated(body, param):
     # An in-place translating MACRO reassigns the parameter just as much as an
     # "=" does, e.g. sysPrxForUser's  YZ_XLAT(lwmutex, sys_lwmutex_t_hle*);
     macro = r"(?:YZ_XLAT|GUEST_XLAT)\s*\(\s*" + re.escape(param) + r"\s*[,)]"
-    return re.search(macro, body) is not None
+    if re.search(macro, body):
+        return True
+    # Rebound to a HOST object, the shape used where a function fills a struct
+    # in pieces and publishes it once on the way out:
+    #     u32 info_ea = GIF_EA(info);
+    #     CellGifDecInfo host_info;
+    #     info = &host_info;
+    # Every info-> after that is a host deref.
+    rebind = r"(?:^|[^\w])" + re.escape(param) + r"\s*=\s*&\s*\w"
+    return re.search(rebind, body) is not None
 
 def strip_comments(src):
     """Blank out comment text, keeping every newline so line numbers still match.
