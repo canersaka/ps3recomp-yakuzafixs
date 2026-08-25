@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+#include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 
 /* Internal state */
 
@@ -43,7 +44,8 @@ s32 cellImeJpOpen(const CellImeJpConfig* config, CellImeJpHandle* handle)
     if (slot < 0) return (s32)CELL_IMEJP_ERROR_OUT_OF_MEMORY;
 
     s_slots[slot].in_use = 1;
-    s_slots[slot].inputMode = config ? config->inputMode : CELL_IMEJP_INPUT_MODE_HIRAGANA;
+    s_slots[slot].inputMode = config ? vm_read32(GUEST_EA(config))   /* inputMode */
+                                     : CELL_IMEJP_INPUT_MODE_HIRAGANA;
     s_slots[slot].inputLen = 0;
     memset(s_slots[slot].input, 0, sizeof(s_slots[slot].input));
 
@@ -133,10 +135,14 @@ s32 cellImeJpGetInputString(CellImeJpHandle handle, u16* str, u32* len)
 
     ImeJpSlot* s = &s_slots[handle];
     u32 copyLen = s->inputLen;
-    if (copyLen > *len) copyLen = *len;
+    u32 cap = vm_read32(GUEST_EA(len));
+    if (copyLen > cap) copyLen = cap;
 
-    memcpy(str, s->input, copyLen * sizeof(u16));
-    *len = copyLen;
+    /* UTF-16 in guest memory is big-endian, so it goes across a unit at a
+     * time rather than as a block copy. */
+    for (u32 i = 0; i < copyLen; i++)
+        vm_write16(GUEST_EA(str) + i * 2, s->input[i]);
+    vm_write32(GUEST_EA(len), copyLen);
     return CELL_OK;
 }
 

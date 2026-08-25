@@ -11,6 +11,7 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_read32 / vm_write32 */
 #include <stdio.h>
 #include <string.h>
+#include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 
 /* Internal state */
 
@@ -310,7 +311,7 @@ s32 cellSailDescriptorGetUri(CellSailDescriptorHandle desc, char* uri, u32 maxLe
 {
     if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use || !uri)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    strncpy(uri, s_descs[desc].uri, maxLen - 1);
+    strncpy(GUEST_PTR(uri, char*), s_descs[desc].uri, maxLen - 1);
     uri[maxLen - 1] = '\0';
     return CELL_OK;
 }

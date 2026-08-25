@@ -411,7 +411,9 @@ s32 cellGifDecDecodeData(CellGifDecMainHandle mainHandle,
                                             &w, &h, &comp, 4);
         if (!pixels) {
             printf("[cellGifDec] stbi_load failed: %s\n", stbi_failure_reason());
-            dataInfo->status = CELL_GIFDEC_DEC_STATUS_STOP;
+            vm_write32(GUEST_EA(dataInfo)
+               + (u32)offsetof(CellGifDecDataInfo, status),
+               CELL_GIFDEC_DEC_STATUS_STOP);
             return CELL_GIFDEC_ERROR_STREAM_FORMAT;
         }
 
@@ -425,18 +427,23 @@ s32 cellGifDecDecodeData(CellGifDecMainHandle mainHandle,
             }
         }
 
-        memcpy(data, pixels, total);
+        memcpy(GUEST_PTR(data, u8*), pixels, total);
         stbi_image_free(pixels);
 
         printf("[cellGifDec]   decoded %ux%u (%u bytes)\n", (u32)w, (u32)h, total);
 
-        dataInfo->recordType = 0;
-        dataInfo->status = CELL_GIFDEC_DEC_STATUS_FINISH;
+        vm_write32(GUEST_EA(dataInfo)
+               + (u32)offsetof(CellGifDecDataInfo, recordType), 0);
+        vm_write32(GUEST_EA(dataInfo)
+                   + (u32)offsetof(CellGifDecDataInfo, status),
+                   CELL_GIFDEC_DEC_STATUS_FINISH);
         return CELL_OK;
     }
 #else
     printf("[cellGifDec] DecodeData: stb_image not available — place stb_image.h in libs/codec/\n");
-    dataInfo->status = CELL_GIFDEC_DEC_STATUS_STOP;
+    vm_write32(GUEST_EA(dataInfo)
+               + (u32)offsetof(CellGifDecDataInfo, status),
+               CELL_GIFDEC_DEC_STATUS_STOP);
     return (s32)CELL_ENOSYS;
 #endif
 }

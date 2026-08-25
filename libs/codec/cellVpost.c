@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+#include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 
 /* Internal state */
 
@@ -44,7 +45,8 @@ s32 cellVpostInit(const CellVpostCfgParam* cfgParam,
         if (!s_handles[i].in_use) {
             memset(&s_handles[i], 0, sizeof(VpostHandle));
             s_handles[i].in_use = 1;
-            s_handles[i].cfg = *cfgParam;
+            guest_struct_load(&s_handles[i].cfg, GUEST_EA(cfgParam),
+                              (u32)sizeof(s_handles[i].cfg));
             vm_write32((u32)(uintptr_t)handle, (u32)i);
             return CELL_OK;
         }
