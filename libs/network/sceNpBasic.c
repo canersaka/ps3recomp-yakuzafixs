@@ -138,6 +138,7 @@ s32 sceNpBasicGetFriendPresence(const SceNpOnlineId* onlineId,
 
 s32 sceNpBasicSetPresence(const SceNpBasicPresence* presence)
 {
+    presence = GUEST_PTR(presence, const SceNpBasicPresence*);
     printf("[sceNpBasic] SetPresence()\n");
 
     if (!s_initialized)
@@ -153,6 +154,7 @@ s32 sceNpBasicSetPresence(const SceNpBasicPresence* presence)
 s32 sceNpBasicSendMessage(const SceNpOnlineId* to,
                            const void* body, u32 bodySize)
 {
+    to = GUEST_PTR(to, const SceNpOnlineId*);
     (void)body;
     (void)bodySize;
 
@@ -169,6 +171,7 @@ s32 sceNpBasicSendMessageAttachment(const SceNpOnlineId* to,
                                       const char* subject,
                                       const void* data, u32 dataSize)
 {
+    to = GUEST_PTR(to, const SceNpOnlineId*);
     (void)data;
     (void)dataSize;
 
@@ -185,6 +188,7 @@ s32 sceNpBasicSendMessageAttachment(const SceNpOnlineId* to,
 s32 sceNpBasicSendInGameInvitation(const SceNpOnlineId* to,
                                      const void* data, u32 dataSize)
 {
+    to = GUEST_PTR(to, const SceNpOnlineId*);
     (void)data;
     (void)dataSize;
 
@@ -226,6 +230,7 @@ s32 sceNpBasicGetBlockListEntryCount(u32* count)
 
 s32 sceNpBasicAddBlockListEntry(const SceNpOnlineId* onlineId)
 {
+    onlineId = GUEST_PTR(onlineId, const SceNpOnlineId*);
     printf("[sceNpBasic] AddBlockListEntry(%.16s)\n",
            onlineId ? onlineId->data : "(null)");
 

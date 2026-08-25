@@ -72,12 +72,12 @@ s32 cellSslCertGetSerialNumber(CellSslCertId certId, u8* serial, u32* serialSize
         return (s32)CELL_SSL_ERROR_INVALID_ARG;
 
     /* Fake serial number */
-    if (*serialSize >= 4) {
+    if (vm_read32((u32)(uintptr_t)serialSize) >= 4) {
         serial[0] = 0x01;
         serial[1] = 0x00;
         serial[2] = 0x00;
         serial[3] = 0x01;
-        *serialSize = 4;
+        vm_write32((u32)(uintptr_t)serialSize, 4);
     }
     return CELL_OK;
 }

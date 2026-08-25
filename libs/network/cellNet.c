@@ -128,12 +128,13 @@ s32 cellNetResolverStartAsynDNS(u32 resolver_id, const char* hostname,
     int rc = getaddrinfo(hostname, NULL, &hints, &result);
     if (rc == 0 && result) {
         struct sockaddr_in* sin = (struct sockaddr_in*)result->ai_addr;
-        *addr = sin->sin_addr.s_addr;
-        s_resolvers[resolver_id].resolved_addr = *addr;
+        u32 resolved = sin->sin_addr.s_addr;
+    vm_write32((u32)(uintptr_t)addr, resolved);
+        s_resolvers[resolver_id].resolved_addr = resolved;
         s_resolvers[resolver_id].done = 1;
         freeaddrinfo(result);
 
-        printf("[cellNet] Resolved %s -> 0x%08X\n", hostname, *addr);
+        printf("[cellNet] Resolved %s -> 0x%08X\n", hostname, resolved);
         return CELL_OK;
     }
 

@@ -388,6 +388,20 @@ s32 cellHttpCreateTransaction(CellHttpTransId* transId, CellHttpClientId clientI
     if (!method || !uri || !transId)
         return CELL_HTTP_ERROR_INVALID_PARAMETER;
 
+    /* CellHttpUri is { const char* scheme, hostname, path, username,
+     * password; u32 port; } -- five 4-byte EAs then the port, twenty bytes
+     * to the guest against forty to us, so nothing but scheme lines up if
+     * you cast. Pull each field out by guest offset. */
+    u32 uri_ea = (u32)(uintptr_t)uri;
+    u32 ea_scheme   = vm_read32(uri_ea +  0);
+    u32 ea_hostname = vm_read32(uri_ea +  4);
+    u32 ea_path     = vm_read32(uri_ea +  8);
+    u32 uri_port    = vm_read32(uri_ea + 20);
+    const char* uri_scheme   = ea_scheme   ? (const char*)(vm_base + ea_scheme)   : NULL;
+    const char* uri_hostname = ea_hostname ? (const char*)(vm_base + ea_hostname) : NULL;
+    const char* uri_path     = ea_path     ? (const char*)(vm_base + ea_path)     : NULL;
+    method = GUEST_PTR(method, const char*);
+
     if (clientId >= CELL_HTTP_MAX_CLIENTS || !s_clients[clientId].in_use)
         return CELL_HTTP_ERROR_NOT_FOUND;
 
@@ -408,20 +422,20 @@ s32 cellHttpCreateTransaction(CellHttpTransId* transId, CellHttpClientId clientI
 
             /* Store hostname, path, port separately for socket connect */
             strncpy(t->hostname,
-                    uri->hostname ? uri->hostname : "unknown",
+                    uri_hostname ? uri_hostname : "unknown",
                     sizeof(t->hostname) - 1);
             t->hostname[sizeof(t->hostname) - 1] = '\0';
 
             strncpy(t->path,
-                    uri->path ? uri->path : "/",
+                    uri_path ? uri_path : "/",
                     sizeof(t->path) - 1);
             t->path[sizeof(t->path) - 1] = '\0';
 
-            t->port = uri->port ? uri->port : 80;
+            t->port = uri_port ? uri_port : 80;
 
             /* Build URL string for logging */
             snprintf(t->url, sizeof(t->url), "%s://%s:%u%s",
-                     uri->scheme   ? uri->scheme   : "http",
+                     uri_scheme   ? uri_scheme   : "http",
                      t->hostname, t->port, t->path);
 
             vm_write32((u32)(uintptr_t)transId, (u32)i);
@@ -666,7 +680,7 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
         u32 copy = t->body_overflow_len;
         if (copy > size)
             copy = size;
-        memcpy(buf, t->body_overflow, copy);
+        memcpy(GUEST_PTR(buf, void*), t->body_overflow, copy);
         filled += copy;
         t->body_received += copy;
 
@@ -861,9 +875,9 @@ s32 cellHttpAddRequestHeader(CellHttpTransId transId, const char* name,
     }
 
     HttpCustomHeader* h = &t->custom_headers[t->custom_header_count];
-    strncpy(h->name, name, sizeof(h->name) - 1);
+    strncpy(h->name, GUEST_PTR(name, const char*), sizeof(h->name) - 1);
     h->name[sizeof(h->name) - 1] = '\0';
-    strncpy(h->value, value, sizeof(h->value) - 1);
+    strncpy(h->value, GUEST_PTR(value, const char*), sizeof(h->value) - 1);
     h->value[sizeof(h->value) - 1] = '\0';
     t->custom_header_count++;
 

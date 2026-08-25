@@ -67,6 +67,7 @@ s32 sceNpCommerce2CreateSessionFinish(SceNpCommerce2Context ctx)
 
 s32 sceNpCommerce2GetSessionInfo(SceNpCommerce2Context ctx, void* info)
 {
+    info = GUEST_PTR(info, void*);
     (void)ctx;
     if (info) memset(info, 0, 64); /* zero out info struct */
     return CELL_OK;
@@ -89,6 +90,7 @@ s32 sceNpCommerce2GetCategoryContentsFinish(SceNpCommerce2Context ctx)
 s32 sceNpCommerce2GetCategoryContentsGetResult(SceNpCommerce2Context ctx,
                                                  void* result)
 {
+    result = GUEST_PTR(result, void*);
     (void)ctx;
     if (result) memset(result, 0, 64);
     return SCE_NP_COMMERCE2_ERROR_SERVER_ERROR;
@@ -110,6 +112,7 @@ s32 sceNpCommerce2GetProductInfoFinish(SceNpCommerce2Context ctx)
 s32 sceNpCommerce2GetProductInfoGetResult(SceNpCommerce2Context ctx,
                                             void* result)
 {
+    result = GUEST_PTR(result, void*);
     (void)ctx;
     if (result) memset(result, 0, 64);
     return SCE_NP_COMMERCE2_ERROR_SERVER_ERROR;

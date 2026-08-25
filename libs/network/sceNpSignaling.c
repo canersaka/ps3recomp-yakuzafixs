@@ -110,8 +110,10 @@ s32 sceNpSignalingGetConnectionInfo(SceNpSignalingCtxId ctxId,
 {
     (void)ctxId; (void)connId;
     if (!info) return (s32)SCE_NP_SIGNALING_ERROR_INVALID_ARGUMENT;
-    memset(info, 0, sizeof(SceNpSignalingConnectionInfo));
-    info->status = SCE_NP_SIGNALING_CONN_STATUS_INACTIVE;
+    u32 info_ea = (u32)(uintptr_t)info;
+    for (u32 o = 0; o < sizeof(SceNpSignalingConnectionInfo); o += 4)
+        vm_write32(info_ea + o, 0);
+    vm_write32(info_ea, SCE_NP_SIGNALING_CONN_STATUS_INACTIVE);
     return CELL_OK;
 }
 

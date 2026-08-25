@@ -166,6 +166,7 @@ static u32 trophy_count_unlocked(TrophyContext* ctx)
 
 void sceNpTrophySetStoragePath(const char* path)
 {
+    path = GUEST_PTR(path, const char*);
     if (path) {
         strncpy(s_storage_path, path, sizeof(s_storage_path) - 1);
         s_storage_path[sizeof(s_storage_path) - 1] = '\0';
@@ -541,11 +542,16 @@ s32 sceNpTrophyGetTrophyUnlockState(SceNpTrophyContext context,
     if (!flags || !count)
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
 
-    memset(flags, 0, sizeof(SceNpTrophyFlagArray));
+    u32 flags_ea = (u32)(uintptr_t)flags;
+    for (u32 o = 0; o < sizeof(SceNpTrophyFlagArray); o += 4)
+        vm_write32(flags_ea + o, 0);
 
     for (u32 i = 0; i < s_contexts[context].total_trophies; i++) {
         if (s_contexts[context].unlocked[i])
-            flags->flag[i / 32] |= (1u << (i % 32));
+            {
+            u32 word_ea = flags_ea + (i / 32) * 4;
+            vm_write32(word_ea, vm_read32(word_ea) | (1u << (i % 32)));
+        }
     }
 
     vm_write32((u32)(uintptr_t)count, (u32)s_contexts[context].total_trophies);
