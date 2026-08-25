@@ -7,6 +7,7 @@
  */
 #include "spu_workload.h"
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
+#include "../ps3_log.h"      /* ps3_log_verbose */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -710,12 +711,22 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
           } }
         return 0;
     }
-    fprintf(stderr, "[spurs-job] dispatch HIT fp=0x%016llX image=%d job=0x%08X\n",
-            (unsigned long long)fp, image_id, job_ea);
-    fflush(stderr);
+    /* Two lines plus two explicit flushes PER JOB. A title running its audio
+     * chain does ~1500 jobs/s, so this alone was ~6k writes/s through one FILE
+     * lock, and it starved the guest threads competing for that lock badly
+     * enough to change what the title does (see ps3_log.h). Milestones stay;
+     * the per-job pair is verbose-only. */
+    int verbose = ps3_log_verbose();
+    if (verbose) {
+        fprintf(stderr, "[spurs-job] dispatch HIT fp=0x%016llX image=%d job=0x%08X\n",
+                (unsigned long long)fp, image_id, job_ea);
+        fflush(stderr);
+    }
     int rc = spu_run_spurs_job(fn, image_id, job_ea, job_desc_size);
-    fprintf(stderr, "[spurs-job] job 0x%08X RETURNED rc=%d\n", job_ea, rc);
-    fflush(stderr);
+    if (verbose) {
+        fprintf(stderr, "[spurs-job] job 0x%08X RETURNED rc=%d\n", job_ea, rc);
+        fflush(stderr);
+    }
     return 1;
 }
 

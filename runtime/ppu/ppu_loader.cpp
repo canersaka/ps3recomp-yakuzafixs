@@ -1526,9 +1526,26 @@ extern "C" int lv2_try_syscall(ppu_context* ctx);
  * rest are dispatched to the real lv2 table, and only genuinely-unregistered
  * numbers fall through to the return-CELL_OK stub. */
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
+/* In-flight lv2 syscall per guest thread; 0 = not in a syscall. See the guard
+ * in lv2_syscall() below. */
+#define PS3_SC_INFLIGHT_MAX 64
+extern "C" uint32_t g_sc_inflight[PS3_SC_INFLIGHT_MAX] = { 0 };
+
 extern "C" void lv2_syscall(ppu_context* ctx)
 {
     uint64_t num = ctx->gpr[11];
+
+    /* Which lv2 syscall each guest thread is currently INSIDE, by thread_id.
+     * A thread blocked in a syscall shows no in-flight HLE (syscalls do not go
+     * through ps3_hle_call) and a stale CTR, so without this a wedged thread is
+     * just "somewhere in ntdll". Cleared on every exit path by the guard. */
+    struct _ScGuard {
+        ppu_context* c;
+        ~_ScGuard() { unsigned t = (unsigned)c->thread_id;
+                      if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = 0; }
+    } _sg{ ctx };
+    { unsigned t = (unsigned)ctx->thread_id;
+      if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = (uint32_t)num; }
     /* Guest-PC breadcrumb for the sampling profiler: record the syscall
      * callsite (lr) in the runtime-side thread info. cia itself is the thread
      * entry OPD (load-bearing for the entry trampoline) -- do not touch it. */

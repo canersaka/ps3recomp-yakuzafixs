@@ -77,6 +77,17 @@ void vm_write64(uint64_t addr, uint64_t val);
 extern "C" uint32_t    g_last_hle_nid  = 0;
 extern "C" const char* g_last_hle_name = "";
 
+/* Which HLE each guest thread is currently INSIDE, indexed by ctx->thread_id.
+ *
+ * g_last_hle_name is a single global, so with several threads calling it names
+ * whoever called most recently -- useless for "what is thread N wedged in".
+ * A thread blocked in a host wait also leaves a stale CTR behind (Tokyo
+ * Jungle's main thread reports CTR=sys_lwmutex_unlock long after that call
+ * returned), so the CTR the watchdog prints is not the answer either. This is:
+ * set on entry, cleared on every exit path by the guard below. */
+#define PS3_HLE_INFLIGHT_MAX 64
+extern "C" const char* g_hle_inflight[PS3_HLE_INFLIGHT_MAX] = { nullptr };
+
 /* Real-PRX bridge: a loaded system PRX (libsre = cellSpurs/cellSync) may export
  * this NID. If so, dispatch into the REAL recompiled Sony code (its OPD -> our
  * indirect dispatcher -> the registered lifted libsre function) instead of the
@@ -165,7 +176,10 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * -> no draws). Snapshot the caller r2+sp now and restore BOTH the live r2 and the
      * ABI slot on every exit path (offset 40 = 0x28 is the reserved TOC doubleword). */
     struct _TocGuard { ppu_context* c; uint64_t toc, sp;
-        ~_TocGuard(){ c->gpr[2] = toc; vm_write64(sp + 0x28, toc); } } _tg{ ctx, ctx->gpr[2], ctx->gpr[1] };
+        ~_TocGuard(){ c->gpr[2] = toc; vm_write64(sp + 0x28, toc);
+                      unsigned t = (unsigned)c->thread_id;
+                      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr; }
+    } _tg{ ctx, ctx->gpr[2], ctx->gpr[1] };
     /* Deliver any pending vblank/flip tick on THIS (guest) thread, serialized with
      * guest execution -- the vblank ticker only marks ticks pending; the handlers
      * run here so guest code never executes concurrently on the ticker thread. */
@@ -574,6 +588,8 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         return;
     }
     g_last_hle_name = e->name;
+    { unsigned t = (unsigned)ctx->thread_id;
+      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = e->name; }
     if (nid == 0xD0B1D189u /*cellGcmSetTile*/ || nid == 0xDC09357Eu /*SetDisplayBuffer*/) {
         static int _g=0; if (_g++ < 8)
             fprintf(stderr, "[hle-trace] %s lr=0x%08X cia=0x%08X r3..r8=%08X %08X %08X %08X %08X %08X\n",
