@@ -68,8 +68,23 @@ def main() -> int:
         assert cls(prefix="", **kw).prefix == "", (
             f"{cls.__name__} invented a prefix from an empty one")
 
+    # --- an import stub above --code-end is still a callable target ---------
+    # --code-end stops data being lifted as code; --hle-stubs exists because a
+    # PRX's import PLT sits ABOVE its last real function. Together they used to
+    # cancel: every `bl` to an import became a "non-code" comment and the call
+    # vanished. libsre lost 1,324 calls that way, including the only one that
+    # reached sys_spu_image_import, which killed SPURS bring-up silently.
+    lf2 = _lifter()
+    lf2.code_lo, lf2.code_hi = 0x10000, 0x1D718
+    lf2.hle_stub_nids = {0x1DA98: 0xEBE5F72F}
+    assert lf2._outside_code(0x1DA98) is False, "import stub treated as non-code"
+    assert lf2._outside_code(0x1E000) is True,  "real data accepted as code"
+    assert lf2._outside_code(0x12000) is False, "in-range code rejected"
+    lf2.code_hi = None
+    assert lf2._outside_code(0x1E000) is False, "no code-end must disable the check"
+
     print("ok: truncated duplicate dropped, widest extent kept, order "
-          "preserved, symbol prefix normalised")
+          "preserved, symbol prefix normalised, import stubs stay callable")
     return 0
 
 

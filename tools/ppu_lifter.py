@@ -1295,7 +1295,7 @@ class PPULifter:
                     return f"{{ g_trampoline_fn = (void(*)(void*)){self.prefix}func_{tgt:08X}; return; }}"
                 if func.start_addr <= tgt < func.end_addr:
                     return f"goto loc_{tgt:08X};"
-                elif self.code_hi is not None and not (self.code_lo <= tgt < self.code_hi):
+                elif self._outside_code(tgt):
                     # Target is outside the executable window -> data misread as
                     # a branch. Don't seed a bogus func_X; just leave the fragment.
                     return f"return; /* b -> non-code 0x{tgt:08X} */"
@@ -1312,7 +1312,7 @@ class PPULifter:
             target = ops[0]
             try:
                 tgt = int(target, 16)
-                if self.code_hi is not None and not (self.code_lo <= tgt < self.code_hi):
+                if self._outside_code(tgt):
                     return f"/* bl -> non-code 0x{tgt:08X} */;"
                 func.calls.append(tgt)
                 self.call_targets.add(tgt)
@@ -1376,7 +1376,7 @@ class PPULifter:
                 if func.start_addr <= tgt < func.end_addr:
                     cond = self._branch_condition(mn, ops)
                     return f"if ({cond}) goto loc_{tgt:08X};"
-                elif self.code_hi is not None and not (self.code_lo <= tgt < self.code_hi):
+                elif self._outside_code(tgt):
                     # Conditional branch to non-code: data misread as code.
                     cond = self._branch_condition(mn, ops)
                     return f"if ({cond}) return; /* bc -> non-code 0x{tgt:08X} */"
@@ -2940,6 +2940,26 @@ class PPULifter:
             sys.stderr.write(f"[ppu_lifter]   0x{a:08X}: {spans} -> kept "
                              f"0x{best[a].end_addr:08X} end\n")
         return out
+
+    def _outside_code(self, tgt: int) -> bool:
+        """True if tgt is outside the executable window AND not an import stub.
+
+        --code-end exists to stop data being misread as code, and --hle-stubs
+        exists because a PRX's import PLT sits ABOVE its last real function.
+        Together they cancelled: every stub address failed the range test, so
+        each `bl` to an import was replaced by a "non-code" comment and the
+        call simply vanished. libsre lost its only call to the
+        sys_spu_image_import stub that way -- cellSpursInitializeWithAttribute
+        then never loaded the SPURS kernel, so no SPU thread group was ever
+        created and the whole SPURS pipeline was dead, silently and with a
+        clean build.
+
+        A stub address is declared callable by definition, so exempt it."""
+        if self.code_hi is None:
+            return False
+        if tgt in self.hle_stub_nids:
+            return False
+        return not (self.code_lo <= tgt < self.code_hi)
 
     def _function_def_lines(self, func, func_by_addr, sorted_addrs,
                             addr_index) -> list[str]:
