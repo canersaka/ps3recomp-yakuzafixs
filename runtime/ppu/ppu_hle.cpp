@@ -456,6 +456,90 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                     _RD(a5,0),_RD(a5,4),_RD(a5,8),_RD(a5,0xC),_RD(a5,0x10),_RD(a5,0x14),_RD(a5,0x18),_RD(a5,0x1C));
                 #undef _RD
             }
+            /* cellSpursEventFlagAttachLv2EventQueue (0x22AAB31D) validates the
+             * event flag at r3 and returns CELL_SPURS_CORE_ERROR_PERM (0x80410909)
+             * unless the direction byte at +0xE is 1 (SPU2PPU) or 3 (ANY2ANY) --
+             * the check is plainly visible in lifted libsre at 0x30015AB4.
+             *
+             * YDKJ attaches a flag that _cellSpursEventFlagInitialize (0x5EF96465)
+             * never ran on: the title imports that NID but never calls it, so +0xE
+             * holds whatever the allocation left. Those four PERMs are why the
+             * title shuts the taskset down without ever creating a task, which is
+             * why no workload is ever READY and the SPU kernel has nothing to run.
+             *
+             * Logged whenever YDKJ_SPURSTRACE is on. YDKJ_EVFLAG_DIR=<1|3> stamps a
+             * valid direction to find the NEXT gate -- a probe, not a fix: the real
+             * answer is to make the title's own event-flag init run. */
+            if (nid == 0x22AAB31Du) {
+                extern uint8_t* vm_base;
+                uint32_t ef = (uint32_t)ctx->gpr[3];
+                if (vm_base && ef) {
+                    uint8_t dir = vm_base[ef + 0xE];
+                    static int _el = 0;
+                    if (getenv("YDKJ_SPURSTRACE") && _el < 8) { _el++;
+                        fprintf(stderr, "[EVFLAG] attach flag=0x%08X +0C=%02X +0D=%02X "
+                                        "+0E=%02X (needs 1 or 3)\n",
+                                ef, vm_base[ef+0xC], vm_base[ef+0xD], dir);
+                        fflush(stderr); }
+                    const char* _ed = getenv("YDKJ_EVFLAG_DIR");
+                    /* YDKJ_EVFLAG_INIT=1: run Sony's OWN initializer on the flag
+                     * rather than stamping bytes. Stamping +0xE only walks to the
+                     * next zero field -- it turned PERM (0x80410909) into
+                     * NULL_POINTER (0x80410911) -- because these flags are wholly
+                     * uninitialised, not one byte short.
+                     *
+                     * _cellSpursEventFlagInitialize (0x5EF96465, libsre 0x30015758)
+                     * is imported by the title and exported by libsre, but never
+                     * called: r3=spurs, r4=taskset, r5=eventFlag, r6=clearMode,
+                     * r7=direction (five args: r3..r7, confirmed from libsre 0x30015760). Same eager-init trick as
+                     * YDKJ_GUESTINIT above. Direction from YDKJ_EVFLAG_DIR (3 =
+                     * ANY2ANY by default; 1 = SPU2PPU).
+                     *
+                     * MEASURED: this does write the struct (+0C=FF +0D=00 +0E=03),
+                     * but it makes things WORSE, and the reason is informative.
+                     * 0x22AAB31D is itself the claim step: it lwarx's the byte at
+                     * +0xC, returns STAT if it is already 0xFF, and otherwise
+                     * stamps 0xFF to claim the flag. Pre-running 0x5EF96465 sets
+                     * +0xC=0xFF first, so the claim then sees its own stamp.
+                     *
+                     * Error walk, direction-stamp only vs eager-init:
+                     *   nothing      -> 0x80410909 PERM          (+0xE == 0)
+                     *   DIR only     -> 0x80410911 NULL_POINTER  (a later field is 0)
+                     *   eager init   -> 0x8041090F STAT          (self-inflicted)
+                     * So DIR-only is the furthest, and the real gap is that the
+                     * title never fills +0xD/+0xE and the pointer field the claim
+                     * dereferences. That code is title-side, not libsre. */
+                    if (getenv("YDKJ_EVFLAG_INIT") && dir != 1 && dir != 3) {
+                        extern uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea;
+                        uint32_t iopd = prx_resolve_export(0x5EF96465u);
+                        uint32_t want = (_ed && _ed[0] == (char)49) ? 1u : 3u;
+                        static int _ei = 0;
+                        if (iopd) {
+                            if (_ei++ < 6) {
+                                fprintf(stderr, "[EVFLAG] eager _cellSpursEventFlagInitialize"
+                                                " flag=0x%08X spurs=0x%08X taskset=0x%08X dir=%u\n",
+                                        ef, g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, want);
+                                fflush(stderr); }
+                            ppu_guest_call(iopd, g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea,
+                                           ef, 0, want, 0, 0, 0);
+                            if (_ei <= 6) {
+                                fprintf(stderr, "[EVFLAG] after init: +0C=%02X +0D=%02X +0E=%02X\n",
+                                        vm_base[ef+0xC], vm_base[ef+0xD], vm_base[ef+0xE]);
+                                fflush(stderr); }
+                        } else if (_ei++ < 2) {
+                            fprintf(stderr, "[EVFLAG] 0x5EF96465 not resolvable via the PRX registry\n");
+                        }
+                    }
+                    if (_ed && dir != 1 && dir != 3) {
+                        vm_base[ef + 0xE] = (uint8_t)((_ed[0] == (char)49) ? 1 : 3);
+                        static int _es = 0;
+                        if (_es++ < 4) {
+                            fprintf(stderr, "[EVFLAG] stamped +0E=%u on 0x%08X\n",
+                                    vm_base[ef+0xE], ef);
+                            fflush(stderr); }
+                    }
+                }
+            }
             uint32_t _cap_ts = (nid==0x87630976u) ? (uint32_t)ctx->gpr[4] : 0; /* taskset EA before the call clobbers r4 */
             ctx->gpr[2] = toc;            /* libsre's own TOC */
             ctx->ctr    = code;
