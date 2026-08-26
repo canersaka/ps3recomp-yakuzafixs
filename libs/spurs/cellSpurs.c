@@ -539,6 +539,7 @@ s32 cellSpursSetPriorities(CellSpurs* spurs, CellSpursWorkloadId wid,
 extern int sys_event_queue_push_by_id(uint32_t queue_id, uint64_t source,
                                       uint64_t data1, uint64_t data2, uint64_t data3);
 extern void sys_event_queue_cancel_by_id(uint32_t queue_id);
+extern void sys_event_queue_uncancel_by_id(uint32_t queue_id);
 
 static u32 s_spurs_event_queue[MAX_SPURS_QUEUES];
 static int s_spurs_event_queue_n = 0;
@@ -561,6 +562,10 @@ s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port,
      * wake a thread sitting in sys_event_queue_receive on it. Tokyo Jungle
      * kicks its job chain and then blocks on exactly that receive. */
     if (queue && s_spurs_event_queue_n < MAX_SPURS_QUEUES) {
+        /* A previous cellSpursFinalize may have cancelled this queue. Attaching
+         * gives it a producer again, so lift that -- otherwise a title that
+         * tears its audio down and brings it back finds every receive failing. */
+        sys_event_queue_uncancel_by_id(queue);
         int dup = 0;
         for (int i = 0; i < s_spurs_event_queue_n; i++)
             if (s_spurs_event_queue[i] == queue) dup = 1;

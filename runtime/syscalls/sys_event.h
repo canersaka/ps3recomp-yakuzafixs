@@ -168,6 +168,9 @@ uint32_t sys_event_find_queue_by_key(uint64_t key);
  * wake to notice the shutdown its owner is waiting on. */
 void sys_event_queue_cancel_by_id(uint32_t queue_id);
 
+/* Undo the above when a producer attaches again. */
+void sys_event_queue_uncancel_by_id(uint32_t queue_id);
+
 #ifdef __cplusplus
 }
 #endif

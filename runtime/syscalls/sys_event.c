@@ -196,6 +196,26 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
  * r4 = pointer to sys_event_t in guest memory
  * r5 = timeout_usec (0 = infinite)
  * -----------------------------------------------------------------------*/
+/* A queue has a producer again (SPURS re-attach after a finalize). Without this
+ * the cancel is permanent: the flag survives, every later receive fails, and a
+ * title that tears its audio down and brings it back never runs again. */
+void sys_event_queue_uncancel_by_id(uint32_t queue_id)
+{
+    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return;
+    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
+    if (!q->active || !q->cancelled) return;
+#ifdef _WIN32
+    EnterCriticalSection(&q->lock);
+    q->cancelled = 0;
+    LeaveCriticalSection(&q->lock);
+#else
+    pthread_mutex_lock(&q->lock);
+    q->cancelled = 0;
+    pthread_mutex_unlock(&q->lock);
+#endif
+    fprintf(stderr, "[evt] queue %u un-cancelled (producer attached again)\n", queue_id);
+}
+
 void sys_event_queue_cancel_by_id(uint32_t queue_id)
 {
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return;
