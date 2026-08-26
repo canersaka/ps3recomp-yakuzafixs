@@ -9,6 +9,7 @@
  */
 
 #include "cellHttps.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host pointer */
 #include <stdio.h>
 #include <string.h>
 
@@ -116,6 +117,7 @@ s32 cellHttpsSetVerifyLevel(CellHttpsHandle handle, u32 verifyPeer, u32 verifyHo
 
 s32 cellHttpsGetCertInfo(CellHttpsHandle handle, CellHttpsCertInfo* info)
 {
+    info = GUEST_PTR(info, CellHttpsCertInfo*);
     printf("[cellHttps] GetCertInfo(handle=%u)\n", handle);
 
     if (handle >= HTTPS_MAX_HANDLES || !s_slots[handle].in_use)

@@ -139,6 +139,9 @@ typedef struct CellSailMemAllocatorFuncs {
 /* Named pFuncs (not "callbacks") so the import-bridge generator's naming
  * heuristic (gen_imports.py param_marshal) treats this as a real guest
  * struct pointer needing host-pointer translation, not a raw callback value. */
+s32 cellSailPlayerInitialize2(u32 pSelf, u32 pAllocator, u32 pCallback,
+                              u32 pUserParam, u32 pAttribute, u32 pResource);
+s32 cellSailSoundAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg);
 s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
                                      CellSailMemAllocatorFuncs* pFuncs);
 

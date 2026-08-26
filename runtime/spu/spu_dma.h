@@ -68,8 +68,20 @@ static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
           MEMORY_BASIC_INFORMATION mbi;
           uint8_t* p = vm_base + ((uintptr_t)pg[i] << 16);
           if (VirtualQuery(p, &mbi, sizeof mbi) == 0) return 0;
-          if (mbi.State != MEM_COMMIT) return 0;
-          if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+          if (mbi.State != MEM_COMMIT) {
+              /* COMMIT it, do not refuse it. The PPU demand-commits guest
+               * pages on first touch; the SPU had no equivalent and simply
+               * dropped the transfer, so the two processors disagreed about
+               * which memory exists. An SPU-written output buffer is the case
+               * that breaks -- the SPU is the FIRST writer, so the page has
+               * never faulted, and the job's results vanish. Worse, a job that
+               * then polls for its own output spins forever: four of Tokyo
+               * Jungle's twelve images wedged this way, each burning 4096
+               * skipped transfers per run before the runaway guard stopped it. */
+              if (!VirtualAlloc(p, 0x10000, MEM_COMMIT, PAGE_READWRITE)) return 0;
+          } else if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) {
+              return 0;
+          }
           g_vm_page_bitmap[pg[i] >> 3] |= (uint8_t)(1u << (pg[i] & 7));
       }
     }
@@ -172,6 +184,72 @@ static inline int mfc_is_fence(uint32_t cmd)
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
+    /* SPU_DMACHK=1: report transfers that break the MFC rules the guest's own
+     * dma.h asserts on -- size 0 or > 16 KB, size not a multiple of 16 for
+     * transfers of 16+ bytes, or LSA/EA not sharing 16-byte alignment. */
+    { static int s_dc = -1; if (s_dc < 0) s_dc = getenv("SPU_DMACHK") ? 1 : 0;
+      if (s_dc) { static int _n = 0;
+          int bad = (size == 0) || (size > 0x4000)
+                 || (size >= 16 && (size & 15))
+                 || (((lsa ^ (uint32_t)ea) & 15) != 0);
+          if (bad && _n++ < 12)
+              fprintf(stderr, "[dmachk] BAD pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u%c",
+                      (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size, 10); } }
+    /* SPU_PUTHIST=1: histogram of PUT destinations by 1 MB bucket. "the SPU
+     * ran 112k instructions" does not say whether its results reached the
+     * buffer the RSX reads; this says where they actually went. */
+    /* SPU_GETHIST=1: the same accounting for GETs, on the SOURCE side. A solver
+     * whose inputs read back as zeros produces zeros no matter how many
+     * instructions it runs. */
+    { static int s_gh = -1; if (s_gh < 0) s_gh = getenv("SPU_GETHIST") ? 1 : 0;
+      if (s_gh && mfc_is_get(cmd) && vm_base) {
+          static uint32_t seen[48]; static int ns = 0;
+          uint32_t k = (uint32_t)ea & ~0xFFFFu;
+          int f = 0; for (int i = 0; i < ns; i++) if (seen[i] == k) f = 1;
+          if (!f && ns < 48) { seen[ns++] = k;
+              uint32_t nzs = 0; const uint8_t* q = vm_base + (uint32_t)ea;
+              for (uint32_t i7 = 0; i7 < size && i7 < 0x4000u; i7 += 7) if (q[i7]) nzs++;
+              fprintf(stderr, "[getea] spu=0x%X 0x%08X size=%u srcNonZero=%u%c",
+                      spu->spu_id, (uint32_t)ea, size, nzs, 10); } } }
+    { static int s_ph = -1; if (s_ph < 0) s_ph = getenv("SPU_PUTHIST") ? 1 : 0;
+      if (s_ph) { static unsigned long long ngets, nputs, nother;
+          if (mfc_is_get(cmd)) ngets++; else if (mfc_is_put(cmd)) nputs++; else nother++;
+          if (((ngets + nputs + nother) % 5000) == 0)
+              fprintf(stderr, "[dma] gets=%llu puts=%llu other=%llu%c",
+                      ngets, nputs, nother, 10); }
+      if (s_ph && mfc_is_put(cmd)) {
+          static unsigned long long buckets[4096]; static unsigned long long tot;
+          buckets[((uint32_t)ea >> 20) & 4095]++;
+          ++tot;
+          /* On the first PUT to EA 0, dump the whole local store: the code that
+           * computed the null destination, and the LS words it read it from,
+           * are both in there. */
+          if (tot == 1 && (uint32_t)ea == 0) {
+              FILE* f = fopen("spu_ls_nullput.bin", "wb");
+              if (f) { fwrite(spu->ls, 1, 0x40000, f); fclose(f);
+                  fprintf(stderr, "[put] wrote spu_ls_nullput.bin (pc=0x%05X)%c",
+                          (uint32_t)spu->pc & SPU_LS_MASK, 10); }
+          }
+          { static u32 seen[48]; static int ns = 0;
+            u32 k = (uint32_t)ea & ~0xFFFFu;       /* 64 KB granularity */
+            int f = 0; for (int i = 0; i < ns; i++) if (seen[i] == k) f = 1;
+            if (!f && ns < 48) { seen[ns++] = k;
+                { u32 nzs = 0; const uint8_t* sp2 = &spu->ls[lsa & SPU_LS_MASK];
+                  for (uint32_t i6 = 0; i6 < size && i6 < 0x4000u; i6 += 7)
+                      if (sp2[i6]) nzs++;
+                  fprintf(stderr, "[putea] spu=0x%X 0x%08X size=%u srcNonZero=%u%c",
+                          spu->spu_id, (uint32_t)ea, size, nzs, 10); } } }
+          if (tot <= 8)
+              fprintf(stderr, "[put#%llu] img=%d pc=0x%05X ea=0x%08X lsa=0x%05X size=%u cmd=0x%X%c",
+                      tot, spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK,
+                      (uint32_t)ea, lsa, size, cmd, 10);
+          if ((tot % 200) == 0) {
+              fprintf(stderr, "[puthist] after %llu puts:%c", tot, 10);
+              for (int i = 0; i < 4096; i++) if (buckets[i])
+                  fprintf(stderr, "   ea 0x%03X00000..  %llu puts%c",
+                          i, buckets[i], 10);
+          }
+      } }
     /* LBP_MFC_TRACE: attribute silent DMA-poll loops (a wedged task whose
      * host thread samples "in ntdll" because VirtualQuery dominates). Prints
      * every 64k-th transfer per thread: enough to see the loop's pc/ea. */
@@ -250,9 +328,22 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     if (!mfc_ea_range_committed(ea, size)) {
         static int s_warned = 0;
         if (s_warned++ < 32)
-            fprintf(stderr, "[spu-dma] SKIP %s lsa=0x%05X ea=0x%08X size=%u "
-                    "(EA not committed -- bad/garbage DMA target)\n",
-                    mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size);
+            fprintf(stderr, "[spu-dma] SKIP %s img=%d pc=0x%05X lsa=0x%05X ea=0x%08X "
+                    "size=%u%s (EA not committed -- bad/garbage DMA target)\n",
+                    mfc_is_get(cmd) ? "GET" : "PUT", spu->image_id,
+                    (uint32_t)spu->pc & SPU_LS_MASK, lsa, (uint32_t)ea, size,
+                    (size <= 8 && ((uint32_t)ea & (size - 1))) ? " MISALIGNED" : "");
+        /* SPU_DMA_SKIP_DUMP=1: show the LS payload a skipped PUT was carrying.
+         * A job that DMAs a small buffer to a garbage EA in a tight loop is
+         * usually an SPU-side assert/print path, and the payload names the
+         * actual complaint -- far more useful than the address it failed at. */
+        { static int s_d = -1; if (s_d < 0) s_d = getenv("SPU_DMA_SKIP_DUMP") ? 1 : 0;
+          if (s_d && s_warned <= 2) {
+            const uint8_t* q = spu->ls + (lsa & SPU_LS_MASK);
+            fprintf(stderr, "  LS[0x%05X] ascii: ", lsa);
+            for (uint32_t i = 0; i < 128; i++)
+                fputc((q[i] >= 32 && q[i] < 127) ? q[i] : 46, stderr);
+            fputc(10, stderr); fflush(stderr); } }
         return -1;
     }
 
@@ -582,6 +673,18 @@ static inline int mfc_enqueue(mfc_engine* mfc, spu_context* spu)
  */
 static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 {
+    /* SPU_CMDHIST=1: every MFC command that reaches the engine, by opcode and
+     * SPU image. Catches list DMAs (putl/getl) that never reach
+     * mfc_do_transfer's per-element path. */
+    { static int s_ch = -1; if (s_ch < 0) s_ch = getenv("SPU_CMDHIST") ? 1 : 0;
+      if (s_ch) { static unsigned long long h[256][8]; static unsigned long long n;
+          h[cmd & 0xFF][spu->image_id & 7]++;
+          if ((++n % 300) == 0) {
+              fprintf(stderr, "[cmdhist] %llu cmds%c", n, 10);
+              for (int c = 0; c < 256; c++) for (int im = 0; im < 8; im++)
+                  if (h[c][im]) fprintf(stderr, "   cmd=0x%02X img=%d  %llu%c",
+                                        c, im, h[c][im], 10);
+          } } }
     uint32_t lsa  = spu->mfc_lsa;
     uint64_t ea   = ((uint64_t)spu->mfc_eah << 32) | spu->mfc_eal;
     uint32_t size = spu->mfc_size;
@@ -615,6 +718,29 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         }
     }
 
+    /* A job re-issuing the SAME transfer forever is wedged, not slow: nothing
+     * about its state can change if the DMA is all it is doing. This used to
+     * count only REJECTED transfers, so once the EA check started committing
+     * pages on demand the counter never advanced and a spinning job simply hung
+     * the chain walker instead. Count repeats whether or not the transfer
+     * succeeds, and halt at a known pc rather than hanging silently. */
+    { static uint32_t s_last_ea, s_last_lsa, s_rep;
+      static uint32_t s_limit = 0;
+      if (!s_limit) { const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
+                      s_limit = e ? (uint32_t)strtoul(e, 0, 0) : 256u; }
+      if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
+          if (++s_rep >= s_limit) {
+              s_rep = 0;   /* re-arm: the chain may run this job again */
+              extern void spu_halt(spu_context*);
+              fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical "
+                      "transfers to ea=0x%08X -- halting the SPU\n",
+                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, s_limit,
+                      (uint32_t)ea);
+              fflush(stderr);
+              spu_halt(spu);
+          }
+      } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; } }
+
     /* Mark tag as in-progress */
     mfc->tag_completed &= ~(1u << tag);
 
@@ -631,10 +757,27 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * whether its source EA holds valid work-queue data. Env YDKJ_DMATRACE. */
     {
         static int64_t dt=-2; if (dt==-2){ const char* e=getenv("YDKJ_DMATRACE"); dt=e?1:0; }
-        if (dt && (spu->image_id==22 || spu->image_id==23)) {
+        /* SPU_DMATRACE=<img> traces one image; YDKJ_DMATRACE keeps the old
+         * hardcoded pair. Seeing a job's FIRST transfers is how you tell a bad
+         * parameter block from a bad address computed later. */
+        static int64_t only=-2;
+        if (only==-2){ const char* e=getenv("SPU_DMATRACE"); only = e ? strtol(e,0,0) : -1; }
+        if ((dt && (spu->image_id==22 || spu->image_id==23)) ||
+            (only >= 0 && spu->image_id == only)) {
             static int _n=0; if (_n++ < 160)
                 fprintf(stderr, "[DMA] img%d cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u\n",
                         spu->image_id, cmd, lsa, (unsigned long long)ea, size, tag);
+            /* Show what a GET actually delivered. A job that reads its parameter
+             * block and then computes a nonsense address is telling you the block
+             * was empty, not that its arithmetic is wrong -- but only if you can
+             * see the bytes. */
+            if (_n <= 160 && mfc_is_get(cmd) && size <= 64 && vm_base &&
+                mfc_ea_range_committed(ea, size)) {
+                const uint8_t* s = vm_base + (uint32_t)ea;
+                fprintf(stderr, "        got:");
+                for (uint32_t k = 0; k < size; k++) fprintf(stderr, " %02X", s[k]);
+                fputc(10, stderr);
+            }
             /* YDKJ_CRI_R4 diag: when the policy issues the mis-computed context
              * DMA (img23, lsa=0x2780, garbage high EA), dump the loaded
              * SpursTasksetContext (LS 0x2700..0x27E0) so we can see which field

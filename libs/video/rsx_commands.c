@@ -16,6 +16,7 @@
 
 #include "rsx_commands.h"
 #include <stdio.h>
+#include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
@@ -47,6 +48,10 @@ rsx_backend* rsx_get_backend(void)
 void rsx_state_init(rsx_state* state)
 {
     memset(state, 0, sizeof(rsx_state));
+    /* RSX reset value for the constant vertex attributes is (0,0,0,1); a zeroed
+     * struct would leave w at 0. */
+    for (int _i = 0; _i < RSX_MAX_VERTEX_ATTRIBS; _i++)
+        state->vertex_data4f[_i][3] = 1.0f;
 
     /* Default viewport */
     state->viewport_w = 1280;
@@ -121,6 +126,11 @@ static int process_surface_method(rsx_state* state, u32 method, u32 data)
         return 0;
     case NV4097_SET_SURFACE_COLOR_AOFFSET:
         state->surface_color_offset[0] = data;
+        { static int _s = -1; if (_s < 0) _s = getenv("SURFDBG") ? 1 : 0;
+          static unsigned _seen[32]; static int _n = 0;
+          if (_s) { int f = 0; for (int k = 0; k < _n; k++) if (_seen[k] == data) f = 1;
+              if (!f && _n < 32) { _seen[_n++] = data;
+                  fprintf(stderr, "[SURF] color offset -> 0x%08X%c", data, 10); } } }
         state->surface_dirty = 1;
         return 0;
     case NV4097_SET_SURFACE_COLOR_BOFFSET:
@@ -248,7 +258,13 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
         attr->size      = (data >> 4) & 0xF;
         attr->stride    = (data >> 8) & 0xFF;
         attr->frequency = (data >> 16) & 0xFFFF;   /* instancing divisor */
-        attr->enabled   = (attr->type != 0); /* type 0 = disabled */
+        /* SIZE (the component count) is what enables the attribute: NV4097 uses
+         * size == 0 to mean "this array is off". Keying off `type` instead marked
+         * every unused slot enabled-with-zero-components, because PSGL writes a
+         * bare type (e.g. 0x00000002 = float32, size 0, stride 0) into the slots
+         * it is NOT using -- so the input layout was built from 16 attributes of
+         * which most were degenerate, and the draws rasterized nothing. */
+        attr->enabled   = (attr->size != 0);
         attr->format    = data;
         state->vertex_dirty = 1;
         return 0;
@@ -271,8 +287,12 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
 
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
-    { static int _rt=-1; if(_rt<0) _rt=getenv("YDKJ_RSXTRACE")?1:0;
-      if(_rt){ static int _m=0; if(_m++<250) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
+    /* YDKJ_RSXTRACE=<N>: trace the first N methods (bare "1" keeps the old 250).
+     * The fixed 250 was spent entirely on boot-time setup, so the methods around
+     * the first real draw -- exactly the ones worth seeing -- were never traced. */
+    { static int _rt=-1; if(_rt<0){ const char* e=getenv("YDKJ_RSXTRACE");
+        _rt = e ? (atoi(e) > 1 ? atoi(e) : 250) : 0; }
+      if(_rt){ static int _m=0; if(_m++<_rt) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
     /* Back-end write label / semaphore (cellGcmSetWriteBackEndLabel): the RSX
      * writes a value to a report/label the CPU polls for CPU<->RSX sync (double
      * buffering). Real hardware DOES this; without it the game's frame-fence
@@ -501,6 +521,13 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
 
+    if (method == NV4097_SET_TRANSFORM_PROGRAM_START) {
+        if (state->transform_program_start != data) state->vp_dirty = 1;
+        state->transform_program_start = data;
+        state->shader_dirty = 1;
+        return 0;
+    }
+
     /* NV4097_SET_TRANSFORM_PROGRAM[0..31] — a run of 32-bit vertex-program
      * microcode words appended at the current write cursor. Capture them so the
      * backend can decompile the real VP (4 words = one NV40 instruction). */
@@ -523,6 +550,28 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         state->vertex_attrib_output_mask = data;
         return 0;
     }
+    /* NV4097_SET_VERTEX_DATA4F_M (0x1C00): the constant/"current" value for each
+     * vertex attribute, 16 attributes x 4 floats. The hardware feeds this to
+     * every vertex when the attribute's ARRAY is disabled -- it is not zero.
+     *
+     * Rubber Ducky leaves attribute 3 (diffuse colour) disabled and sets it here
+     * instead; its duck shader computes (lighting * col0) * texture + spec, so a
+     * zero col0 multiplies the texture away and the ducks rendered as a dim grey
+     * specular term only -- present in the framebuffer, invisible on screen.
+     * SET_VERTEX_DATA2F/4UB/2S/4S are the other encodings of the same register
+     * file; add them if a title needs them. */
+    if (method >= 0x1C00u && method < 0x1C00u + RSX_MAX_VERTEX_ATTRIBS * 16u) {
+        u32 idx  = (method - 0x1C00u) >> 4;         /* attribute */
+        u32 lane = ((method - 0x1C00u) >> 2) & 3;   /* x/y/z/w   */
+        float f; memcpy(&f, &data, 4);
+        state->vertex_data4f[idx][lane] = f;
+        { static int _d = -1; if (_d < 0) _d = getenv("VDATA_DBG") ? 1 : 0;
+          static int _n = 0;
+          if (_d && _n < 400) { _n++;
+            fprintf(stderr, "[VDATA4F] attr=%u lane=%u = %.4f%c", idx, lane, f, 10); } }
+        return 0;
+    }
+
     if (method == NV4097_SET_TRANSFORM_CONSTANT_LOAD) {
         { static int _n=0; if (getenv("LOAD_DBG") && _n++ < 200)
             fprintf(stderr, "[LOAD] transform_constant_load = %u\n", data); }
@@ -547,7 +596,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
             memcpy(&f, &data, 4);
             { static int _en=-1; if(_en<0){const char*e=getenv("TCONST_DBG");_en=e?1:0;}
               static int _n=0;
-              int _hit = _en && (getenv("TCONST_ALL") ? (_n<64) : (slot>=12 && slot<=30 && _n<400));
+              static int _max=-1; if(_max<0){const char*m=getenv("TCONST_MAX");_max=m?atoi(m):64;}
+              int _hit = _en && (getenv("TCONST_ALL") ? (_n<_max) : (slot>=12 && slot<=30 && _n<400));
               if(_hit){ _n++; fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); } }
             state->vertex_constants[slot][lane] = f;
             { static int _sq=0; if (getenv("SEQ_DBG") && slot==256 && lane==0 && _sq++ < 500)
@@ -569,6 +619,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         if (data != 0) {
             state->primitive_type = data;
             state->in_begin_end = 1;
+            state->begin_epoch++;
 
             /* Flush dirty state to backend before drawing */
             if (s_backend) {

@@ -108,14 +108,25 @@ static u8 s_local_offset_page[1024];
 /* Command buffer control */
 static CellGcmControl s_control;
 
-/* Offset table storage */
+/* Offset table storage
+ *
+ * set_offset_table/clear_offset_table keep these two host arrays in step with
+ * the IO mappings, and that part was always fine. What was not: the tables
+ * cellGcmGetOffsetTable hands out are indexed BY THE GUEST --
+ * ioAddress[ea >> 20] and eaAddress[io >> 20] -- and it handed over 64-bit host
+ * pointers through a struct whose guest form is two 4-byte fields, so the title
+ * got two truncated addresses pointing at nothing it could read.
+ *
+ * The guest-visible copy lives in the reserved GCM window alongside the label
+ * and control blocks, published on each call. 4096 pages covers the 4 GiB
+ * address space at 1 MiB granularity, 8 KiB a side, and this is not a hot path.
+ * 0xFFFF means "not mapped", as it does in the host tables. */
 static u16 s_io_address_table[65536];
 static u16 s_ea_address_table[65536];
 
-static CellGcmOffsetTable s_offset_table = {
-    s_io_address_table,
-    s_ea_address_table,
-};
+#define GCM_OFFSET_TABLE_PAGES   4096u                 /* 4 GiB / 1 MiB       */
+#define GCM_OFFSET_TABLE_IO_ADDR 0x03003000u           /* ea >> 20  -> io>>20 */
+#define GCM_OFFSET_TABLE_EA_ADDR 0x03005000u           /* io >> 20  -> ea>>20 */
 
 /* Local memory bump allocator */
 static u32 s_local_mem_allocated = 0;  /* next free offset in local memory */
@@ -135,6 +146,16 @@ static int s_io_mapping_count = 0;
  * recompiled game, not host function pointers. Stored as uint32_t and
  * invoked through g_ps3_guest_caller (see ps3emu/guest_call.h). */
 static u32 s_flip_handler_opd     = 0;
+
+/* GCM_FLIPCB_ONTICK=1: fire the guest flip handler only when the flip
+ * completes (cellGcmTickFlip), not also when it is requested. */
+static int gcm_flipcb_on_tick_only(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("GCM_FLIPCB_ONTICK") ? 1 : 0;
+    return v;
+}
+
 static u32 s_vblank_handler_opd   = 0;
 static u32 s_user_handler_opd     = 0;
 static u32 s_second_v_handler_opd = 0;
@@ -234,7 +255,12 @@ static void populate_offset_table(u32 ea, u32 io, u32 size)
      * ioAddress[ea >> 20] = io >> 20   (EA -> IO offset)
      * eaAddress[io >> 20] = ea >> 20   (IO offset -> EA)
      */
-    u32 pages = size >> 20;  /* number of 1MB pages */
+    /* Round UP: a mapping is described by whole 1MB table entries, so a size
+     * that is not a multiple of 1MB still needs its final partial page mapped.
+     * Truncating dropped that page -- and dropped the mapping ENTIRELY for any
+     * size below 1MB (pages == 0) -- after which cellGcmResolveOffset finds no
+     * IO entry and falls back to VRAM, where the guest never wrote anything. */
+    u32 pages = (size + 0xFFFFFu) >> 20;  /* number of 1MB pages, rounded up */
     u32 ea_page = ea >> 20;
     u32 io_page = io >> 20;
 
@@ -578,7 +604,23 @@ void ppu_gcm_pump(void)
 /* Back-compat: the old direct entry points now just mark a tick pending (so any
  * caller other than the ticker still works) -- delivery stays on the main thread. */
 void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
-void cellGcmTickFlip(void)   { GCM_PENDING_SET(2); }
+/* Only deliver a flip completion when a flip is actually outstanding.
+ *
+ * Ticking unconditionally at 60 Hz fires the guest's flip handler even when
+ * the guest never asked for a flip. A title whose handler touches the flip
+ * status then livelocks: Tokyo Jungle's main loop is
+ *
+ *     do { usleep(100); } while (cellGcmGetFlipStatus() != DONE);
+ *     cellGcmResetFlipStatus();
+ *
+ * and its handler runs code that puts the status back to WAITING, so the
+ * poll never saw DONE and the game never rendered another frame. On hardware
+ * the callback IS the flip interrupt -- no flip, no callback. */
+void cellGcmTickFlip(void)
+{
+    if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING)
+        GCM_PENDING_SET(2);
+}
 
 /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread
  * (boot_main vblank_ticker). Not yet active: s_control.put stays 0 because
@@ -636,8 +678,174 @@ static struct {
     u32 size_out;     /* NV308A 0x0308 SET_SIZE_OUT                 */
 } s_gcm2d;
 
+static struct {
+    u32 src_dma, dst_surf, fmt, op, clip_pt, clip_sz, out_pt, out_sz;
+    u32 ds_dx, dt_dy, in_sz, in_fmt, in_off, in_uv;
+} s_nv3089;
+
+/* NV309E "swizzled surface" -- the destination object for a scaled-image blit
+ * whose target is a swizzled (Morton-ordered) texture rather than a linear
+ * surface. Rubber Ducky binds it to the same subchannel this file previously
+ * assumed was always NV308A (image-from-CPU), so its SET_OFFSET was being read
+ * as an NV308A "point" and the blit destination was never picked up at all.
+ * The two are told apart by method 0x0300: NV308A has no such method. */
+static struct {
+    u32 fmt;        /* 0x0300: (log2h << 24) | (log2w << 16) | format */
+    u32 offset;     /* 0x0304: destination offset                     */
+    int active;
+    int subch;      /* which subchannel NV309E is bound to. Per-subchannel:
+                     * this title has NV309E on 4 and NV308A on 5, and a global
+                     * flag made 5's NV308A POINT (also 0x0304) be swallowed as
+                     * an NV309E offset, breaking every inline transfer. */
+} s_nv309e;
+
+/* Execute one NV3089 blit into the currently-bound NV3062 destination surface.
+ * Point-sampled: ds/dx and dt/dy are 20.12 fixed point and are 0x100000 (1.0)
+ * for the straight uploads this exists for; a scaled blit still lands, just
+ * without filtering. */
+/* Morton/Z-order offset for an NV309E swizzled surface: interleave the low
+ * min(l2w,l2h) bits of x and y, then append the remaining bits of the larger
+ * dimension above them. */
+static u32 nv309e_swz(u32 x, u32 y, u32 l2w, u32 l2h)
+{
+    u32 n = l2w < l2h ? l2w : l2h, off = 0;
+    for (u32 i = 0; i < n; i++)
+        off |= (((x >> i) & 1u) << (2 * i)) | (((y >> i) & 1u) << (2 * i + 1));
+    if (l2w > l2h)      off |= (x >> n) << (2 * n);
+    else if (l2h > l2w) off |= (y >> n) << (2 * n);
+    return off;
+}
+
+static void nv3089_blit(void)
+{
+    u32 out_w = s_nv3089.out_sz & 0xFFFF, out_h = s_nv3089.out_sz >> 16;
+    u32 out_x = s_nv3089.out_pt & 0xFFFF, out_y = s_nv3089.out_pt >> 16;
+    u32 in_pitch = s_nv3089.in_fmt & 0xFFFF;
+    u32 dst_pitch = s_gcm2d.pitch >> 16;
+    if (!out_w || !out_h || !in_pitch || !dst_pitch) return;
+    /* Only the 32-bit colour formats are handled; anything else would need a
+     * per-format converter and is better skipped loudly than written wrong. */
+    u32 f = s_nv3089.fmt & 0xFF;
+    /* NOTE: format 0x3 appears here as a downsample chain (1024x512 -> 1024x256
+     * -> 512x128 -> 256x64 -> 128x32, all into one destination) that builds a
+     * mip/blur pyramid, and skipping it leaves that texture empty. Treating it
+     * as 4-byte A8R8G8B8 like 7/8/0xD is WRONG -- it floods the scene blue
+     * (flat-blue coverage 17k -> 537k pixels), so its pixel layout differs.
+     * Decode it properly before enabling; do not just add it to this list. */
+    /* NV309E swizzled destination. Colour format 0x3 is A8R8G8B8 in the
+     * scaled-image enum; this title uses it to build a mip/blur pyramid into a
+     * swizzled texture (1024x512 -> 1024x256 -> ... all through NV309E).
+     * Writing it LINEARLY into the NV3062 destination is what flooded the scene
+     * blue -- wrong destination and wrong layout. */
+    { u32 l2w = (s_nv309e.fmt >> 16) & 0xFF, l2h = (s_nv309e.fmt >> 24) & 0xFF;
+      static int en = -1;
+      /* On by default: this is the mip/blur pyramid. Without it textures have
+       * no mip levels, which shows up as aliased blocky tiles and a noise patch
+       * where a minified surface should be, and the shell that samples the
+       * pyramid draws untextured. NV309E_BLIT=0 disables. */
+      if (en < 0) { const char* e = getenv("NV309E_BLIT"); en = e ? atoi(e) : 1; }
+      if (en && f == 3 && s_nv309e.active && s_nv309e.offset &&
+          (1u << l2w) == out_w && (1u << l2h) == out_h) {
+        int sl = (s_nv3089.src_dma != 0xFEED0001u);
+        u32 src2 = cellGcmResolveLocated(sl, s_nv3089.in_off);
+        u32 dst2 = cellGcmResolveLocated(1, s_nv309e.offset);
+        u32 u0b = s_nv3089.in_uv & 0xFFFF, v0b = s_nv3089.in_uv >> 16;
+        /* Copy words verbatim through raw pointers rather than vm_read32/
+         * vm_write32: this moves ~500k pixels per blit and several blits run per
+         * frame, and the two byte swaps would cancel anyway. */
+        { extern u8* vm_base;
+          const u8* sbase = vm_base + src2;
+          u8* dbase = vm_base + dst2;
+          for (u32 y = 0; y < out_h; y++) {
+              u64 sv = ((u64)v0b << 8) + (u64)y * s_nv3089.dt_dy;
+              const u8* srow = sbase + (u32)(sv >> 20) * in_pitch;
+              for (u32 x = 0; x < out_w; x++) {
+                  u64 su = ((u64)u0b << 8) + (u64)x * s_nv3089.ds_dx;
+                  memcpy(dbase + (u64)nv309e_swz(x, y, l2w, l2h) * 4,
+                         srow + (u32)(su >> 20) * 4, 4);
+              }
+          } }
+        { static int _n = 0; static int cap = -1;
+          if (cap < 0) { const char* e = getenv("NV3089_DBG"); cap = e ? atoi(e) : 0; }
+          if (cap && _n < cap) { _n++;
+            printf("[NV3089] swizzled %ux%u fmt=0x%X src=0x%08X -> NV309E dst=0x%08X%c",
+                   out_w, out_h, f, src2, dst2, 10); } }
+        return;
+      } }
+    /* 0x3 is A8R8G8B8 in the scaled-image format enum. This title uses it for
+     * two different things: the swizzled mip/blur pyramid handled above, and
+     * (with a LINEAR NV3062 destination) copies of the rendered scene surface
+     * into the textures its water and effects sample -- e.g.
+     * src=0xCE340000 (the scene) -> dst=0xC3746200, which is the single most
+     * sampled blended texture in the frame. Skipping those left every one of
+     * those textures empty. Same 4-byte pixel layout as the formats already
+     * handled. */
+    if (f != 3 /* A8R8G8B8 (scale-format enum) */ &&
+        f != 7 /* A8R8G8B8 */ && f != 8 /* X8R8G8B8 */ && f != 0xD /* A8B8G8R8 */) {
+        /* Log the GEOMETRY of a skipped blit, not just the format: a full-screen
+         * copy from the scene surface to a registered display buffer is the
+         * composite this title needs, and is worth telling apart from some
+         * incidental small transfer. */
+        { int _sl = (s_nv3089.src_dma != 0xFEED0001u);
+          int _dl = (s_gcm2d.dst_dma  != 0xFEED0001u);
+          printf("[NV3089] SKIPPED fmt=0x%X  %ux%u  src=0x%08X(pitch %u,%s) -> dst=0x%08X(pitch %u,%s) at %u,%u%c",
+                 f, out_w, out_h,
+                 cellGcmResolveLocated(_sl, s_nv3089.in_off), in_pitch, _sl?"LOCAL":"MAIN",
+                 cellGcmResolveLocated(_dl, s_gcm2d.dst_offset), dst_pitch, _dl?"LOCAL":"MAIN",
+                 out_x, out_y, 10); }
+        static int _w = 0;
+        if (_w++ < 4) printf("[NV3089] unsupported colour format 0x%X, blit skipped\n", f);
+        return;
+    }
+    int src_local = (s_nv3089.src_dma != 0xFEED0001u);
+    int dst_local = (s_gcm2d.dst_dma  != 0xFEED0001u);
+    u32 src = cellGcmResolveLocated(src_local, s_nv3089.in_off);
+    u32 dst = cellGcmResolveLocated(dst_local, s_gcm2d.dst_offset);
+    u32 u0 = s_nv3089.in_uv & 0xFFFF, v0 = s_nv3089.in_uv >> 16;   /* 12.4 start */
+    for (u32 y = 0; y < out_h; y++) {
+        u64 sv = ((u64)v0 << 8) + (u64)y * s_nv3089.dt_dy;         /* 20.12 */
+        u32 sy = (u32)(sv >> 20);
+        for (u32 x = 0; x < out_w; x++) {
+            u64 su = ((u64)u0 << 8) + (u64)x * s_nv3089.ds_dx;
+            u32 sx = (u32)(su >> 20);
+            u32 s = src + sy * in_pitch + sx * 4;
+            u32 d = dst + (out_y + y) * dst_pitch + (out_x + x) * 4;
+            vm_write32(d, vm_read32(s));
+        }
+    }
+    { static int _n = 0; static int cap = -1;
+      if (cap < 0) { const char* e = getenv("NV3089_DBG"); cap = e ? atoi(e) : 0; }
+      if (cap && _n < cap) { _n++;
+        printf("[NV3089] %ux%u fmt=0x%X src=0x%08X(pitch %u) -> dst=0x%08X(pitch %u) at %u,%u\n",
+               out_w, out_h, f, src, in_pitch, dst, dst_pitch, out_x, out_y); } }
+}
+
 static void gcm_2d_method(u32 subch, u32 method, u32 data)
 {
+    /* GCM2D_TRACE=1: histogram of (subchannel, method) actually seen. The
+     * subchannel a title binds each 2D object to is libgcm-version-specific and
+     * SET_OBJECT binds are not tracked, so state landing on an unexpected
+     * subchannel is silently dropped -- which looks like a blit using stale
+     * destination state rather than like missing state. */
+    { static int tr = -1;
+      if (tr < 0) { const char* e = getenv("GCM2D_TRACE"); tr = e ? atoi(e) : 0; }
+      if (tr) {
+          static u8 seen[8][1024]; static u64 n = 0;
+          u32 mi = (method >> 2) & 1023;
+          if (subch < 8 && !seen[subch][mi]) {
+              seen[subch][mi] = 1;
+              printf("[GCM2D-TRACE] subch=%u method=0x%04X (first, data=0x%08X)%c",
+                     subch, method, data, 10);
+          }
+          if (++n == 400000ull) {
+              printf("[GCM2D-TRACE] --- subchannels used: ");
+              for (u32 sc = 0; sc < 8; sc++) {
+                  u32 c = 0; for (u32 m = 0; m < 1024; m++) c += seen[sc][m];
+                  if (c) printf("%u(%u methods) ", sc, c);
+              }
+              printf("---%c", 10);
+          }
+      } }
     /* Subchannel bindings are libgcm-version-specific (SET_OBJECT binds are
      * not tracked): demosaic's SDK emits dest-surface on sub 3 and image-from-
      * CPU on sub 5 (cellGcmSetInlineTransfer: 0x4630C / 0xCA304 / 0xA400
@@ -651,7 +859,18 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
         }
         return;
     }
-    if (subch == 4 || subch == 5) {         /* NV308A image from CPU */
+    if (subch == 4 || subch == 5) {         /* NV308A image-from-CPU, or NV309E */
+        /* NV309E swizzled-surface state. SET_FORMAT (0x0300) does not exist on
+         * NV308A, so seeing it identifies the object bound here. */
+        if (method == 0x0300) { s_nv309e.fmt = data; s_nv309e.active = 1;
+                                s_nv309e.subch = (int)subch;
+            { static int _n = 0; if (_n++ < 4)
+                printf("[NV309E] format=0x%08X (log2 %ux%u fmt=0x%X)%c", data,
+                       1u << ((data >> 16) & 0xFF), 1u << ((data >> 24) & 0xFF),
+                       data & 0xFFFF, 10); }
+            return; }
+        if (method == 0x0304 && s_nv309e.active && s_nv309e.subch == (int)subch) {
+            s_nv309e.offset = data; return; }
         switch (method) {
         case 0x0304: s_gcm2d.point    = data; return;
         case 0x0308: s_gcm2d.size_out = data; return;
@@ -677,9 +896,43 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
         }
         return;
     }
-    /* NV0039 / NV309E / NV3089: not implemented yet -- log first sightings. */
-    static int warned = 0;
-    if (warned++ < 8)
+    /* NV3089 "scaled image from memory" -- the blit PSGL uses to move a texture
+     * it has assembled elsewhere into the VRAM the sampler reads. Without it a
+     * title's textures stay whatever the destination was before (zero), so
+     * geometry renders flat no matter how correct the sampler is.
+     *
+     * Registers: 0x0184 source DMA, 0x0198 destination surface (the NV3062
+     * state above), 0x0300 colour format, 0x0304 operation, 0x0308/0x030C clip
+     * point/size, 0x0310/0x0314 out point/size, 0x0318/0x031C ds/dx dt/dy in
+     * 20.12 fixed point, 0x0400 in size, 0x0404 (origin<<16)|pitch, 0x0408 in
+     * offset, 0x040C in u/v start -- which is also the trigger. */
+    if (subch == 6 || subch == 7) {
+        switch (method) {
+        case 0x0184: s_nv3089.src_dma   = data; return;
+        case 0x0198: s_nv3089.dst_surf  = data; return;
+        case 0x0300: s_nv3089.fmt       = data; return;
+        case 0x0304: s_nv3089.op        = data; return;
+        case 0x0308: s_nv3089.clip_pt   = data; return;
+        case 0x030C: s_nv3089.clip_sz   = data; return;
+        case 0x0310: s_nv3089.out_pt    = data; return;
+        case 0x0314: s_nv3089.out_sz    = data; return;
+        case 0x0318: s_nv3089.ds_dx     = data; return;
+        case 0x031C: s_nv3089.dt_dy     = data; return;
+        case 0x0400: s_nv3089.in_sz     = data; return;
+        case 0x0404: s_nv3089.in_fmt    = data; return;
+        case 0x0408: s_nv3089.in_off    = data; return;
+        case 0x040C: s_nv3089.in_uv     = data; nv3089_blit(); return;
+        }
+        return;
+    }
+    /* NV0039 / NV309E: not implemented yet -- log first sightings. */
+    /* GCM2D_DBG=<N> raises the cap and adds the data word: the fixed 8 showed
+     * only that SOMETHING was unhandled, not enough to implement it. */
+    static int warned = 0, wcap = -1;
+    if (wcap < 0) { const char* e = getenv("GCM2D_DBG"); wcap = e ? atoi(e) : 8; }
+    if (warned < wcap) { warned++;
+        printf("[GCM2D-UNH] subch %u method 0x%04X data=0x%08X\n", subch, method, data); }
+    if (0)
         printf("[cellGcmSys] FIFO subch %u method 0x%04X (unhandled 2D engine)\n",
                subch, method);
 }
@@ -714,6 +967,20 @@ int cellGcm_take_flip_pending_synced(void)
 #define GCM_REF_QLEN 4096
 static u32 s_ref_q[GCM_REF_QLEN];
 static volatile u32 s_ref_qhead = 0, s_ref_qtail = 0;   /* single producer+consumer: the ticker */
+
+/* A JUMP/CALL whose target has no IO mapping must not be taken. Taking one
+ * teleports the walker into unmapped space, where it can never reach `put`
+ * again: the FIFO silently stops being processed, no fences are published, and
+ * a title spinning on ctrl->ref waits forever with no indication why. Tokyo
+ * Jungle did exactly this -- get left the 1 MB ring for IO 0x00F00000, which it
+ * never mapped, while put sat at 0x604. Stop at the bad word and say so. */
+static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
+{
+    static int n = 0;
+    if (n++ < 8)
+        fprintf(stderr, "[cellGcmSys] FIFO %s to unmapped IO 0x%08X (word 0x%08X) "
+                "-- not taken, drain stops here\n", kind, target, word);
+}
 
 static void gcm_ref_push_at(u32 v, u32 getoff)
 {
@@ -849,7 +1116,26 @@ static void gcm_rsx_process_fifo_unlocked(void)
     int budget = 0x100000;                    /* words per tick cap */
     while (s_fifo_getoff != put && budget-- > 0) {
         u32 ea = gcm_io2ea(s_fifo_getoff);
-        if (!ea) break;
+        if (!ea) {
+            /* get is sitting on an IO offset with no mapping -- the title
+             * branched into a region and then unmapped it, or the offset was
+             * never valid. Breaking silently (what this did) leaves get stuck
+             * there FOREVER: it can never reach put, the FIFO stops draining,
+             * no fences publish, and anything waiting on ctrl->ref hangs with
+             * nothing logged. Resynchronise to put instead. Commands between
+             * here and put are lost, which is bad, but a permanently dead FIFO
+             * is worse -- and now it says so. */
+            static u32 last_bad; static int n;
+            if (s_fifo_getoff != last_bad || n < 4) {
+                last_bad = s_fifo_getoff;
+                if (n++ < 16)
+                    fprintf(stderr, "[cellGcmSys] FIFO get=0x%08X has no IO "
+                            "mapping -- resyncing to put=0x%08X\n",
+                            s_fifo_getoff, put);
+            }
+            s_fifo_getoff = put;
+            break;
+        }
         u32 w = vm_read32(ea);
         u32 type = w >> 29;
 
@@ -870,12 +1156,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
             { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
               if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
                                s_fifo_getoff, w & 0x1FFFFFFCu, put); }
-            s_fifo_getoff = w & 0x1FFFFFFCu;
+            { u32 tgt = w & 0x1FFFFFFCu;
+              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); break; }
+              s_fifo_getoff = tgt; }
             continue;
         }
         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
-            s_fifo_calloff = s_fifo_getoff + 4;
-            s_fifo_getoff  = w & 0x1FFFFFFCu;
+            { u32 tgt = w & 0x1FFFFFFCu;
+              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); break; }
+              s_fifo_calloff = s_fifo_getoff + 4;
+              s_fifo_getoff  = tgt; }
             continue;
         }
         if (w == 0x00020000u) {                /* RET */
@@ -887,6 +1177,25 @@ static void gcm_rsx_process_fifo_unlocked(void)
             u32 count  = (w >> 18) & 0x7FF;
             u32 method = w & 0x1FFCu;
             u32 subch  = (w >> 13) & 7;
+            /* TCONST_FIFO=1: how the title actually streams vertex constants.
+             * NV4097_SET_TRANSFORM_CONSTANT is a 32-register window; if a block
+             * arrives NON-INCREMENTING then every dword carries the same method
+             * and any handler that derives the constant slot from the method
+             * offset writes them all on top of each other. */
+            { static int tf = -1;
+              if (tf < 0) { const char* e = getenv("TCONST_FIFO"); tf = e ? atoi(e) : 0; }
+              if (tf && subch == 0) {
+                  static u32 hist[2048]; static u32 tot[2048]; static int dumped = 0;
+                  u32 mi = (method >> 2) & 2047;
+                  hist[mi]++; tot[mi] += count;
+                  static u64 seen = 0;
+                  if (++seen == 200000ull && !dumped) { dumped = 1;
+                      fprintf(stderr, "[TCFIFO] method histogram (blocks, dwords):%c", 10);
+                      for (u32 k = 0; k < 2048; k++) if (hist[k])
+                          fprintf(stderr, "[TCFIFO]   0x%04X  %8u blocks %10u dwords%c",
+                                  k << 2, hist[k], tot[k], 10);
+                  }
+              } }
             for (u32 i = 0; i < count; i++) {
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
@@ -1038,8 +1347,16 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
     s_flip_request_count++;
     s_last_flip_time = get_timestamp_ns();
 
-    /* Invoke via OPD resolution, not a raw call into guest code. */
-    if (s_flip_handler_opd && g_ps3_guest_caller)
+    /* Invoke via OPD resolution, not a raw call into guest code.
+     *
+     * On hardware this callback fires when the flip COMPLETES, at vsync --
+     * which is what cellGcmTickFlip does. Calling it again here, at request
+     * time, is a compatibility wart: some titles need the early edge, but a
+     * title that issues its first flip while still initialising then runs its
+     * handler against half-built state. Tokyo Jungle faults that way, in
+     * func_001F2D3C, dereferencing a singleton it has not constructed yet.
+     * GCM_FLIPCB_ONTICK=1 leaves the callback to the tick alone. */
+    if (s_flip_handler_opd && g_ps3_guest_caller && !gcm_flipcb_on_tick_only())
         g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);  /* head 0 = primary display */
 
     return CELL_OK;
@@ -1087,8 +1404,9 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 
     /* Invoke the guest flip handler via OPD resolution -- s_flip_handler holds
      * the raw guest OPD (e.g. 0x530D70); calling it as a host function pointer
-     * jumps into guest code and crashes. */
-    if (s_flip_handler_opd && g_ps3_guest_caller)
+     * jumps into guest code and crashes. See cellGcmSetFlipCommand for why
+     * GCM_FLIPCB_ONTICK exists. */
+    if (s_flip_handler_opd && g_ps3_guest_caller && !gcm_flipcb_on_tick_only())
         g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);
 
     return CELL_OK;
@@ -1156,12 +1474,26 @@ u64 cellGcmGetLastFlipTime(void)
  * -----------------------------------------------------------------------*/
 
 /* NID: 0x0E6B0DFF */
+/* Mirror the host tables into the guest window the title will index. */
+static void gcm_publish_offset_tables(void)
+{
+    for (u32 i = 0; i < GCM_OFFSET_TABLE_PAGES; i++) {
+        vm_write16(GCM_OFFSET_TABLE_IO_ADDR + i * 2, s_io_address_table[i]);
+        vm_write16(GCM_OFFSET_TABLE_EA_ADDR + i * 2, s_ea_address_table[i]);
+    }
+}
+
 s32 cellGcmGetOffsetTable(CellGcmOffsetTable* table)
 {
-    if (!table)
+    u32 ea = (u32)(uintptr_t)table;
+    if (!ea)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    *table = s_offset_table;
+    gcm_publish_offset_tables();
+
+    /* The guest struct is two 4-byte EAs, not two host pointers. */
+    vm_write32(ea + 0, GCM_OFFSET_TABLE_IO_ADDR);
+    vm_write32(ea + 4, GCM_OFFSET_TABLE_EA_ADDR);
     return CELL_OK;
 }
 
@@ -1174,6 +1506,15 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
     uint32_t off_ea = (uint32_t)(uintptr_t)offset;
     if (!off_ea)
         return CELL_GCM_ERROR_INVALID_VALUE;
+    /* A2O_DBG=<N>: the EA->offset conversions a title asks for. A texture bound
+     * at an offset nothing ever writes usually means the offset came from an EA
+     * in a space we classified wrongly, and that is only visible here. */
+    { static int cap = -1, k = 0;
+      if (cap < 0) { const char* e = getenv("A2O_DBG"); cap = e ? atoi(e) : 0; }
+      if (cap && k < cap) { k++;
+        u32 nz = 0;
+        for (u32 i = 0; i < 0x400u; i += 13) if (vm_base && vm_base[address + i]) nz++;
+        printf("[A2O] ea=0x%08X  (first 1KB nonzero=%u/79)\n", address, nz); } }
 
     /* Local memory: offset = address - localBase. Record the offset page as
      * LOCAL-derived so cellGcmResolveOffset can disambiguate it from an IO
@@ -1220,6 +1561,10 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
 
     printf("[cellGcmSys] WARNING: AddressToOffset failed for 0x%08X\n", address);
     vm_write32(off_ea, 0);
+    { static int _d = -1; if (_d < 0) _d = getenv("A2O_FAILDBG") ? 1 : 0;
+      if (_d) { static int _n = 0; if (_n++ < 12)
+          fprintf(stderr, "[A2O] FAILED ea=0x%08X (not in local or IO space)%c",
+                  address, 10); } }
     return CELL_GCM_ERROR_FAILURE;
 }
 
@@ -1383,6 +1728,24 @@ u32 cellGcmResolveOffset(u32 offset)
             return ((u32)ea_page << 20) | (offset & 0xFFFFF);
     }
     return s_config.localAddress + offset;
+}
+
+/* IO-table-first resolve: skip the local-page shortcut and ask the IO offset
+ * table, falling back to VRAM only if the page is unmapped. cellGcmResolveOffset
+ * prefers local for any page the guest ever derived from a local EA, which is
+ * right for a title that really does keep the data in VRAM but wrong for one
+ * that builds its textures in main memory on pages whose numbers happen to
+ * collide. Returns 0 when the IO table has no mapping, so a caller can tell
+ * "not IO-mapped" from "IO-mapped at 0". */
+u32 cellGcmResolveIO(u32 offset)
+{
+    u32 page = offset >> 20;
+    if (page < 65536) {
+        u16 ea_page = s_ea_address_table[page];
+        if (ea_page != 0 && ea_page != 0xFFFF)
+            return ((u32)ea_page << 20) | (offset & 0xFFFFF);
+    }
+    return 0;
 }
 
 /* Location-aware resolve. RSX offsets are TWO overlapping number spaces --
@@ -1587,7 +1950,14 @@ void* cellGcmGetNotifyDataAddress(u32 index)
 /* Timestamp location — returns CELL_GCM_LOCATION_LOCAL or MAIN */
 u32 cellGcmGetTimeStampLocation(u32 index, u32* location)
 {
-    if (location) *location = CELL_GCM_LOCATION_LOCAL;
+    /* `location` is a GUEST address (see cellGcmGetConfiguration): the HLE
+     * ABI adapter passes pointer parameters through as guest values, so
+     * dereferencing one writes to whatever host address shares that number
+     * -- an access violation. Tokyo Jungle calls this during display setup,
+     * which is how it turned up. */
+    uint32_t loc_ea = (uint32_t)(uintptr_t)location;
+    (void)index;
+    if (loc_ea) vm_write32(loc_ea, CELL_GCM_LOCATION_LOCAL);
     return 0;
 }
 
@@ -1653,11 +2023,12 @@ s32 cellGcmMapLocalMemory(u32* address, u32* size)
     if (!address || !size)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    *address = s_config.localAddress;
-    *size    = s_config.localSize;
+    /* Guest out-params, like every other pointer parameter in this file. */
+    vm_write32((uint32_t)(uintptr_t)address, s_config.localAddress);
+    vm_write32((uint32_t)(uintptr_t)size,    s_config.localSize);
 
     printf("[cellGcmSys] MapLocalMemory(address=0x%08X, size=0x%X)\n",
-           *address, *size);
+           s_config.localAddress, s_config.localSize);
     return CELL_OK;
 }
 
@@ -1898,4 +2269,50 @@ u32 cellGcmGetReportDataLocation(u32 index, u32 location)
         return 0;
 
     return s_report_data[index].value;
+}
+
+/* ---------------------------------------------------------------------------
+ * VRAM upload registry
+ *
+ * A title whose texture uploads land at an address that does not match the
+ * offset it later programs into SET_TEXTURE_OFFSET leaves the sampler reading
+ * untouched memory. Recording what was uploaded lets the texture path find the
+ * real bytes by size instead of trusting the offset. Diagnostic bridge: it is
+ * a lookup, not a fix for the offset bookkeeping itself.
+ * -----------------------------------------------------------------------*/
+#define RSX_UPLOAD_LOG 256
+static struct { u32 dst, size; int claimed; } s_uploads[RSX_UPLOAD_LOG];
+static u32 s_upload_n;
+
+void rsx_note_vram_upload(u32 dst_ea, u32 size)
+{
+    if (!size) return;
+    s_uploads[s_upload_n % RSX_UPLOAD_LOG].dst     = dst_ea;
+    s_uploads[s_upload_n % RSX_UPLOAD_LOG].size    = size;
+    s_uploads[s_upload_n % RSX_UPLOAD_LOG].claimed = 0;
+    s_upload_n++;
+}
+
+/* OLDEST unclaimed upload of exactly `want` bytes, claimed on return. Matching
+ * by size alone hands every same-sized surface the same image; consuming them in
+ * order pairs the Nth bind of a size with the Nth upload of that size, which is
+ * the order a title loads and then draws its materials in. Returns 0 if none. */
+u32 rsx_find_vram_upload(u32 want)
+{
+    u32 n = s_upload_n < RSX_UPLOAD_LOG ? s_upload_n : RSX_UPLOAD_LOG;
+    u32 first = s_upload_n > RSX_UPLOAD_LOG ? s_upload_n - RSX_UPLOAD_LOG : 0;
+    for (u32 i = 0; i < n; i++) {
+        u32 idx = (first + i) % RSX_UPLOAD_LOG;
+        if (s_uploads[idx].size == want && !s_uploads[idx].claimed) {
+            s_uploads[idx].claimed = 1;
+            return s_uploads[idx].dst;
+        }
+    }
+    return 0;
+}
+
+/* Let the same pairing repeat next frame. */
+void rsx_reset_upload_claims(void)
+{
+    for (u32 i = 0; i < RSX_UPLOAD_LOG; i++) s_uploads[i].claimed = 0;
 }

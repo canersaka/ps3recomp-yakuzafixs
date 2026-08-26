@@ -196,6 +196,47 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
  * r4 = pointer to sys_event_t in guest memory
  * r5 = timeout_usec (0 = infinite)
  * -----------------------------------------------------------------------*/
+/* A queue has a producer again (SPURS re-attach after a finalize). Without this
+ * the cancel is permanent: the flag survives, every later receive fails, and a
+ * title that tears its audio down and brings it back never runs again. */
+void sys_event_queue_uncancel_by_id(uint32_t queue_id)
+{
+    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return;
+    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
+    if (!q->active || !q->cancelled) return;
+#ifdef _WIN32
+    EnterCriticalSection(&q->lock);
+    q->cancelled = 0;
+    LeaveCriticalSection(&q->lock);
+#else
+    pthread_mutex_lock(&q->lock);
+    q->cancelled = 0;
+    pthread_mutex_unlock(&q->lock);
+#endif
+    fprintf(stderr, "[evt] queue %u un-cancelled (producer attached again)\n", queue_id);
+}
+
+void sys_event_queue_cancel_by_id(uint32_t queue_id)
+{
+    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return;
+    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
+    if (!q->active) return;
+
+#ifdef _WIN32
+    EnterCriticalSection(&q->lock);
+    q->cancelled = 1;
+    WakeAllConditionVariable(&q->not_empty);   /* every waiter, not one */
+    LeaveCriticalSection(&q->lock);
+#else
+    pthread_mutex_lock(&q->lock);
+    q->cancelled = 1;
+    pthread_cond_broadcast(&q->not_empty);
+    pthread_mutex_unlock(&q->lock);
+#endif
+    fprintf(stderr, "[evt] queue %u cancelled (producer gone) -- waiters released\n",
+            queue_id);
+}
+
 int64_t sys_event_queue_receive(ppu_context* ctx)
 {
     uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
@@ -325,12 +366,37 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
 #endif
     }
 
+    /* Demand-driven sim-SPU dispatch. The game's persistent worker SPUs are
+     * fed by event_port_send during ASSET LOAD, but its main loop never sends --
+     * it just receives each worker's per-frame completion, expecting the SPU to
+     * be free-running. A send-triggered dispatcher therefore starves the main
+     * loop: the first frame consumes the completions left over from load and
+     * every frame after blocks forever.
+     *
+     * Run the worker when the guest actually blocks on its completion queue
+     * instead. That is exactly 1:1 by construction -- one run per event the
+     * guest waits for -- so it can neither oversupply (which desynchronises the
+     * queue and wedges the loop, the failure mode of forwarding every plain
+     * WrOutMbox write) nor undersupply (the failure mode of one event per run,
+     * when a worker signals more than once per frame).
+     * ponytail: one attempt per receive, then fall through to the normal wait --
+     * no retry loop, so a worker that genuinely produces nothing still blocks
+     * rather than spinning. */
+    if (q->count == 0 && timeout_us == 0) {
+        extern int spu_dispatch_frame_by_queue(uint32_t, uint32_t);
+        spu_dispatch_frame_by_queue(queue_id, 0);
+    }
+
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
 
     if (timeout_us == 0) {
-        while (q->count == 0 && q->active) {
+        while (q->count == 0 && q->active && !q->cancelled) {
             SleepConditionVariableCS(&q->not_empty, &q->lock, INFINITE);
+        }
+        if (q->count == 0 && q->cancelled) {
+            LeaveCriticalSection(&q->lock);
+            return (int64_t)(int32_t)CELL_ECANCELED;
         }
     } else if (timeout_us < 1000) {
         /* Sub-millisecond timeout = the title's non-blocking event poll (it polls
@@ -346,7 +412,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
     } else {
         DWORD ms = (DWORD)(timeout_us / 1000);
-        while (q->count == 0 && q->active) {
+        while (q->count == 0 && q->active && !q->cancelled) {
             if (!SleepConditionVariableCS(&q->not_empty, &q->lock, ms)) {
                 if (GetLastError() == ERROR_TIMEOUT) {
                     LeaveCriticalSection(&q->lock);
@@ -356,6 +422,10 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
     }
 
+    if (q->count == 0 && q->cancelled) {
+        LeaveCriticalSection(&q->lock);
+        return (int64_t)(int32_t)CELL_ECANCELED;
+    }
     if (!q->active || q->count == 0) {
         LeaveCriticalSection(&q->lock);
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -370,7 +440,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     pthread_mutex_lock(&q->lock);
 
     if (timeout_us == 0) {
-        while (q->count == 0 && q->active) {
+        while (q->count == 0 && q->active && !q->cancelled) {
             pthread_cond_wait(&q->not_empty, &q->lock);
         }
     } else {
@@ -382,7 +452,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
             ts.tv_sec++;
             ts.tv_nsec -= 1000000000L;
         }
-        while (q->count == 0 && q->active) {
+        while (q->count == 0 && q->active && !q->cancelled) {
             int rc = pthread_cond_timedwait(&q->not_empty, &q->lock, &ts);
             if (rc == ETIMEDOUT) {
                 pthread_mutex_unlock(&q->lock);
@@ -391,6 +461,10 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
     }
 
+    if (q->count == 0 && q->cancelled) {
+        pthread_mutex_unlock(&q->lock);
+        return (int64_t)(int32_t)CELL_ECANCELED;
+    }
     if (!q->active || q->count == 0) {
         pthread_mutex_unlock(&q->lock);
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -779,15 +853,34 @@ int64_t sys_event_port_send(ppu_context* ctx)
     evt.data2  = data2;
     evt.data3  = data3;
 
-    if (event_queue_push(q, &evt) < 0) {
-        return (int64_t)(int32_t)CELL_EBUSY;
-    }
-
     /* Per-frame sim-SPU trigger: the game sends the work-descriptor EA (data2) to
      * a "start" queue and waits on the SPU's completion queue (start+1). Re-run
-     * that SPU with the work EA so it produces this frame's result + completion. */
+     * that SPU with the work EA so it produces this frame's result + completion.
+     *
+     * Dispatch BEFORE the push, and skip the push entirely when a sim SPU took
+     * the work: on hardware the SPU thread is what drains its start queue, and we
+     * have no such thread -- so pushing anyway leaves the event queued forever.
+     * The queue then fills after ~190 frames and event_queue_push returns EBUSY,
+     * which the guest asserts on (SpuThreadGroup.cpp:315 ret == CELL_OK). */
     { extern int spu_dispatch_frame_by_queue(uint32_t, uint32_t);
-      spu_dispatch_frame_by_queue((uint32_t)qidx + 1, (uint32_t)data2); }
+      /* Stage the full event for the SPU's sys_spu_thread_receive_event
+       * (stop 0x110): the worker reads back {CELL_OK, data1, data2, data3} and
+       * takes its work-descriptor EA from those, so data2 alone is not enough. */
+      extern uint32_t g_spu_pending_evt[3];
+      extern int      g_spu_pending_evt_valid;
+      g_spu_pending_evt[0] = (uint32_t)data1;
+      g_spu_pending_evt[1] = (uint32_t)data2;
+      g_spu_pending_evt[2] = (uint32_t)data3;
+      g_spu_pending_evt_valid = 1;
+      if (spu_dispatch_frame_by_queue((uint32_t)qidx + 1, (uint32_t)data2))
+          return CELL_OK;
+      g_spu_pending_evt_valid = 0; }
+
+    if (event_queue_push(q, &evt) < 0) {
+        fprintf(stderr, "[evt] port_send(port=%u): queue %d FULL -> EBUSY%c",
+                port_id, qidx, 10);
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
 
     return CELL_OK;
 }

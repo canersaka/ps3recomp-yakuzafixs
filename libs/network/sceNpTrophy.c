@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include "ps3emu/endian.h"                   /* ps3_bswap64 -- guest is big-endian */
+#include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 /* HLE args arrive as guest effective addresses; translate before deref. */
 #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 
@@ -166,6 +167,7 @@ static u32 trophy_count_unlocked(TrophyContext* ctx)
 
 void sceNpTrophySetStoragePath(const char* path)
 {
+    path = GUEST_PTR(path, const char*);
     if (path) {
         strncpy(s_storage_path, path, sizeof(s_storage_path) - 1);
         s_storage_path[sizeof(s_storage_path) - 1] = '\0';
@@ -514,7 +516,7 @@ s32 sceNpTrophyUnlockTrophy(SceNpTrophyContext context,
 
     /* Check if all non-platinum trophies are unlocked -> platinum */
     if (platinumId) {
-        *platinumId = SCE_NP_TROPHY_INVALID_TROPHY_ID;
+        vm_write32((u32)(uintptr_t)platinumId, (u32)SCE_NP_TROPHY_INVALID_TROPHY_ID);
         /* Simplified: don't auto-award platinum without grade info */
     }
 
@@ -541,14 +543,19 @@ s32 sceNpTrophyGetTrophyUnlockState(SceNpTrophyContext context,
     if (!flags || !count)
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
 
-    memset(flags, 0, sizeof(SceNpTrophyFlagArray));
+    u32 flags_ea = (u32)(uintptr_t)flags;
+    for (u32 o = 0; o < sizeof(SceNpTrophyFlagArray); o += 4)
+        vm_write32(flags_ea + o, 0);
 
     for (u32 i = 0; i < s_contexts[context].total_trophies; i++) {
         if (s_contexts[context].unlocked[i])
-            flags->flag[i / 32] |= (1u << (i % 32));
+            {
+            u32 word_ea = flags_ea + (i / 32) * 4;
+            vm_write32(word_ea, vm_read32(word_ea) | (1u << (i % 32)));
+        }
     }
 
-    *count = s_contexts[context].total_trophies;
+    vm_write32((u32)(uintptr_t)count, (u32)s_contexts[context].total_trophies);
     return CELL_OK;
 }
 
@@ -574,9 +581,10 @@ s32 sceNpTrophyGetGameProgress(SceNpTrophyContext context,
     u32 total = s_contexts[context].total_trophies;
     u32 unlocked = trophy_count_unlocked(&s_contexts[context]);
 
-    *percentage = total > 0 ? (s32)((unlocked * 100) / total) : 0;
+    s32 pct = total > 0 ? (s32)((unlocked * 100) / total) : 0;
+    vm_write32(GUEST_EA(percentage), (u32)pct);
 
     printf("[sceNpTrophy] GetGameProgress(ctx=%d) -> %d%%\n",
-           context, *percentage);
+           context, pct);
     return CELL_OK;
 }

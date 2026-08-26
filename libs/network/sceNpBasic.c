@@ -9,6 +9,7 @@
 #include "sceNpBasic.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -108,7 +109,7 @@ s32 sceNpBasicGetFriendListEntryCount(u32* count)
     if (!count)
         return (s32)SCE_NP_BASIC_ERROR_INVALID_ARGUMENT;
 
-    *count = 0; /* offline -- no friends */
+    vm_write32((u32)(uintptr_t)count, (u32)0); /* offline -- no friends */
     return CELL_OK;
 }
 
@@ -137,6 +138,7 @@ s32 sceNpBasicGetFriendPresence(const SceNpOnlineId* onlineId,
 
 s32 sceNpBasicSetPresence(const SceNpBasicPresence* presence)
 {
+    presence = GUEST_PTR(presence, const SceNpBasicPresence*);
     printf("[sceNpBasic] SetPresence()\n");
 
     if (!s_initialized)
@@ -152,6 +154,7 @@ s32 sceNpBasicSetPresence(const SceNpBasicPresence* presence)
 s32 sceNpBasicSendMessage(const SceNpOnlineId* to,
                            const void* body, u32 bodySize)
 {
+    to = GUEST_PTR(to, const SceNpOnlineId*);
     (void)body;
     (void)bodySize;
 
@@ -168,6 +171,7 @@ s32 sceNpBasicSendMessageAttachment(const SceNpOnlineId* to,
                                       const char* subject,
                                       const void* data, u32 dataSize)
 {
+    to = GUEST_PTR(to, const SceNpOnlineId*);
     (void)data;
     (void)dataSize;
 
@@ -184,6 +188,7 @@ s32 sceNpBasicSendMessageAttachment(const SceNpOnlineId* to,
 s32 sceNpBasicSendInGameInvitation(const SceNpOnlineId* to,
                                      const void* data, u32 dataSize)
 {
+    to = GUEST_PTR(to, const SceNpOnlineId*);
     (void)data;
     (void)dataSize;
 
@@ -206,7 +211,7 @@ s32 sceNpBasicRecvInGameInvitation(void* data, u32 dataMaxSize,
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     if (dataSize)
-        *dataSize = 0;
+        vm_write32((u32)(uintptr_t)dataSize, (u32)0);
 
     return (s32)SCE_NP_BASIC_ERROR_DATA_NOT_FOUND;
 }
@@ -219,12 +224,13 @@ s32 sceNpBasicGetBlockListEntryCount(u32* count)
     if (!count)
         return (s32)SCE_NP_BASIC_ERROR_INVALID_ARGUMENT;
 
-    *count = 0;
+    vm_write32((u32)(uintptr_t)count, (u32)0);
     return CELL_OK;
 }
 
 s32 sceNpBasicAddBlockListEntry(const SceNpOnlineId* onlineId)
 {
+    onlineId = GUEST_PTR(onlineId, const SceNpOnlineId*);
     printf("[sceNpBasic] AddBlockListEntry(%.16s)\n",
            onlineId ? onlineId->data : "(null)");
 

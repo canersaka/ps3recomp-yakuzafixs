@@ -9,6 +9,7 @@
  * below so this file is self-documenting.
  */
 
+#include <stdlib.h>   /* getenv, atoi */
 #include "rsx_fp_decompiler.h"
 #include <stdio.h>
 #include <string.h>
@@ -184,8 +185,20 @@ static const char* input_expr(u32 input_src)
 }
 
 /* Build the swizzled/negated/abs'd HLSL for one source into `buf`. */
+/* FP_CONSTBUF=0 restores the old behaviour of compiling inline constants as
+ * HLSL literals. On (default) they become fp_k[] lookups in the per-draw
+ * constant buffer, which makes the compiled shader invariant under the guest
+ * re-patching those constants -- the thing that forced the pipeline cache to
+ * key on a hash of the ucode bytes. */
+static int fp_constbuf_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("FP_CONSTBUF"); v = (e && *e == '0') ? 0 : 1; }
+    return v;
+}
+
 static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
-                     char* buf, u32 bufsz)
+                     int k_idx, char* buf, u32 bufsz)
 {
     char base[96];
     if (s->type == FP_REG_TYPE_TEMP) {
@@ -200,7 +213,9 @@ static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
     } else if (s->type == FP_REG_TYPE_INPUT) {
         snprintf(base, sizeof(base), "%s", input_expr(input_src));
     } else { /* CONST */
-        if (has_k) {
+        if (has_k && fp_constbuf_on() && k_idx >= 0) {
+            snprintf(base, sizeof(base), "fp_k[%d]", k_idx);
+        } else if (has_k) {
             char c0[24], c1[24], c2[24], c3[24];
             fp_fmt_float(k[0], c0, sizeof c0); fp_fmt_float(k[1], c1, sizeof c1);
             fp_fmt_float(k[2], c2, sizeof c2); fp_fmt_float(k[3], c3, sizeof c3);
@@ -231,9 +246,79 @@ static void dest_mask(u32 op0, char* m)
     m[n] = '\0';
 }
 
+/* FNV-1a over a program's INSTRUCTION words only, skipping the inline constant
+ * slots. With constants hoisted into fp_k[] the compiled shader does not depend
+ * on their values, so including them in the pipeline key made it change every
+ * time the title re-patched a constant -- which is exactly what thrashed the
+ * cache. */
+u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes)
+{
+    u32 h = 2166136261u;
+    if (!ucode) return h;
+    u32 off = 0;
+    while (off + 16 <= max_bytes) {
+        u32 w0 = rsx_fp_read_word(ucode + off + 0);
+        u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        for (u32 i = 0; i < 16; i++) { h ^= ucode[off + i]; h *= 16777619u; }
+        off += 16;
+        int is_branch = (w2 & FP_BRANCH) != 0;
+        int has_k = !is_branch &&
+            ((((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
+             (((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
+             (((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST));
+        if (has_k) off += 16;            /* skip the constant, do not hash it */
+        if (w0 & FP_END) break;
+    }
+    return h;
+}
+
+/* Walk a program the same way the decompiler does and copy out its inline
+ * constants in the SAME order the decompiler assigns fp_k[] indices. The backend
+ * calls this per draw, so re-patched constants take effect without recompiling. */
+int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_out)
+{
+    if (!ucode || !out) return 0;
+    u32 off = 0; int n = 0;
+    while (off + 16 <= max_bytes) {
+        u32 w0 = rsx_fp_read_word(ucode + off + 0);
+        u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        off += 16;
+        int is_branch = (w2 & FP_BRANCH) != 0;
+        int has_k = !is_branch &&
+            ((((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
+             (((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
+             (((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST));
+        if (has_k) {
+            if (off + 16 <= max_bytes) {
+                for (int i = 0; i < 4; i++) {
+                    u32 cw = rsx_fp_read_word(ucode + off + i * 4);
+                    if (n < max_out) memcpy(&out[n * 4 + i], &cw, 4);
+                }
+                off += 16;
+            }
+            if (n < max_out) n++;
+        }
+        if (w0 & FP_END) break;
+    }
+    { static int dbg = -1;
+      if (dbg < 0) { const char* e = getenv("FP_KDBG"); dbg = e ? atoi(e) : 0; }
+      if (dbg) { static int m = 0; if (m++ < 3) {
+        fprintf(stderr, "[FPK] %d consts%c", n, 10);
+        for (int _q = 0; _q < n; _q++)
+            fprintf(stderr, "   k[%2d] = (%g %g %g %g)%c", _q, out[_q*4+0],
+                    out[_q*4+1], out[_q*4+2], out[_q*4+3], 10); } }
+    }
+    return n;
+}
+
 int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
                      int exports32)
 {
+    int n_consts = 0;   /* fp_k[] slots assigned so far */
     if (!ucode || !out || out_size == 0) return -1;
 
     Out o = { out, out_size, 0, 1 };
@@ -257,7 +342,8 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
         /* Per-draw texcoord scale (b1): RSX textures with the UNnormalized
          * flag are sampled in texel space; the backend supplies 1/size for
          * those units and 1.0 for normalized ones. */
-        "cbuffer FPTex : register(b1) { float4 rsx_texscale[4]; float4 rsx_alphatest; };\n"
+        "cbuffer FPTex : register(b1) { float4 rsx_texscale[4]; float4 rsx_alphatest;"
+        " float4 fp_k[64]; };\n"
         "SamplerState rsx_samp0 : register(s0); SamplerState rsx_samp1 : register(s1);\n"
         "SamplerState rsx_samp2 : register(s2); SamplerState rsx_samp3 : register(s3);\n"
         "struct PSOut { float4 c0:SV_Target0; float4 c1:SV_Target1;\n"
@@ -338,6 +424,12 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
         default: break;
         }
 
+        /* FP_CC_OFF=1: treat every predicated write as unconditional. Isolates
+         * "the condition register is wrong / its inputs are garbage" from "the
+         * gate itself is mis-decoded" -- both show up as unlit black geometry. */
+        { static int _cc = -1; if (_cc < 0) { const char* e = getenv("FP_CC_OFF");
+              _cc = e ? atoi(e) : 0; }
+          if (_cc && exec_cond != 0) exec_cond = 7; }
         const char* cmp = NULL;   /* NULL = unconditional */
         switch (exec_cond) {
         case 1: cmp = "< 0";  break;
@@ -366,10 +458,14 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
             has_k = 1;
         }
 
+        /* One inline constant slot per instruction; all three sources of that
+         * instruction reference the same slot. */
+        int k_idx = -1;
+        if (has_k) { k_idx = n_consts; if (n_consts < FP_MAX_CONSTS) n_consts++; }
         char a[200], b[200], c[200];
-        emit_src(&s0, input_src, k, has_k, a, sizeof(a));
-        emit_src(&s1, input_src, k, has_k, b, sizeof(b));
-        emit_src(&s2, input_src, k, has_k, c, sizeof(c));
+        emit_src(&s0, input_src, k, has_k, k_idx, a, sizeof(a));
+        emit_src(&s1, input_src, k, has_k, k_idx, b, sizeof(b));
+        emit_src(&s2, input_src, k, has_k, k_idx, c, sizeof(c));
 
         if (is_branch) {
             /* Branch opcodes live in a second table (base | 0x40): 0x42 = IFE
@@ -416,6 +512,40 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
         case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
         case OP_RSQ: snprintf(rhs, sizeof(rhs), "rsqrt((%s).x)", a); break;
         case OP_EX2: snprintf(rhs, sizeof(rhs), "exp2((%s).x)", a); break;
+        /* Screen-space derivatives. HLSL has these natively; dropping them left
+         * the destination holding a stale value, silently corrupting whatever
+         * effect differentiates a coordinate (edge/threshold and filtering work
+         * both do). 26 DDX + 24 DDY across this title's shaders. */
+        case OP_DDX: snprintf(rhs, sizeof(rhs), "ddx(%s)", a); break;
+        case OP_DDY: snprintf(rhs, sizeof(rhs), "ddy(%s)", a); break;
+        /* LIF (0x3C) is NV40's LIT. Evidence from this title's shaders: the
+         * write mask is always .yz -- LIT's x and w results are the constant
+         * 1.0, so Cg masks them off -- and the source arrives swizzled .xyzz
+         * with .x a dot product, .y the diffuse term and .z already holding
+         * log2(specular) * power, i.e. the LG2/MUL half of a pow() the compiler
+         * emitted separately. So the remaining work is LIT's exponentiate and
+         * its "only if facing the light" gate:
+         *     dst = (1, max(s.x,0), s.x > 0 ? exp2(s.z) : 0, 1)
+         * Dropping it left .z holding log2(spec)*power -- a wrong, typically
+         * negative, specular fed straight into the lighting sum. */
+        case OP_LIF:
+            /* FP_LIT_OFF=1: emit nothing for LIT, reproducing the pre-fix
+             * behaviour. Lets "did implementing LIT introduce this?" be answered
+             * directly instead of inferred. */
+            { static int off = -1;
+              if (off < 0) { const char* e = getenv("FP_LIT_OFF"); off = e ? atoi(e) : 0; }
+              if (off) { handled = 0; break; } }
+            /* Clamp the exponent. Hardware LIT bounds the specular power to
+             * +/-128; here the compiler has already folded log2(NdotH)*power
+             * into .z, so an NdotH that rounds above 1 makes that positive and
+             * exp2 explodes, saturating a channel. In this title's wall shader
+             * the power is 100, and the blown result was leaking into the
+             * colour sum as a magenta cast. */
+            snprintf(rhs, sizeof(rhs),
+                     "float4(1.0, max((%s).x, 0.0), ((%s).x > 0.0)"
+                     " ? exp2(clamp((%s).z, -128.0, 128.0)) : 0.0, 1.0)",
+                     a, a, a);
+            break;
         case OP_LG2: snprintf(rhs, sizeof(rhs), "log2((%s).x)", a); break;
         case OP_COS: snprintf(rhs, sizeof(rhs), "cos((%s).x)", a); break;
         case OP_SIN: snprintf(rhs, sizeof(rhs), "sin((%s).x)", a); break;
@@ -457,9 +587,33 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
             handled = 0;
             break; }
         default:
-            out_puts(&o, "    /* TODO: unhandled FP opcode ");
-            out_puts(&o, rsx_fp_opcode_name(opcode));
-            out_puts(&o, " */\n");
+            /* Report the dst register/mask and the raw words too: "unhandled
+             * opcode X" alone is not enough to implement it -- what it writes
+             * and what it reads is what tells you the semantics. */
+            /* FP_CENSUS: tally unhandled opcodes across EVERY program compiled,
+             * not just whichever one is being dumped. A decode gap shows up as
+             * wrong shading on whatever happens to use it, so a census is how
+             * you find them all at once instead of one surface at a time. */
+            { static u32 cen[256]; static int reg = 0;
+              if (opcode < 256) cen[opcode]++;
+              if (!reg) { reg = 1; }
+              { static int cap = -1; static u32 n = 0;
+                if (cap < 0) { const char* e = getenv("FP_CENSUS"); cap = e ? atoi(e) : 0; }
+                if (cap && ++n % (u32)cap == 0) {
+                    fprintf(stderr, "[FPCENSUS] unhandled opcodes so far:");
+                    for (int i = 0; i < 256; i++) if (cen[i])
+                        fprintf(stderr, " %s(0x%02X)x%u", rsx_fp_opcode_name(i), i, cen[i]);
+                    fprintf(stderr, "%c", 10);
+                } } }
+            { char _tb[256]; char _mm[5]; dest_mask(w0, _mm);
+              snprintf(_tb, sizeof _tb,
+                       "    /* TODO: unhandled FP opcode %s (0x%02X) dst=%s%u.%s"
+                       " src0=%s src1=%s src2=%s w=%08X %08X %08X %08X */%c",
+                       rsx_fp_opcode_name(opcode), opcode,
+                       (w0 & FP_OUT_HALF) ? "h" : "r",
+                       (unsigned)((w0 & FP_OUT_REG_MASK) >> FP_OUT_REG_SHIFT),
+                       _mm[0] ? _mm : "xyzw", a, b, c, w0, w1, w2, w3, 10);
+              out_puts(&o, _tb); }
             handled = 0;
             break;
         }

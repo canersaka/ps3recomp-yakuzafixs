@@ -109,6 +109,12 @@ extern "C" {
 #define CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS 0x00000040
 #define NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK    0x00001FF4
 #define NV4097_SET_TRANSFORM_PROGRAM_LOAD       0x00001E9C
+/* Which INSTRUCTION the vertex program starts executing at. Separate from
+ * _LOAD, which only says where following microcode words are written. A title
+ * that keeps several programs resident in the 512-instruction store selects
+ * between them with this, so ignoring it runs whichever program happens to sit
+ * at instruction 0 for every draw. */
+#define NV4097_SET_TRANSFORM_PROGRAM_START      0x00001EA0
 #define NV4097_SET_TRANSFORM_PROGRAM            0x00000B80
 #define NV4097_SET_TRANSFORM_CONSTANT_LOAD      0x00001EFC
 /* Vertex constants are written as up to 64 dwords (16 vec4s) per command,
@@ -249,6 +255,11 @@ typedef struct rsx_state {
 
     /* Vertex attributes */
     rsx_vertex_attrib vertex_attribs[RSX_MAX_VERTEX_ATTRIBS];
+    /* Constant ("current") vertex attributes -- NV4097_SET_VERTEX_DATA4F_M and
+     * friends. When an attribute array is DISABLED, the hardware feeds every
+     * vertex this register rather than zero, exactly like glColor4f with the
+     * colour array switched off. Default (0,0,0,1) matches the RSX reset state. */
+    float vertex_data4f[RSX_MAX_VERTEX_ATTRIBS][4];
     /* NV4097_SET_FREQUENCY_DIVIDER_OPERATION (0x1FC0): per-attribute bitmask
      * selecting how the frequency divisor is applied -- bit set = MODULO
      * (index = vertex % freq, repeats a mesh), clear = DIVIDE (index =
@@ -262,6 +273,11 @@ typedef struct rsx_state {
     /* Index array (SET_INDEX_ARRAY_ADDRESS/_DMA): offset is a raw RSX offset;
      * dma bits [3:0] = location context (0=local 1=main via CELL_GCM_DMA ids),
      * bits [7:4] = index type (0 = u32, 1 = u16). */
+    /* Incremented on every SET_BEGIN_END(begin). One primitive stream may be
+     * split across several DRAW_ARRAYS/DRAW_INDEX_ARRAY entries inside one
+     * BEGIN/END; the backend concatenates those and must not merge across a
+     * boundary, where the transform constants can change. */
+    u32 begin_epoch;
     u32 index_array_offset;
     u32 index_array_dma;
 
@@ -274,7 +290,8 @@ typedef struct rsx_state {
     u32 shader_control;       /* SET_SHADER_CONTROL (0x40 = 32-bit colour exports) */
     u32 fragment_program_addr;
     u32 vertex_attrib_output_mask;
-    u32 transform_program_load; /* vertex program load slot index */
+    u32 transform_program_load;
+    u32 transform_program_start; /* vertex program load slot index */
     u32 transform_constant_load;
     int shader_dirty;
 

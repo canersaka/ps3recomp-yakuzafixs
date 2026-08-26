@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 
 /* ---------------------------------------------------------------------------
  * Backend selection
@@ -373,12 +374,11 @@ void cellPad_poll(void)
     }
 }
 
-/* HLE args are GUEST effective addresses; guest structs are BIG-ENDIAN. These
- * runtime helpers translate + byte-swap. (cellPad was written for host pointers
- * and was never actually invoked until its NIDs were fixed.) */
-extern void vm_write8 (unsigned long long a, unsigned char  v);
-extern void vm_write16(unsigned long long a, unsigned short v);
-extern void vm_write32(unsigned long long a, unsigned int   v);
+/* HLE args are GUEST effective addresses; guest structs are BIG-ENDIAN. The
+ * vm_write helpers from ppu_memory.h translate + byte-swap. (cellPad was
+ * written for host pointers and was never actually invoked until its NIDs
+ * were fixed.) These used to be redeclared here with a 64-bit address
+ * parameter, which conflicts with the header now that it is included. */
 
 s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
 {
@@ -484,6 +484,49 @@ skip_inject: ;
       } }
 
     /* Analog sticks */
+    /* PAD_STICK="lx,ly,rx,ry" (0-255, 128 = centred): hold the analog sticks at
+     * fixed positions. Rubber Ducky drives its camera from the sticks and never
+     * moves on its own, so with no host pad the view is frozen wherever it
+     * started -- which can leave the subject of the demo off-screen or too far
+     * away to make out. Legit input simulation, same footing as YDKJ_INJECT_PAD. */
+    { static int s_st = -1;
+      static unsigned char s_v[4] = {128,128,128,128};
+      if (s_st < 0) { const char* e = getenv("PAD_STICK");
+        s_st = e ? 1 : 0;
+        if (e) { int a=128,b=128,c=128,d=128;
+                 sscanf(e, "%d,%d,%d,%d", &a,&b,&c,&d);
+                 s_v[0]=(unsigned char)a; s_v[1]=(unsigned char)b;
+                 s_v[2]=(unsigned char)c; s_v[3]=(unsigned char)d; } }
+      if (s_st) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
+                  hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3];
+                  hs->connected = 1; }
+      /* PAD_SWEEP=<seconds per step>: walk the sticks through a fixed set of
+       * deflections instead of holding one. Guessing a single stick position and
+       * re-running costs ~5 minutes a try; a sweep answers "can input move the
+       * camera anywhere useful" in one run, and the frame dumps say which step
+       * paid off. Steps: centre, each left-stick direction, then each right. */
+      { static int sw = -1; static clock_t t0 = 0;
+        if (sw < 0) { const char* e = getenv("PAD_SWEEP");
+                      sw = e ? atoi(e) : 0; if (sw < 0) sw = 0; }
+        if (sw) {
+            static const unsigned char steps[9][4] = {
+                {128,128,128,128},
+                {128,  0,128,128}, {128,255,128,128},
+                {  0,128,128,128}, {255,128,128,128},
+                {128,128,128,  0}, {128,128,128,255},
+                {128,128,  0,128}, {128,128,255,128},
+            };
+            if (!t0) t0 = clock();
+            long el = (long)((double)(clock() - t0) / (double)CLOCKS_PER_SEC);
+            int k = (int)((el / (sw > 0 ? sw : 1)) % 9);
+            hs->analog_lx = steps[k][0]; hs->analog_ly = steps[k][1];
+            hs->analog_rx = steps[k][2]; hs->analog_ry = steps[k][3];
+            hs->connected = 1;
+            { static int lastk = -1;
+              if (k != lastk) { lastk = k;
+                fprintf(stderr, "[PADSWEEP] step %d: l=(%u,%u) r=(%u,%u)%c", k,
+                        steps[k][0], steps[k][1], steps[k][2], steps[k][3], 10); } }
+        } } }
     data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X] = hs->analog_rx;
     data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y] = hs->analog_ry;
     data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X]  = hs->analog_lx;
@@ -686,14 +729,16 @@ s32 cellPadGetCapabilityInfo(u32 port_no, CellPadCapabilityInfo* info)
     if (port_no >= CELL_PAD_MAX_PORT_NUM || !info)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
 
-    memset(info, 0, sizeof(CellPadCapabilityInfo));
+    u32 info_ea = (u32)(uintptr_t)info;
+    for (u32 i = 0; i < CELL_PAD_MAX_CODES; i++)
+        vm_write32(info_ea + i * 4, 0);
 
     /* Report standard DualShock 3 capabilities */
-    info->info[0] = CELL_PAD_CAPABILITY_PS3_CONFORMITY
-                   | CELL_PAD_CAPABILITY_PRESS_MODE
-                   | CELL_PAD_CAPABILITY_SENSOR_MODE
-                   | CELL_PAD_CAPABILITY_HP_ANALOG_STICK
-                   | CELL_PAD_CAPABILITY_ACTUATOR;
+    vm_write32(info_ea, CELL_PAD_CAPABILITY_PS3_CONFORMITY
+                        | CELL_PAD_CAPABILITY_PRESS_MODE
+                        | CELL_PAD_CAPABILITY_SENSOR_MODE
+                        | CELL_PAD_CAPABILITY_HP_ANALOG_STICK
+                        | CELL_PAD_CAPABILITY_ACTUATOR);
 
     return CELL_OK;
 }
@@ -705,6 +750,8 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
 
     if (port_no >= CELL_PAD_MAX_PORT_NUM || !param)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
+
+    param = GUEST_PTR(param, CellPadActParam*);
 
 #if PAD_BACKEND_XINPUT
     /* Map to XInput vibration */

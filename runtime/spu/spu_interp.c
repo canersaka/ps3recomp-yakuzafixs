@@ -18,6 +18,12 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel);
 
 #include "spu_interp_tables.inc"   /* spu_op enum, spu_op_name[], spu_dec_* */
 
+/* Work descriptor for the next SYS_SPU_THREAD_STOP_RECEIVE_EVENT service, set
+ * by the event-port send that wakes a sim SPU. Single-slot: dispatch is
+ * synchronous -- the sending PPU thread runs the SPU inline. */
+uint32_t g_spu_pending_evt[3];
+int      g_spu_pending_evt_valid;
+
 /* ---- decode: 32-bit insn -> fields (mirrors spu_disasm.spu_decode order) ---- */
 typedef struct {
     spu_op   op;
@@ -257,6 +263,7 @@ static int spu_step(spu_context* ctx) {
     /* rotate / shift extras */
     case SPU_rothm:    DST = spu_rothm(A,B); break;
     case SPU_rotqmbi:  DST = spu_rotqmbi(A,B); break;
+    case SPU_rotqmbii: DST = spu_rotqmbii(A,(int)I); break;
     case SPU_rotqbybi: DST = spu_rotqbybi(A,B); break;
     case SPU_rotqmbybi:DST = spu_rotqmbybi(A,B); break;
     case SPU_shlqbybi: DST = spu_shlqbybi(A,B); break;
@@ -382,7 +389,27 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
             #undef LB
             fflush(stderr); _tr--; g_spu_interp_steps=steps; return 0x2000u;
         }
-        if (spu_step(ctx)) { g_spu_interp_steps = steps;
+        if (spu_step(ctx)) {
+            /* stop 0x110 = SYS_SPU_THREAD_STOP_RECEIVE_EVENT. The worker writes
+             * the SPU queue number to its out-mailbox, stops, and lv2 replies
+             * with {CELL_OK, data1, data2, data3} in the in-mailbox -- which is
+             * how these sim SPUs receive each frame's work-descriptor EA.
+             * Treating the stop as "job finished" let them resume with nothing
+             * in that structure and DMA their results to address 0.
+             * Service it and keep running; with no event pending, fall through
+             * to the old behaviour so nothing waits forever. */
+            if (ctx->stop_code == 0x110 && g_spu_pending_evt_valid) {
+                spu_channel_read(&ctx->ch_out_mbox);      /* the SPU queue key */
+                ctx->rcv_evt[0] = 0;                      /* CELL_OK */
+                ctx->rcv_evt[1] = g_spu_pending_evt[0];
+                ctx->rcv_evt[2] = g_spu_pending_evt[1];
+                ctx->rcv_evt[3] = g_spu_pending_evt[2];
+                ctx->rcv_evt_n = 4; ctx->rcv_evt_i = 0;
+                g_spu_pending_evt_valid = 0;
+                ctx->status = SPU_STATUS_RUNNING;
+                continue;
+            }
+            g_spu_interp_steps = steps;
             if (_tr>0) { fprintf(stderr,"[spu-trace] halt stop=0x%X pc=0x%05X after %llu steps; last %d PCs:",
                     ctx->stop_code, ctx->pc, (unsigned long long)steps, rn);
                 for(int k=rn;k>0;k--) fprintf(stderr," %05X", ring[(rc-k)&63]);

@@ -7,6 +7,7 @@
  */
 #include "spu_workload.h"
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
+#include "../ps3_log.h"      /* ps3_log_verbose */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -417,8 +418,9 @@ static void spu_async_run(spu_async_job* j)
                 p[6]=(uint8_t)(inst>>8);  p[7]=(uint8_t)inst;   /* lo32 */
                 fprintf(stderr, "[cri] YDKJ_CRI_TASKSET: loaded taskset policy@0xA00, LS[0x1C0]=inst, running policy entry (img23)\n");
                 fflush(stderr);
-                /* Run the taskset policy entry instead of the cri task entry. */
-                extern int32_t spu_run_lifted_job_abi(void(*)(spu_context*), uint8_t*, uint32_t, int, int, uint32_t*);
+                /* Run the taskset policy entry instead of the cri task entry.
+                 * (Declared by spu_lifted_job.h -- a local extern re-declaration
+                 * here conflicts with the header's static inline under clang.) */
                 int32_t prc = spu_run_lifted_job_abi(tsp_spu_func_00000A00, ls,
                                                      j->args_ea, 23, 1, j->have_r3 ? j->r3 : 0);
                 fprintf(stderr, "[cri] taskset policy RETURNED rc=%d\n", prc);
@@ -683,14 +685,48 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
     if (!fn) {
         fprintf(stderr, "[spurs-job] dispatch MISS fp=0x%016llX size=%u job=0x%08X\n",
                 (unsigned long long)fp, image_size, job_ea);
+        /* SPU_DUMP_MISS=<dir>: write the unrecognised image out so it can be
+         * lifted and registered. SPURS job binaries are raw code+data blobs
+         * the title loads from its own data files -- unlike sys_spu_image
+         * programs they are NOT embedded ELFs in the EBOOT, so
+         * tools/extract_spu_images.py cannot find them and this is the only
+         * place the bytes exist. One file per fingerprint. */
+        { const char* _dir = getenv("SPU_DUMP_MISS");
+          if (_dir && *_dir) {
+              static uint64_t _seen[64]; static unsigned _nseen = 0;
+              unsigned _k = 0;
+              for (; _k < _nseen; _k++) if (_seen[_k] == fp) break;
+              if (_k == _nseen && _nseen < 64) {
+                  char _path[512];
+                  _seen[_nseen++] = fp;
+                  snprintf(_path, sizeof(_path), "%s/spujob_%016llX_%u.bin",
+                           _dir, (unsigned long long)fp, image_size);
+                  FILE* _f = fopen(_path, "wb");
+                  if (_f) {
+                      fwrite(image, 1, image_size, _f);
+                      fclose(_f);
+                      fprintf(stderr, "[spurs-job] dumped -> %s\n", _path);
+                  }
+              }
+          } }
         return 0;
     }
-    fprintf(stderr, "[spurs-job] dispatch HIT fp=0x%016llX image=%d job=0x%08X\n",
-            (unsigned long long)fp, image_id, job_ea);
-    fflush(stderr);
+    /* Two lines plus two explicit flushes PER JOB. A title running its audio
+     * chain does ~1500 jobs/s, so this alone was ~6k writes/s through one FILE
+     * lock, and it starved the guest threads competing for that lock badly
+     * enough to change what the title does (see ps3_log.h). Milestones stay;
+     * the per-job pair is verbose-only. */
+    int verbose = ps3_log_verbose();
+    if (verbose) {
+        fprintf(stderr, "[spurs-job] dispatch HIT fp=0x%016llX image=%d job=0x%08X\n",
+                (unsigned long long)fp, image_id, job_ea);
+        fflush(stderr);
+    }
     int rc = spu_run_spurs_job(fn, image_id, job_ea, job_desc_size);
-    fprintf(stderr, "[spurs-job] job 0x%08X RETURNED rc=%d\n", job_ea, rc);
-    fflush(stderr);
+    if (verbose) {
+        fprintf(stderr, "[spurs-job] job 0x%08X RETURNED rc=%d\n", job_ea, rc);
+        fflush(stderr);
+    }
     return 1;
 }
 

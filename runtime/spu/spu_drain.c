@@ -34,9 +34,64 @@ void* volatile    g_pm_flow_ctx = 0;
  * that bail spin, the in-flight loads HAVE in fact completed in our model, so
  * set the done bit on the pending records -- the faithful sync equivalent of
  * the completion interrupt. Env LBP_JOBDRAIN (default off while validating). */
+extern void spu_halt(spu_context*);
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
     (void)fn;
+    /* A SPURS job returning to LS 0 is finished -- its crt tail-jumps to the
+     * resident job manager, and with the job loaded at 0 that lands on its own
+     * entry. Planting a return address in r0 catches the jobs that get there
+     * via `bi $r0`, but some branch to 0 DIRECTLY, which the lifter turns into
+     * a plain trampoline that never reaches spu_indirect_branch. The drain sees
+     * every step, so catch it here too. Step 0 is the real entry. */
+    static int s_no_ls0 = -1;
+    if (s_no_ls0 < 0) s_no_ls0 = getenv("SPU_NO_LS0_END") ? 1 : 0;
+    /* SPU_EXITTRACE=<img>: remember the last PCs this image executed and dump
+     * them when the job ends. "Why did it exit here" is a question about the
+     * path taken, and a forward trace from the entry never reaches far enough
+     * to show it. */
+    static int64_t s_et = -2;
+    if (s_et == -2) { const char* e = getenv("SPU_EXITTRACE");
+                      s_et = e ? strtol(e, 0, 0) : -1; }
+    static uint32_t s_ring[64]; static uint32_t s_ri;
+    if (s_et >= 0 && ctx->image_id == s_et)
+        s_ring[s_ri++ & 63] = (uint32_t)ctx->pc & SPU_LS_MASK;
+
+    if (!s_no_ls0 && ctx->steps++ && (ctx->pc & SPU_LS_MASK) == 0 &&
+        !ctx->policy_mode && ctx->image_id > 0) {
+        static int _n = 0;
+        if (_n++ < 8)
+            fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete\n",
+                    ctx->image_id);
+        if (s_et >= 0 && ctx->image_id == s_et) {
+            fprintf(stderr, "[spu-exit] img=%d last PCs:", ctx->image_id);
+            for (int i = 32; i >= 1; i--)
+                fprintf(stderr, " %05X", s_ring[(s_ri - i) & 63]);
+            fputc(10, stderr); fflush(stderr);
+        }
+        spu_halt(ctx);
+        return;
+    }
+    /* SPU_STEPTRACE=<img>: pc and the argument registers at every trampoline
+     * step. This runs on each drain iteration, so it is the finest-grained
+     * view of a register file changing under a running job. */
+    { static int64_t s_t = -2;
+      if (s_t == -2) { const char* e = getenv("SPU_STEPTRACE"); s_t = e ? strtol(e,0,0) : -1; }
+      static int64_t s_from = -2;
+      if (s_from == -2) { const char* e = getenv("SPU_STEPTRACE_FROM");
+                          s_from = e ? strtol(e,0,16) : -1; }
+      static int s_armed = 0;
+      if (s_t >= 0 && ctx->image_id == s_t) {
+          if (s_from >= 0 && !s_armed &&
+              ((uint32_t)ctx->pc & SPU_LS_MASK) == (uint32_t)s_from) s_armed = 1;
+          static int n = 0;
+          if ((s_from < 0 || s_armed) && n++ < 40) {
+              fprintf(stderr, "[step] pc=0x%05X r1=0x%05X r2=0x%08X r3=0x%08X r4=0x%08X\n",
+                      (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[1]._u32[0],
+                      ctx->gpr[2]._u32[0], ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0]);
+              fflush(stderr);
+          }
+      } }
     if (g_pm_flow_ctx == (void*)ctx && g_pm_flow_n < 8192)
         g_pm_flow_buf[g_pm_flow_n++] = ctx->pc;
 
@@ -165,6 +220,16 @@ static void spu_irq_regs_save(spu_context* ctx)
 
 /* Called from spu_indirect_branch on every dispatch. Restores + clears when
  * the iret lands. Returns 1 if a restore happened (diagnostic). */
+/* Drop any saved register file belonging to this context. The save slots are
+ * keyed by RAW POINTER, and an spu_context is typically a stack local -- so a
+ * later, unrelated run lands on the same address and inherits the earlier
+ * context's registers wholesale. A fresh run must never do that. */
+void spu_irq_regs_forget(spu_context* ctx)
+{
+    for (int i = 0; i < SPU_IRQ_SLOTS; i++)
+        if (g_irq_save[i].ctx == ctx) g_irq_save[i].ctx = 0;
+}
+
 int spu_irq_regs_maybe_restore(spu_context* ctx)
 {
     for (int i = 0; i < SPU_IRQ_SLOTS; i++) {

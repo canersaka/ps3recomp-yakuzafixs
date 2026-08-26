@@ -72,12 +72,12 @@ s32 cellSslCertGetSerialNumber(CellSslCertId certId, u8* serial, u32* serialSize
         return (s32)CELL_SSL_ERROR_INVALID_ARG;
 
     /* Fake serial number */
-    if (*serialSize >= 4) {
+    if (vm_read32((u32)(uintptr_t)serialSize) >= 4) {
         serial[0] = 0x01;
         serial[1] = 0x00;
         serial[2] = 0x00;
         serial[3] = 0x01;
-        *serialSize = 4;
+        vm_write32((u32)(uintptr_t)serialSize, 4);
     }
     return CELL_OK;
 }
@@ -89,7 +89,7 @@ s32 cellSslCertGetPublicKey(CellSslCertId certId, u8* key, u32* keySize)
     printf("[cellSsl] CertGetPublicKey()\n");
 
     if (keySize)
-        *keySize = 0;
+        vm_write32((u32)(uintptr_t)keySize, (u32)0);
 
     return CELL_OK;
 }
@@ -98,7 +98,7 @@ s32 cellSslCertGetNotBefore(CellSslCertId certId, u64* time)
 {
     (void)certId;
     if (!time) return (s32)CELL_SSL_ERROR_INVALID_ARG;
-    *time = 0;
+    vm_write64((u32)(uintptr_t)time, (u64)0);
     return CELL_OK;
 }
 
@@ -106,7 +106,7 @@ s32 cellSslCertGetNotAfter(CellSslCertId certId, u64* time)
 {
     (void)certId;
     if (!time) return (s32)CELL_SSL_ERROR_INVALID_ARG;
-    *time = 0xFFFFFFFFFFFFFFFFULL;
+    vm_write64((u32)(uintptr_t)time, (u64)0xFFFFFFFFFFFFFFFFULL);
     return CELL_OK;
 }
 

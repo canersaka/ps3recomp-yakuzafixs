@@ -115,6 +115,10 @@ static int rtc_is_guest(const void* p)
     uintptr_t v = (uintptr_t)p;
     return v && v < 0x100000000ull;
 }
+static char* rtc_str(char* p)
+{
+    return rtc_is_guest(p) ? (char*)(vm_base + (uint32_t)(uintptr_t)p) : p;
+}
 static u64 rtc_tick_read(const CellRtcTick* p)
 {
     return rtc_is_guest(p) ? vm_read64((uint32_t)(uintptr_t)p) : p->tick;
@@ -306,7 +310,7 @@ s32 cellRtcTickAddDays(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAdd)
     if (!pTick0 || !pTick1)
         return CELL_EINVAL;
 
-    pTick0->tick = pTick1->tick + (s64)iAdd * 24LL * 3600LL * USEC_PER_SEC;
+    rtc_tick_write(pTick0, rtc_tick_read(pTick1) + (u64)((s64)iAdd * 24LL * 3600LL * USEC_PER_SEC));
     return CELL_OK;
 }
 
@@ -315,7 +319,7 @@ s32 cellRtcTickAddHours(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAdd
     if (!pTick0 || !pTick1)
         return CELL_EINVAL;
 
-    pTick0->tick = pTick1->tick + (s64)iAdd * 3600LL * USEC_PER_SEC;
+    rtc_tick_write(pTick0, rtc_tick_read(pTick1) + (u64)((s64)iAdd * 3600LL * USEC_PER_SEC));
     return CELL_OK;
 }
 
@@ -324,7 +328,7 @@ s32 cellRtcTickAddMinutes(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iA
     if (!pTick0 || !pTick1)
         return CELL_EINVAL;
 
-    pTick0->tick = pTick1->tick + (s64)iAdd * 60LL * USEC_PER_SEC;
+    rtc_tick_write(pTick0, rtc_tick_read(pTick1) + (u64)((s64)iAdd * 60LL * USEC_PER_SEC));
     return CELL_OK;
 }
 
@@ -333,7 +337,7 @@ s32 cellRtcTickAddSeconds(CellRtcTick* pTick0, const CellRtcTick* pTick1, s64 iA
     if (!pTick0 || !pTick1)
         return CELL_EINVAL;
 
-    pTick0->tick = pTick1->tick + iAdd * (s64)USEC_PER_SEC;
+    rtc_tick_write(pTick0, rtc_tick_read(pTick1) + (u64)(iAdd * (s64)USEC_PER_SEC));
     return CELL_OK;
 }
 
@@ -342,7 +346,7 @@ s32 cellRtcTickAddMicroseconds(CellRtcTick* pTick0, const CellRtcTick* pTick1, s
     if (!pTick0 || !pTick1)
         return CELL_EINVAL;
 
-    pTick0->tick = pTick1->tick + iAdd;
+    rtc_tick_write(pTick0, rtc_tick_read(pTick1) + (u64)iAdd);
     return CELL_OK;
 }
 
@@ -366,7 +370,7 @@ s32 cellRtcConvertLocalTimeToUtc(const CellRtcTick* pLocalTime, CellRtcTick* pUt
     time_t utc_t   = mktime(&utc_tm);
     s64 offset_sec = (s64)(local_t - utc_t);
 
-    pUtc->tick = pLocalTime->tick - (u64)(offset_sec * (s64)USEC_PER_SEC);
+    rtc_tick_write(pUtc, rtc_tick_read(pLocalTime) - (u64)(offset_sec * (s64)USEC_PER_SEC));
     return CELL_OK;
 }
 
@@ -389,7 +393,7 @@ s32 cellRtcConvertUtcToLocalTime(const CellRtcTick* pUtc, CellRtcTick* pLocalTim
     time_t utc_t   = mktime(&utc_tm);
     s64 offset_sec = (s64)(local_t - utc_t);
 
-    pLocalTime->tick = pUtc->tick + (u64)(offset_sec * (s64)USEC_PER_SEC);
+    rtc_tick_write(pLocalTime, rtc_tick_read(pUtc) + (u64)(offset_sec * (s64)USEC_PER_SEC));
     return CELL_OK;
 }
 
@@ -399,7 +403,7 @@ s32 cellRtcFormatRfc2822(char* pszDateTime, const CellRtcTick* pTick, s32 iTimeZ
         return CELL_EINVAL;
 
     /* Convert tick to time_t, apply timezone offset */
-    s64 unix_time = tick_to_time_t(pTick->tick);
+    s64 unix_time = tick_to_time_t(rtc_tick_read(pTick));
     unix_time += (s64)iTimeZoneMinutes * 60;
 
     time_t t = (time_t)unix_time;
@@ -413,7 +417,7 @@ s32 cellRtcFormatRfc2822(char* pszDateTime, const CellRtcTick* pTick, s32 iTimeZ
     s32 tz_h = iTimeZoneMinutes / 60;
     s32 tz_m = abs(iTimeZoneMinutes) % 60;
 
-    sprintf(pszDateTime, "%s, %02d %s %04d %02d:%02d:%02d %c%02d%02d",
+    sprintf(rtc_str(pszDateTime), "%s, %02d %s %04d %02d:%02d:%02d %c%02d%02d",
             s_dow_names[tm_val.tm_wday],
             tm_val.tm_mday,
             s_month_names[tm_val.tm_mon],
@@ -432,7 +436,7 @@ s32 cellRtcFormatRfc3339(char* pszDateTime, const CellRtcTick* pTick, s32 iTimeZ
     if (!pszDateTime || !pTick)
         return CELL_EINVAL;
 
-    s64 unix_time = tick_to_time_t(pTick->tick);
+    s64 unix_time = tick_to_time_t(rtc_tick_read(pTick));
     unix_time += (s64)iTimeZoneMinutes * 60;
 
     time_t t = (time_t)unix_time;
@@ -444,7 +448,7 @@ s32 cellRtcFormatRfc3339(char* pszDateTime, const CellRtcTick* pTick, s32 iTimeZ
 #endif
 
     if (iTimeZoneMinutes == 0) {
-        sprintf(pszDateTime, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+        sprintf(rtc_str(pszDateTime), "%04d-%02d-%02dT%02d:%02d:%02dZ",
                 tm_val.tm_year + 1900,
                 tm_val.tm_mon + 1,
                 tm_val.tm_mday,
@@ -454,7 +458,7 @@ s32 cellRtcFormatRfc3339(char* pszDateTime, const CellRtcTick* pTick, s32 iTimeZ
     } else {
         s32 tz_h = iTimeZoneMinutes / 60;
         s32 tz_m = abs(iTimeZoneMinutes) % 60;
-        sprintf(pszDateTime, "%04d-%02d-%02dT%02d:%02d:%02d%c%02d:%02d",
+        sprintf(rtc_str(pszDateTime), "%04d-%02d-%02dT%02d:%02d:%02d%c%02d:%02d",
                 tm_val.tm_year + 1900,
                 tm_val.tm_mon + 1,
                 tm_val.tm_mday,

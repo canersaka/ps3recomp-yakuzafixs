@@ -573,9 +573,23 @@ def find_end(start, insns_by_addr, sorted_starts, code_end):
     return min(next_start, code_end)
 
 
-def detect_functions(buf, base_override=None, verbose=True):
-    elf = parse_elf(buf)
-    text_off, text_va, text_size = pick_text(elf["phs"])
+def detect_functions(buf, base_override=None, verbose=True, raw=False):
+    if raw:
+        # A raw local-store image: a SPURS job binary, which the title loads
+        # from its own data files as a flat code+data blob rather than as an
+        # embedded ELF. There is no program header, no entry field and no
+        # symbol table -- the whole file is .text at `base`, and every seed has
+        # to come from the branch/call analysis below. Discovered via
+        # spu_workload's SPU_DUMP_MISS, which is the only place these bytes
+        # exist in one piece.
+        base = base_override if base_override is not None else 0
+        elf = {"entry": base, "phs": [{"type": 1, "flags": 1, "off": 0,
+                                       "vaddr": base, "filesz": len(buf),
+                                       "memsz": len(buf)}], "shs": []}
+        text_off, text_va, text_size = 0, base, len(buf)
+    else:
+        elf = parse_elf(buf)
+        text_off, text_va, text_size = pick_text(elf["phs"])
     code = buf[text_off:text_off + text_size]
     base = base_override if base_override is not None else text_va
     insns = disassemble_spu(code, base_addr=base)
@@ -584,7 +598,7 @@ def detect_functions(buf, base_override=None, verbose=True):
     code_end   = base + len(code)
 
     # ---- seeds ----
-    syms = read_symbols(buf, elf["shs"])
+    syms = read_symbols(buf, elf["shs"]) if elf["shs"] else []
     seed_starts = set()
     sized_funcs = []   # (start, end) from symbols with non-zero size
 
@@ -674,6 +688,10 @@ def main():
     p.add_argument("--code-out", default=None,
                    help="Also write the raw .text bytes here (for "
                         "`spu_lifter.py --base <va>`)")
+    p.add_argument("--raw", action="store_true",
+                   help="input is a raw local-store image (a SPURS job blob), "
+                        "not an ELF: no phdrs, no symbols, so every seed comes "
+                        "from the branch analysis")
     p.add_argument("--base", type=lambda x: int(x, 0), default=None,
                    help="Override the .text base address")
     args = p.parse_args()
@@ -681,7 +699,7 @@ def main():
     with open(args.input, "rb") as f:
         buf = f.read()
 
-    funcs, (text_off, base, size) = detect_functions(buf, args.base)
+    funcs, (text_off, base, size) = detect_functions(buf, args.base, raw=args.raw)
 
     out_obj = [{"start": s, "end": e} for s, e in funcs]
     if args.out:

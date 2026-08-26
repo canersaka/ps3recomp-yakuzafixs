@@ -154,6 +154,11 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
                     (void*)entry);
             fflush(stderr); }
     }
+    /* Also discard any saved register file keyed to this context pointer:
+     * contexts are stack locals, so the address recurs and a stale save from
+     * an earlier run would be restored over this job's arguments. */
+    { extern void spu_irq_regs_forget(spu_context*); spu_irq_regs_forget(ctx); }
+    ctx->steps = 0;   /* fresh run: step 0 is the entry */
     s_spu_halt_armed = 1;
     g_spu_trampoline_fn = 0;                        /* no stale transfer pending */
     /* Lockstep gate (env YZ_SPU_LOCKSTEP, default off): join the round-robin
@@ -171,6 +176,13 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
          * halts (stop -> longjmp) or the trampoline empties. Nested brsl/bisl
          * calls drain inside their own call brackets (see the lifter). */
         entry(ctx);
+        { static int _e = 0;
+          if (getenv("SPU_ARGWATCH") && _e < 8) { _e++;
+              fprintf(stderr, "[argwatch] after entry(): img=%d pc=0x%05X "
+                      "r2=0x%08X r3=0x%08X r4=0x%08X\n", ctx->image_id,
+                      (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[2]._u32[0],
+                      ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0]);
+              fflush(stderr); } }
         SPU_DRAIN(ctx);
     }
     yz_lockstep_unregister(ctx);   /* leave the ring; hand the token onward */
@@ -237,9 +249,29 @@ volatile unsigned g_spu_putllc_count = 0;
  * work-run on the stalled job queue from the dozen idle jobmanager instances. */
 volatile unsigned g_spu_putllc_sync_hit = 0;
 
+/* Lowest LS address treated as "not job code". Jobs load at 0 and
+ * their stacks top out well below this; a branch at or above it with no
+ * lifted code is a runaway, not a service call. */
+#define SPU_JM2_KERNEL_BASE 0x15000u
+
+/* Link-register value handed to a SPURS job so its final `bi $r0` lands
+ * somewhere we recognise. The real job manager passes a return address into
+ * itself; we have no manager, so we pass this and treat arriving here as job
+ * completion. Chosen above the context/descriptor we park near the top of LS. */
+#define SPU_JOB_RETURN_LS   0x3FF00u
+
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
+    /* Classify FIRST. Every MFC_Cmd write lands here, and only the switch at
+     * the bottom used to filter -- so the uncommitted-EA guard below reported
+     * ORDINARY DMA as `[spu-atomic]`. A plain put (0x20) to a garbage EA read
+     * as an atomic spin, which is a genuinely misleading place to start
+     * debugging from. Non-atomic commands belong to the DMA engine. */
+    if (cmd != MFC_GETLLAR_CMD && cmd != MFC_PUTLLC_CMD &&
+        cmd != MFC_PUTLLUC_CMD && cmd != MFC_PUTQLLUC_CMD)
+        return 0;
+
     uint32_t ea  = ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1);
     uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK;
     uint8_t* ls  = &ctx->ls[lsa];
@@ -289,7 +321,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     if (!mfc_ea_range_committed(ea, MFC_ATOMIC_LINE)) {
         static int s_w = 0;
         if (s_w++ < 16)
-            fprintf(stderr, "[spu-atomic] cmd=0x%X ea=0x%08X uncommitted -- skipped\n", cmd, ea);
+            fprintf(stderr, "[spu-atomic] cmd=0x%X ea=0x%08X pc=0x%05X img=%d uncommitted -- skipped\n",
+                    cmd, ea, (uint32_t)ctx->pc & SPU_LS_MASK, ctx->image_id);
         if (cmd == MFC_GETLLAR_CMD) {
             memset(ls, 0, MFC_ATOMIC_LINE);
             ctx->resv_ea = ea; ctx->resv_valid = 0; ctx->atomic_stat = 0;
@@ -412,6 +445,16 @@ static int channel_is_mfc(uint32_t ch)
  * ===========================================================================*/
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 {
+    /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
+     * worker that never issues an MFC command is either not being handed its
+     * work descriptor or is waiting on a channel we never satisfy; the channel
+     * mix distinguishes those. */
+    { static int s_c = -1; if (s_c < 0) s_c = getenv("SPU_CHHIST") ? 1 : 0;
+      if (s_c) { static unsigned long long w[128]; static unsigned long long n;
+          w[channel & 127]++;
+          if ((++n % 2000) == 0) { fprintf(stderr, "[chw] %llu writes:%c", n, 10);
+              for (int i = 0; i < 128; i++) if (w[i])
+                  fprintf(stderr, "   wrch ch%-3d %llu%c", i, w[i], 10); } } }
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
 
     if (channel_is_mfc(channel)) {
@@ -487,7 +530,7 @@ static int yz_ch_block(void)
 static int spu_ch_ready(spu_context* ctx, uint32_t channel)
 {
     switch (channel) {
-    case SPU_RdInMbox:      return ctx->ch_in_mbox.count != 0;
+    case SPU_RdInMbox:      return ctx->rcv_evt_n != 0 || ctx->ch_in_mbox.count != 0;
     case SPU_RdSigNotify1:  return ctx->ch_sig_notify[0].count != 0;
     case SPU_RdSigNotify2:  return ctx->ch_sig_notify[1].count != 0;
     case SPU_RdEventStat:   return (ctx->event_status & ctx->event_mask) != 0;
@@ -542,6 +585,12 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
  * ===========================================================================*/
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
+    { static int s_c = -1; if (s_c < 0) s_c = getenv("SPU_CHHIST") ? 1 : 0;
+      if (s_c) { static unsigned long long r[128]; static unsigned long long n;
+          r[channel & 127]++;
+          if ((++n % 2000) == 0) { fprintf(stderr, "[chr] %llu reads:%c", n, 10);
+              for (int i = 0; i < 128; i++) if (r[i])
+                  fprintf(stderr, "   rdch ch%-3d %llu%c", i, r[i], 10); } } }
     /* Block (never fabricate) on an empty producer-fed read channel (opt-in
      * YZ_CH_BLOCK). RdEventStat now has a producer (the MFC tag-status event
      * raise above), but only block it when the SPU has actually enabled events
@@ -572,7 +621,10 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     }
 
     switch (channel) {
-    case SPU_RdInMbox:      v = spu_channel_read(&ctx->ch_in_mbox);     break;
+    case SPU_RdInMbox:
+        if (ctx->rcv_evt_n > 0) { v = ctx->rcv_evt[ctx->rcv_evt_i++]; ctx->rcv_evt_n--; }
+        else v = spu_channel_read(&ctx->ch_in_mbox);
+        break;
     case SPU_RdSigNotify1:  v = spu_channel_read(&ctx->ch_sig_notify[0]); break;
     case SPU_RdSigNotify2:  v = spu_channel_read(&ctx->ch_sig_notify[1]); break;
     /* The decrementer must actually DECREMENT. Returning the latched WrDec
@@ -629,7 +681,20 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
                   (unsigned long long)s_cnt[3],(unsigned long long)s_cnt[4],(unsigned long long)s_cnt[5],
                   (unsigned long long)s_cnt[6],(unsigned long long)s_cnt[7], channel); } }
     switch (channel) {
-    case SPU_RdInMbox:       return ctx->ch_in_mbox.count;                 /* readable */
+    case SPU_RdInMbox:
+        /* Synchronous persistent-worker park: after its handshake the SPU polls
+         * the inbound mailbox for PPU commands; if empty and parking is armed,
+         * halt (longjmp out of spu_run_with_halt) instead of spinning forever. */
+        /* A pending sys_spu_thread_receive_event reply counts as readable
+         * mailbox words: the worker checks rchcnt to decide whether its reply
+         * has arrived, and parking on an "empty" inbox that actually holds the
+         * reply strands it. */
+        if (ctx->park_on_empty_inmbox && ctx->rcv_evt_n == 0 &&
+            ctx->ch_in_mbox.count == 0) {
+            extern void spu_halt(spu_context*);
+            spu_halt(ctx);
+        }
+        return (uint32_t)ctx->rcv_evt_n + ctx->ch_in_mbox.count;           /* readable */
     case SPU_WrOutMbox:      return SPU_MBOX_DEPTH - ctx->ch_out_mbox.count; /* free slots */
     case SPU_WrOutIntrMbox:  return SPU_INTR_MBOX_DEPTH - ctx->ch_out_intr_mbox.count;
     case SPU_RdSigNotify1:   return ctx->ch_sig_notify[0].count;
@@ -1130,6 +1195,47 @@ void spu_indirect_branch(spu_context* ctx)
      * addresses may also be registered (historical junk lifts) and must lose. */
     spu_fn fn = ctx->resident_ovl ? spu_lookup(ctx->pc, ctx->resident_ovl) : NULL;
     if (!fn) fn = spu_lookup(ctx->pc, ctx->image_id);
+    /* The job returned through the link register we planted: it is finished.
+     * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
+     * return landed on LS 0, which is the job's OWN entry, and it ran a second
+     * lap with dead registers: re-reading its parameters through a now-zero
+     * context pointer and spinning on a DMA to what were really its own
+     * opcodes. The work is already done by the time it returns. */
+    if (!ctx->policy_mode && ctx->pc == SPU_JOB_RETURN_LS) {
+        static int _n = 0;
+        if (_n++ < 4)
+            fprintf(stderr, "[spurs-job] img=%d returned to the job manager \n",
+                    ctx->image_id);
+        spu_halt(ctx);
+        return;
+    }
+    /* Branch into high LS with no lifted code there.
+     *
+     * This was added believing the jobs called a resident SPURS job-manager
+     * kernel at 0x16100 / 0x18160 / 0x1A100. That was WRONG. Those "absolute
+     * branches" were the disassembler decoding ASCII as instructions: the
+     * bytes behind one of them are 30 2C 20 43, i.e. "0, C" from the string
+     * "ch0, F:0:400, 100, Channel 0 level, %". Every job embeds the same
+     * parameter-description text, which is why the same phantom target
+     * appeared in 9 of 12 unrelated images and looked like a shared ABI.
+     *
+     * The guard is kept because branching into unlifted high local store is
+     * still an error worth stopping at rather than executing whatever is
+     * there -- but it is a backstop, not a kernel interface. */
+    if (!fn && !ctx->policy_mode && ctx->pc >= SPU_JM2_KERNEL_BASE) {
+        static uint32_t seen[16]; static int n_seen = 0;
+        int known = 0;
+        for (int i = 0; i < n_seen; i++) if (seen[i] == ctx->pc) { known = 1; break; }
+        if (!known && n_seen < 16) {
+            seen[n_seen++] = ctx->pc;
+            fprintf(stderr, "[spu] img=%d branched into unlifted LS 0x%05X "
+                    "(lr=0x%05X) -- ending the job\n",
+                    ctx->image_id, ctx->pc, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+            fflush(stderr);
+        }
+        spu_halt(ctx);
+        return;
+    }
     /* WWS job-code overlay match: the PM (image 2) streams a job module into the
      * code buffer (base = LS[0x1320]) and branches to base+entryOffset. Its 16-byte
      * ila header identifies which of the 89 lifted job modules it is; match it and
@@ -1337,6 +1443,29 @@ void spu_indirect_branch(spu_context* ctx)
                     "resuming PM at link 0x%05X\n", ctx->gpr[0]._u32[0] & SPU_LS_MASK);
         ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
         spu_indirect_branch(ctx);      /* re-dispatch at the rewritten pc */
+        return;
+    }
+
+    /* A SPURS *job* that branches back to LS 0 has RETURNED TO THE JOB MANAGER.
+     * That is how a jm2 job signals completion: its crt tail-jumps to the
+     * resident manager, which on hardware loads the next job and sets up r3/r4
+     * afresh. We load the job at LS 0 and have no manager, so the jump lands on
+     * the job's OWN entry and it runs a second lap -- with dead registers.
+     *
+     * Tokyo Jungle showed exactly that: lap one is correct at every step and
+     * does the real work, then the crt jumps to 0 and lap two re-reads its
+     * parameters through a now-zero context pointer (hence the reads of LS 0x20
+     * and the DMA addresses that were really its own opcodes) and spins forever.
+     * The work was already finished before the jump; the second lap is noise.
+     *
+     * The initial entry is called directly, not through here, so any arrival at
+     * LS 0 in this path is a re-entry. Treat it as job end. */
+    if (!ctx->policy_mode && ctx->pc == 0 && ctx->image_id > 0) {
+        static int _n = 0;
+        if (_n++ < 8)
+            fprintf(stderr, "[spurs-job] img=%d returned to the job manager "
+                    "(branch to LS 0) -- job complete\n", ctx->image_id);
+        spu_halt(ctx);
         return;
     }
     if (ctx->image_id == 2 &&

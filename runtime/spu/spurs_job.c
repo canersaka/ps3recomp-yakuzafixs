@@ -109,6 +109,28 @@ enum {
 #define JOB_DMA_TAG   20u          /* "one of: {20,21}" — job_context_types.h */
 #define JOB_STACK_DEFAULT 8192u    /* _cellSpursCheckJob's sizeStack==0 default */
 
+/* Local store of the most recent job, kept alive past the run.
+ *
+ * A title can poll the SPU that runs a job chain with sys_spu_thread_read_LS,
+ * identifying it by the CHAIN HANDLE rather than an lv2 thread id -- Tokyo
+ * Jungle reads its bus counts that way, 45k polls of offset 0 in a 45 s run.
+ * The job context is a stack local, so by the time the PPU looks there is
+ * nothing to read and every poll fails. Retain the store and let the syscall
+ * resolve a chain handle to it. */
+static uint8_t  s_job_ls[SPU_LS_SIZE];
+static int      s_job_ls_valid;
+uint32_t        g_spurs_job_ls_handle;   /* set by the chain walker */
+
+const uint8_t* spurs_job_ls_for_handle(uint32_t handle)
+{
+    if (!s_job_ls_valid || !handle || handle != g_spurs_job_ls_handle) return 0;
+    return s_job_ls;
+}
+
+/* Last outbound mailbox posted by a finished job (see below). */
+uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr;
+int g_spurs_job_mbox_valid;
+
 int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size)
 {
@@ -141,11 +163,24 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
 
     /* ---- regions, following _cellSpursCheckJob's own arithmetic --------- */
     uint32_t p         = ALIGN1024(size_bin);
-    uint32_t io_ls     = size_io  ? p : 0;  p += ALIGN1024(size_io);
-    uint32_t out_ls    = size_out ? p : 0;  p += ALIGN1024(size_out);
+    /* Same rule as the scratch pointer: these are REGION BASES and stay valid
+     * when the region is empty. NULL invites the job to dereference 0 -- and
+     * since the job binary loads at LS 0, reading through a null base returns
+     * the job's OWN INSTRUCTION WORDS. That is exactly what Tokyo Jungle's
+     * wedged jobs were doing: each spun DMAing to the word at offset 0x64 of
+     * its own image, which is why the addresses were misaligned and looked
+     * like floats -- they were opcodes. */
+    uint32_t io_ls     = p;                p += ALIGN1024(size_io);
+    uint32_t out_ls    = p;                p += ALIGN1024(size_out);
     if (use_io && !out_ls) out_ls = io_ls;    /* in-out: output shares ioBuffer */
     uint32_t ss_size   = ALIGN1024(size_scr + size_stk);
-    uint32_t s_ls      = size_scr ? p : 0;
+    /* The scratch pointer is the BASE OF THE SCRATCH+STACK BLOCK, and it is
+     * valid even when sizeScratch is 0 -- a zero-length buffer still has an
+     * address. Handing the job a NULL here meant it dereferenced 0 and read
+     * ITS OWN CODE as data: every wedged job in Tokyo Jungle was loading a
+     * word from LS 0x64 and using that SPU instruction word as a DMA address,
+     * which is why the addresses looked like misaligned floats. */
+    uint32_t s_ls      = p;
     uint32_t stack_top = p + ss_size;
     p += ss_size;
 
@@ -214,6 +249,33 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
               out_ls, size_out, s_ls, size_scr, stack_top, size_stk, n_cache,
               ctx_ls, desc_ls, dsz); }
 
+    /* SPURS_JOB_DESCDUMP=1: hexdump the guest job descriptor. The SPU derives
+     * its DMA and atomic EAs from these words, so when a job spins on a
+     * lock-line address that is not backed, this is what to read first. */
+    { static int _d = 0;
+      if (getenv("SPURS_JOB_DESCDUMP") && _d++ < 4) {
+          fprintf(stderr, "[spurs-job] desc @0x%08X (%u bytes):", job_ea, dsz);
+          for (uint32_t o = 0; o < dsz && o < 128; o += 4) {
+              if ((o & 31) == 0) fprintf(stderr, "\n    +%02X:", o);
+              fprintf(stderr, " %08X", g32(job_ea + o));
+          }
+          fprintf(stderr, "\n");
+          /* SPURS_JOB_DESCDUMP=2: follow plausible guest EAs in the job user
+           * data (past JH_SIZE) and dump what they point at. The job reads its
+           * parameters from there, so a wild DMA/atomic address usually
+           * originates in one of these blocks. */
+          if (atoi(getenv("SPURS_JOB_DESCDUMP")) >= 2) {
+              for (uint32_t o = JH_SIZE; o < dsz && o < 128; o += 4) {
+                  uint32_t v = g32(job_ea + o);
+                  if (v < 0x10000u || v >= 0xD0000000u) continue;
+                  fprintf(stderr, "[spurs-job]   user+0x%02X -> 0x%08X:", o, v);
+                  for (uint32_t q = 0; q < 8; q++)
+                      fprintf(stderr, " %08X", g32(v + q * 4));
+                  fprintf(stderr, "\n");
+              }
+          }
+      } }
+
     /* LBP job protocol probe (LBP_JOB_DUMP): the game's one shared job binary
      * ("JOBCRT Ver13" crt + main @0x1570) reads a be u64 EA out of the
      * descriptor's USER DATA at +0x30, GETs a 128-byte command block from it,
@@ -261,6 +323,10 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     ctx.image_id = image_id;
     memcpy(ctx.ls, ls, SPU_LS_SIZE);
     ctx.gpr[1]._u32[0] = (stack_top - 16u) & ~15u;   /* SPU stack grows down */
+    /* Link register: where the job returns when it is done. The job manager
+     * would pass an address inside itself; 0 makes the job re-enter its own
+     * entry at LS 0 and run a bogus second lap. */
+    ctx.gpr[0]._u32[0] = 0x3FF00u;                   /* SPU_JOB_RETURN_LS */
     ctx.gpr[3]._u32[0] = ctx_ls;                     /* CellSpursJobContext2* */
     ctx.gpr[4]._u32[0] = desc_ls;                    /* CellSpursJob256*      */
 
@@ -276,6 +342,26 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * HALT-ASSERT heqi 0x1650 seen once per jm2 job is NORMAL COMPLETION
      * noise, not a failure: the job's real work finished before the jump. */
     spu_run_with_halt(entry, &ctx);
+
+    /* Capture the job's outbound mailbox. These are LS POINTERS TO STRINGS for
+     * the SPU printf service, NOT query results -- value 0x83C0 from the sound
+     * job points at " compressor, 1/n..." inside its own image. An earlier
+     * comment here claimed they carried the title's bus counts; they do not,
+     * and feeding them into the completion event turned 0x40000000 into a 1 GB
+     * allocation request. Kept because the printf service needs them. */
+    memcpy(s_job_ls, ctx.ls, SPU_LS_SIZE);   /* keep the store readable */
+    s_job_ls_valid = 1;
+
+    g_spurs_job_mbox      = spu_channel_has_data(&ctx.ch_out_mbox)
+                          ? ctx.ch_out_mbox.value : 0;
+    g_spurs_job_mbox_intr = spu_channel_has_data(&ctx.ch_out_intr_mbox)
+                          ? ctx.ch_out_intr_mbox.value : 0;
+    g_spurs_job_mbox_valid = g_spurs_job_mbox || g_spurs_job_mbox_intr;
+    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_JOB_MBOX") ? 1 : 0;
+      static int n = 0;
+      if (s_t && n++ < 16 && g_spurs_job_mbox_valid)
+          fprintf(stderr, "[spurs-job] job 0x%08X posted mbox=0x%08X intr=0x%08X\n",
+                  job_ea, g_spurs_job_mbox, g_spurs_job_mbox_intr); }
 
     if (getenv("LBP_JOB_DUMP")) {
         fprintf(stderr, "[spurs-job] job 0x%08X exit: status=0x%X stop=0x%X pc=0x%05X\n",

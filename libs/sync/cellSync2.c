@@ -7,6 +7,7 @@
  */
 
 #include "cellSync2.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host pointer */
 #include <stdio.h>
 #include <string.h>
 
@@ -92,6 +93,7 @@ _Static_assert(sizeof(Sync2QueueInternal) <= CELL_SYNC2_QUEUE_SIZE,
 
 s32 cellSync2MutexAttributeInitialize(CellSync2MutexAttribute* attr)
 {
+    attr = GUEST_PTR(attr, CellSync2MutexAttribute*);
     if (!attr) return CELL_SYNC2_ERROR_NULL_POINTER;
     attr->maxWaiters = 32;
     attr->recursive = 0;
@@ -100,6 +102,7 @@ s32 cellSync2MutexAttributeInitialize(CellSync2MutexAttribute* attr)
 
 s32 cellSync2MutexInit(CellSync2Mutex* mutex, const CellSync2MutexAttribute* attr)
 {
+    attr = GUEST_PTR(attr, const CellSync2MutexAttribute*);
     if (!mutex) return CELL_SYNC2_ERROR_NULL_POINTER;
 
     Sync2MutexInternal* m = (Sync2MutexInternal*)mutex;
@@ -208,6 +211,7 @@ s32 cellSync2MutexUnlock(CellSync2Mutex* mutex)
 
 s32 cellSync2CondAttributeInitialize(CellSync2CondAttribute* attr)
 {
+    attr = GUEST_PTR(attr, CellSync2CondAttribute*);
     if (!attr) return CELL_SYNC2_ERROR_NULL_POINTER;
     attr->maxWaiters = 32;
     return CELL_OK;
@@ -303,6 +307,7 @@ s32 cellSync2CondSignalAll(CellSync2Cond* cond)
 
 s32 cellSync2SemaphoreAttributeInitialize(CellSync2SemaphoreAttribute* attr)
 {
+    attr = GUEST_PTR(attr, CellSync2SemaphoreAttribute*);
     if (!attr) return CELL_SYNC2_ERROR_NULL_POINTER;
     attr->maxWaiters = 32;
     attr->maxValue = 0x7FFFFFFF;
@@ -312,6 +317,7 @@ s32 cellSync2SemaphoreAttributeInitialize(CellSync2SemaphoreAttribute* attr)
 s32 cellSync2SemaphoreInit(CellSync2Semaphore* sem, s32 initialValue,
                            const CellSync2SemaphoreAttribute* attr)
 {
+    attr = GUEST_PTR(attr, const CellSync2SemaphoreAttribute*);
     if (!sem) return CELL_SYNC2_ERROR_NULL_POINTER;
 
     Sync2SemInternal* s = (Sync2SemInternal*)sem;
@@ -415,11 +421,11 @@ s32 cellSync2SemaphoreGetValue(const CellSync2Semaphore* sem, s32* value)
 #ifdef _WIN32
     /* Windows doesn't have a direct "get value" for semaphores.
      * Use a 0-timeout wait + release trick, or track internally. */
-    *value = s->value; /* approximate */
+    vm_write32((u32)(uintptr_t)value, (u32)s->value); /* approximate */
 #else
     int v;
     sem_getvalue(&s->sem, &v);
-    *value = (s32)v;
+    vm_write32((u32)(uintptr_t)value, (u32)v);
 #endif
 
     return CELL_OK;
@@ -431,6 +437,7 @@ s32 cellSync2SemaphoreGetValue(const CellSync2Semaphore* sem, s32* value)
 
 s32 cellSync2QueueAttributeInitialize(CellSync2QueueAttribute* attr)
 {
+    attr = GUEST_PTR(attr, CellSync2QueueAttribute*);
     if (!attr) return CELL_SYNC2_ERROR_NULL_POINTER;
     /* ponytail: writes the correct 128-byte ABI layout, but like the rest of this
      * module it does NOT translate the guest EA (GUEST_PTR) or byte-swap to
@@ -447,6 +454,7 @@ s32 cellSync2QueueInit(CellSync2Queue* queue, void* buffer,
                        u32 elemSize, u32 depth,
                        const CellSync2QueueAttribute* attr)
 {
+    buffer = GUEST_PTR(buffer, void*);
     (void)attr;
 
     if (!queue || !buffer) return CELL_SYNC2_ERROR_NULL_POINTER;
@@ -477,6 +485,7 @@ s32 cellSync2QueueInit(CellSync2Queue* queue, void* buffer,
 s32 cellSync2QueuePush(CellSync2Queue* queue, const void* data,
                        u64 timeoutUsec)
 {
+    data = GUEST_PTR(data, const void*);
     if (!queue || !data) return CELL_SYNC2_ERROR_NULL_POINTER;
     Sync2QueueInternal* q = (Sync2QueueInternal*)queue;
     if (!q->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
@@ -528,6 +537,7 @@ s32 cellSync2QueuePush(CellSync2Queue* queue, const void* data,
 
 s32 cellSync2QueueTryPush(CellSync2Queue* queue, const void* data)
 {
+    data = GUEST_PTR(data, const void*);
     if (!queue || !data) return CELL_SYNC2_ERROR_NULL_POINTER;
     Sync2QueueInternal* q = (Sync2QueueInternal*)queue;
     if (!q->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
@@ -570,6 +580,7 @@ s32 cellSync2QueueTryPush(CellSync2Queue* queue, const void* data)
 s32 cellSync2QueuePop(CellSync2Queue* queue, void* data,
                       u64 timeoutUsec)
 {
+    data = GUEST_PTR(data, void*);
     if (!queue || !data) return CELL_SYNC2_ERROR_NULL_POINTER;
     Sync2QueueInternal* q = (Sync2QueueInternal*)queue;
     if (!q->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
@@ -621,6 +632,7 @@ s32 cellSync2QueuePop(CellSync2Queue* queue, void* data,
 
 s32 cellSync2QueueTryPop(CellSync2Queue* queue, void* data)
 {
+    data = GUEST_PTR(data, void*);
     if (!queue || !data) return CELL_SYNC2_ERROR_NULL_POINTER;
     Sync2QueueInternal* q = (Sync2QueueInternal*)queue;
     if (!q->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
@@ -666,6 +678,6 @@ s32 cellSync2QueueSize(const CellSync2Queue* queue, u32* size)
     const Sync2QueueInternal* q = (const Sync2QueueInternal*)queue;
     if (!q->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
 
-    *size = q->count;
+    vm_write32((u32)(uintptr_t)size, q->count);
     return CELL_OK;
 }

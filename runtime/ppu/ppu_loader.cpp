@@ -19,7 +19,129 @@
  */
 
 #include "ppu_recomp.h"     /* ppu_context, func decls, ppu_recomp_register */
+#include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+
+/* Resolve the GUEST function on the host stack (closest lifted entry below
+ * each frame) -- the same trick the [BLOCK] profiler uses. */
+extern "C" void ppu_guest_caller(char* out, size_t n)
+{
+    snprintf(out, n, "?");
+    void* fr[24]; unsigned short cnt = RtlCaptureStackBackTrace(0, 24, fr, 0);
+    for (unsigned short i = 0; i < cnt; i++) {
+        uintptr_t tgt = (uintptr_t)fr[i], best_h = 0; uint32_t best_g = 0;
+        for (uint64_t k = 0; k < function_table_count; k++) {
+            uintptr_t h = (uintptr_t)function_table[k].func;
+            if (h <= tgt && h > best_h) { best_h = h; best_g = function_table[k].addr; }
+        }
+        if (best_g && tgt - best_h < 0x20000) {
+            snprintf(out, n, "func_%08X+0x%llX", best_g,
+                     (unsigned long long)(tgt - best_h));
+            return;
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Guest-pointer trap
+ *
+ * The HLE ABI hands a guest function's pointer arguments through as raw 32-bit
+ * GUEST addresses. An implementation that dereferences one directly -- instead
+ * of translating through vm_base -- reads or writes host address 0x00000000 to
+ * 0xFFFFFFFF. vm_base sits far above that, so those two worlds never overlap.
+ *
+ * That mistake has been the single most expensive bug class in this runtime.
+ * cellFsRead read an entire sound bank to an untranslated pointer, and the
+ * symptom was a title deadlocking in audio initialisation four subsystems away.
+ * cellAvconfExt, cellSail and cellFs cost similar hunts. Found by crashing, they
+ * are archaeology; found here, they are a one-line fix at a named function.
+ *
+ * Reserving the low 4 GB is what makes the report RELIABLE rather than lucky:
+ * unreserved address space faults today, but nothing stops the CRT or a DLL from
+ * allocating there later, at which point the same bug silently corrupts unrelated
+ * memory instead of faulting. Reserve it and the fault is guaranteed.
+ *
+ * Deliberately does NOT swallow the exception: it reports and lets the normal
+ * handling proceed, so a real bug still stops the run.
+ * -----------------------------------------------------------------------*/
+static LONG WINAPI ps3_guest_ptr_veh(EXCEPTION_POINTERS* ep)
+{
+    const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
+        er->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    uintptr_t at = (uintptr_t)er->ExceptionInformation[1];
+    if (at >= 0x100000000ull) return EXCEPTION_CONTINUE_SEARCH;   /* not a guest addr */
+    if (at < 0x10000u) return EXCEPTION_CONTINUE_SEARCH;          /* a plain NULL deref */
+
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) <= 32) {
+        char who[64]; ppu_guest_caller(who, sizeof who);
+        const char* how = er->ExceptionInformation[0] == 0 ? "read"
+                        : er->ExceptionInformation[0] == 1 ? "write" : "execute";
+        fprintf(stderr,
+                "\n[ps3] UNTRANSLATED GUEST POINTER: %s of guest 0x%08X as a host "
+                "address\n      (an HLE function dereferenced a pointer parameter without "
+                "vm_base)\n      guest caller: %s\n", how, (uint32_t)at, who);
+        fflush(stderr);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+extern "C" void ps3_install_guest_ptr_trap(void)
+{
+    if (getenv("PS3_NO_GUEST_PTR_TRAP")) return;
+    /* Reserve the low 4 GB in chunks; a chunk already in use just fails and is
+     * skipped, which is fine -- every chunk we do get is one the bug can no
+     * longer land in silently. */
+    size_t got = 0;
+    for (uintptr_t a = 0x10000u; a < 0x100000000ull; a += 0x10000000ull) {
+        SIZE_T len = 0x10000000u;
+        if (a == 0x10000u) len -= 0x10000u;
+        if (VirtualAlloc((void*)a, len, MEM_RESERVE, PAGE_NOACCESS)) got += len;
+    }
+    AddVectoredExceptionHandler(1, ps3_guest_ptr_veh);
+    fprintf(stderr, "[ps3] guest-pointer trap armed (%zu MB of the low 4 GB reserved)\n",
+            got >> 20);
+}
+
+/* PS3_SCTRACE=1: every lv2 syscall with its arguments and RETURN VALUE.
+ * An unimplemented syscall is loud (it logs "(stub)") but an IMPLEMENTED one
+ * that returns an error is silent, and that is the harder failure to find:
+ * middleware just prints its own complaint and tears down. Optionally filtered
+ * to failures only with PS3_SCTRACE=fail. */
+static void sc_trace(uint64_t num, ppu_context* ctx, uint64_t a3, uint64_t a4,
+                     uint64_t a5, uint64_t a6)
+{
+    static int mode = -1;
+    if (mode < 0) { const char* e = getenv("PS3_SCTRACE");
+        mode = !e ? 0 : (strcmp(e, "fail") == 0 ? 2 : 1); }
+    if (!mode) return;
+    int64_t rv = (int64_t)ctx->gpr[3];
+    if (mode == 2 && (rv == 0 || (uint64_t)rv < 0x80000000ull)) return;
+    /* Resolve the GUEST function that made the call: walk the host stack and
+     * find the lifted function whose entry is the closest one below each frame
+     * (same trick the [BLOCK] profiler uses). Without this a syscall trace says
+     * what happened but never who asked for it. */
+    char who[64] = "?";
+    { void* fr[24]; unsigned short n = RtlCaptureStackBackTrace(0, 24, fr, 0);
+      for (unsigned short i = 0; i < n && who[0] == 63; i++) {
+          uintptr_t tgt = (uintptr_t)fr[i], best_h = 0; uint32_t best_g = 0;
+          for (uint64_t k = 0; k < function_table_count; k++) {
+              uintptr_t h = (uintptr_t)function_table[k].func;
+              if (h <= tgt && h > best_h) { best_h = h; best_g = function_table[k].addr; }
+          }
+          if (best_g && tgt - best_h < 0x20000)
+              snprintf(who, sizeof who, "func_%08X+0x%llX", best_g,
+                       (unsigned long long)(tgt - best_h));
+      } }
+    fprintf(stderr, "[sc] %llu(0x%llX, 0x%llX, 0x%llX, 0x%llX) -> 0x%llX tid=%u from %s\n",
+            (unsigned long long)num, (unsigned long long)a3, (unsigned long long)a4,
+            (unsigned long long)a5, (unsigned long long)a6,
+            (unsigned long long)rv, (unsigned)ctx->thread_id, who);
+    fflush(stderr);
+}
+
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -345,6 +467,13 @@ uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; vm_hotmap(
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap16(v); }
 uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
+    /* RD_FORCE_ADDR=<hex>: force reads of one address to RD_FORCE_VAL (default 0)
+     * -- diagnostic to break a completion spin and see whether the game proceeds.
+     * (From eeff394; dropped by the runtime/spu consolidation, restored here.) */
+    { static int64_t _fa=-2; static uint32_t _fv=0;
+      if(_fa==-2){ const char* e=getenv("RD_FORCE_ADDR"); _fa=e?(int64_t)strtoul(e,0,16):-1;
+                   const char* ev=getenv("RD_FORCE_VAL"); _fv=ev?(uint32_t)strtoul(ev,0,16):0; }
+      if (_fa>=0 && (uint32_t)a==(uint32_t)_fa) return _fv; }
     /* GCM_REFPOLL: read-driven RSX fence publication. A spin-read of the ref
      * register (GCM_CONTROL+8 = 0x03002008) advances one queued fence (paced
      * <=1/ms), so cellGcmFinish makes progress even when the 60 Hz present
@@ -431,7 +560,23 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
     /* Hot-poll detector: a thread spinning on the same address (e.g. a GCM FIFO
      * get-pointer / label waiting on RSX) reads it thousands of times in a row. */
     { static __declspec(thread) uint32_t last=0xFFFFFFFFu; static __declspec(thread) uint32_t n=0;
-      if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD] spinning on 0x%08X (=0x%08X)\n", (uint32_t)a, __builtin_bswap32(v)); n=0;
+      if ((uint32_t)a==last) { if (++n==200000) { if (((uint32_t)a & ~0xFFFu) == 0x03002000u) {
+              /* A spin on the GCM control block is a fence/FIFO wait. Print the
+               * WHOLE block: put vs get says whether the RSX side is behind or
+               * whether the guest never submitted, which is the difference
+               * between a stalled pump and a command that never arrived. */
+              extern uint8_t* vm_base;
+              uint32_t pu = 0, ge = 0, rf = 0;
+              if (vm_base) {
+                  const uint8_t* c = vm_base + 0x03002000u;
+                  pu = ((uint32_t)c[0]<<24)|((uint32_t)c[1]<<16)|((uint32_t)c[2]<<8)|c[3];
+                  ge = ((uint32_t)c[4]<<24)|((uint32_t)c[5]<<16)|((uint32_t)c[6]<<8)|c[7];
+                  rf = ((uint32_t)c[8]<<24)|((uint32_t)c[9]<<16)|((uint32_t)c[10]<<8)|c[11];
+              }
+              fprintf(stderr, "[HOTREAD] GCM control spin: put=0x%08X get=0x%08X "
+                      "ref=0x%08X (addr 0x%08X)\n", pu, ge, rf, (uint32_t)a);
+          } else fprintf(stderr, "[HOTREAD] spinning on 0x%08X (=0x%08X) guest cia=0x%08X lr=0x%08X\n", (uint32_t)a, __builtin_bswap32(v),
+          g_active_ctx?(uint32_t)g_active_ctx->cia:0, g_active_ctx?(uint32_t)g_active_ctx->lr:0); n=0;
 #ifdef _WIN32
         /* YDKJ_SPINBT=<addr>: one-shot host backtrace when the read32 hot spin
          * is on the watched address -- names the guest function containing the
@@ -480,13 +625,36 @@ uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap(
  * any PPU store into [base+0x40, base+0xC0) is then logged with its guest
  * function, catching whoever bumps the per-SPU lane counters. */
 extern "C" uint32_t g_barrier_sync_watch = 0;
+
+/* Window for the INLINE write-watch in ppu_memory.h (libs/ stores). Same LBP_WW
+ * setting as below; kept as a pair so the inline check is two compares against
+ * zeros when the watch is off. */
+extern "C" uint32_t g_ww_lo = 0, g_ww_hi = 0;
+
+extern "C" void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width)
+{
+    static int n = 0;
+    if (n++ >= 64) return;
+    fprintf(stderr, "[ww-hle] 0x%08X <- 0x%llX (w%d) from an HLE (libs/)\n",
+            addr, (unsigned long long)val, width);
+    fflush(stderr);
+}
+
+/* Called once LBP_WW has been parsed, so both watches cover the same line. */
+static void ww_arm_inline_window(uint32_t ww)
+{
+    if (!ww) return;
+    g_ww_lo = ww & ~15u;
+    g_ww_hi = (ww & ~15u) + 0x20;
+}
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
     /* LBP_WW=<hexEA>: log every PPU store into the 16-byte line at that EA,
      * with the writing guest function -- to find who fills (or fails to fill)
      * a struct field (e.g. FMOD's overlay descriptor source at 0x94F680). */
     { static uint32_t s_ww = 0xFFFFFFFFu;
-      if (s_ww == 0xFFFFFFFFu) { const char* e = getenv("LBP_WW"); s_ww = e ? (uint32_t)strtoul(e,0,0) : 0; }
+      if (s_ww == 0xFFFFFFFFu) { const char* e = getenv("LBP_WW"); s_ww = e ? (uint32_t)strtoul(e,0,0) : 0;
+                                 ww_arm_inline_window(s_ww); }
       if (s_ww && a >= (s_ww & ~15u) && a < (s_ww & ~15u) + 0x20) {
           static int _n = 0;
           if (_n++ < 64) {
@@ -993,15 +1161,69 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
      * generic visibility into vtable/callback dispatch (e.g. which job body a
      * JobManager worker runs). */
     { static int64_t ctr_n=-2; if(ctr_n==-2){const char*e=getenv("PS3_CALLTRACE"); ctr_n=e?atoi(e):0;}
+      /* PS3_CALLTRACE_LR=<hex>: only calls returning to this guest address.
+       * An unfiltered trace is far too heavy to reach a late failure -- it
+       * changes the timing enough that the run never gets there. */
+      static int64_t only_lr = -2;
+      if (only_lr == -2) { const char* e = getenv("PS3_CALLTRACE_LR");
+                           only_lr = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+      /* PS3_CALLTRACE_R5=<n>: only calls with this selector in r5. Some lifted
+       * bctrl sites never set ctx->lr (the lifter uses a host call there), so
+       * filtering by return address silently matches nothing -- an argument
+       * value is the reliable handle on a specific call. */
+      /* PS3_CALLTRACE_FROM=<guest fn hex>: only calls made from inside this
+       * lifted function, resolved off the host stack. The most reliable handle
+       * when neither lr nor an argument is distinctive. */
+      /* PS3_CALLTRACE_TO=<hex>: only calls whose TARGET is this address --
+       * the way to catch an entry point that has no direct callers. */
+      static int64_t only_to = -2;
+      if (only_to == -2) { const char* e = getenv("PS3_CALLTRACE_TO");
+                           only_to = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+      if (only_to >= 0 && addr != (uint32_t)only_to) goto skip_calltrace;
+      static int64_t only_from = -2;
+      if (only_from == -2) { const char* e = getenv("PS3_CALLTRACE_FROM");
+                             only_from = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+      char cf[64];
+      if (only_from >= 0) {
+          ppu_guest_caller(cf, sizeof cf);
+          char want[32]; snprintf(want, sizeof want, "func_%08X", (uint32_t)only_from);
+          if (strncmp(cf, want, strlen(want)) != 0) goto skip_calltrace;
+      }
+      static int64_t only_r5 = -2;
+      if (only_r5 == -2) { const char* e = getenv("PS3_CALLTRACE_R5");
+                           only_r5 = e ? strtol(e, 0, 0) : -1; }
+      if (only_r5 >= 0 && (int64_t)(int32_t)ctx->gpr[5] != only_r5) { /* skip */ } else
+      if (only_lr >= 0 && (uint32_t)ctx->lr != (uint32_t)only_lr) { /* skip */ } else
       if(ctr_n>0){ ctr_n--;
-        fprintf(stderr,"[CALL] -> 0x%08X r3=0x%08X r4=0x%08X tid=%llu\n",
+        fprintf(stderr,"[CALL] -> 0x%08X r3=0x%08X r4=0x%08X r5=%lld tid=%llu\n",
                 addr,(uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],
+                (long long)(int32_t)ctx->gpr[5],
                 (unsigned long long)ctx->thread_id); } }
+      skip_calltrace: ;
     /* Null / return-to-OS sentinel: a bctr to address 0 means the guest
      * unwound to the initial frame (or a not-yet-populated function pointer).
      * Don't treat it as an unresolved call -- just return to the caller. */
-    if (addr == 0)
+    if (addr == 0) {
+        /* Returning silently leaves r3 HOLDING THE FIRST ARGUMENT, so the guest
+         * reads its own input back as the return value and reports a nonsense
+         * error code. Tokyo Jungle: cellAudioSetNotifyEventQueue(key=0x23A0)
+         * "failed" with status 0x23A0 -- the key itself. Say so."*/
+        static int n = 0;
+        if (n++ < 400)
+        { char who[64]; ppu_guest_caller(who, sizeof who);
+          if (n <= 400) {
+            /* The lifted import thunk leaves the OPD address it loaded in r12,
+             * so we can tell a zero SLOT from a zeroed OPD -- i.e. whether the
+             * import was never resolved or was resolved and later clobbered. */
+            uint32_t opd = (uint32_t)ctx->gpr[12];
+            uint32_t o0 = (opd && vm_base) ? __builtin_bswap32(*(volatile uint32_t*)(vm_base+opd)) : 0;
+            fprintf(stderr, "[ppu] bctr to NULL from %s r12(opd)=0x%08X opd[0]=0x%08X "
+                    "(r3=0x%08X r4=0x%08X "
+                    "tid=%llu) -- returning with r3 untouched\n", who, opd, o0,
+                    (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
+                    (unsigned long long)ctx->thread_id); } }
         return;
+    }
 
     /* SPURS trace: log calls into libsre's cellSpurs export range so we can
      * identify the instance-init function (called with &spurs = 0x40009D00) and
@@ -1327,9 +1549,26 @@ extern "C" int lv2_try_syscall(ppu_context* ctx);
  * rest are dispatched to the real lv2 table, and only genuinely-unregistered
  * numbers fall through to the return-CELL_OK stub. */
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
+/* In-flight lv2 syscall per guest thread; 0 = not in a syscall. See the guard
+ * in lv2_syscall() below. */
+#define PS3_SC_INFLIGHT_MAX 64
+extern "C" uint32_t g_sc_inflight[PS3_SC_INFLIGHT_MAX] = { 0 };
+
 extern "C" void lv2_syscall(ppu_context* ctx)
 {
     uint64_t num = ctx->gpr[11];
+
+    /* Which lv2 syscall each guest thread is currently INSIDE, by thread_id.
+     * A thread blocked in a syscall shows no in-flight HLE (syscalls do not go
+     * through ps3_hle_call) and a stale CTR, so without this a wedged thread is
+     * just "somewhere in ntdll". Cleared on every exit path by the guard. */
+    struct _ScGuard {
+        ppu_context* c;
+        ~_ScGuard() { unsigned t = (unsigned)c->thread_id;
+                      if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = 0; }
+    } _sg{ ctx };
+    { unsigned t = (unsigned)ctx->thread_id;
+      if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = (uint32_t)num; }
     /* Guest-PC breadcrumb for the sampling profiler: record the syscall
      * callsite (lr) in the runtime-side thread info. cia itself is the thread
      * entry OPD (load-bearing for the entry trampoline) -- do not touch it. */
@@ -1401,6 +1640,14 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         if (!size) size = 0x100000u;
         uint32_t va = s_map_next;
         s_map_next = (s_map_next + size + 0xFFFFFu) & ~0xFFFFFu;
+        /* MAP the block, don't just name it. This handed back an address into
+         * MEM_RESERVE, so the page only ever came into existence if the PPU
+         * happened to touch it first (the boot harness commits on fault; a
+         * port with its own main() does not even do that). An SPU-written
+         * output buffer is the case that breaks: the SPU is the FIRST writer,
+         * its DMA guard sees an uncommitted EA and skips the transfer, and the
+         * job's results are silently dropped. */
+        vm_commit(va, size);
         if (outp) vm_write32(outp, va);
         ctx->gpr[3] = 0;
         return;
@@ -1450,9 +1697,20 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                 fprintf(stderr, "%s\n", line); fflush(stderr);
             }
         }
-        for (uint32_t i = 0; i < wlen; i++) {
-            if (ppu_vm_size && buf + i >= ppu_vm_size) break;
-            fputc(vm_read8(buf + i), out);
+        /* Assemble the whole message and emit it in ONE call. Writing a byte at
+         * a time let other threads interleave INSIDE a guest message -- a title
+         * error would come out as "out of range b" + another thread's line +
+         * "us (1,1)". That is not just ugly: it silently defeats grep, so a
+         * message that IS in the log reads as absent, and several readings of
+         * this title's state were wrong because of it. */
+        {
+            char tty[0x4001];
+            uint32_t n = 0;
+            for (uint32_t i = 0; i < wlen && n < sizeof tty - 1; i++) {
+                if (ppu_vm_size && buf + i >= ppu_vm_size) break;
+                tty[n++] = (char)vm_read8(buf + i);
+            }
+            if (n) fwrite(tty, 1, n, out);
         }
         fflush(out);
         if (pwl) vm_write32(pwl, len);
@@ -1488,10 +1746,12 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                     fprintf(stderr,"[BLOCKSUM] syscall %d: %llums total over %u calls (last 2s)\n",n,(unsigned long long)s_acc[n],s_cnt[n]);
                 for (int n=0;n<1024;n++){s_acc[n]=0;s_cnt[n]=0;} s_win=_t0;
             }
-            if (_ok) return;
+            if (_ok) { sc_trace(num, ctx, _a3, _a4, _a5, 0); return; }
         } else {
-            if (lv2_try_syscall(ctx))
+            if (lv2_try_syscall(ctx)) {
+                sc_trace(num, ctx, ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6]);
                 return;
+            }
         }
         static int logged = 0;
         if (logged < 30) {
@@ -1614,6 +1874,21 @@ static void ppu_thread_entry_trampoline(ppu_context* ctx)
     g_active_ctx = ctx;
     fn(ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(ctx); }
+}
+
+/* Install that trampoline without going through ppu_run().
+ *
+ * ppu_run() sets it as a side effect of dispatching the guest entry point. A
+ * host harness that dispatches the entry itself (Tokyo Jungle calls the lifted
+ * _start directly) never runs that line, so g_ppu_thread_entry_trampoline
+ * stays NULL -- and then every sys_ppu_thread_create'd thread spawns, finds no
+ * trampoline, logs "[THREAD n] g_ppu_thread_entry_trampoline is NULL -- thread
+ * is a no-op" and exits without executing a single guest instruction. The
+ * threads all report FINISHED, so nothing looks wrong; the title just never
+ * gets whatever those threads were supposed to do. */
+extern "C" void ppu_install_thread_trampoline(void)
+{
+    g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
 }
 
 /* Call a guest function by OPD with up to 4 integer args, on a private scratch

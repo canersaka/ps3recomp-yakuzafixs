@@ -187,6 +187,13 @@ typedef struct spu_context {
      * here. 0 = match any image (back-compat for single-image contexts). */
     int image_id;
 
+    /* When set, a rchcnt(SPU_RdInMbox) that finds the inbound mailbox EMPTY halts
+     * the SPU (spu_halt longjmp) instead of returning 0. Lets a persistent-worker
+     * SPU (e.g. the Rubber Ducky AsyncCopy raw SPU) run SYNCHRONOUSLY: it does its
+     * full init + ready-mailbox handshake, then parks the first time it idle-waits
+     * for a PPU command -- no async host thread racing the PPU. */
+    int park_on_empty_inmbox;
+
     /* Decrementer: a free-running down counter, ticking at the PS3 timebase.
      * SPU_WrDec latches the reload value here and stamps dec_base_ns; SPU_RdDec
      * derives the live value from the host clock. Storing only the written
@@ -205,6 +212,13 @@ typedef struct spu_context {
     /* Channels */
     spu_channel ch_out_mbox;        /* SPU -> PPU outbound mailbox */
     spu_channel ch_in_mbox;         /* PPU -> SPU inbound mailbox */
+    /* sys_spu_thread_receive_event (stop 0x110) replies with FOUR values --
+     * {CELL_OK, data1, data2, data3} -- and the worker reads them back with
+     * four rdch SPU_RdInMbox. spu_channel holds one, so queue the reply here
+     * and let the in-mailbox read drain it first. */
+    uint32_t rcv_evt[4];
+    int      rcv_evt_n;             /* remaining unread reply words */
+    int      rcv_evt_i;
     spu_channel ch_out_intr_mbox;   /* SPU -> PPU interrupt mailbox */
     spu_channel ch_sig_notify[2];   /* Signal notification 1 & 2 */
 
@@ -250,6 +264,11 @@ typedef struct spu_context {
      * persistent workload-module image adopted at LS 0xA00, re-applied at
      * dispatch after a call-bracket image restore. */
     uint32_t host_depth;
+
+    /* Trampoline steps taken since this context started running. Only needed
+     * to tell a job's INITIAL entry at LS 0 from a later return to LS 0, which
+     * means something quite different (see spu_task_launch_check). */
+    uint32_t steps;
     int      module_img_a00;
 
     /* SPU lockstep gate (spu_lockstep.c; env YZ_SPU_LOCKSTEP, default off).
@@ -375,6 +394,26 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
+    /* SPU_LS_LOWREAD=1: a job that reads its OWN first bytes as data is
+     * dereferencing a null base -- the job binary loads at LS 0, so [NULL+off]
+     * returns its own instruction words. Report each distinct low address once,
+     * with the pc, to find which pointer was never filled in. */
+    { static int s_lw = -1;
+      if (s_lw < 0) s_lw = getenv("SPU_LS_LOWREAD") ? 1 : 0;
+      if (s_lw && lsa < 0x200u && ctx->image_id > 0 && !ctx->policy_mode) {
+          static uint32_t seen[24]; static int n = 0; int known = 0;
+          uint32_t key = (uint32_t)ctx->image_id << 24 | (lsa & 0x1F0);
+          for (int i = 0; i < n; i++) if (seen[i] == key) { known = 1; break; }
+          if (!known && n < 24) {
+              seen[n++] = key;
+              fprintf(stderr, "[spu-lowread] img=%d read LS 0x%03X at pc=0x%05X "
+                      "ctx=%p r1=0x%05X r2=0x%08X r3=0x%08X r4=0x%08X\n",
+                      ctx->image_id, lsa, (uint32_t)ctx->pc & SPU_LS_MASK,
+                      (const void*)ctx,                      ctx->gpr[1]._u32[0], ctx->gpr[2]._u32[0],
+                      ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0]);
+              fflush(stderr);
+          }
+      } }
     /* WWS buffer-resolution probe: GetLogicalBuffer reads bufferSetArray at
      * 0xDF0 + (jobNum<<6) + (logBufSet<<2), so the raw address encodes both.
      * Log them (capped) to see which set each command -- especially RunJob --

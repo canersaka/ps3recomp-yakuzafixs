@@ -60,6 +60,12 @@ static void write_be32(uint32_t addr, uint32_t val)
  * r4 = mutex_id to associate with
  * r5 = pointer to attribute struct
  * -----------------------------------------------------------------------*/
+/* Guest address the cond id was written to, per id. A guest sync object
+ * usually embeds {flag, mutex, cond, count}, so the cond id lives at a known
+ * offset inside it and this recovers the object address -- enough to watch the
+ * counter a waiter is blocked on. */
+uint32_t g_cond_id_addr[SYS_COND_MAX + 1];
+
 int64_t sys_cond_create(ppu_context* ctx)
 {
     uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
@@ -106,6 +112,7 @@ int64_t sys_cond_create(ppu_context* ctx)
     uint32_t cond_id = (uint32_t)(slot + 1);
     if (id_out_addr != 0) {
         write_be32(id_out_addr, cond_id);
+        if ((uint32_t)(slot + 1) <= SYS_COND_MAX) g_cond_id_addr[slot + 1] = id_out_addr;
     }
 
     cond_table_unlock();
@@ -152,6 +159,17 @@ int64_t sys_cond_wait(ppu_context* ctx)
 {
     uint32_t cond_id    = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
+    { static int s_ow = -1; if (s_ow < 0) s_ow = getenv("PS3_COND_OBJ") ? 1 : 0;
+      if (s_ow && cond_id <= SYS_COND_MAX && g_cond_id_addr[cond_id]) {
+          uint32_t obj = g_cond_id_addr[cond_id] - 8;   /* {flag,mutex,cond,count} */
+          extern uint8_t* vm_base;
+          static int _n = 0;
+          if (_n++ < 12 && vm_base) {
+              const uint8_t* o = vm_base + obj;
+              fprintf(stderr, "[cond-obj] cond=%u obj=0x%08X:", cond_id, obj);
+              for (int k = 0; k < 16; k++) fprintf(stderr, " %02X", o[k]);
+              fputc(10, stderr);
+          } } }
     fprintf(stderr, "[WAIT] cond_wait(cond=%u timeout=%llu) tid=%llu lr=0x%08X\n", cond_id, (unsigned long long)timeout_us,
             (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
     /* YDKJ_THREADGATE: creating thread is blocking -> let gated workers run. */

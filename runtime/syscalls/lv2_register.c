@@ -661,6 +661,18 @@ static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea,
 int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
 {
     if (!getenv("RD_SPU_INTERP")) return 0;
+    /* Two callers reach here: an event-port send, which carries the frame's
+     * work descriptor in data2, and the blocking-receive path, which has none
+     * and passes 0. A worker started without a descriptor reads an empty inbox,
+     * takes the 0 as its descriptor EA and DMAs its results to the zero page --
+     * hundreds of thousands of 128-byte PUTs to EA 0 and no output anywhere.
+     * Remember the last descriptor seen per queue and reuse it when the
+     * receive path re-runs the same worker. */
+    static uint32_t last_work[64];
+    if (comp_queue < 64) {
+        if (work_ea) last_work[comp_queue] = work_ea;
+        else         work_ea = last_work[comp_queue];
+    }
     for (uint32_t i = 0; i < MAX_SPU_THREADS; i++) {
         spu_thread_t* t = &s_spu_threads[i];
         if (!t->in_use || t->connected_queue != comp_queue || !t->img_ea) continue;
@@ -669,7 +681,59 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
         uint32_t entry = spu_load_image_to_ls(t->img_ea, ls);
         fprintf(stderr, "[SPU-FRAME] tid=0x%X q=%u work=0x%08X -> re-run\n",
                 t->tid, comp_queue, work_ea);
-        spu_run_interp_job(ls, entry, t->args_ea, -1, t->tid, t->group_id, work_ea);
+        /* Seed the inbound mailbox with the work descriptor when we HAVE one.
+         * spu_run_interp_job treats 0 as "do not seed", so the blocking-receive
+         * dispatch -- which is called with no descriptor -- behaves exactly as
+         * before, while an event-port send delivers its real data2.
+         *
+         * This used to be gated behind RD_SPU_FRAME_MBOX and passed 0 either
+         * way, because force-seeding had made a worker spin. That spin was the
+         * seed being 0: the receive path calls us with work_ea = 0, the solver
+         * took that as its descriptor EA and DMA'd results to address 0 -- half
+         * a million PUTs into the zero page, no progress, and the fluid's vertex
+         * buffer left untouched. Seeding only a real descriptor keeps the
+         * completion handshake intact and gives the workers their input. */
+        /* RD_WORKDUMP=1: the work descriptor the PPU hands the worker. Its
+         * pointers are where the job DMAs from and to, so a job that writes
+         * only scratch is either reading the wrong descriptor or the descriptor
+         * does not name the buffer we expect. */
+        { static int _wd = -1; if (_wd < 0) _wd = getenv("RD_WORKDUMP") ? 1 : 0;
+          if (_wd && work_ea > 0x1000000u && vm_base) { static int _n = 0; if (_n++ < 3) {
+              fprintf(stderr, "[WORKDESC] tid=0x%X ea=0x%08X:%c", t->tid, work_ea, 10);
+              for (int r = 0; r < 16; r++) {
+                  fprintf(stderr, "  +0x%03X:", r * 16);
+                  for (int c = 0; c < 4; c++)
+                      fprintf(stderr, " %08X", vm_read_be32(work_ea + r*16 + c*4));
+                  fprintf(stderr, "%c", 10);
+              } } } }
+        { static int _wh = -1; if (_wh < 0) _wh = getenv("RD_WORKHDR") ? 1 : 0;
+          if (_wh && work_ea > 0x1000000u && vm_base) { static int _n = 0; if (_n++ < 40)
+              fprintf(stderr, "[WORKHDR] tid=0x%X ea=0x%08X w0=%u w1=%u f2=%g f3=%g%c",
+                      t->tid, work_ea, vm_read_be32(work_ea), vm_read_be32(work_ea+4),
+                      (double)*(const float*)&(const uint32_t){0}, 0.0, 10); }
+          if (_wh && work_ea > 0x1000000u && vm_base) { } }
+        { static int _sd = -1; if (_sd < 0) _sd = getenv("RD_SEEDDBG") ? 1 : 0;
+          if (_sd) { static int _n = 0; if (_n++ < 12)
+              fprintf(stderr, "[SPU-SEED] tid=0x%X entry=0x%05X args=0x%08X seed=0x%08X%c",
+                      t->tid, entry, t->args_ea, work_ea, 10); } }
+        /* Do NOT seed the inbound mailbox. It is the reply channel for the
+         * SPU's own sys_spu_thread_receive_event (stop 0x110) service, and the
+         * worker's spu_printf helper treats a non-empty inbox as EBUSY. The
+         * work descriptor reaches the SPU through that service instead. */
+        LARGE_INTEGER _t0, _t1, _fq; QueryPerformanceCounter(&_t0);
+        int32_t frc = spu_run_interp_job(ls, entry, t->args_ea, -1, t->tid, t->group_id,
+                                         getenv("RD_SPU_FRAME_MBOX") ? work_ea : 0u);
+        { static int _sp = -1; if (_sp < 0) _sp = getenv("SPU_SPEED") ? 1 : 0;
+          if (_sp) { QueryPerformanceCounter(&_t1); QueryPerformanceFrequency(&_fq);
+              extern uint64_t g_spu_interp_steps;
+              double sec = (double)(_t1.QuadPart - _t0.QuadPart) / (double)_fq.QuadPart;
+              static int _n = 0; if (_n++ < 20)
+                  fprintf(stderr, "[spu-speed] tid=0x%X %llu insns in %.3f s = %.1f M/s%c",
+                          t->tid, (unsigned long long)g_spu_interp_steps, sec,
+                          sec > 0 ? g_spu_interp_steps / sec / 1e6 : 0.0, 10); } }
+        { extern uint32_t g_spu_interp_last_pc; extern uint64_t g_spu_interp_steps;
+          fprintf(stderr, "[SPU-FRAME] tid=0x%X done (stop=0x%X, %llu insns, last pc=0x%05X)\n",
+                  t->tid, frc, (unsigned long long)g_spu_interp_steps, g_spu_interp_last_pc); }
         return 1;
     }
     return 0;
@@ -711,6 +775,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
      * group_join() blocks until all spawned host threads finish. */
     int spawned = 0;
     int instant = 0;
+    int nofb    = 0;   /* subset of `instant` that had no fallback at all */
     for (uint32_t i = 0; i < g->num_threads && i < 8; i++) {
         uint32_t idx = g->thread_indices[i];
         if (idx >= MAX_SPU_THREADS) continue;
@@ -728,7 +793,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         if (!fb) {
             t->exit_status = 0;
             t->running = 0;
-            instant++;
+            instant++; nofb++;
             continue;
         }
         t->fb_handler = fb;
@@ -777,8 +842,12 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         g->state = SPU_GROUP_STATE_STOPPED;
         g->cause = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
         g->exit_status = 0;
-        fprintf(stderr, "[SPU] group_start id=0x%X (no fallback for any of %u thread(s); instantly completed)\n",
-                id, g->num_threads);
+        /* `instant` counts BOTH no-fallback threads and threads that ran to
+         * completion synchronously (the interpreter path). Reporting "no
+         * fallback" whenever spawned==0 hid a perfectly working interpreted
+         * run -- say which it actually was. */
+        fprintf(stderr, "[SPU] group_start id=0x%X (%u thread(s), none spawned: %d ran synchronously, %d had no fallback)\n",
+                id, g->num_threads, instant - nofb, nofb);
     } else {
         fprintf(stderr, "[SPU] group_start id=0x%X (%d host threads running, %d instant)\n",
                 id, spawned, instant);
@@ -1046,6 +1115,9 @@ static void ydkj_spu_out_mbox_deliver(uint32_t group_id, uint32_t spu_id,
     spu_thread_t* t = spu_find_thread(spu_id);
     if (t && t->connected_queue) q = t->connected_queue;
     if (!q) { spu_group_t* g = spu_find_group(group_id); if (g) q = g->event_queue_id; }
+    { static int s_d = 0; if (getenv("YDKJ_MBOXTRACE") && s_d++ < 64)
+        fprintf(stderr, "[SPU->PPU] deliver? spu=0x%X intr=%d val=0x%08X q=%u (thread %s)\n",
+                spu_id, is_intr, value, q, t ? "found" : "MISSING"); }
     if (!q) return;
     /* SPURS SPU-event source convention: high word tags it as an SPU thread
      * event; data1 = the mailbox value. */
@@ -1122,6 +1194,35 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
     uint32_t ls_offset = (uint32_t)ctx->gpr[4];
     uint32_t value_ea  = (uint32_t)ctx->gpr[5];
     uint32_t type      = (uint32_t)ctx->gpr[6];
+    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_LSREAD_TRACE") ? 1 : 0;
+      static int n = 0;
+      if (s_t && n++ < 12)
+          { extern void ppu_guest_caller(char*, size_t);
+            char who[64]; ppu_guest_caller(who, sizeof who);
+            fprintf(stderr, "[spu-readls] tid=0x%08X off=0x%05X size=%u from %s\n",
+                    tid, ls_offset, type, who); } }
+    /* A SPURS job chain is polled by its CHAIN HANDLE, not an lv2 thread id.
+     * This is the SPU PRINTF service: it reads a pointer from local store and
+     * then walks a format string byte by byte (func_00250A8C). Without this
+     * the lookup fails outright and the title reports
+     * "failed to SPURS printf server". It is debug output, not the path any
+     * query result travels. */
+    { extern const uint8_t* spurs_job_ls_for_handle(uint32_t);
+      const uint8_t* jls = spurs_job_ls_for_handle(tid);
+      if (jls && value_ea && vm_base && ls_offset + type <= SPU_LS_SIZE) {
+          uint64_t v = 0;
+          for (uint32_t k = 0; k < type && k < 8; k++)
+              v = (v << 8) | jls[ls_offset + k];
+          for (int k = 0; k < 8; k++)
+              vm_base[value_ea + k] = (uint8_t)(v >> (56 - 8 * k));
+          { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_LSREAD_TRACE") ? 1 : 0;
+            static int n = 0;
+            if (s_t && n++ < 8)
+                fprintf(stderr, "[spu-readls] chain 0x%08X off=0x%05X -> 0x%llX\n",
+                        tid, ls_offset, (unsigned long long)v); }
+          ctx->gpr[3] = 0;
+          return 0;
+      } }
     spu_thread_t* t = spu_find_thread(tid);
     if (!t || !value_ea || !vm_base) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
@@ -1540,6 +1641,18 @@ int lv2_try_syscall(ppu_context* ctx)
      * why libsre asserts ESRCH in event_helper.c. Snapshot args BEFORE handler. */
     uint32_t _a3 = (uint32_t)ctx->gpr[3], _a4 = (uint32_t)ctx->gpr[4], _a5 = (uint32_t)ctx->gpr[5];
     ctx->gpr[3] = (uint64_t)h(ctx);
+    /* LV2_ERRDBG=1: every syscall that returns non-OK, deduped by (number,
+     * result). A guest that asserts on a result once per frame is easier to
+     * find from this side than by reading its lifted code. */
+    { static int _ed = -1; if (_ed < 0) _ed = getenv("LV2_ERRDBG") ? 1 : 0;
+      if (_ed && (int32_t)ctx->gpr[3] != 0) {
+          static uint64_t seen[64]; static int ns = 0;
+          uint64_t k = ((uint64_t)num << 32) | (uint32_t)ctx->gpr[3];
+          int f = 0; for (int i = 0; i < ns; i++) if (seen[i] == k) f = 1;
+          if (!f && ns < 64) { seen[ns++] = k;
+              fprintf(stderr, "[lv2err] syscall %u(r3=0x%08X r4=0x%08X r5=0x%08X)"
+                              " -> 0x%08X lr=0x%08X%c",
+                      num, _a3, _a4, _a5, (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr, 10); } } }
     if (getenv("YDKJ_GFXSCAN") && num >= 128 && num <= 141) {
         static int _e = 0; if (_e++ < 60)
             fprintf(stderr, "[EVT-SC] #%u(r3=0x%08X r4=0x%08X r5=0x%08X) -> 0x%08X lr=0x%08X\n",

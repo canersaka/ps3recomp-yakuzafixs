@@ -300,8 +300,24 @@ int64_t sys_semaphore_destroy(ppu_context* ctx)
  * r3 = sem_id
  * r4 = timeout_usec (0 = infinite)
  * -----------------------------------------------------------------------*/
+/* SEM_ERRDBG=1: report non-OK returns. PSGL's PlatformDevice asserts on one of
+ * these once per frame, and naming the failing call beats inferring it. */
+static int64_t sys_semaphore_wait_impl(ppu_context* ctx);
 int64_t sys_semaphore_wait(ppu_context* ctx)
 {
+    int64_t r = sys_semaphore_wait_impl(ctx);
+    static int d = -1; if (d < 0) d = getenv("SEM_ERRDBG") ? 1 : 0;
+    if (d && r) { static int n = 0; if (n++ < 12)
+        fprintf(stderr, "[sem] wait(sem=%u) -> %lld%c",
+                (unsigned)ctx->gpr[3], (long long)r, 10); }
+    return r;
+}
+static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
+{
+    { static int _d = -1; if (_d < 0) _d = getenv("SEM_WAITDBG") ? 1 : 0;
+      if (_d) { static int _n = 0; if (_n++ < 20)
+          fprintf(stderr, "[sem] wait(id=%u) tid=%llu%c", (unsigned)ctx->gpr[3],
+                  (unsigned long long)ctx->thread_id, 10); } }
     uint32_t sem_id     = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
     /* LBP_HLE_JOBDONE: the JobManagerWorker spins on sys_semaphore_wait/trywait
@@ -410,8 +426,13 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
-    if (!s->active)
+    if (!s->active) {
+        static int _n = 0; if (_n++ < 6)
+            fprintf(stderr, "[sem] post(id=%u) -> ESRCH: slot inactive"
+                            " (value=%d max=%d)%c",
+                    sem_id, s->value, s->max_value, 10);
         return (int64_t)(int32_t)CELL_ESRCH;
+    }
 
 #ifdef _WIN32
     EnterCriticalSection(&s->value_lock);

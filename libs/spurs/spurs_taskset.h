@@ -20,12 +20,17 @@
 
 #include <stdint.h>
 
-/* BE guest-memory accessors (defined in runtime/ppu/ppu_loader.cpp).
- * Signatures match runtime/ppu/ppu_memory.h (32-bit guest EA). */
-uint32_t vm_read32(uint32_t ea);
-uint64_t vm_read64(uint32_t ea);
-void     vm_write32(uint32_t ea, uint32_t v);
-void     vm_write64(uint32_t ea, uint64_t v);
+/* BE guest-memory accessors. Pull in the canonical definitions rather than
+ * re-declaring them here: ppu_memory.h defines this family `static inline`, and
+ * a preceding extern declaration gives them external linkage instead, so every
+ * translation unit including this header emitted its own vm_read32/vm_read64/
+ * vm_write32/vm_write64.
+ *
+ * That stayed invisible while no title linked both this and the loader's
+ * same-named (64-bit EA) family -- a static library only pulls in the objects
+ * it needs. Tokyo Jungle references SPURS, which drags cellSpurs.c in, and the
+ * link then failed with five duplicate symbols. */
+#include "../../runtime/ppu/ppu_memory.h"
 
 /* ---- CellSpursTaskset (main memory, 128-byte aligned) --------------------
  * The PM reads the task bitsets to pick a ready task and the TaskInfo array for

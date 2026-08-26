@@ -121,8 +121,9 @@ s32 cellSyncBarrierNotify(CellSyncBarrier* barrier)
 
 s32 cellSyncBarrierTryNotify(CellSyncBarrier* barrier)
 {
-    barrier = GUEST_PTR(barrier, CellSyncBarrier*);
-    /* Same as notify for this implementation */
+    /* Same as notify for this implementation. Forward the GUEST pointer as it
+     * arrived -- cellSyncBarrierNotify translates it, and translating here too
+     * added vm_base twice. */
     return cellSyncBarrierNotify(barrier);
 }
 
