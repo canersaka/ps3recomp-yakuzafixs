@@ -196,6 +196,27 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
  * r4 = pointer to sys_event_t in guest memory
  * r5 = timeout_usec (0 = infinite)
  * -----------------------------------------------------------------------*/
+void sys_event_queue_cancel_by_id(uint32_t queue_id)
+{
+    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return;
+    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
+    if (!q->active) return;
+
+#ifdef _WIN32
+    EnterCriticalSection(&q->lock);
+    q->cancelled = 1;
+    WakeAllConditionVariable(&q->not_empty);   /* every waiter, not one */
+    LeaveCriticalSection(&q->lock);
+#else
+    pthread_mutex_lock(&q->lock);
+    q->cancelled = 1;
+    pthread_cond_broadcast(&q->not_empty);
+    pthread_mutex_unlock(&q->lock);
+#endif
+    fprintf(stderr, "[evt] queue %u cancelled (producer gone) -- waiters released\n",
+            queue_id);
+}
+
 int64_t sys_event_queue_receive(ppu_context* ctx)
 {
     uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
@@ -350,8 +371,12 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     EnterCriticalSection(&q->lock);
 
     if (timeout_us == 0) {
-        while (q->count == 0 && q->active) {
+        while (q->count == 0 && q->active && !q->cancelled) {
             SleepConditionVariableCS(&q->not_empty, &q->lock, INFINITE);
+        }
+        if (q->count == 0 && q->cancelled) {
+            LeaveCriticalSection(&q->lock);
+            return (int64_t)(int32_t)CELL_ECANCELED;
         }
     } else if (timeout_us < 1000) {
         /* Sub-millisecond timeout = the title's non-blocking event poll (it polls
@@ -367,7 +392,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
     } else {
         DWORD ms = (DWORD)(timeout_us / 1000);
-        while (q->count == 0 && q->active) {
+        while (q->count == 0 && q->active && !q->cancelled) {
             if (!SleepConditionVariableCS(&q->not_empty, &q->lock, ms)) {
                 if (GetLastError() == ERROR_TIMEOUT) {
                     LeaveCriticalSection(&q->lock);
@@ -377,6 +402,10 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
     }
 
+    if (q->count == 0 && q->cancelled) {
+        LeaveCriticalSection(&q->lock);
+        return (int64_t)(int32_t)CELL_ECANCELED;
+    }
     if (!q->active || q->count == 0) {
         LeaveCriticalSection(&q->lock);
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -391,7 +420,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     pthread_mutex_lock(&q->lock);
 
     if (timeout_us == 0) {
-        while (q->count == 0 && q->active) {
+        while (q->count == 0 && q->active && !q->cancelled) {
             pthread_cond_wait(&q->not_empty, &q->lock);
         }
     } else {
@@ -403,7 +432,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
             ts.tv_sec++;
             ts.tv_nsec -= 1000000000L;
         }
-        while (q->count == 0 && q->active) {
+        while (q->count == 0 && q->active && !q->cancelled) {
             int rc = pthread_cond_timedwait(&q->not_empty, &q->lock, &ts);
             if (rc == ETIMEDOUT) {
                 pthread_mutex_unlock(&q->lock);
@@ -412,6 +441,10 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
     }
 
+    if (q->count == 0 && q->cancelled) {
+        pthread_mutex_unlock(&q->lock);
+        return (int64_t)(int32_t)CELL_ECANCELED;
+    }
     if (!q->active || q->count == 0) {
         pthread_mutex_unlock(&q->lock);
         return (int64_t)(int32_t)CELL_ESRCH;

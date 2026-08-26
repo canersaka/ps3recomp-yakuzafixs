@@ -59,6 +59,12 @@ typedef struct sys_event_queue_info {
     int          tail;
     int          count;
 
+    /* Set when the thing that feeds this queue is gone (SPURS finalize), so a
+     * receive can no longer possibly be satisfied. Blocked receivers are woken
+     * and return CELL_ECANCELED instead of waiting for an event that can never
+     * arrive; later receives fail the same way rather than re-blocking. */
+    int          cancelled;
+
 #ifdef _WIN32
     CRITICAL_SECTION lock;
     CONDITION_VARIABLE not_empty;
@@ -155,6 +161,12 @@ int sys_event_queue_push_by_id(uint32_t queue_id,
 
 /* Resolve an event queue by its ipc_key; returns queue_id (1-based) or 0. */
 uint32_t sys_event_find_queue_by_key(uint64_t key);
+
+/* Mark a queue as having no producer left and release anyone blocked on it.
+ * Used by cellSpursFinalize: after it, no job completion can ever arrive, and
+ * a worker parked on the completion queue with an infinite timeout would never
+ * wake to notice the shutdown its owner is waiting on. */
+void sys_event_queue_cancel_by_id(uint32_t queue_id);
 
 #ifdef __cplusplus
 }

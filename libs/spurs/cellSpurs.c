@@ -396,10 +396,26 @@ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
     return spurs_initialize_common(spurs_ea, attr->nSpus, (const char*)attr->prefix);
 }
 
+static void spurs_cancel_attached_queues(void);  /* defined with the queue table */
+
 s32 cellSpursFinalize(CellSpurs* spurs)
 {
     if (!spurs)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+
+    /* After this, no job completion can ever reach the attached queues, so a
+     * worker parked on one with an infinite timeout would sleep forever -- and
+     * the shutdown that called us then blocks in sys_ppu_thread_join waiting
+     * for that worker to notice it should quit. Tokyo Jungle wedges exactly
+     * there: "terminate audio thread (6)" then join(6), with tid 6 in
+     * event_queue_receive(q=3) and the title never rendering again. Releasing
+     * the waiters lets the receive fail, which is the path its loop already
+     * handles -- an error return leaves the loop and the thread exits.
+     *
+     * Done BEFORE the instance lookup: that lookup fails here, and a failed
+     * handle is no reason to strand a thread. */
+    spurs_cancel_attached_queues();
+
     struct SpursInst* si = spurs_inst_find((u32)(uintptr_t)spurs);
     if (!si)
         return CELL_SPURS_CORE_ERROR_STAT;
@@ -519,11 +535,22 @@ s32 cellSpursSetPriorities(CellSpurs* spurs, CellSpursWorkloadId wid,
  * A title may attach more than one (Tokyo Jungle attaches two), so keep them
  * all -- storing a single id let the second attach hide the first. */
 #define MAX_SPURS_QUEUES 8
-static u32 s_spurs_event_queue[MAX_SPURS_QUEUES];
-static int s_spurs_event_queue_n = 0;
 #define SPURS_EVENT_PORT 0u
 extern int sys_event_queue_push_by_id(uint32_t queue_id, uint64_t source,
                                       uint64_t data1, uint64_t data2, uint64_t data3);
+extern void sys_event_queue_cancel_by_id(uint32_t queue_id);
+
+static u32 s_spurs_event_queue[MAX_SPURS_QUEUES];
+static int s_spurs_event_queue_n = 0;
+
+/* Release anyone blocked on the completion queues SPURS attached; see
+ * cellSpursFinalize. */
+static void spurs_cancel_attached_queues(void)
+{
+    for (int i = 0; i < s_spurs_event_queue_n; i++)
+        sys_event_queue_cancel_by_id(s_spurs_event_queue[i]);
+    s_spurs_event_queue_n = 0;
+}
 
 s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port,
                                  s32 isDynamic)
