@@ -192,7 +192,13 @@ cmake -B build -DPS3_MODULE_MAX_FUNCS=1024
 
 ### macOS
 
-Similar to Linux. Use Xcode command-line tools or a standalone Clang installation.
+> **Not working yet.** The runtime library does not currently compile on arm64
+> macOS — reported with the full error list in
+> [#94](https://github.com/sp00nznet/ps3recomp/issues/94), which was correct:
+> the docs advertised support the code did not have. A fix and a macOS CI
+> workflow are in review ([#95](https://github.com/sp00nznet/ps3recomp/pull/95)),
+> along with a Metal backend ([#96](https://github.com/sp00nznet/ps3recomp/pull/96)).
+> Until those land, treat macOS as unsupported.
 
 ---
 
@@ -204,8 +210,8 @@ Similar to Linux. Use Xcode command-line tools or a standalone Clang installatio
 |----------|---------|----------|--------|
 | MSVC | 19.35+ (VS 2022) | Windows | Full support |
 | GCC | 12+ | Linux | Full support |
-| Clang | 14+ | Linux/macOS | Full support |
-| Apple Clang | 14+ (Xcode 14) | macOS | Full support |
+| Clang | 14+ | Linux | Full support |
+| Clang / Apple Clang | 14+ (Xcode 14) | macOS | **Not building** — see #94, fix in review (#95) |
 | MinGW-w64 | GCC 12+ | Windows | Supported |
 
 ### Required C17 Features

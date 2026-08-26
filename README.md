@@ -261,11 +261,13 @@ cd ps3recomp
 # Install Python tools
 pip install -r requirements.txt
 
-# Analyze a decrypted PS3 ELF
-python tools/elf_parser.py /path/to/EBOOT.ELF --output analysis/
+# Analyze a decrypted PS3 ELF (writes JSON to stdout -- redirect it)
+mkdir -p analysis
+python tools/elf_parser.py /path/to/EBOOT.ELF --all > analysis/elf_info.json
 
-# Disassemble PPU code
-python tools/ppu_disasm.py analysis/EBOOT.ELF --output disasm/
+# Find functions, then disassemble (ppu_disasm also writes to stdout)
+python tools/find_functions.py /path/to/EBOOT.ELF --output analysis/functions.json
+python tools/ppu_disasm.py /path/to/EBOOT.ELF --functions > disasm.txt
 
 # Lift to C
 python tools/ppu_lifter.py disasm/ --output recomp/
@@ -340,9 +342,57 @@ for who did what — thank you, everyone.
 ## Changelog
 
 ### Unreleased
-*Everything folded via `integrate/fold-2026-08-14` — [@sagemono](https://github.com/sagemono)'s
-guest-ABI HLE batch and SPU-lifter faithful adoption, plus
+
+*Two batches. First, `#92` — the guest-pointer sweep, a SPURS teardown fix, and
+making the logging stop lying. Then everything folded via
+`integrate/fold-2026-08-14` — [@sagemono](https://github.com/sagemono)'s guest-ABI
+HLE batch and SPU-lifter faithful adoption, plus
 [@canersaka](https://github.com/canersaka)'s guest-callback/lv2/ABI batch.*
+
+**The guest-pointer sweep — `libs/` is clean** (#92)
+- **304 → 0 candidates.** HLE entry points receive pointer arguments as raw
+  32-bit guest addresses, so dereferencing one reaches whatever host address
+  happens to share that number. The sweep found it was really *three* problems:
+  the address; the byte order (a scalar the guest reads back needs `vm_write*`,
+  not a bare store); and **layout** — a struct holding a pointer is 4 bytes per
+  field to the guest and 8 to us, so every field after it shifts, and a `u64`
+  cannot be moved word-at-a-time. Only the first is a translation.
+- `cellFont` is the case that shows why: `CellFontRenderSurface` and the glyph
+  structs lead with a host pointer, so casting a guest EA to them misplaced
+  *every* field and stored floats little-endian — a title reads a glyph advance
+  of `4.6e-41` and lays every string on top of itself.
+- **`cellGcmGetOffsetTable` handed the title two truncated host pointers** through
+  a struct whose guest form is two 4-byte fields. The host tables were always
+  correct; the bug was on the way out.
+- **`tools/audit_guest_ptrs.py`** finds the bug class, **`tools/audit_entry_calls.py`**
+  finds a library calling its own entry points (which double-translates — it
+  caught two live ones), and **`tools/test_audit_guest_ptrs.py`** pins the audit in
+  both directions, because the heuristic silently stopped matching three times
+  during the sweep and a clean report meant nothing until it was checked.
+- `libs/guest_struct.h` documents when the easy helpers do *not* apply.
+
+**Runtime**
+- **`sys_event`: release queue waiters when SPURS finalizes.** A title's worker
+  waits on the SPURS completion queue with an infinite timeout and only re-tests
+  its quit flag when a completion wakes it — but `cellSpursFinalize` has already
+  stopped the job chains, so none can arrive. The shutdown that called finalize
+  then blocks in `sys_ppu_thread_join` forever. Cancelling the attached queues
+  returns `CELL_ECANCELED` to the waiters, which is the path titles already
+  handle. Lifted again on re-attach, so teardown-then-setup works.
+- **Logging no longer changes what a title does.** `ps3_log_verbose()` treated a
+  non-tty stderr as "be verbose" with no way to say otherwise, so *capturing a
+  log turned the firehose on*; and the SPURS job path wrote two lines with an
+  explicit `fflush` per job — ~6k writes/s through one `FILE` lock, enough to
+  starve a guest thread for seconds. Tokyo Jungle presents four frames in 40 s
+  with the log discarded and one with it redirected to a file. `PS3_VERBOSE=0`
+  now decides, and the per-job pair is verbose-only.
+- **A wedged thread names itself.** `g_hle_inflight[tid]` and `g_sc_inflight[tid]`
+  record the HLE call and lv2 syscall each guest thread is *inside*. The
+  watchdog's `CTR` is the last `bctrl` target and goes stale the moment a call
+  returns — it named `sys_lwmutex_unlock` for a thread that had long since left
+  it. The write-watch also covers `ppu_memory.h`'s inline `vm_write*` now, so
+  "nothing writes this address" is a claim it can actually support.
+- clang-cl build repaired, two missed guest-call sites, and the dropped SPU park.
 
 **HLE & guest ABI**
 - **Guest-EA / big-endian out-param marshalling** across the HLE surface — `cellUserInfo`, trophy u64s, `cellGameGetParamInt` DISC type, open PSID, `cellRtc`, save-data user paths, `cellJpgDecDecodeData`, `cellPngDec`, and the `cellAudio` read index as a BE u64 — *[@sagemono](https://github.com/sagemono)* (#79, #81)

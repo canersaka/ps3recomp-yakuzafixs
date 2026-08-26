@@ -285,6 +285,27 @@ upstream:
   translation units now compile clean so downstream game projects get a Linux
   runtime to link against. (v0.6.1)
 
+### slushiimusic — [@slushiimusic](https://github.com/slushiimusic)
+*Submitted and under review — listed here because the work is real and the
+report was correct, not because it has landed yet.*
+- **macOS is not actually supported, and said so with receipts** (#94) — the
+  README advertised macOS while the runtime failed to compile on arm64 with 77
+  errors. Filed with the errors *and* a fix.
+- **arm64 macOS build + CI** (#95) — makes the runtime library compile on Apple
+  silicon and adds a macOS workflow so the claim stops drifting from reality.
+- **RSX → Metal backend, POSIX host, and the draw path** (#96) — a second
+  graphics backend beside D3D12, ~1,500 lines.
+
+### lilbeefaroni — [@lilbeefaroni](https://github.com/lilbeefaroni)
+- **Caught the porting guide documenting flags that do not exist** (#93) —
+  `elf_parser.py --output` / `--decrypt`. Both were wrong, and auditing every
+  documented command against its tool's real argument parser turned up four more
+  in the guide and two in the README. Fixed.
+
+### Filedownloader-tech — [@Filedownloader-tech](https://github.com/Filedownloader-tech)
+- **Build failure report with a full log** (#89) — the kind of report that can
+  actually be acted on.
+
 ---
 
 ## A note on AI-assisted contributions
