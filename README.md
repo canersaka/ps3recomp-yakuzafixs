@@ -341,13 +341,16 @@ for who did what — thank you, everyone.
 
 ## Changelog
 
-### Unreleased
+### v0.8.0 — *"Ground Truth"* (August 2026)
+<!-- TODO(maintainer): codename is a suggestion -- rename freely. -->
 
-*Two batches. First, `#92` — the guest-pointer sweep, a SPURS teardown fix, and
-making the logging stop lying. Then everything folded via
-`integrate/fold-2026-08-14` — [@sagemono](https://github.com/sagemono)'s guest-ABI
-HLE batch and SPU-lifter faithful adoption, plus
-[@canersaka](https://github.com/canersaka)'s guest-callback/lv2/ABI batch.*
+*A correctness release about the guest/host boundary, and about instrumentation
+that can support its own claims. Two batches: `#92` — the guest-pointer sweep,
+a SPURS teardown fix, and making the logging stop changing what titles do — and
+everything folded via `integrate/fold-2026-08-14`,
+[@sagemono](https://github.com/sagemono)'s guest-ABI HLE batch and SPU-lifter
+faithful adoption plus [@canersaka](https://github.com/canersaka)'s
+guest-callback/lv2/ABI batch.*
 
 **The guest-pointer sweep — `libs/` is clean** (#92)
 - **304 → 0 candidates.** HLE entry points receive pointer arguments as raw

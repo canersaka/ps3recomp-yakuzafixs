@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
+# Keep in step with the changelog in README.md -- this had sat at 0.3.0 since
+# March 2026 while the project shipped 0.6.1, 0.6.6, 0.6.7 and 0.7.0, so every
+# build printed "ps3recomp runtime v0.3.0" and was believed.
 project(ps3recomp_runtime
-    VERSION 0.3.0
+    VERSION 0.8.0
     LANGUAGES C CXX
     DESCRIPTION "ps3recomp - Static recompilation runtime for PS3 games"
 )
