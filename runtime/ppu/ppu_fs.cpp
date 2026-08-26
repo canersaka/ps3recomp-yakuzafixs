@@ -49,7 +49,8 @@ extern "C" const char* ppu_vfs_root = ".";
 
 /* CELL_FS return / mode / flag constants. */
 #define CELL_OK              0
-#define CELL_FS_ENOENT       (-2147418090)   /* 0x80010006 */
+#define CELL_FS_ENOENT       (-2147418106)   /* 0x80010006 -- was -2147418090, which is 0x80010016 = CELL_ENOTCONN, not ENOENT */
+#define CELL_FS_EISDIR       (-2147418094)   /* 0x80010012 */
 #define CELL_FS_EIO          (-2147418111)
 #define CELL_FS_S_IFDIR      0x4000u
 #define CELL_FS_S_IFREG      0x8000u
@@ -116,6 +117,23 @@ static void host_path(char* out, size_t cap, const char* guest)
     for (size_t i = 0; i < sizeof(mounts)/sizeof(mounts[0]); i++) {
         size_t n = strlen(mounts[i]);
         if (strncmp(guest, mounts[i], n) == 0) { rel = guest + n; break; }
+        /* Every mount above ends in '/', so a BARE device root never matched
+         * its own mount: "/dev_bdvd" is not a prefix-match for "/dev_bdvd/".
+         * It fell through to the strip-leading-slash case and resolved to
+         * <root>/dev_bdvd, which does not exist -- so a title that opendirs or
+         * stats the device to check the medium is present reads it as "no
+         * disc". YDKJ does exactly that, 27 times a boot, and consequently
+         * loaded none of its Scaleform UI or FMOD banks: no logos, no legal
+         * screen, just a clear colour.
+         *
+         * libs/filesystem/cellFs.c already carries this fix (Tokyo Jungle hit
+         * the same wall and retried forever); ppu_fs is the other half of the
+         * split filesystem and never got it. Map the bare root to the mount
+         * directory itself. */
+        if (n > 1 && strncmp(guest, mounts[i], n - 1) == 0 && guest[n - 1] == '\0') {
+            rel = guest + n - 1;   /* points at the NUL -> <root>/ */
+            break;
+        }
     }
     if (rel == guest && guest[0] == '/') rel = guest + 1;   /* strip leading '/' */
     snprintf(out, cap, "%s/%s", ppu_vfs_root, rel);
@@ -161,6 +179,19 @@ static void cellFsOpen(ppu_context* ctx)
     if (flags & CELL_FS_O_TRUNC)  oflags |= O_TRUNC;
     if (flags & CELL_FS_O_APPEND) oflags |= O_APPEND;
 
+    /* A bare device root ("/dev_bdvd") resolves to a DIRECTORY, and open() on a
+     * directory fails on Windows. Real cellFsOpen answers EISDIR there, and a
+     * title reads that as "the medium is mounted" -- YDKJ probes the disc this
+     * way before loading its Scaleform UI and FMOD banks, so the ENOENT it got
+     * instead read as "no disc" and it drew nothing but a clear colour.
+     * S_IFMT/S_IFDIR rather than S_ISDIR: MSVC's CRT does not define the macro. */
+    {
+        struct stat _dst;
+        if (stat(hpath, &_dst) == 0 && (_dst.st_mode & S_IFMT) == S_IFDIR) {
+            ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EISDIR;
+            return;
+        }
+    }
     int hfd = open(hpath, oflags | O_BINARY, 0666);
     if (hfd < 0) {
         fprintf(stderr, "[fs] open FAIL '%s' -> '%s'\n", gpath, hpath);
