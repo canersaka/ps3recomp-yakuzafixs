@@ -625,13 +625,36 @@ uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap(
  * any PPU store into [base+0x40, base+0xC0) is then logged with its guest
  * function, catching whoever bumps the per-SPU lane counters. */
 extern "C" uint32_t g_barrier_sync_watch = 0;
+
+/* Window for the INLINE write-watch in ppu_memory.h (libs/ stores). Same LBP_WW
+ * setting as below; kept as a pair so the inline check is two compares against
+ * zeros when the watch is off. */
+extern "C" uint32_t g_ww_lo = 0, g_ww_hi = 0;
+
+extern "C" void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width)
+{
+    static int n = 0;
+    if (n++ >= 64) return;
+    fprintf(stderr, "[ww-hle] 0x%08X <- 0x%llX (w%d) from an HLE (libs/)\n",
+            addr, (unsigned long long)val, width);
+    fflush(stderr);
+}
+
+/* Called once LBP_WW has been parsed, so both watches cover the same line. */
+static void ww_arm_inline_window(uint32_t ww)
+{
+    if (!ww) return;
+    g_ww_lo = ww & ~15u;
+    g_ww_hi = (ww & ~15u) + 0x20;
+}
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
     /* LBP_WW=<hexEA>: log every PPU store into the 16-byte line at that EA,
      * with the writing guest function -- to find who fills (or fails to fill)
      * a struct field (e.g. FMOD's overlay descriptor source at 0x94F680). */
     { static uint32_t s_ww = 0xFFFFFFFFu;
-      if (s_ww == 0xFFFFFFFFu) { const char* e = getenv("LBP_WW"); s_ww = e ? (uint32_t)strtoul(e,0,0) : 0; }
+      if (s_ww == 0xFFFFFFFFu) { const char* e = getenv("LBP_WW"); s_ww = e ? (uint32_t)strtoul(e,0,0) : 0;
+                                 ww_arm_inline_window(s_ww); }
       if (s_ww && a >= (s_ww & ~15u) && a < (s_ww & ~15u) + 0x20) {
           static int _n = 0;
           if (_n++ < 64) {

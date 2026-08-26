@@ -125,19 +125,45 @@ void        ppu_resv_break_store(uint64_t ea);
 }
 #endif
 
+/* ---------------------------------------------------------------------------
+ * Write-watch hook for the INLINE writers.
+ *
+ * LBP_WW (ppu_loader.cpp) logs stores to a watched address along with the guest
+ * function responsible. Recompiled guest code calls the extern vm_write* family
+ * there, so it is covered -- but everything in libs/ uses the inline family
+ * below, and those stores were invisible to it. That makes "nothing writes this
+ * address" a claim the watch cannot actually support, which is exactly the sort
+ * of thing worth not being wrong about: an HLE writing a zero looks identical
+ * to nobody writing at all.
+ *
+ * Cost is two compares against a pair that stay 0 unless LBP_WW is set, on the
+ * HLE path only -- guest stores never reach here.
+ * -----------------------------------------------------------------------*/
+extern uint32_t g_ww_lo, g_ww_hi;
+void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width);
+
+#define PS3_WW_CHECK(a, v, w)                                                 \
+    do {                                                                      \
+        if ((a) >= g_ww_lo && (a) < g_ww_hi)                                  \
+            ps3_ww_report_inline((uint32_t)(a), (uint64_t)(v), (w));          \
+    } while (0)
+
 static inline void vm_write8(uint32_t addr, uint8_t val)
 {
+    PS3_WW_CHECK(addr, val, 1);
     *vm_ptr8(addr) = val;
 }
 
 static inline void vm_write16(uint32_t addr, uint16_t val)
 {
+    PS3_WW_CHECK(addr, val, 2);
     uint16_t raw = ps3_bswap16(val);
     memcpy(vm_ptr8(addr), &raw, sizeof(raw));
 }
 
 static inline void vm_write32(uint32_t addr, uint32_t val)
 {
+    PS3_WW_CHECK(addr, val, 4);
     uint32_t raw = ps3_bswap32(val);
     memcpy(vm_ptr8(addr), &raw, sizeof(raw));
     if (g_resv_store_active > 0) ppu_resv_break_store(addr);
@@ -145,6 +171,7 @@ static inline void vm_write32(uint32_t addr, uint32_t val)
 
 static inline void vm_write64(uint32_t addr, uint64_t val)
 {
+    PS3_WW_CHECK(addr, val, 8);
     uint64_t raw = ps3_bswap64(val);
     memcpy(vm_ptr8(addr), &raw, sizeof(raw));
     if (g_resv_store_active > 0) ppu_resv_break_store(addr);
