@@ -2888,6 +2888,48 @@ class PPULifter:
         lines.append("")
         return lines
 
+    def _emit_functions(self) -> list["LiftedFunction"]:
+        """One definition per start address, widest extent wins.
+
+        A function list can carry the same start twice with different ends --
+        two discovery passes seed the same entry and one gets cut short at a
+        spurious boundary. Emitting both is a C redefinition error, so the file
+        never compiles; worse, silently keeping the shorter one drops real
+        instructions. libsre's 0x30001848 hit exactly that: the truncated copy
+        stopped after the compare and jumped to the next function, skipping the
+        `stdu r1,-0xB0(r1)` frame setup and six register saves, so anything that
+        ran it would corrupt the stack.
+
+        Widest extent wins because the short body is the truncation: its span
+        does not reach the next function's start, while the full one does.
+        """
+        best: dict[int, "LiftedFunction"] = {}
+        for f in self.functions:
+            cur = best.get(f.start_addr)
+            if cur is None or f.end_addr > cur.end_addr:
+                best[f.start_addr] = f
+        if len(best) == len(self.functions):
+            return list(self.functions)
+        out, seen = [], set()
+        for f in self.functions:
+            if f.start_addr in seen:
+                continue
+            seen.add(f.start_addr)
+            out.append(best[f.start_addr])
+        dropped = len(self.functions) - len(out)
+        sys.stderr.write(
+            f"[ppu_lifter] dropped {dropped} duplicate function definition(s); "
+            f"kept the widest extent for each\n")
+        by_addr: dict[int, list] = {}
+        for f in self.functions:
+            by_addr.setdefault(f.start_addr, []).append(f)
+        for a in sorted(a for a, v in by_addr.items() if len(v) > 1):
+            spans = ", ".join(f"0x{d.start_addr:08X}-0x{d.end_addr:08X}"
+                              for d in by_addr[a])
+            sys.stderr.write(f"[ppu_lifter]   0x{a:08X}: {spans} -> kept "
+                             f"0x{best[a].end_addr:08X} end\n")
+        return out
+
     def _function_def_lines(self, func, func_by_addr, sorted_addrs,
                             addr_index) -> list[str]:
         """C lines for one lifted function (body + fallthrough trampoline)."""
@@ -2940,12 +2982,13 @@ class PPULifter:
         the header). Emitted once, into the final chunk file."""
         lines: list[str] = []
         lines.append("/* Function table */")
+        funcs = self._emit_functions()
         lines.append(f"const func_entry {self.prefix}function_table[] = {{")
-        for func in self.functions:
+        for func in funcs:
             lines.append(f'    {{ 0x{func.start_addr:08X}ULL, {func.name}, "{func.name}" }},')
         lines.append("    { 0, NULL, NULL }")
         lines.append("};")
-        lines.append(f"const uint64_t {self.prefix}function_table_count = {len(self.functions)};")
+        lines.append(f"const uint64_t {self.prefix}function_table_count = {len(funcs)};")
         lines.append("")
         return lines
 
@@ -2953,11 +2996,12 @@ class PPULifter:
         """Full single-file C source (kept for small binaries and tests; the
         default build path uses write_source_files, which splits the output
         to stay under the MSVC source-line limit)."""
-        func_by_addr = {f.start_addr: f for f in self.functions}
+        emit_funcs = self._emit_functions()
+        func_by_addr = {f.start_addr: f for f in emit_funcs}
         sorted_addrs = sorted(func_by_addr.keys())
         addr_index = {a: i for i, a in enumerate(sorted_addrs)}
         lines = self._preamble_lines()
-        for func in self.functions:
+        for func in emit_funcs:
             lines += self._function_def_lines(func, func_by_addr, sorted_addrs, addr_index)
         lines += self._table_lines()
         return "\n".join(lines)
@@ -2969,7 +3013,8 @@ class PPULifter:
         single file; splitting also lets the build compile chunks in parallel
         and rebuild incrementally. Chunks are cut only at function
         boundaries. Returns the list of written paths."""
-        func_by_addr = {f.start_addr: f for f in self.functions}
+        emit_funcs = self._emit_functions()
+        func_by_addr = {f.start_addr: f for f in emit_funcs}
         sorted_addrs = sorted(func_by_addr.keys())
         addr_index = {a: i for i, a in enumerate(sorted_addrs)}
 
@@ -2990,8 +3035,8 @@ class PPULifter:
 
         cur: list[str] = []
         cur_len = len(preamble)
-        n = len(self.functions)
-        for i, func in enumerate(self.functions):
+        n = len(emit_funcs)
+        for i, func in enumerate(emit_funcs):
             if i % 10000 == 0:
                 print(f"  ... emitting {i}/{n} functions", flush=True)
             deflines = self._function_def_lines(func, func_by_addr, sorted_addrs, addr_index)
