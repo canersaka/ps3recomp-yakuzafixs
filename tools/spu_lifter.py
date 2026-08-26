@@ -453,6 +453,17 @@ class SPULifter:
         # Symbol prefix for all emitted spu_func_* / spu_recomp_register symbols.
         # Lets multiple lifted SPU images link into one binary without collisions
         # (every image otherwise exports spu_func_00000090 etc.). Empty = legacy.
+        # A prefix that does not end in "_" still concatenates, but silently
+        # yields symbols that violate the documented contract: "libsre" gives
+        # libsrefunc_XXXX and libsrefunction_table, so an integration TU
+        # declaring the documented libsre_function_table links against nothing.
+        # YDKJ lost its real-libsre boot path to exactly that. Normalise, and
+        # say so rather than fixing it up in silence.
+        if prefix and not prefix.endswith("_"):
+            sys.stderr.write(
+                f"[spu_lifter] symbol prefix {prefix!r} has no trailing "
+                f"underscore; using {prefix + chr(95)!r}"+chr(10))
+            prefix += "_"
         self.prefix = prefix
         # Addresses of `bi/biz/... $r0` that are COMPUTED TAIL JUMPS (r0 reloaded
         # via lqa/lqr), not function returns -- see compute_bi_r0_jumps(). Empty

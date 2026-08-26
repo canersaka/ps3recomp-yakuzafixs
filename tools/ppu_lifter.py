@@ -477,6 +477,17 @@ class PPULifter:
         # title without func_XXXXXXXX / function_table collisions. Shared types
         # (ppu_context, func_entry) stay unprefixed — integration TUs declare
         # the prefixed table extern manually rather than including two headers.
+        # A prefix that does not end in "_" still concatenates, but silently
+        # yields symbols that violate the documented contract: "libsre" gives
+        # libsrefunc_XXXX and libsrefunction_table, so an integration TU
+        # declaring the documented libsre_function_table links against nothing.
+        # YDKJ lost its real-libsre boot path to exactly that. Normalise, and
+        # say so rather than fixing it up in silence.
+        if prefix and not prefix.endswith("_"):
+            sys.stderr.write(
+                f"[ppu_lifter] symbol prefix {prefix!r} has no trailing "
+                f"underscore; using {prefix + chr(95)!r}"+chr(10))
+            prefix += "_"
         self.prefix = prefix
         # Cache for _range_insns: (instructions, len, ordered, addrs). Keyed by
         # the instruction-list identity so the FULL list (mid-function / serial

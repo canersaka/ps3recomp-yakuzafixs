@@ -55,7 +55,21 @@ def main() -> int:
     ]
     assert len(lf._emit_functions()) == 2
 
-    print("ok: truncated duplicate dropped, widest extent kept, order preserved")
+    # --- symbol prefix must be normalised to end in "_" -------------------
+    # "libsre" concatenates to libsrefunc_XXXX / libsrefunction_table, which
+    # links against nothing when the integration TU declares the documented
+    # libsre_function_table. YDKJ's real-libsre boot path died on this.
+    from spu_lifter import SPULifter  # noqa: E402
+    for cls, kw in ((PPULifter, {}), (SPULifter, {})):
+        assert cls(prefix="libsre", **kw).prefix == "libsre_", (
+            f"{cls.__name__} left a prefix without a trailing underscore")
+        assert cls(prefix="libsre_", **kw).prefix == "libsre_", (
+            f"{cls.__name__} double-appended the underscore")
+        assert cls(prefix="", **kw).prefix == "", (
+            f"{cls.__name__} invented a prefix from an empty one")
+
+    print("ok: truncated duplicate dropped, widest extent kept, order "
+          "preserved, symbol prefix normalised")
     return 0
 
 
