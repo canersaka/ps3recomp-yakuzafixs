@@ -769,6 +769,45 @@ void spu_register_function(uint32_t addr, spu_fn fn)
     }
 }
 
+/* Report a CROSS-IMAGE match: the registry served a function some other image
+ * registered at this address, because one side's image_id was the 0 wildcard.
+ *
+ * This is a real hazard, reported with evidence by @canersaka (#59): SPURS job
+ * chains load job binaries into descriptor-assigned LS slots, so the same binary
+ * can sit at different addresses on different rounds. If the lift was fixed-base
+ * and the exact match misses, the wildcard can serve ANOTHER image's function at
+ * that address -- the job then runs the wrong program end to end, returns
+ * cleanly, and the only symptom is something three layers downstream that never
+ * happens. Their words: one log line would have saved a day.
+ *
+ * Logging, not refusing. Refusing the wildcard outright was measured and does
+ * NOT survive contact: a dormant task image can register spans overlapping the
+ * resident kernel's low LS range, so a legitimate service-to-kernel yield gets
+ * falsely rejected. Telling resident from dormant needs residency tracking the
+ * registry does not have. So this reports and keeps going.
+ *
+ * Deduped per (addr, from, to): spu_lookup runs millions of times a second, and
+ * a substitution that repeats every dispatch would bury the log it is meant to
+ * make readable. */
+static void spu_report_cross_image(uint32_t addr, int want, int got)
+{
+    enum { SEEN_MAX = 64 };
+    static struct { uint32_t addr; int want, got; } seen[SEEN_MAX];
+    static unsigned n_seen = 0;
+    for (unsigned i = 0; i < n_seen; i++)
+        if (seen[i].addr == addr && seen[i].want == want && seen[i].got == got)
+            return;
+    if (n_seen < SEEN_MAX) {
+        seen[n_seen].addr = addr; seen[n_seen].want = want; seen[n_seen].got = got;
+        n_seen++;
+    }
+    fprintf(stderr,
+            "[spu] CROSS-IMAGE dispatch: LS 0x%05X requested by image %d, served "
+            "by image %d's function (id-0 wildcard). If this job was loaded at a "
+            "runtime-chosen base, it may be running the WRONG program -- see "
+            "issue #59.\n", addr, want, got);
+}
+
 spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-path dispatch (spu_dispatch_mt.c) needs it */
 {
     /* Match the context's active image; image_id 0 (context or entry) matches
@@ -776,8 +815,12 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
     for (uint32_t n = s_hash_head[spu_fn_hash(addr)]; n; n = s_hash_next[n - 1]) {
         const spu_reg_entry* e = &s_registry[n - 1];
         if (e->addr == addr &&
-            (image_id == 0 || e->image_id == 0 || e->image_id == image_id))
+            (image_id == 0 || e->image_id == 0 || e->image_id == image_id)) {
+            /* One compare on the return path; the report itself is rare. */
+            if (e->image_id != image_id)
+                spu_report_cross_image(addr, image_id, e->image_id);
             return e->fn;
+        }
     }
     return NULL;
 }
