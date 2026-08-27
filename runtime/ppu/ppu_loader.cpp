@@ -344,6 +344,17 @@ static LONG WINAPI ppu_guard_veh(EXCEPTION_POINTERS* ep)
               if (_z++ < 3) {
                   fprintf(stderr, "[GUARD] CLEARED 0x%08X: 0x%08X -> 0\n",
                           s_guard_ea, s_guard_pre);
+                  /* The guard fires INSIDE the clearing routine, so the live guest
+                   * context still holds its arguments: for a memset that is
+                   * (dst, value, length) in r3/r4/r5. That is the range being
+                   * zeroed, which is the whole question here. */
+                  if (g_active_ctx) {
+                      fprintf(stderr, "[GUARD]   live ctx r3=0x%08X r4=0x%08X r5=0x%08X"
+                                      " r6=0x%08X r30=0x%08X r31=0x%08X\n",
+                              (uint32_t)g_active_ctx->gpr[3], (uint32_t)g_active_ctx->gpr[4],
+                              (uint32_t)g_active_ctx->gpr[5], (uint32_t)g_active_ctx->gpr[6],
+                              (uint32_t)g_active_ctx->gpr[30], (uint32_t)g_active_ctx->gpr[31]);
+                  }
                   fflush(stderr);
                   ppu_guest_callstack("guard-zeroed");
               }
@@ -356,6 +367,10 @@ static LONG WINAPI ppu_guard_veh(EXCEPTION_POINTERS* ep)
 }
 extern "C" void ppu_guard_page(uint32_t guest_ea)
 {
+    /* PPU_GUARD_EA=<hex> arms this page directly, with no dependency on a store
+     * watch firing first -- needed to probe a page the guest clears but never
+     * meaningfully sets, e.g. to measure how far a block clear actually runs. */
+
     if (!vm_base || s_guard_page) return;
     s_guard_ea   = guest_ea;
     s_guard_page = ((uintptr_t)vm_base + guest_ea) & ~(uintptr_t)0xFFF;
@@ -1701,6 +1716,14 @@ extern "C" uint32_t g_sc_inflight[PS3_SC_INFLIGHT_MAX] = { 0 };
 
 extern "C" void lv2_syscall(ppu_context* ctx)
 {
+    /* One-shot: PPU_GUARD_EA=<hex> arms the page guard on that address without
+     * waiting for a store watch to fire. Armed here because lv2_syscall runs
+     * early and unconditionally; used to measure how far a guest block clear
+     * actually runs by guarding the page past its expected end. */
+    { static int _ge = 0;
+      if (!_ge) { _ge = 1;
+          const char* e = getenv("PPU_GUARD_EA");
+          if (e && *e) ppu_guard_page((uint32_t)strtoul(e, 0, 16)); } }
     uint64_t num = ctx->gpr[11];
 
     /* Which lv2 syscall each guest thread is currently INSIDE, by thread_id.
