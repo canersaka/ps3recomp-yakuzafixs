@@ -306,14 +306,29 @@ void spu_depth_guard(spu_context* ctx)
         const char* e = getenv("SPU_HOST_DEPTH_MAX");
         s_max = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
     }
+
+    /* Ring of recent drain sites. When the depth trips, the useful question is
+     * not "where are we" but "what cycle got us here" -- one pc names a point,
+     * a ring names the loop. */
+    enum { RING = 24 };
+    static uint32_t s_ring[RING];
+    static uint32_t s_n;
+    s_ring[s_n % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
+    s_n++;
+
     if (ctx->host_depth < s_max) return;
     static int s_reported = 0;
-    if (s_reported < 4) {
+    if (s_reported < 1) {   /* one report: five SPU threads all trip together */
         s_reported++;
         fprintf(stderr, "[spu-depth] img=%d pc=0x%05X lr=0x%05X host_depth=%u"
                         " -- lifted call recursion, halting the SPU\n",
                 ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
                 ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->host_depth);
+        fprintf(stderr, "[spu-depth] recent drain sites (oldest first):");
+        uint32_t start = (s_n > RING) ? (s_n - RING) : 0;
+        for (uint32_t k = start; k < s_n; k++)
+            fprintf(stderr, " %05X", s_ring[k % RING]);
+        fprintf(stderr, "\n");
         fflush(stderr);
     }
     { extern void spu_halt(spu_context*); spu_halt(ctx); }
