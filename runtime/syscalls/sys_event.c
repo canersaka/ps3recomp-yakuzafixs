@@ -116,6 +116,20 @@ uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size)
     q->key      = key;
     q->capacity = size;
     q->type     = SYS_PPU_QUEUE;
+
+    /* The waiter primitives MUST be initialised here too. memset+fields is
+     * not enough: a zeroed CRITICAL_SECTION is not a valid one, and the
+     * first EnterCriticalSection on it faults writing near offset 0x24 of a
+     * null internal pointer -- which is exactly how YDKJ's FMOD audio thread
+     * died the moment it was finally given a real queue to block on. */
+#ifdef _WIN32
+    InitializeCriticalSection(&q->lock);
+    InitializeConditionVariable(&q->not_empty);
+#else
+    pthread_mutex_init(&q->lock, NULL);
+    pthread_cond_init(&q->not_empty, NULL);
+#endif
+
     evt_table_unlock();
 
     fprintf(stderr, "[evt] queue_create_direct -> id=%d key=0x%llX size=%d\n",
