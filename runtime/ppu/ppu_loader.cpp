@@ -1573,6 +1573,12 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
                   uintptr_t h=(uintptr_t)function_table[k].func;
                   if(h<=tgt && h>bestHost){ bestHost=h; bestGuest=function_table[k].addr; }
               }
+              /* Same bound as the watchdog: an offset larger than any real lifted
+               * function means the address is not in lifted code at all, and the
+               * "nearest symbol below" answer is worse than admitting ignorance.
+               * Unbounded, this printed confident wrong frames (func_0070A69C+0x86C
+               * for a host CRT address) that cost real debugging time. */
+              if(bestGuest && tgt-bestHost > 0x10000u) bestGuest=0;
               if(bestGuest) gp+=snprintf(gl+gp,sizeof(gl)-gp," func_%08X+0x%llX",bestGuest,(unsigned long long)(tgt-bestHost));
               else gp+=snprintf(gl+gp,sizeof(gl)-gp," ?");
           }

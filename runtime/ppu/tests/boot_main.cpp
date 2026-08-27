@@ -393,9 +393,37 @@ static void dump_threads(const char* label, HMODULE self)
                                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                            (LPCSTR)v, &mm);
                         if (mm == self) {
-                            fprintf(stderr, "[WATCHDOG]       tid %5lu ret rva=0x%llX\n",
+                            /* Resolve to the guest function containing this return
+                             * address: the function_table entry with the largest host
+                             * pointer <= it. A raw RVA needs symbols a release build
+                             * does not have, and "ret rva=0x519F66" says nothing about
+                             * where a hung title actually is. Same mapping the
+                             * unresolved-call dump uses. */
+                            uint32_t bestGuest = 0;
+                            uintptr_t bestHost = 0, nextHost = 0, maxHost = 0;
+                            for (uint64_t q = 0; q < function_table_count; q++) {
+                                uintptr_t h = (uintptr_t)function_table[q].func;
+                                if (h > maxHost) maxHost = h;
+                                if (h <= (uintptr_t)v && h > bestHost) {
+                                    bestHost = h; bestGuest = function_table[q].addr;
+                                }
+                            }
+                            for (uint64_t q = 0; q < function_table_count; q++) {
+                                uintptr_t h = (uintptr_t)function_table[q].func;
+                                if (h > bestHost && (nextHost == 0 || h < nextHost)) nextHost = h;
+                            }
+                            /* The highest-addressed lifted function has no next, so its
+                             * extent is unknown -- and EVERY runtime/CRT address above it
+                             * was attributed to it. Refuse to guess there. A confident
+                             * wrong frame is worse than no frame. */
+                            if (bestHost == maxHost ||
+                                (uintptr_t)v - bestHost > 0x4000u) bestGuest = 0;
+                            fprintf(stderr, bestGuest
+                                    ? "[WATCHDOG]       tid %5lu ret rva=0x%llX  func_%08X+0x%llX\n"
+                                    : "[WATCHDOG]       tid %5lu ret rva=0x%llX\n",
                                     (unsigned long)te.th32ThreadID,
-                                    (unsigned long long)(v - (uint64_t)self));
+                                    (unsigned long long)(v - (uint64_t)self),
+                                    bestGuest, (unsigned long long)((uintptr_t)v - bestHost));
                             found++;
                         }
                     }
