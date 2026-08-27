@@ -710,9 +710,17 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
              * u64 pref-doubleword: bytes0-3=0, bytes4-7=0x0F000000 -> _u32[0]=0,
              * _u32[1]=EA. Gated (default on with CRI_CHAIN unless YDKJ_NO_CRI_R4). */
             if (!getenv("YDKJ_NO_CRI_R4")) {
+                /* Use libsre's REAL taskset when we have one. 0x0F000000 was a
+                 * fabricated struct from when cellSpursCreateTask was a no-op;
+                 * handing the policy that address makes it walk a taskset with
+                 * no real task in it. */
+                extern uint32_t g_ydkj_real_taskset_ea;
+                uint32_t _ts = g_ydkj_real_taskset_ea ? g_ydkj_real_taskset_ea
+                                                      : 0x0F000000u;
                 spu->gpr[4]._u32[0] = 0x00000000u;
-                spu->gpr[4]._u32[1] = 0x0F000000u;   /* taskset EA (matches CRI_CHAIN TSEA) */
-                fprintf(stderr, "[cri-chain] injected r4 = taskset EA 0x0F000000 (-> ctxt->taskset @LS 0x27B8)\n");
+                spu->gpr[4]._u32[1] = _ts;
+                fprintf(stderr, "[cri-chain] injected r4 = taskset EA 0x%08X (%s)\n",
+                        _ts, g_ydkj_real_taskset_ea ? "real" : "synthetic");
             }
             fflush(stderr);
         }
