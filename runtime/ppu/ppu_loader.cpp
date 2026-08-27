@@ -296,6 +296,11 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
 #ifdef _WIN32
 static volatile uintptr_t s_guard_page = 0;   /* host base of the guarded 4KB page */
 static volatile uint32_t  s_guard_ea   = 0;   /* guest ea being watched */
+/* Defined later in this file with C linkage; the guard handler needs it, and a
+ * block-scope plain declaration would mangle as C++ and fail to link. */
+extern "C" void ppu_guest_callstack(const char* tag);
+
+static uint32_t s_guard_pre = 0;
 static LONG WINAPI ppu_guard_veh(EXCEPTION_POINTERS* ep)
 {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
@@ -305,14 +310,44 @@ static LONG WINAPI ppu_guard_veh(EXCEPTION_POINTERS* ep)
         if (tgt >= s_guard_page && tgt < s_guard_page + 0x1000) {
             uint32_t guest = (uint32_t)(tgt - (uintptr_t)vm_base);
             char* mbase = (char*)GetModuleHandleA(NULL);
-            fprintf(stderr, "[GUARD] WRITE guest=0x%08X from RIP rva=0x%llX%s\n", guest, (unsigned long long)((char*)ep->ContextRecord->Rip - mbase), (guest == s_guard_ea) ? "  <<< watched addr!" : "");
+            { extern uint32_t ppu_prof_resolve_host(void*);
+              uint32_t gfn = ppu_prof_resolve_host((void*)ep->ContextRecord->Rip);
+              fprintf(stderr, "[GUARD] WRITE guest=0x%08X from RIP rva=0x%llX guest-fn=0x%08X%s\n",
+                      guest, (unsigned long long)((char*)ep->ContextRecord->Rip - mbase), gfn,
+                      (guest == s_guard_ea) ? "  <<< watched addr!" : ""); }
+            /* On the watched word specifically, dump the guest call stack: with a
+             * memset-style clear the writer is always the same memcpy body, and
+             * the only useful question is WHO called it. */
+            /* Same 32-byte line, not the exact word: a dcbz-style block clear
+             * reports the LINE BASE as the faulting address, so an exact match
+             * misses precisely the writer we are hunting. */
+            if ((guest & ~31u) == (s_guard_ea & ~31u)) {
+                static int _cs = 0;
+                if (_cs++ < 6) {
+                    ppu_guest_callstack("guard-clear");
+                }
+            }
             fflush(stderr);
+            /* Remember the watched word before letting the write through, so the
+             * single-step below can report a non-zero -> zero transition and name
+             * exactly who cleared it. */
+            s_guard_pre = __builtin_bswap32(*(volatile uint32_t*)(vm_base + s_guard_ea));
             DWORD old; VirtualProtect((void*)s_guard_page, 0x1000, PAGE_READWRITE, &old);
             ep->ContextRecord->EFlags |= 0x100;   /* single-step to re-arm after the write */
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
     if (code == EXCEPTION_SINGLE_STEP && s_guard_page) {
+        { uint32_t nowv = __builtin_bswap32(*(volatile uint32_t*)(vm_base + s_guard_ea));
+          if (s_guard_pre && !nowv) {
+              static int _z = 0;
+              if (_z++ < 3) {
+                  fprintf(stderr, "[GUARD] CLEARED 0x%08X: 0x%08X -> 0\n",
+                          s_guard_ea, s_guard_pre);
+                  fflush(stderr);
+                  ppu_guest_callstack("guard-zeroed");
+              }
+          } }
         DWORD old; VirtualProtect((void*)s_guard_page, 0x1000, PAGE_READONLY, &old);
         ep->ContextRecord->EFlags &= ~0x100u;
         return EXCEPTION_CONTINUE_EXECUTION;
@@ -670,6 +705,20 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
                       s_wwlen = e2 ? (uint32_t)strtoul(e2,0,0) : 0x20;
                       if (s_wwlen < 0x20) s_wwlen = 0x20; }
       if (s_ww && a >= (s_ww & ~15u) && a < (s_ww & ~15u) + s_wwlen) {
+          /* PPU_WW_GUARD=1: once the watched word is first SET, page-guard it.
+           * The store watch only sees lifted guest stores -- a host-side memset
+           * or an atomic clears a field invisibly. flOw loses its render config
+           * exactly that way: written 0x00C03D8C, reads back 0, no store in
+           * between. A page guard catches the writer whatever it is. */
+          { static int _g = -1;
+            if (_g < 0) { const char* e3 = getenv("PPU_WW_GUARD"); _g = e3 ? 1 : 0; }
+            if (_g && v && a == s_ww) {
+                static int _armed = 0;
+                if (!_armed) { _armed = 1;
+                    fprintf(stderr, "[GUARD] arming after first set of 0x%08X = 0x%X\n", a, v);
+                    ppu_guard_page(a); }
+            } }
+
           static int _n = 0;
           if (_n++ < 64) {
               fprintf(stderr, "[ww] 0x%08X <- 0x%X (w%d) guest-fn=0x%08X\n",
