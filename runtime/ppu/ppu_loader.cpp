@@ -1209,10 +1209,68 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
       if (only_r5 >= 0 && (int64_t)(int32_t)ctx->gpr[5] != only_r5) { /* skip */ } else
       if (only_lr >= 0 && (uint32_t)ctx->lr != (uint32_t)only_lr) { /* skip */ } else
       if(ctr_n>0){ ctr_n--;
-        fprintf(stderr,"[CALL] -> 0x%08X r3=0x%08X r4=0x%08X r5=%lld tid=%llu\n",
+        /* Name the CALLER too: for an indirect call the interesting question
+         * is usually who dispatched it, not just where it landed. flOw calls
+         * setScreenRenderTarget(this, NULL) exactly once and the caller is the
+         * only way to find where that null config came from. */
+        char _fromw[64]; ppu_guest_caller(_fromw, sizeof _fromw);
+        fprintf(stderr,"[CALL] -> 0x%08X r3=0x%08X r4=0x%08X r5=%lld lr=0x%08X from=%s tid=%llu\n",
                 addr,(uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],
-                (long long)(int32_t)ctx->gpr[5],
-                (unsigned long long)ctx->thread_id); } }
+                (long long)(int32_t)ctx->gpr[5], (uint32_t)ctx->lr, _fromw,
+                (unsigned long long)ctx->thread_id);
+        /* r28-r31 usually hold the caller's object pointers; for a virtual
+         * call with a null argument they are the only handle on WHICH object
+         * supplied it. */
+        fprintf(stderr,"[CALL]    r28=0x%08X r29=0x%08X r30=0x%08X r31=0x%08X\n",
+                (uint32_t)ctx->gpr[28],(uint32_t)ctx->gpr[29],
+                (uint32_t)ctx->gpr[30],(uint32_t)ctx->gpr[31]); } }
+      /* FLOW_FORCE_RTCFG=1: flOw calls PCoreGcmRenderInterface::
+       * setScreenRenderTarget(this, config) exactly once, with config = NULL,
+       * and every later setScreenRenderTargetInternal() then reports "No
+       * config" and issues no draw calls. The config object DOES exist by then:
+       * func_000CFC8C writes it to r29+0x18F4 (0x10167A74 -> 0x00C03D8C),
+       * verified with a write-watch, BEFORE this call happens. The caller just
+       * does not deliver it.
+       *
+       * A probe, not a fix: pass the config the object already holds and see
+       * whether the engine then binds a screen target and draws. Scoped to the
+       * exact call (target + null arg) so nothing else can be affected. */
+      if (addr == 0x000DBD84u && (uint32_t)ctx->gpr[4] == 0 && vm_base) {
+          static int _ff = -1;
+          static uint32_t _fixed = 0;
+          if (_ff < 0) { const char* e = getenv("FLOW_FORCE_RTCFG");
+                         _ff = e ? 1 : 0;
+                         /* A hex value supplies the config EXPLICITLY, for when
+                          * the object field has been cleared by a path the write-
+                          * watch cannot see (host memset / atomic). */
+                         if (e && (e[0] == (char)48) && (e[1] == (char)120))
+                             _fixed = (uint32_t)strtoul(e, 0, 16); }
+          if (_ff) {
+              uint32_t obj = (uint32_t)ctx->gpr[29];
+              uint32_t cfg = obj ? __builtin_bswap32(*(volatile uint32_t*)(vm_base + obj + 0x18F4)) : 0;
+              fprintf(stderr, "[FLOW-RTCFG] obj=0x%08X read cfg=0x%08X\n", obj, cfg);
+              /* Whole-object dump: distinguishes a targeted store from a memset
+               * of the live object -- the watch cannot see host-side writes. */
+              { char b[256]; int m = 0;
+                m += snprintf(b+m, sizeof b-m, "[FLOW-RTCFG] obj+0x18E0..0x1900:");
+                for (int i = 0; i < 8; i++) {
+                    uint32_t w = __builtin_bswap32(*(volatile uint32_t*)(vm_base + obj + 0x18E0 + i*4));
+                    m += snprintf(b+m, sizeof b-m, " %08X", w);
+                }
+                snprintf(b+m, sizeof b-m, "\n"); fputs(b, stderr); fflush(stderr); }
+              fflush(stderr);
+              if (!cfg && _fixed) {
+                  cfg = _fixed;
+                  fprintf(stderr, "[FLOW-RTCFG] field was 0; using supplied 0x%08X\n", cfg);
+              }
+              if (cfg) {
+                  fprintf(stderr, "[FLOW-RTCFG] supplying config 0x%08X (from 0x%08X+0x18F4)\n",
+                          cfg, obj);
+                  fflush(stderr);
+                  ctx->gpr[4] = cfg;
+              }
+          }
+      }
       skip_calltrace: ;
     /* Null / return-to-OS sentinel: a bctr to address 0 means the guest
      * unwound to the initial frame (or a not-yet-populated function pointer).
