@@ -162,6 +162,10 @@ int sys_event_queue_push_by_id(uint32_t queue_id,
 /* Resolve an event queue by its ipc_key; returns queue_id (1-based) or 0. */
 uint32_t sys_event_find_queue_by_key(uint64_t key);
 
+/* Create a queue without a guest context (for HLE libs that must hand the
+ * game a queue id, e.g. cellAudioCreateNotifyEventQueue). 0 = table full. */
+uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
+
 /* Mark a queue as having no producer left and release anyone blocked on it.
  * Used by cellSpursFinalize: after it, no job completion can ever arrive, and
  * a worker parked on the completion queue with an infinite timeout would never

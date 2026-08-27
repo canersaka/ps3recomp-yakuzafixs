@@ -28,6 +28,7 @@ extern int      sys_event_queue_push_by_id(uint32_t queue_id,
                                             uint64_t source, uint64_t data1,
                                             uint64_t data2,  uint64_t data3);
 extern uint32_t sys_event_find_queue_by_key(uint64_t key);
+extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
 
 /* ---------------------------------------------------------------------------
  * Backend selection
@@ -804,6 +805,59 @@ s32 cellAudioPortStop(u32 portNum)
     s_ports[portNum].running = 0;
     mutex_unlock(&s_audio_mutex);
 
+    return CELL_OK;
+}
+
+/* cellAudioCreateNotifyEventQueue(sys_event_queue_t* id, u64* key)
+ *
+ * Creates the queue the game will block on for audio-period events, and
+ * registers it for notification in one step -- the game never calls
+ * SetNotifyEventQueue for this one.
+ *
+ * This was missing entirely. YDKJ imports it, got the unimplemented-NID path,
+ * and then blocked on an id nothing had created: sys_event_queue_receive
+ * answered CELL_ESRCH every time and the title logged 1.7 MILLION
+ * "ERROR - LIBAUDIO DROPOUT" lines in a 60 s run.
+ *
+ * Both params are GUEST addresses and both are big-endian out-values; the id
+ * is 32-bit and the key 64-bit, so they cannot be written with a plain store. */
+s32 cellAudioCreateNotifyEventQueue(u32* id, u64* key)
+{
+    uint32_t id_ea  = (uint32_t)(uintptr_t)id;
+    uint32_t key_ea = (uint32_t)(uintptr_t)key;
+
+    printf("[cellAudio] CreateNotifyEventQueue(id_ea=0x%08X key_ea=0x%08X)\n",
+           id_ea, key_ea);
+
+    if (!s_audio_initialized)
+        return CELL_AUDIO_ERROR_NOT_INIT;
+    if (!id_ea || !key_ea)
+        return CELL_AUDIO_ERROR_PARAM;
+
+    /* A distinct key per queue: the notify path resolves queues BY KEY, and the
+     * game creates its other queues with key 0, so reusing 0 here would make
+     * find_queue_by_key ambiguous and post audio events to whichever matched. */
+    static uint64_t s_next_key = 0x8000000000000001ull;
+    uint64_t k = s_next_key++;
+
+    uint32_t qid = sys_event_queue_create_direct(k, 8);
+    if (!qid)
+        return CELL_AUDIO_ERROR_EVENT_QUEUE;
+
+    mutex_lock(&s_audio_mutex);
+    int slot = -1;
+    for (int i = 0; i < CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES; i++) {
+        if (!s_notify_queues[i].in_use) { slot = i; break; }
+    }
+    if (slot < 0) { mutex_unlock(&s_audio_mutex); return CELL_AUDIO_ERROR_PARAM; }
+    s_notify_queues[slot].in_use = 1;
+    s_notify_queues[slot].key    = k;
+    mutex_unlock(&s_audio_mutex);
+
+    vm_write32(id_ea, qid);
+    vm_write64(key_ea, k);
+    printf("[cellAudio] CreateNotifyEventQueue -> id=%u key=0x%llX\n",
+           qid, (unsigned long long)k);
     return CELL_OK;
 }
 

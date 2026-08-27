@@ -91,6 +91,38 @@ static uint64_t bswap64(uint64_t v)
  * r5 = key (u64)
  * r6 = size (s32)
  * -----------------------------------------------------------------------*/
+/* Create a queue directly, without a guest ppu_context.
+ *
+ * HLE libraries sometimes have to CREATE a queue rather than merely find one:
+ * cellAudioCreateNotifyEventQueue hands the game back a queue id + key that the
+ * game then blocks on. Without this the game receives on an id nothing ever
+ * created and gets ESRCH forever -- YDKJ printed 1.7 MILLION "LIBAUDIO DROPOUT"
+ * lines a run that way. Returns the queue id, or 0 if the table is full. */
+uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size)
+{
+    if (size <= 0 || size > SYS_EVENT_QUEUE_BUF_MAX)
+        size = SYS_EVENT_QUEUE_BUF_MAX;
+
+    evt_table_lock();
+    int slot = -1;
+    for (int i = 0; i < SYS_EVENT_QUEUE_MAX; i++) {
+        if (!g_sys_event_queues[i].active) { slot = i; break; }
+    }
+    if (slot < 0) { evt_table_unlock(); return 0; }
+
+    sys_event_queue_info* q = &g_sys_event_queues[slot];
+    memset(q, 0, sizeof(*q));
+    q->active   = 1;
+    q->key      = key;
+    q->capacity = size;
+    q->type     = SYS_PPU_QUEUE;
+    evt_table_unlock();
+
+    fprintf(stderr, "[evt] queue_create_direct -> id=%d key=0x%llX size=%d\n",
+            slot + 1, (unsigned long long)key, size);
+    return (uint32_t)(slot + 1);
+}
+
 int64_t sys_event_queue_create(ppu_context* ctx)
 {
     uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
