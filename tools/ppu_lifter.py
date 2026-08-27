@@ -3219,15 +3219,35 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                     # main loop spun forever without ever issuing a draw.)
                     _mid = a[1][a[1].index('(') + 1:-1].strip()
                     _d2 = mem_disp(a[1]); _d2_is_ld = (w.mnemonic == 'ld')
-                    for w2 in reversed(win):
-                        b = [x.strip() for x in w2.operands.split(',')]
-                        if not b or b[0] != _mid:
-                            continue
-                        if w2.mnemonic in ('lwz', 'ld') and len(b) == 2 and '(r2)' in b[1]:
-                            disp = mem_disp(b[1]); r_base = cand
-                            base_is_ld = (w2.mnemonic == 'ld')
-                            disp2 = _d2; disp2_is_ld = _d2_is_ld
-                        break                   # nearest def of the mid reg only
+                    # The intermediate register is usually a FUNCTION-SCOPE base
+                    # pointer: SN loads it once in the prologue and every switch
+                    # in the body reads through it. flOw's func_0060F6F8 loads
+                    # r30 at entry and dispatches 686 instructions later, so the
+                    # 30-instruction window cannot see the definition. Look in
+                    # the window first; if nothing DEFINES the register there,
+                    # widen to the enclosing function -- bounded by the nearest
+                    # preceding blr, so the scan cannot drift into the previous
+                    # function and latch a stale base.
+                    _scan, _resolved = win, False
+                    for _pass in (0, 1):
+                        for w2 in reversed(_scan):
+                            b = [x.strip() for x in w2.operands.split(',')]
+                            if not b or b[0] != _mid:
+                                continue
+                            if w2.mnemonic in ('lwz', 'ld') and len(b) == 2 and '(r2)' in b[1]:
+                                disp = mem_disp(b[1]); r_base = cand
+                                base_is_ld = (w2.mnemonic == 'ld')
+                                disp2 = _d2; disp2_is_ld = _d2_is_ld
+                            _resolved = True    # nearest def wins, TOC load or not
+                            break
+                        if _resolved or _pass:
+                            break
+                        _lo = 0
+                        for _k in range(i - 1, -1, -1):
+                            if all_insns[_k].mnemonic == 'blr':
+                                _lo = _k + 1
+                                break
+                        _scan = all_insns[_lo:i]
                 break                           # first definition of cand wins/loses
             if disp is not None:
                 break
