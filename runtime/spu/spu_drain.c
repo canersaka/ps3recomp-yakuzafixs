@@ -333,3 +333,11 @@ void spu_depth_guard(spu_context* ctx)
     }
     { extern void spu_halt(spu_context*); spu_halt(ctx); }
 }
+
+/* See spu_context.h. Env-gated: SPU_TAILRET=1. */
+int spu_tailret_enabled(void)
+{
+    static int s_on = -1;
+    if (s_on < 0) { const char* e = getenv("SPU_TAILRET"); s_on = (e && e[0] == 0x31) ? 1 : 0; }
+    return s_on;
+}

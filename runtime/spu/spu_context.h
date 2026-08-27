@@ -618,6 +618,7 @@ void spu_ch_wake(spu_context* ctx);
  * SPU code is looping. Report the SPU pc/image once and halt instead.
  * SPU_HOST_DEPTH_MAX overrides the limit. */
 void spu_depth_guard(spu_context* ctx);
+int  spu_tailret_enabled(void);
 /* Take a pending SPU interrupt (spu_drain.c): srr0 <- ctx->pc, int_enable <- 0,
  * decode the guest-planted branch at LS 0 into ctx->pc, and return the
  * dispatcher to run instead of the interrupted transfer. Returns `tf`
@@ -630,6 +631,19 @@ void (*spu_take_interrupt(spu_context* ctx,
 #define SPU_DRAIN(ctx) do {                                    \
         spu_depth_guard(ctx);                                  \
         while (g_spu_trampoline_fn) {                           \
+            /* SPU_TAILRET=1: a pending transfer whose target equals the   \
+             * link register IS a return. SPU_RET only recognises `bi $r0`;\
+             * code returning through another register (`bi $r6`, r6 = the \
+             * link) lowers as a transfer, so the host frame opened by the \
+             * matching brsl/bisl never pops and a poll loop nests a frame \
+             * per iteration until the host stack dies. Off by default --  \
+             * this changes core dispatch for every title. */              \
+            if (spu_tailret_enabled() && (ctx)->host_depth > 0 &&          \
+                (((uint32_t)(ctx)->pc & SPU_LS_MASK) ==                    \
+                 ((ctx)->gpr[0]._u32[0] & SPU_LS_MASK))) {                 \
+                g_spu_trampoline_fn = 0;                                   \
+                break;                                                     \
+            }                                                              \
             void (*_tf)(spu_context*) = g_spu_trampoline_fn;    \
             g_spu_trampoline_fn = 0;                            \
             yz_lockstep_tick(ctx);                             \
