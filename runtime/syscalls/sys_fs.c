@@ -160,6 +160,29 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
                 snprintf(host_path, (size_t)host_path_size, "%s", alt);
         }
     }
+
+    /* Working-directory fallback: a PS3 title runs with its USRDIR as the
+     * working directory, so a RELATIVE open resolves there -- not at the vfs
+     * root. flOw opens "Data/Resources/first.xml" that way (it prints
+     * "Command Line: /dev_bdvd/PS3_GAME/USRDIR/" and "Working Path: /"), and
+     * resolving it against the root looked for <root>/Data/... while the file
+     * sits at <root>/USRDIR/Data/... . Missing it left the engine without its
+     * render config, which is what produced
+     *   PCoreGcmRenderInterface::setScreenRenderTargetInternal(): No config
+     * and therefore no draw calls at all.
+     *
+     * Additive and last-resort: only when the primary path does not exist and
+     * the guest path is relative, so nothing that already resolves changes. */
+    /* Use the STRIPPED path and do not require a relative spelling: the title
+     * reports Working Path "/" and opens "/Data/Resources/first.xml", which is
+     * absolute but still means "relative to my USRDIR". */
+    if (stat(host_path, &st) != 0) {
+        char alt2[1024];
+        snprintf(alt2, sizeof(alt2), "%s/USRDIR/%s", g_sys_fs_root, rel);
+        fs_normalize_sep(alt2);
+        if (stat(alt2, &st) == 0)
+            snprintf(host_path, (size_t)host_path_size, "%s", alt2);
+    }
 }
 
 /* ---------------------------------------------------------------------------

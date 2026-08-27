@@ -1218,6 +1218,29 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
      * unwound to the initial frame (or a not-yet-populated function pointer).
      * Don't treat it as an unresolved call -- just return to the caller. */
     if (addr == 0) {
+        /* PPU_OPD_RECOVER=1: ctr==0 while r12 still points at a VALID OPD means
+         * the lifted thunk failed to load the code word -- not that the function
+         * pointer is genuinely null. We already read opd[0] for the diagnostic
+         * below, so when it names a plausible code address, dispatch through it
+         * instead of returning. flOw dies exactly here during render init
+         * (func_0014F88C, opd[0]=0x10100148), and swallowing the call is why its
+         * engine never establishes a screen render-target config.
+         *
+         * Off by default: a genuinely-null pointer must still return quietly. */
+        {   static int _rec = -1;
+            if (_rec < 0) { const char* e = getenv("PPU_OPD_RECOVER"); _rec = e ? 1 : 0; }
+            uint32_t _opd = (uint32_t)ctx->gpr[12];
+            if (_rec && _opd && vm_base) {
+                uint32_t _c = __builtin_bswap32(*(volatile uint32_t*)(vm_base + _opd));
+                if (_c && (_c & 3) == 0) {
+                    static int _n2 = 0;
+                    if (_n2++ < 8)
+                        fprintf(stderr, "[ppu] OPD-RECOVER: ctr=0 -> dispatching opd[0]=0x%08X\n", _c);
+                    addr = _c;
+                }
+            }
+        }
+        if (addr == 0) {
         /* Returning silently leaves r3 HOLDING THE FIRST ARGUMENT, so the guest
          * reads its own input back as the return value and reports a nonsense
          * error code. Tokyo Jungle: cellAudioSetNotifyEventQueue(key=0x23A0)
@@ -1237,6 +1260,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
                     (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
                     (unsigned long long)ctx->thread_id); } }
         return;
+        }
     }
 
     /* SPURS trace: log calls into libsre's cellSpurs export range so we can
