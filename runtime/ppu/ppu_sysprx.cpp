@@ -17,7 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
-#include <windows.h>        /* CRITICAL_SECTION for real lwmutex exclusion */
+#include <windows.h>        /* CRITICAL_SECTION for real lwmutex exclusion */
+#include "../memory/vm.h"                 /* VM_HLE_INJECT_BASE */
 #endif
 
 extern "C" uint8_t* vm_base;
@@ -494,9 +495,15 @@ static void gcm_guest_write32(unsigned int addr, unsigned int val) { vm_write32(
 /* FIFO command-buffer-full callback. cellGcmSetupContext points the guest
  * context's callback OPD at GCM_FIFO_CALLBACK_SENTINEL_EA; the title's inline
  * gcmReserve calls context->callback(context, count) on ring wrap, which the
- * indirect dispatcher routes here. r3 = guest context EA. Must match the sentinel
- * define in libs/video/cellGcmSys.c. */
-#define GCM_FIFO_CALLBACK_SENTINEL_EA 0x03002F00u
+ * indirect dispatcher routes here. r3 = guest context EA.
+ *
+ * Derived from VM_HLE_INJECT_BASE, the same base libs/video/cellGcmSys.c
+ * builds the OPD from. This was a second hardcoded copy of the address, and
+ * moving the injected block out of guest-allocatable memory updated only one
+ * of them: the OPD then pointed at an EA with no registered function, the
+ * garbage-vcall guard no-opped the callback, the FIFO never recycled and the
+ * title stopped flipping. One definition, one place. */
+#define GCM_FIFO_CALLBACK_SENTINEL_EA (VM_HLE_INJECT_BASE + 0x2F00u)
 extern "C" void cellGcm_fifo_recycle(unsigned int ctx_ea);
 extern "C" void ppu_register_function(uint64_t addr, void (*fn)(ppu_context*));
 static void hle_gcm_callback(ppu_context* ctx)
