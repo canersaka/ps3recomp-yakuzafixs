@@ -191,13 +191,41 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * every call through it into "code 0x00000000 not registered". */
     { static long s_w = -1; if (s_w < 0) { const char* e = getenv("SPU_DMA_WATCH");
         s_w = e && *e ? (long)strtoul(e, 0, 16) : 0; }
-      if (s_w && (uint32_t)ea <= (uint32_t)s_w && (uint32_t)s_w < (uint32_t)ea + size) {
+      /* Treat the value as the END of a watched window starting at 0x10000:
+       * the whole loaded ELF image. Any SPU DMA into the image is a bug, and
+       * a single stray one is invisible to the sampling traces. */
+      if (s_w && (uint32_t)ea < (uint32_t)s_w && (uint32_t)ea + size > 0x10000u) {
           static int _n = 0;
           if (_n++ < 8)
               fprintf(stderr, "[dma-watch] pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X"
                               " size=%u covers 0x%08X\n",
                       (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size,
                       (uint32_t)s_w); } }
+    /* Malformed transfers are REJECTED, as the hardware MFC does. The rules
+     * are the ones the SDK's own dma.h asserts: a non-zero size, at most
+     * 16 KB, a multiple of 16 once >= 16 bytes, and LSA/EA sharing 16-byte
+     * alignment. Real hardware raises an MFC alignment exception and does
+     * NOT move the data; performing it anyway lets one bad descriptor spray
+     * the guest image. YDKJ issues exactly one such PUT -- 16 KB from a
+     * 4-byte-aligned EA of 0x00542004, straight over the title's own data --
+     * and every later call through the clobbered OPDs reports
+     * "code 0x00000000 not registered".
+     *
+     * SPU_DMA_LAX=1 restores the old permissive behaviour. */
+    { static int s_lax = -1; if (s_lax < 0) s_lax = getenv("SPU_DMA_LAX") ? 1 : 0;
+      if (!s_lax) {
+          int malformed = (size == 0) || (size > 0x4000)
+                       || (size >= 16 && (size & 15))
+                       || (((lsa ^ (uint32_t)ea) & 15) != 0);
+          if (malformed) {
+              static int _n = 0;
+              if (_n++ < 8)
+                  fprintf(stderr, "[mfc] REJECTED malformed transfer: img=%d pc=0x%05X"
+                                  " cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
+                          spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, cmd,
+                          lsa, (uint32_t)ea, size);
+              return 0;
+          } } }
     /* SPU_DMACHK=1: report transfers that break the MFC rules the guest's own
      * dma.h asserts on -- size 0 or > 16 KB, size not a multiple of 16 for
      * transfers of 16+ bytes, or LSA/EA not sharing 16-byte alignment. */
