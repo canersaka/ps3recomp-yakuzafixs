@@ -73,6 +73,38 @@ static void fs_normalize_sep(char* p) {
 #endif
 }
 
+/* Extracted game trees come in two shapes: the disc layout (<root>/PS3_GAME/
+ * USRDIR/...) and a flattened one (<root>/USRDIR/...). cellGame hands the title
+ * disc-style paths either way -- cellGameContentPermit reports
+ * /dev_bdvd/PS3_GAME/USRDIR -- so on a flattened tree every path that came from
+ * cellGame misses. flOw opendir'd /dev_bdvd/PS3_GAME/USRDIR, got ENOENT, and
+ * read that as "no disc".
+ *
+ * Additive and last-resort: if the translated path does not exist but dropping
+ * a PS3_GAME component yields one that does, use that. When neither exists the
+ * original is kept, so failure messages still name the path the guest asked for.
+ *
+ * All three path translators call this -- sys_fs, cellFs and ppu_fs each do
+ * their own translation (see docs), and a guest path can arrive at any of them. */
+void ps3_vfs_ps3game_fallback(char* path, size_t cap)
+{
+    struct stat st;
+    if (!path || !*path || stat(path, &st) == 0)
+        return;
+    char* p = strstr(path, "/PS3_GAME/");
+    if (!p)
+        return;
+    char alt[1024];
+    size_t head = (size_t)(p - path);
+    if (head + 1 >= sizeof alt)
+        return;
+    memcpy(alt, path, head);
+    snprintf(alt + head, sizeof alt - head, "/%s", p + 10);
+    if (stat(alt, &st) != 0)
+        return;
+    snprintf(path, cap, "%s", alt);
+}
+
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
 {
     /* Lazily adopt PS3_VFS_ROOT if the root is still the default ".", so this
@@ -183,6 +215,7 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
         if (stat(alt2, &st) == 0)
             snprintf(host_path, (size_t)host_path_size, "%s", alt2);
     }
+    ps3_vfs_ps3game_fallback(host_path, (size_t)host_path_size);
 }
 
 /* ---------------------------------------------------------------------------

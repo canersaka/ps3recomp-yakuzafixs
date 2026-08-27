@@ -3162,6 +3162,7 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
         # base silently skipped every dispatcher with the operands swapped.)
         r_val = p[0]
         disp = None; r_base = None; base_is_ld = False
+        disp2 = None; disp2_is_ld = False
         # Prefer the lwzx operand that the `add ..., base` feeding mtctr combines
         # with the loaded offset. Both operands are often TOC-loaded, so "first
         # candidate with a TOC-load definition" can pick an unrelated index reg
@@ -3208,10 +3209,29 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                 if w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(r2)' in a[1]:
                     disp = mem_disp(a[1]); r_base = cand
                     base_is_ld = (w.mnemonic == 'ld')
+                elif w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(' in a[1]:
+                    # TWO-LEVEL base: `lwz r30, d1(r2); lwz r11, d2(r30)`. The
+                    # table address is not in the TOC itself but in a global the
+                    # TOC points at, so the one-level test above rejects the
+                    # dispatcher outright. (flOw func_00511EC0: the title's
+                    # 31-state application state machine. Every case fell through
+                    # to an unresolved bctr, so the state never advanced and the
+                    # main loop spun forever without ever issuing a draw.)
+                    _mid = a[1][a[1].index('(') + 1:-1].strip()
+                    _d2 = mem_disp(a[1]); _d2_is_ld = (w.mnemonic == 'ld')
+                    for w2 in reversed(win):
+                        b = [x.strip() for x in w2.operands.split(',')]
+                        if not b or b[0] != _mid:
+                            continue
+                        if w2.mnemonic in ('lwz', 'ld') and len(b) == 2 and '(r2)' in b[1]:
+                            disp = mem_disp(b[1]); r_base = cand
+                            base_is_ld = (w2.mnemonic == 'ld')
+                            disp2 = _d2; disp2_is_ld = _d2_is_ld
+                        break                   # nearest def of the mid reg only
                 break                           # first definition of cand wins/loses
             if disp is not None:
                 break
-        _dbg(all_insns[i].addr, f"disp={disp} r_base={r_base} base_is_ld={base_is_ld} toc={toc}")
+        _dbg(all_insns[i].addr, f"disp={disp} disp2={disp2} r_base={r_base} base_is_ld={base_is_ld} toc={toc}")
         if disp is None or not toc:
             continue
         toc_candidates = toc if isinstance(toc, (list, tuple)) else [toc]
@@ -3283,13 +3303,18 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
         for cand in toc_candidates:
             if not cand:
                 continue
-            if base_is_ld:
-                hi = read_u32((cand + disp) & 0xFFFFFFFF)
-                table_base = read_u32((cand + disp + 4) & 0xFFFFFFFF)
-                if hi:              # table addresses live in the 32-bit VA space
-                    table_base = None
-            else:
-                table_base = read_u32((cand + disp) & 0xFFFFFFFF)
+            def _read_ptr(_ea, _is_ld):
+                # ELFv1 TOC entries are 64-bit; a table address always fits the
+                # low word, so a non-zero high word means we read the wrong slot.
+                _ea &= 0xFFFFFFFF
+                if not _is_ld:
+                    return read_u32(_ea)
+                if read_u32(_ea):
+                    return None
+                return read_u32((_ea + 4) & 0xFFFFFFFF)
+            table_base = _read_ptr(cand + disp, base_is_ld)
+            if table_base is not None and disp2 is not None:
+                table_base = _read_ptr(table_base + disp2, disp2_is_ld)
             _dbg(all_insns[i].addr, f"cand_toc=0x{cand:X} table_base={None if table_base is None else hex(table_base)} count={count} is_offset={is_offset} text=[0x{text_lo:X},0x{text_hi:X})")
             if table_base is None:
                 continue

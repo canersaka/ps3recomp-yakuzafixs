@@ -79,6 +79,10 @@ static void guest_strcpy(char* dst, uint32_t gaddr, size_t cap)
     dst[i] = 0;
 }
 
+/* Defined in runtime/syscalls/sys_fs.c -- shared by all three path
+ * translators. (extern "C" is ill-formed at block scope.) */
+extern "C" void ps3_vfs_ps3game_fallback(char* path, size_t cap);
+
 /* Translate a guest path to a host path under ppu_vfs_root. Known PS3 mount
  * prefixes are stripped; the rest is appended to the root. */
 static void host_path(char* out, size_t cap, const char* guest)
@@ -138,6 +142,7 @@ static void host_path(char* out, size_t cap, const char* guest)
     if (rel == guest && guest[0] == '/') rel = guest + 1;   /* strip leading '/' */
     snprintf(out, cap, "%s/%s", ppu_vfs_root, rel);
     for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
+    ps3_vfs_ps3game_fallback(out, cap);
 }
 
 /* ---- fd / dir handle tables ---- */
