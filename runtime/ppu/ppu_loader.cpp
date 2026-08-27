@@ -644,8 +644,14 @@ extern "C" void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width)
 static void ww_arm_inline_window(uint32_t ww)
 {
     if (!ww) return;
+    /* Must match the span barrier_watch_hit accepts (LBP_WW_LEN): this is the
+     * inline fast-path gate, so a narrower window here silently filters the
+     * stores before the logger ever sees them. */
+    uint32_t len = 0x20;
+    { const char* e = getenv("LBP_WW_LEN");
+      if (e) { len = (uint32_t)strtoul(e, 0, 0); if (len < 0x20) len = 0x20; } }
     g_ww_lo = ww & ~15u;
-    g_ww_hi = (ww & ~15u) + 0x20;
+    g_ww_hi = (ww & ~15u) + len;
 }
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
@@ -655,7 +661,15 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
     { static uint32_t s_ww = 0xFFFFFFFFu;
       if (s_ww == 0xFFFFFFFFu) { const char* e = getenv("LBP_WW"); s_ww = e ? (uint32_t)strtoul(e,0,0) : 0;
                                  ww_arm_inline_window(s_ww); }
-      if (s_ww && a >= (s_ww & ~15u) && a < (s_ww & ~15u) + 0x20) {
+      /* LBP_WW_LEN=<bytes>: widen the watched span. 0x20 is fine for a single
+       * field but useless for "who fills this struct" -- the SPURS instance is
+       * 0x1000+ and a 32-byte window reported "nothing writes it" twice while
+       * the writes were landing at higher offsets. */
+      static uint32_t s_wwlen = 0;
+      if (!s_wwlen) { const char* e2 = getenv("LBP_WW_LEN");
+                      s_wwlen = e2 ? (uint32_t)strtoul(e2,0,0) : 0x20;
+                      if (s_wwlen < 0x20) s_wwlen = 0x20; }
+      if (s_ww && a >= (s_ww & ~15u) && a < (s_ww & ~15u) + s_wwlen) {
           static int _n = 0;
           if (_n++ < 64) {
               fprintf(stderr, "[ww] 0x%08X <- 0x%X (w%d) guest-fn=0x%08X\n",

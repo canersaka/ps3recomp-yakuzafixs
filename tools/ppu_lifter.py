@@ -3461,6 +3461,13 @@ def main() -> None:
                              "treated as data, not promoted to functions. Use the "
                              "end of the last .text section to stop .rodata in the "
                              "R-X segment from exploding into bogus functions.")
+    parser.add_argument("--toc", type=lambda x: int(x, 0), default=None,
+                        help="TOC (r2) value for --raw input. Jump-table "
+                             "dispatchers load their table base TOC-relative, so "
+                             "without this a raw lift (e.g. a relocated PRX) finds "
+                             "no tables at all and every switch becomes an "
+                             "unresolved indirect call. Read it from any export "
+                             "OPD's second word.")
     parser.add_argument("--symbol-prefix", default="",
                         help="Prefix for every emitted func_*/function_table "
                              "symbol (e.g. 'libsre_') so a relocated PRX image "
@@ -3688,6 +3695,32 @@ def main() -> None:
     jt_targets = set()
     jt_dispatchers: dict[int, list[int]] = {}   # {bctr_addr: [case targets]}
     toc_candidates: list[int] = []              # raw mode has no ELF TOC; ELF path fills this below
+    if args.raw and args.toc:
+        # Raw input (a relocated PRX image) has no ELF headers to mine a TOC
+        # from, so this pass used to be skipped outright -- every switch in the
+        # module lifted to a bare `bctr` and became an unresolved indirect call.
+        # libsre came out with 0 switches and 72 bare dispatchers that way, which
+        # is why cellSpursCreateTask returned success without doing anything.
+        # With --toc supplied the same discovery works on raw images.
+        _raw_lo = min(s for s, _ in func_bounds)
+        _raw_hi = max(e for _, e in func_bounds)
+        if args.code_end is not None:
+            _raw_hi = min(_raw_hi, args.code_end)
+
+        def _raw_read_u32(a):
+            off = a - base_addr
+            if 0 <= off <= len(file_data) - 4:
+                return int.from_bytes(file_data[off:off + 4],
+                                      'little' if args.little_endian else 'big')
+            return None
+
+        tables = discover_jump_tables(all_insns, _raw_read_u32, [args.toc],
+                                      _raw_lo, _raw_hi)
+        jt_dispatchers = tables
+        for ts in tables.values():
+            jt_targets.update(ts)
+        print(f"  jump tables (raw, toc=0x{args.toc:X}): {len(tables)} dispatchers, "
+              f"{len(jt_targets)} case targets")
     if not args.raw:
         try:
             seg_map = [(ph.p_vaddr, ph.p_vaddr + ph.p_filesz,
