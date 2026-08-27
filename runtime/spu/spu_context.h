@@ -611,6 +611,13 @@ void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    
 void spu_img_restore(spu_context* ctx, int32_t saved_img);
 /* Wake a host thread blocked in a channel wait (channel-stall milestone). */
 void spu_ch_wake(spu_context* ctx);
+/* Runaway lifted-call recursion guard. A lifted brsl/bisl nests a real host
+ * call frame, so an SPU loop the lifter lowered as a CALL rather than a
+ * transfer recurses until the host stack dies -- surfacing as a bare
+ * STACKOVERFLOW backtrace of unsymbolised RVAs that says nothing about which
+ * SPU code is looping. Report the SPU pc/image once and halt instead.
+ * SPU_HOST_DEPTH_MAX overrides the limit. */
+void spu_depth_guard(spu_context* ctx);
 /* Take a pending SPU interrupt (spu_drain.c): srr0 <- ctx->pc, int_enable <- 0,
  * decode the guest-planted branch at LS 0 into ctx->pc, and return the
  * dispatcher to run instead of the interrupted transfer. Returns `tf`
@@ -621,6 +628,7 @@ void (*spu_take_interrupt(spu_context* ctx,
 /* Drain the pending trampoline chain: run each queued transfer target until
  * none remain. The one central hook site for the faithful execution model. */
 #define SPU_DRAIN(ctx) do {                                    \
+        spu_depth_guard(ctx);                                  \
         while (g_spu_trampoline_fn) {                           \
             void (*_tf)(spu_context*) = g_spu_trampoline_fn;    \
             g_spu_trampoline_fn = 0;                            \

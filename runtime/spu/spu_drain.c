@@ -297,3 +297,24 @@ void (*spu_take_interrupt(spu_context* ctx,
                   js[8],js[9],js[10],js[11], js[12],js[13],js[14],js[15]); } }
     return spu_indirect_branch;
 }
+
+/* See the declaration in spu_context.h. */
+void spu_depth_guard(spu_context* ctx)
+{
+    static uint32_t s_max = 0;
+    if (!s_max) {
+        const char* e = getenv("SPU_HOST_DEPTH_MAX");
+        s_max = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
+    }
+    if (ctx->host_depth < s_max) return;
+    static int s_reported = 0;
+    if (s_reported < 4) {
+        s_reported++;
+        fprintf(stderr, "[spu-depth] img=%d pc=0x%05X lr=0x%05X host_depth=%u"
+                        " -- lifted call recursion, halting the SPU\n",
+                ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
+                ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->host_depth);
+        fflush(stderr);
+    }
+    { extern void spu_halt(spu_context*); spu_halt(ctx); }
+}
