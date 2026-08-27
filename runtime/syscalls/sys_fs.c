@@ -312,6 +312,20 @@ int64_t sys_fs_open(ppu_context* ctx)
         fp = fopen(host_path, "w+b");
     }
 
+    /* A DIRECTORY open is not a failure. fopen() cannot open one on Windows,
+     * but real cellFsOpen answers CELL_EISDIR and titles branch on it -- flOw
+     * opens Data/Titles/ (its localisation XML dir) and a generic ENOENT tells
+     * it the content is missing rather than "that is a directory".
+     * libs/filesystem/cellFs.c and runtime/ppu/ppu_fs.cpp already answer this
+     * correctly; sys_fs is the third filesystem path and never got it. */
+    if (!fp) {
+        struct stat _sd;
+        if (stat(host_path, &_sd) == 0 && (_sd.st_mode & S_IFMT) == S_IFDIR) {
+            fprintf(stderr, "[sys_fs] open -> EISDIR (directory): %s\n", host_path);
+            return (int64_t)(int32_t)CELL_EISDIR;
+        }
+    }
+
     if (!fp) {
         { struct stat _s2; int _ex = (stat(host_path,&_s2)==0);
           fprintf(stderr, "[sys_fs] open FAILED: %s (errno=%d %s, exists=%d, size=%lld)\n",
