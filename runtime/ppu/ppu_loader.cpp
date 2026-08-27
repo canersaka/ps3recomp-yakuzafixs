@@ -533,7 +533,7 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
      * publishing, LBP's asset loading -- thousands of fence-waits -- crawled
      * at ~28 fences/s (minutes-to-hours of [finspin]); read-driven pacing
      * publishes at up to 1/ms and the loading progresses ~35x faster. */
-    if ((uint32_t)a == 0x03002008u) { static int _rp=-1;
+    if ((uint32_t)a == (VM_HLE_INJECT_BASE + 0x2008u)) { static int _rp=-1;
         if(_rp<0){ const char* e=getenv("GCM_REFPOLL"); _rp=(e&&*e=='0')?0:1; }
         if(_rp){ extern void cellGcm_ref_on_poll(void); cellGcm_ref_on_poll(); } }
     uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4);
@@ -610,7 +610,7 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
     /* Hot-poll detector: a thread spinning on the same address (e.g. a GCM FIFO
      * get-pointer / label waiting on RSX) reads it thousands of times in a row. */
     { static __declspec(thread) uint32_t last=0xFFFFFFFFu; static __declspec(thread) uint32_t n=0;
-      if ((uint32_t)a==last) { if (++n==200000) { if (((uint32_t)a & ~0xFFFu) == 0x03002000u) {
+      if ((uint32_t)a==last) { if (++n==200000) { if (((uint32_t)a & ~0xFFFu) == (VM_HLE_INJECT_BASE + 0x2000u)) {
               /* A spin on the GCM control block is a fence/FIFO wait. Print the
                * WHOLE block: put vs get says whether the RSX side is behind or
                * whether the guest never submitted, which is the difference
@@ -618,7 +618,7 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
               extern uint8_t* vm_base;
               uint32_t pu = 0, ge = 0, rf = 0;
               if (vm_base) {
-                  const uint8_t* c = vm_base + 0x03002000u;
+                  const uint8_t* c = vm_base + (VM_HLE_INJECT_BASE + 0x2000u);
                   pu = ((uint32_t)c[0]<<24)|((uint32_t)c[1]<<16)|((uint32_t)c[2]<<8)|c[3];
                   ge = ((uint32_t)c[4]<<24)|((uint32_t)c[5]<<16)|((uint32_t)c[6]<<8)|c[7];
                   rf = ((uint32_t)c[8]<<24)|((uint32_t)c[9]<<16)|((uint32_t)c[10]<<8)|c[11];

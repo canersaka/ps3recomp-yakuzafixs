@@ -10,6 +10,7 @@
 
 #include "cellGcmSys.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
+#include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
 
 /* Guest EA of the GCM context (begin/end/current/callback) the title writes its
@@ -125,8 +126,8 @@ static u16 s_io_address_table[65536];
 static u16 s_ea_address_table[65536];
 
 #define GCM_OFFSET_TABLE_PAGES   4096u                 /* 4 GiB / 1 MiB       */
-#define GCM_OFFSET_TABLE_IO_ADDR 0x03003000u           /* ea >> 20  -> io>>20 */
-#define GCM_OFFSET_TABLE_EA_ADDR 0x03005000u           /* io >> 20  -> ea>>20 */
+#define GCM_OFFSET_TABLE_IO_ADDR (VM_HLE_INJECT_BASE + 0x3000u)           /* ea >> 20  -> io>>20 */
+#define GCM_OFFSET_TABLE_EA_ADDR (VM_HLE_INJECT_BASE + 0x5000u)           /* io >> 20  -> ea>>20 */
 
 /* Local memory bump allocator */
 static u32 s_local_mem_allocated = 0;  /* next free offset in local memory */
@@ -218,7 +219,7 @@ static CellGcmReportData s_report_data[CELL_GCM_MAX_REPORT_COUNT];
  * recompiled game can poll them via vm_read32; cellGcmGetLabelAddress returns a
  * guest address into this window (16-byte spaced as on hardware). A host array
  * pointer would be read as a guest offset and land out of bounds. */
-#define GCM_LABEL_GUEST_BASE  0x03000000u
+#define GCM_LABEL_GUEST_BASE  (VM_HLE_INJECT_BASE + 0x0000u)
 #define GCM_LABEL_STRIDE      0x10u
 static u32 s_labels[CELL_GCM_MAX_LABEL_COUNT];
 
@@ -228,7 +229,7 @@ static u32 s_labels[CELL_GCM_MAX_LABEL_COUNT];
  * pointer would be read through vm_base as a guest address and never update, so
  * every FIFO-space / cellGcmFinish wait would hang. Placed just past the 256
  * label slots (0x03000000..0x03001000). Fields are big-endian (vm_write32). */
-#define GCM_CONTROL_GUEST_ADDR 0x03002000u
+#define GCM_CONTROL_GUEST_ADDR (VM_HLE_INJECT_BASE + 0x2000u)
 
 /* Synthetic guest code EA for the FIFO command-buffer-full callback. The title's
  * inline gcmReserve calls context->callback(context, count) when `current` nears
@@ -236,7 +237,7 @@ static u32 s_labels[CELL_GCM_MAX_LABEL_COUNT];
  * PPU function table (ppu_sysprx.cpp: hle_gcm_callback) so the indirect call
  * routes back into cellGcm_fifo_recycle(). Lives in the injected control page,
  * never real guest code. MUST match GCM_FIFO_CALLBACK_SENTINEL_EA there. */
-#define GCM_FIFO_CALLBACK_SENTINEL_EA 0x03002F00u
+#define GCM_FIFO_CALLBACK_SENTINEL_EA (VM_HLE_INJECT_BASE + 0x2F00u)
 
 /* EA the ticker's RSX drain has consumed up to. Exposed so the wrap callback can
  * wait for the RSX to catch up before recycling the ring (else the frame's

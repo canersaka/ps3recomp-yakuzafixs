@@ -48,6 +48,22 @@ extern "C" {
 #define VM_STACK_REGION     0x10000000u      /* 256 MB stack region */
 
 #define VM_PPU_STACK_SIZE   0x00100000u      /* 1 MB default PPU stack */
+
+/* Home for guest-visible structures the RUNTIME injects -- the GCM label window,
+ * the control register (put/get/ref) and the IO<->EA offset tables. These must
+ * NOT sit inside main memory, because that is where the title's own allocator
+ * hands out blocks: flOw's heap runs 0x00C00000..0x0D000000, which swallowed the
+ * old 0x03000000 home. The game memset straight over the control register, our
+ * FIFO drain then read ASCII text as `put` (0x3D3D3D0F -- "===" from a log
+ * banner), walked `get` into unmapped IO and resynchronised away whole frames of
+ * commands. Nothing was drawn and nothing said why.
+ *
+ * 0x20000000 is unclaimed by the map above: past RSX (ends 0x20000000) and well
+ * below the raw-SPU windows (0x30000000). The title only ever learns these
+ * addresses through cellGcmGetLabelAddress / cellGcmGetControlRegister, so the
+ * value is free to move as long as every user goes through this base. */
+#define VM_HLE_INJECT_BASE  0x20000000u
+
 #define VM_PAGE_SIZE        0x00001000u      /* 4 KB page size */
 
 /* Align a value up to `align` (must be power of 2) */
