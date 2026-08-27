@@ -2012,6 +2012,14 @@ extern "C" uint32_t ppu_load_elf(const char* path)
     }
     free(file);
     fprintf(stderr, "[ppu] loaded %d PT_LOAD segments, entry OPD 0x%08X\n", loaded, entry);
+
+    /* Arm PPU_GUARD_EA here as well as in lv2_syscall. The syscall path only
+     * runs once the guest CRT is already going, which misses anything the CRT
+     * itself clobbers -- and a .bss-zeroing loop with wrong bounds wipes
+     * INITIALISED data before the first syscall ever happens. Guarding from
+     * load time covers that window; the later arm is a no-op once armed. */
+    { const char* ge = getenv("PPU_GUARD_EA");
+      if (ge && *ge) ppu_guard_page((uint32_t)strtoul(ge, 0, 16)); }
     return entry;
 }
 
@@ -2099,8 +2107,15 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                 code = s_opd_fixups[i].code; toc = s_opd_fixups[i].toc;
                 fn = ppu_lookup(code); break; }
     }
-    if (!fn) { fprintf(stderr, "[ppu] guest_call: OPD 0x%08X -> code 0x%08X not registered\n",
-                       opd_addr, code); return 0; }
+    if (!fn) {
+        /* Print the descriptor bytes too: "code 0x00000000" alone cannot
+         * distinguish a CLOBBERED OPD from one the loader never populated,
+         * and those need opposite fixes. */
+        fprintf(stderr, "[ppu] guest_call: OPD 0x%08X -> code 0x%08X not registered"
+                        " (opd: %08X %08X %08X %08X)\n",
+                opd_addr, code, vm_read32(opd_addr), vm_read32(opd_addr + 4),
+                vm_read32(opd_addr + 8), vm_read32(opd_addr + 12));
+        return 0; }
 
     /* Private scratch stack high in the guest stack region, distinct from the
      * main + ppu_thread stacks. One callback at a time per caller thread. */
@@ -2341,6 +2356,19 @@ extern "C" void ppu_guest_callstack(const char* tag)
             last = bg;
         }
     }
+    /* Also print the RAW module RVAs. When the writer is HOST code -- an HLE
+     * function, a CRT memset, a backend call -- no frame maps to a guest
+     * function and the line above comes out empty, which reads as "nothing
+     * to report" when it actually means "the caller is ours, not the game's".
+     * The RVAs are enough to find it. */
+    { char rs[900]; int rp = snprintf(rs, sizeof rs, "[GCS:%s] host rva:", tag ? tag : "?");
+      char* mb2 = (char*)GetModuleHandleA(NULL);
+      for (int q = 0; q < fr && rp < 850; q++)
+          { extern uint32_t ppu_prof_resolve_host(void*);
+            uint32_t gf = ppu_prof_resolve_host(bt[q]);
+            rp += snprintf(rs+rp, sizeof(rs)-rp, gf ? " %llX(f_%08X)" : " %llX",
+                           (unsigned long long)((char*)bt[q] - mb2), gf); }
+      fprintf(stderr, "%s\n", rs); }
     fprintf(stderr, "%s\n", gs); fflush(stderr);
 #else
     (void)tag;

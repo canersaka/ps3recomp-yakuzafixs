@@ -184,6 +184,20 @@ static inline int mfc_is_fence(uint32_t cmd)
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
+    /* SPU_DMA_WATCH=<hex>: report any transfer whose destination RANGE covers
+     * this guest address. A DMA landing in the loaded ELF image is always a
+     * bug, and it is invisible to the sampling traces -- YDKJ had an SPU job
+     * writing over the title's own OPD table at 0x00530D78, which turned
+     * every call through it into "code 0x00000000 not registered". */
+    { static long s_w = -1; if (s_w < 0) { const char* e = getenv("SPU_DMA_WATCH");
+        s_w = e && *e ? (long)strtoul(e, 0, 16) : 0; }
+      if (s_w && (uint32_t)ea <= (uint32_t)s_w && (uint32_t)s_w < (uint32_t)ea + size) {
+          static int _n = 0;
+          if (_n++ < 8)
+              fprintf(stderr, "[dma-watch] pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X"
+                              " size=%u covers 0x%08X\n",
+                      (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size,
+                      (uint32_t)s_w); } }
     /* SPU_DMACHK=1: report transfers that break the MFC rules the guest's own
      * dma.h asserts on -- size 0 or > 16 KB, size not a multiple of 16 for
      * transfers of 16+ bytes, or LSA/EA not sharing 16-byte alignment. */
