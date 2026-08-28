@@ -353,9 +353,13 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
           if (_n++ < 48) {
               extern uint8_t* vm_base;
               const uint8_t* r = vm_base + ((uint32_t)ea & ~127u);
-              fprintf(stderr, "[atom-ea] cmd=0x%X img=%d pc=0x%05X ea=0x%08X "
+              /* lr (gpr[0]) too: these atomics sit in generic inc/dec helpers, so
+               * pc names the HELPER and only the link register names the caller
+               * that gives the counter its meaning. */
+              fprintf(stderr, "[atom-ea] cmd=0x%X img=%d pc=0x%05X lr=0x%05X ea=0x%08X "
                       "RAM=%02X%02X%02X%02X %02X%02X%02X%02X",
-                      cmd, ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK, (uint32_t)ea,
+                      cmd, ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
+                      ctx->gpr[0]._u32[0] & SPU_LS_MASK, (uint32_t)ea,
                       r[0],r[1],r[2],r[3], r[4],r[5],r[6],r[7]);
               if (cmd == MFC_PUTLLC_CMD) {
                   fprintf(stderr, " STORE=%02X%02X%02X%02X %02X%02X%02X%02X",
