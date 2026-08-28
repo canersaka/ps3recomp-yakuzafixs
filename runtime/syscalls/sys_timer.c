@@ -109,6 +109,31 @@ int64_t sys_timer_usleep(ppu_context* ctx)
     uint64_t usec = LV2_ARG_U64(ctx, 0);
     { static int n=0; if (n++ < 60) fprintf(stderr, "[WAIT] timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n",
         (unsigned long long)usec, (unsigned long long)ctx->lr, (unsigned long long)ctx->cia); }
+    /* PS3_WAIT_OBJ=<lr-hex>: when a usleep spin is reached from this return
+     * address, dump the registers and the object they point at. A poll loop
+     * tells you WHERE it is spinning; this tells you WHAT it is spinning on,
+     * which is the part you actually need to find who never releases it. */
+    { static long s_wo = -1;
+      if (s_wo < 0) { const char* e = getenv("PS3_WAIT_OBJ");
+                      s_wo = e ? (long)strtoul(e, 0, 16) : 0; }
+      if (s_wo && (uint32_t)ctx->lr == (uint32_t)s_wo) {
+        static int _n = 0;
+        if (_n++ < 8) {
+          uint32_t o = (uint32_t)ctx->gpr[29];
+          fprintf(stderr, "[wait-obj] lr=0x%08X r3=%llu r9=0x%08X r29=0x%08X r30=0x%08X r31=0x%08X",
+                  (uint32_t)ctx->lr, (unsigned long long)usec, (uint32_t)ctx->gpr[9],
+                  o, (uint32_t)ctx->gpr[30], (uint32_t)ctx->gpr[31]);
+          /* guest memory is big-endian: assemble the words explicitly. */
+          if (o && vm_base) {
+            const uint8_t* p = vm_base + o;
+            uint32_t w0 = (uint32_t)(((uint32_t)(p)[0]<<24)|((uint32_t)(p)[1]<<16)|((uint32_t)(p)[2]<<8)|(uint32_t)(p)[3]);
+            p = vm_base + o + 0x24;
+            uint32_t w24 = (uint32_t)(((uint32_t)(p)[0]<<24)|((uint32_t)(p)[1]<<16)|((uint32_t)(p)[2]<<8)|(uint32_t)(p)[3]);
+            fprintf(stderr, "  [r29+0x00]=0x%08X [r29+0x24]=0x%08X", w0, w24);
+          }
+          fprintf(stderr, "\n"); fflush(stderr);
+        } } }
+
     /* POLLSITE: resolve the host chain of the 1ms poller (LBP bringup) to
      * guest functions -- names the stage that is starving. */
     { static int _ps = -1; if (_ps < 0) _ps = getenv("POLLSITE") ? 12 : 0;
