@@ -7,10 +7,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-extern u8* vm_base;
-extern u32 cellGcmResolveOffset(u32);
-extern u32 cellGcmResolveLocated(int, u32);
-
 float rsx_rd_bef(const u8* p)
 {
     u32 w; memcpy(&w, p, 4);

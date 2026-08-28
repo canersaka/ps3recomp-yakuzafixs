@@ -37,6 +37,20 @@
 extern "C" {
 #endif
 
+/* Guest memory, and the RSX offset -> effective address resolvers.
+ *
+ * Declared here because every backend that reads guest data needs them, and
+ * each one was otherwise carrying its own local `extern` block -- which is how
+ * the Metal backend ended up with a use whose declaration lived inside a
+ * duplicated fetch routine, and lost it when that duplicate was removed.
+ *
+ * location: 0 = MAIN (IO-mapped system memory), 1 = LOCAL (VRAM). Resolving
+ * LOCAL through cellGcmResolveOffset instead lets the IO table shadow it; see
+ * the note on rsx_fetch_attrib below. */
+extern u8* vm_base;
+u32 cellGcmResolveOffset(u32 offset);
+u32 cellGcmResolveLocated(int location, u32 offset);
+
 /* Big-endian scalar reads. Every component in a guest vertex array is stored
  * in the PS3's byte order, so these are the bottom of every fetch path. */
 float rsx_rd_bef(const u8* p);      /* 4-byte IEEE float          */
