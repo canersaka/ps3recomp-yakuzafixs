@@ -286,15 +286,23 @@ upstream:
   runtime to link against. (v0.6.1)
 
 ### slushiimusic — [@slushiimusic](https://github.com/slushiimusic)
-*Submitted and under review — listed here because the work is real and the
-report was correct, not because it has landed yet.*
+Gave the project its first CI and its second platform, in **v0.9.0**.
 - **macOS is not actually supported, and said so with receipts** (#94) — the
-  README advertised macOS while the runtime failed to compile on arm64 with 77
-  errors. Filed with the errors *and* a fix.
-- **arm64 macOS build + CI** (#95) — makes the runtime library compile on Apple
-  silicon and adds a macOS workflow so the claim stops drifting from reality.
+  docs advertised Apple Clang 14+ under "full support" while the runtime failed
+  to compile on arm64 with 77 errors. Filed with the errors *and* a fix.
+- **arm64 macOS build + the first CI this repository has ever had** (#95).
+  Its value was immediate and slightly embarrassing: it failed 17 seconds after
+  landing on a `getenv` without `<stdlib.h>` that MSVC had been quietly
+  accepting, and again on Win32 timing APIs used unguarded.
 - **RSX → Metal backend, POSIX host, and the draw path** (#96) — a second
-  graphics backend beside D3D12, ~1,500 lines.
+  graphics backend beside D3D12: clear, flip, guest vertex fetch, a
+  pipeline-state cache and blend translation, windowed or headless.
+  `runtime/host/host_posix.c` drives cellGcm → RSX → backend with **no lifted
+  game**, hand-building a big-endian NV4097 command buffer — which is what
+  makes non-Windows graphics work startable at all.
+- The CI those PRs brought asserts the **presented pixel** rather than an exit
+  code, and running the existing lifter suites under it immediately exposed
+  fifteen silent VMX miscompiles that had been in the tree unnoticed.
 
 ### lilbeefaroni — [@lilbeefaroni](https://github.com/lilbeefaroni)
 - **Caught the porting guide documenting flags that do not exist** (#93) —
