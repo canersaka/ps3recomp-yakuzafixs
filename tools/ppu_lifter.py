@@ -1466,6 +1466,17 @@ class PPULifter:
                          "LR": "lr", "8": "lr",
                          "CTR": "ctr", "9": "ctr"}.get(s)
             g = _reg_idx(gpr_op)
+            # VRSAVE (SPR 256) is a software-managed bitmask of which VMX
+            # registers are live, so the KERNEL can skip saving the rest across
+            # a context switch. A recompiler saves the whole vector file
+            # unconditionally, so the register has no effect on us -- but a READ
+            # still has to produce a value. Falling through to the no-op below
+            # left the destination GPR holding whatever happened to be in it, so
+            # the guest read a stale register instead of a defined one.
+            if s in ("VRSAVE", "256"):
+                if mn == "mfspr":
+                    return f"ctx->gpr[{g}] = 0;  /* mfspr VRSAVE: unmodeled (we save all of VMX) */"
+                return f"/* mtspr VRSAVE, r{g}: unmodeled -- we save all of VMX */;"
             if spr_field is None:
                 return f"/* {mn} {insn.operands}: unsupported SPR -- no-op */;"
             if mn == "mfspr":
@@ -1822,6 +1833,15 @@ class PPULifter:
             return f"{{ uint64_t fpscr64 = ctx->fpscr; memcpy(&ctx->fpr[{frd}], &fpscr64, 8); }}"
 
         # mtfsf — move to FPSCR fields
+        # mtfsb0/mtfsb1 clear/set a single FPSCR bit; mtfsfi sets a 4-bit field.
+        # Those bits are the rounding mode, the exception enables and the sticky
+        # exception flags. We model none of them -- the same reason mtfsf below is
+        # ignored -- so there is nothing for these to change. They were reaching
+        # the unhandled catch-all and being emitted as "/* TODO */", which reads
+        # as a lifter gap rather than a deliberate omission.
+        if mn.rstrip(".") in ("mtfsb0", "mtfsb1", "mtfsfi"):
+            return f"/* {mn} {insn.operands}: FPSCR unmodeled */;"
+
         if mn == "mtfsf":
             return f"/* mtfsf: FPSCR update — ignored for now */;"
 
@@ -2284,9 +2304,22 @@ class PPULifter:
             ety, n = vcmpgt_family[base_mn]
             uty = ety.replace("int", "uint") if not ety.startswith("u") else ety
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            body = (f"{{ {ety}* a=({ety}*)&ctx->vr[{va}]; {ety}* b=({ety}*)&ctx->vr[{vb}]; "
-                    f"{uty}* d=({uty}*)&ctx->vr[{vd}]; int t=0; "
-                    f"for(int i=0;i<{n};i++){{ {uty} r=a[i]>b[i]?({uty})~({uty})0:0; d[i]=r; t+=r?1:0; }}")
+            # The register file is BIG-ENDIAN, so reading elements wider than a
+            # byte through a host {ety}* byte-swaps them and the comparison is
+            # made on the wrong numbers (vcmpgtsw/vcmpgtsh returned all-zero
+            # masks). Compose each element from its bytes instead; the result
+            # mask is all-ones or all-zero, so it needs no swap on the way out.
+            w = {"int8_t": 1, "uint8_t": 1, "int16_t": 2, "uint16_t": 2,
+                 "int32_t": 4, "uint32_t": 4}[ety]
+            body = (f"{{ const uint8_t* a=(const uint8_t*)&ctx->vr[{va}]; "
+                    f"const uint8_t* b=(const uint8_t*)&ctx->vr[{vb}]; "
+                    f"uint8_t d[16]; int t=0; "
+                    f"for(int i=0;i<{n};i++){{ {uty} x=0,y=0; "
+                    f"for(int k=0;k<{w};k++){{ x=({uty})((x<<8)|a[i*{w}+k]); "
+                    f"y=({uty})((y<<8)|b[i*{w}+k]); }} "
+                    f"int gt=(({ety})x>({ety})y); "
+                    f"for(int k=0;k<{w};k++) d[i*{w}+k]=gt?0xFFu:0x00u; t+=gt; }} "
+                    f"memcpy(&ctx->vr[{vd}], d, 16);")
             if mn.endswith("."):
                 body += (f" uint32_t c6=(t=={n}?8u:0u)|(t==0?2u:0u); "
                          f"ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);")
@@ -2309,12 +2342,31 @@ class PPULifter:
             "vminsb":  None, "vminsh": None, "vminsw": None,
         }
 
-        if mn in ("vaddubm", "vadduhm", "vadduwm", "vsububm", "vsubuhm", "vsubuwm", "vand"):
+        if mn == "vand":
+            # Bitwise, so element order does not matter -- no swap needed.
             ty, cnt, op = vmx_int_binop[mn]
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
             return (f"{{ {ty}* d=({ty}*)&ctx->vr[{vd}]; {ty}* a=({ty}*)&ctx->vr[{va}]; "
                     f"{ty}* b=({ty}*)&ctx->vr[{vb}]; "
                     f"for(int i=0;i<{cnt};i++) d[i]=a[i]{op}b[i]; }}")
+
+        if mn in ("vaddubm", "vadduhm", "vadduwm", "vsububm", "vsubuhm", "vsubuwm"):
+            # ARITHMETIC, unlike the bitwise ops above, cares about byte order:
+            # carries propagate the wrong way when a big-endian element is read
+            # through a host pointer. Compose each element from its bytes, do the
+            # sum, and write the result back big-endian. (vadduwm was returning
+            # byte-reversed sums and corrupting neighbouring elements.)
+            ty, cnt, op = vmx_int_binop[mn]
+            w = {"uint8_t": 1, "uint16_t": 2, "uint32_t": 4}[ty]
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ const uint8_t* a=(const uint8_t*)&ctx->vr[{va}]; "
+                    f"const uint8_t* b=(const uint8_t*)&ctx->vr[{vb}]; uint8_t d[16]; "
+                    f"for(int i=0;i<{cnt};i++){{ {ty} x=0,y=0; "
+                    f"for(int k=0;k<{w};k++){{ x=({ty})((x<<8)|a[i*{w}+k]); "
+                    f"y=({ty})((y<<8)|b[i*{w}+k]); }} "
+                    f"{ty} r=({ty})(x{op}y); "
+                    f"for(int k=0;k<{w};k++) d[i*{w}+k]=(uint8_t)(r>>(8*({w}-1-k))); }} "
+                    f"memcpy(&ctx->vr[{vd}], d, 16); }}")
 
         if mn == "vandc":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
@@ -2489,12 +2541,19 @@ class PPULifter:
                     f"r[3]=(int32_t)(s1>0x7FFFFFFFLL?0x7FFFFFFFLL:s1<-0x80000000LL?-0x80000000LL:s1); "
                     f"memcpy(&ctx->vr[{vd}], r, 16); }}")
 
+            # The vector register file holds BIG-ENDIAN data. Reading it through
+            # a host int16_t*/int32_t* and writing the result back the same way
+            # byte-swaps every element -- which is why all 12 vupk conformance
+            # cases failed with their result bytes reversed within each element.
+            # Assemble the bytes explicitly instead.
         if mn == "vupkhsh":
             # Unpack high signed halfword: sign-extend the high 4 halfwords
             # (BE elements 0-3) to 4 words. temp so vD may alias vB.
             vd = int(ops[0][1:]); vb = int(ops[-1][1:])
-            return (f"{{ int16_t* b=(int16_t*)&ctx->vr[{vb}]; int32_t r[4]; "
-                    f"for(int i=0;i<4;i++) r[i]=(int32_t)b[i]; "
+            return (f"{{ const uint8_t* b=(const uint8_t*)&ctx->vr[{vb}]; uint8_t r[16]; "
+                    f"for(int i=0;i<4;i++){{ int16_t h=(int16_t)((b[2*i]<<8)|b[2*i+1]); "
+                    f"int32_t v=(int32_t)h; r[4*i]=(uint8_t)(v>>24); r[4*i+1]=(uint8_t)(v>>16); "
+                    f"r[4*i+2]=(uint8_t)(v>>8); r[4*i+3]=(uint8_t)v; }} "
                     f"memcpy(&ctx->vr[{vd}], r, 16); }}")
 
         if mn == "vupklsh":
@@ -2503,8 +2562,10 @@ class PPULifter:
             # vD. Mirror of vupkhsh over the low half. temp so vD may alias
             # vB. ops[-1] for vB (matches the vupkhsh convention above).
             vd = int(ops[0][1:]); vb = int(ops[-1][1:])
-            return (f"{{ int16_t* b=(int16_t*)&ctx->vr[{vb}]; int32_t r[4]; "
-                    f"for(int i=0;i<4;i++) r[i]=(int32_t)b[4+i]; "
+            return (f"{{ const uint8_t* b=(const uint8_t*)&ctx->vr[{vb}]; uint8_t r[16]; "
+                    f"for(int i=0;i<4;i++){{ int16_t h=(int16_t)((b[2*(4+i)]<<8)|b[2*(4+i)+1]); "
+                    f"int32_t v=(int32_t)h; r[4*i]=(uint8_t)(v>>24); r[4*i+1]=(uint8_t)(v>>16); "
+                    f"r[4*i+2]=(uint8_t)(v>>8); r[4*i+3]=(uint8_t)v; }} "
                     f"memcpy(&ctx->vr[{vd}], r, 16); }}")
 
         if mn == "vupkhsb":
@@ -2512,8 +2573,9 @@ class PPULifter:
             # sign-extend the HIGH 8 signed bytes (elements 0-7) to 8 signed
             # halfwords in vD. temp so vD may alias vB.
             vd = int(ops[0][1:]); vb = int(ops[-1][1:])
-            return (f"{{ int8_t* b=(int8_t*)&ctx->vr[{vb}]; int16_t r[8]; "
-                    f"for(int i=0;i<8;i++) r[i]=(int16_t)b[i]; "
+            return (f"{{ const uint8_t* b=(const uint8_t*)&ctx->vr[{vb}]; uint8_t r[16]; "
+                    f"for(int i=0;i<8;i++){{ int16_t v=(int16_t)(int8_t)b[i]; "
+                    f"r[2*i]=(uint8_t)(v>>8); r[2*i+1]=(uint8_t)v; }} "
                     f"memcpy(&ctx->vr[{vd}], r, 16); }}")
 
         if mn == "vupklsb":
@@ -2521,8 +2583,9 @@ class PPULifter:
             # sign-extend the LOW 8 signed bytes (elements 8-15) to 8 signed
             # halfwords in vD. Mirror of vupkhsb over the low half.
             vd = int(ops[0][1:]); vb = int(ops[-1][1:])
-            return (f"{{ int8_t* b=(int8_t*)&ctx->vr[{vb}]; int16_t r[8]; "
-                    f"for(int i=0;i<8;i++) r[i]=(int16_t)b[8+i]; "
+            return (f"{{ const uint8_t* b=(const uint8_t*)&ctx->vr[{vb}]; uint8_t r[16]; "
+                    f"for(int i=0;i<8;i++){{ int16_t v=(int16_t)(int8_t)b[8+i]; "
+                    f"r[2*i]=(uint8_t)(v>>8); r[2*i+1]=(uint8_t)v; }} "
                     f"memcpy(&ctx->vr[{vd}], r, 16); }}")
 
         # Shifts and rotates
