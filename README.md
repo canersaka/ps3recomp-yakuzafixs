@@ -30,7 +30,30 @@ The PlayStation 3 has over **3,000 titles** and some of the most beloved games e
 - **Lower hardware requirements** — runs on mid-range PCs
 - **Moddability** — recompiled C/C++ is infinitely more hackable than PPC binaries
 - **Preservation** — native ports survive long after emulators stop being maintained
-- **Portability** — compile for Windows, Linux, macOS, ARM, whatever
+- **Portability** — the output is C/C++, so it can target any platform a compiler does (see [platform support](#platform-support) for where the runtime actually stands today)
+
+## Platform support
+
+Verified by CI on every push unless noted.
+
+| | Windows | macOS (arm64) | Linux |
+|---|---|---|---|
+| Runtime library builds | yes | yes | untested |
+| Lifter + 8 test suites | yes | yes | untested |
+| Render backend | D3D12 | Metal | none |
+| Runs a recompiled game | **yes** | **no** | no |
+
+The gap on macOS is the PPU boot scaffold — `ppu_loader.cpp`, `boot_main.cpp`
+and the HLE dispatch are still Win32-only (thread creation, VirtualAlloc, SEH,
+stack walking), and they are compiled per-game rather than into the library.
+So macOS builds the runtime, renders through Metal and passes the full test
+suite, but cannot yet load and run a title. `ps3recomp_host` drives
+cellGcm → RSX → Metal end to end without a game, which is what makes further
+graphics work possible there.
+
+Linux has no CI and no render backend. The POSIX paths exist and the library
+may well build; nobody has checked, so it is listed as untested rather than
+supported.
 
 ## The Challenge
 
@@ -244,7 +267,7 @@ We've written extensive docs covering every aspect of the project. Whether you'r
 | **[NID System](docs/NID_SYSTEM.md)** | How PS3 function linking works, NID computation, module registration framework |
 | **[Module Reference](docs/MODULES_REFERENCE.md)** | Detailed documentation for all 93+ HLE modules — what they do and how they're implemented |
 | **[Module Status](docs/MODULE_STATUS.md)** | Quick-reference status table for all modules |
-| **[RSX Graphics](docs/RSX_GRAPHICS.md)** | RSX GPU translation architecture: command processor, D3D12/Vulkan backends, shader strategy |
+| **[RSX Graphics](docs/RSX_GRAPHICS.md)** | RSX GPU translation architecture: command processor, D3D12 and Metal backends, shader strategy |
 | **[Tools Reference](docs/TOOLS.md)** | Every recompiler pipeline tool documented: ELF parser, disassembler, lifter, NID database |
 | **[SPU Lifter](docs/SPU_LIFTER.md)** | SPU ISA decoding/lifting, the runtime model (local store, channels, DMA, per-image dispatch), and the SPU tests |
 | **[Platform Abstraction](docs/PLATFORM_ABSTRACTION.md)** | How we handle Win32 vs POSIX: threading, sockets, timers, audio, memory, fibers |
@@ -343,6 +366,64 @@ ps3recomp is built by a growing community. See **[CONTRIBUTORS.md](CONTRIBUTORS.
 for who did what — thank you, everyone.
 
 ## Changelog
+
+### v0.9.0 — *"Second Platform"* (August 2026)
+
+*The first tagged release, and the first that another platform can verify.*
+*Two outside contributions from [@slushiimusic](https://github.com/slushiimusic)*
+*gave the project CI and a second render backend; wiring the existing test*
+*suites into that CI immediately found fifteen silent miscompiles.*
+
+**macOS, and the project's first CI** (#94, #95, #96)
+- `docs/BUILDING.md` had listed Apple Clang 14+ under "full support" while the
+  tree did not compile there at all. Reported in #94, which was correct.
+- **#95** makes the runtime library build on arm64 macOS and adds the first CI
+  workflow this repository has ever had. It caught two of its own follow-ups
+  within 17 seconds of landing.
+- **#96** adds an RSX **Metal** backend (clear, flip, guest vertex fetch,
+  pipeline-state cache, blend translation), a POSIX host that drives
+  cellGcm → RSX → backend with **no lifted game**, and .app/dmg packaging.
+- CI asserts the **presented pixel**, not the exit code: the guest clear colour
+  through the FIFO, and an NV4097 triangle covering the centre pixel.
+- macOS still **cannot run a recompiled game** — the PPU boot scaffold is
+  Win32-only. See [platform support](#platform-support).
+
+**Fifteen VMX miscompiles, found by running the tests somewhere new**
+- The conformance suite only ever compiled its generated driver on Windows.
+  Everywhere else it printed `COMPILE FAILED` and executed nothing — and a
+  missing compiler exited **0**, so a skip read as a pass.
+- With it actually running: `vupkhsb/vupklsb/vupkhsh/vupklsh` (12 cases) read
+  and wrote the big-endian vector file through host `int16_t*`/`int32_t*`,
+  byte-reversing every result element. `vcmpgtsw`/`vcmpgtsh` compared
+  byte-reversed values, so a mixed-sign vector produced an all-zero mask.
+  `vadduwm` propagated carries the wrong way and spilled into neighbouring
+  elements. The byte-width members of each family passed by luck.
+- `vadduhm`, `vsubuhm`, `vsubuwm` had the same latent bug with no test
+  covering them; fixed together. 1311 checks, 0 failures.
+- `mtfsb0`/`mtfsb1`/`mtfsfi` reached the unhandled catch-all. `mfspr VRSAVE`
+  was a bare no-op that left the destination register **stale**.
+
+**Runtime fixes found while driving two titles**
+- **The GCM label/control/offset block lived at a hardcoded `0x03000000`** —
+  inside main memory, where a title's own allocator hands out blocks. flOw's
+  heap swallowed it: the game memset over the control register, the FIFO drain
+  read ASCII as `put` and discarded whole frames. Moved to
+  `VM_HLE_INJECT_BASE`, with every user deriving from it.
+- **Malformed MFC transfers were reported and then performed anyway.** Real
+  hardware raises an alignment exception and moves nothing. YDKJ's FMOD mixer
+  issues eight 16 KB PUTs with a 4-byte-misaligned EA marching through its own
+  loaded image, which zeroed the title's OPD table; the boot now survives.
+- **The host-RVA → guest-function mapper invented frames.** "Largest host
+  pointer ≤ target" with no upper bound attributes any runtime or CRT address
+  to whichever lifted function sits below it. It cost real debugging time on
+  both titles. Now bounded, and it prints the raw RVA rather than guessing.
+- **Two-level jump tables** (`lwz r30,d1(r2); lwz r11,d2(r30)`) were rejected
+  outright, including the common case where the base is loaded in the prologue
+  hundreds of instructions earlier.
+- The VFS now tolerates a flattened extracted tree (no `PS3_GAME` level).
+
+*Earlier versions in this changelog predate tagging and have no release
+artifacts; v0.9.0 is where that starts.*
 
 ### v0.8.0 — *"Ground Truth"* (August 2026)
 <!-- TODO(maintainer): codename is a suggestion -- rename freely. -->

@@ -181,6 +181,10 @@ cmake -B build -DPS3_MODULE_MAX_FUNCS=1024
 
 ### Linux
 
+> **Untested.** There is no Linux CI and no render backend for it. The POSIX
+> paths exist and the library may build, but nobody has verified it — treat
+> the notes below as a starting point rather than a supported configuration.
+
 **Compiler Flags (GCC/Clang):**
 - `-Wall -Wextra` — Enable warnings
 - `-Wno-unused-parameter` — Suppress for HLE stubs
@@ -192,13 +196,32 @@ cmake -B build -DPS3_MODULE_MAX_FUNCS=1024
 
 ### macOS
 
-> **Not working yet.** The runtime library does not currently compile on arm64
-> macOS — reported with the full error list in
-> [#94](https://github.com/sp00nznet/ps3recomp/issues/94), which was correct:
-> the docs advertised support the code did not have. A fix and a macOS CI
-> workflow are in review ([#95](https://github.com/sp00nznet/ps3recomp/pull/95)),
-> along with a Metal backend ([#96](https://github.com/sp00nznet/ps3recomp/pull/96)).
-> Until those land, treat macOS as unsupported.
+Builds and is covered by CI (`.github/workflows/macos.yml`, arm64, Debug and
+Release on every push). That workflow builds the runtime library, runs all
+eight lifter test suites — including the 1300+ instruction conformance checks,
+which compile and *execute* lifted code — and then runs `ps3recomp_host`
+headlessly, asserting the presented pixel matches the guest clear colour and
+that an NV4097 triangle covers the centre pixel. A green tick means the
+graphics bridge works, not merely that it compiled.
+
+```bash
+brew install ninja sdl2
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
+```
+
+**It cannot run a recompiled game yet.** The PPU boot scaffold —
+`runtime/ppu/ppu_loader.cpp`, `runtime/ppu/tests/boot_main.cpp` and the HLE
+dispatch — is still Win32-only (thread creation, `VirtualAlloc`, SEH, stack
+walking) and is compiled per-game rather than into the library, so it is not
+covered by the macOS build. Porting that scaffold is the remaining work.
+
+Thanks to [@slushiimusic](https://github.com/slushiimusic), who reported the
+original docs-vs-reality gap in
+[#94](https://github.com/sp00nznet/ps3recomp/issues/94) and contributed both
+the build fix with CI ([#95](https://github.com/sp00nznet/ps3recomp/pull/95))
+and the Metal backend ([#96](https://github.com/sp00nznet/ps3recomp/pull/96)).
 
 ---
 
