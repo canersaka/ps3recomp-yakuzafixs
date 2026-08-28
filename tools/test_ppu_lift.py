@@ -767,6 +767,43 @@ static void check_fpr(const char* name, int reg, uint64_t got, uint64_t want) {
 #include <stdlib.h>   /* MSVC _byteswap_* */
 static uint8_t g_vm_stub[65536];
 #define VMOFF(a) ((uint32_t)(a) & 0xFFFFu)
+/* Trap guard. A "may_trap" case exists to prove lifted code does NOT fault --
+ * e.g. divw by zero must be lowered to a defined result, not a hardware trap.
+ * MSVC catches that with SEH. POSIX has no SEH, so arm a signal handler and
+ * siglongjmp back: without this the whole run dies on the first bad case and
+ * the remaining 1300 checks never report. */
+#ifdef _MSC_VER
+#  define CONF_TRY     __try {
+#  define CONF_EXCEPT  } __except (1) {
+#  define CONF_ENDTRY  }
+#else
+#  include <setjmp.h>
+#  include <signal.h>
+static sigjmp_buf g_conf_jmp;
+static volatile sig_atomic_t g_conf_armed = 0;
+static void conf_trap_handler(int sig) {
+    (void)sig;
+    if (g_conf_armed) { g_conf_armed = 0; siglongjmp(g_conf_jmp, 1); }
+    _exit(3);
+}
+#  define CONF_TRY                                                          \
+     { struct sigaction _sa, _ofpe, _osegv, _oill;                          \
+       _sa.sa_handler = conf_trap_handler;                                  \
+       sigemptyset(&_sa.sa_mask); _sa.sa_flags = 0;                         \
+       sigaction(SIGFPE,  &_sa, &_ofpe);                                    \
+       sigaction(SIGSEGV, &_sa, &_osegv);                                   \
+       sigaction(SIGILL,  &_sa, &_oill);                                    \
+       g_conf_armed = 1;                                                    \
+       if (sigsetjmp(g_conf_jmp, 1) == 0) {
+#  define CONF_EXCEPT  } else {
+#  define CONF_ENDTRY                                                       \
+       }                                                                    \
+       g_conf_armed = 0;                                                    \
+       sigaction(SIGFPE,  &_ofpe,  0);                                      \
+       sigaction(SIGSEGV, &_osegv, 0);                                      \
+       sigaction(SIGILL,  &_oill,  0); }
+#  include <unistd.h>   /* _exit */
+#endif
 /* _byteswap_* are MSVC intrinsics; this driver is built with plain cl on
  * Windows and with clang/gcc everywhere else, so pick per compiler. */
 #ifdef _MSC_VER
@@ -830,13 +867,13 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = CONF_BSWAP64(v); memcpy
             nib, shift = c["exp_cr"]
             body.append(f'        check_cr("{nm}", ctx->cr, {nib}, {shift});')
         if c["may_trap"]:
-            out.append("      __try {")
+            out.append("      CONF_TRY")
             out.extend(body)
             out.append("        g_pass++;")
-            out.append("      } __except (1) {")
+            out.append("      CONF_EXCEPT")
             out.append(f'        printf("FAIL {nm}: HOST TRAP (div?) -- lifted code must not fault\\n");')
             out.append("        g_fail++;")
-            out.append("      }")
+            out.append("      CONF_ENDTRY")
         else:
             out.extend(body)
         out.append("    }")
