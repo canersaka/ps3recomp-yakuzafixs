@@ -11,6 +11,7 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_read32 / vm_write32 */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>   /* getenv -- Clang errors on the implicit declaration MSVC allows */
 #include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 
 /* Internal state */
