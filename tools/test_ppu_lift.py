@@ -938,7 +938,7 @@ def main():
     if len(fails) > 40:
         print(f"... and {len(fails) - 40} more failures")
     for ln in tail.splitlines():
-        if "[ppu-conformance]" in ln or "error C" in ln:
+        if "[ppu-conformance]" in ln or "error C" in ln or "error:" in ln:
             print(ln)
     if rc == 2:
         # Distinguish "no compiler on PATH" from "the generated code does not
