@@ -425,6 +425,20 @@ static LONG WINAPI ppu_guard_veh(EXCEPTION_POINTERS* ep)
             if ((guest & ~31u) == (s_guard_ea & ~31u)) {
                 static int _cs = 0;
                 if (_cs++ < 6) {
+                    /* The writer's own arguments, live. The guard fires INSIDE
+                     * the writing routine, so for a memset/memcpy/arena-init
+                     * these are (dst, value/src, length) in r3/r4/r5 -- i.e. the
+                     * RANGE being written, which is usually the whole question.
+                     * This used to print only on a non-zero -> zero transition
+                     * of the watched word; a fill with any other value (-1 is
+                     * the common one) left the range invisible. */
+                    if (g_active_ctx)
+                        fprintf(stderr, "[GUARD]   live ctx r3=0x%08X r4=0x%08X r5=0x%08X"
+                                        " r6=0x%08X r30=0x%08X r31=0x%08X lr=0x%08X\n",
+                                (uint32_t)g_active_ctx->gpr[3], (uint32_t)g_active_ctx->gpr[4],
+                                (uint32_t)g_active_ctx->gpr[5], (uint32_t)g_active_ctx->gpr[6],
+                                (uint32_t)g_active_ctx->gpr[30], (uint32_t)g_active_ctx->gpr[31],
+                                (uint32_t)g_active_ctx->lr);
                     ppu_guest_callstack("guard-clear");
                 }
             }
