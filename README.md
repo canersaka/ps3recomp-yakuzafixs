@@ -18,7 +18,7 @@ This is the same philosophy behind:
 - [UnleashedRecomp](https://github.com/hedge-dev/UnleashedRecomp) (Xbox 360 -> native)
 - [PS2Recomp](https://github.com/ran-j/PS2Recomp) (PS2 -> native)
 - [burnout3](https://github.com/sp00nznet/burnout3) (Original Xbox -> native)
-- [360tools](https://github.com/sp00nznet/360tools) (Xbox 360 -> native)
+- [ReXGlue](https://github.com/rexglue/rexglue-sdk) (Xbox 360 -> native)
 
 ...but for the PS3's glorious, terrifying **Cell Broadband Engine**.
 
@@ -157,7 +157,7 @@ ps3recomp/
 
 ## How It Works
 
-The pipeline follows the same proven approach as our [360tools](https://github.com/sp00nznet/360tools) and [burnout3](https://github.com/sp00nznet/burnout3) projects, adapted for the Cell architecture:
+The pipeline follows the same proven approach as our [burnout3](https://github.com/sp00nznet/burnout3) project, adapted for the Cell architecture:
 
 ```
    PS3 Game Disc / PKG
@@ -325,7 +325,7 @@ Want to port a game? Start with the [Getting Started](#getting-started) section,
 | **[XenonRecomp](https://github.com/hedge-dev/XenonRecomp)** | PowerPC recompiler for Xbox 360. Both CPUs are PowerPC — we adapt its lifter for PPU-specific extensions. |
 | **[N64Recomp](https://github.com/N64Recomp/N64Recomp)** | Pioneered the modern static recomp approach. Our architecture follows the same "recompile to C, link with runtime" philosophy. |
 | **[PS2Recomp](https://github.com/ran-j/PS2Recomp)** | Sibling project for PS2. Different ISA (MIPS vs PowerPC) but same spirit. |
-| **[360tools](https://github.com/sp00nznet/360tools)** | Our own Xbox 360 toolkit. ps3recomp follows the same project structure and conventions. |
+| **[ReXGlue](https://github.com/rexglue/rexglue-sdk)** | The closest sibling this project has: a static recompilation SDK for the Xbox 360, turning PowerPC into portable C++ compiled ahead of time rather than interpreted. Same shape as ps3recomp — a toolkit plus a runtime, with game ports built on top — and a generation of Xenon hardware away from Cell. Their release engineering is well ahead of ours and worth copying: one reusable build workflow driving five platforms, nightlies, and tagged releases that publish artifacts. |
 | **[pcrecomp](https://github.com/sp00nznet/pcrecomp)** | Our PC recompilation toolkit. Shared philosophy of "analyze → disassemble → lift → link → ship". |
 
 ## Building Blocks We Leverage
