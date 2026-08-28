@@ -913,7 +913,19 @@ def main():
         if "[ppu-conformance]" in ln or "error C" in ln:
             print(ln)
     if r.returncode == 2:
-        print("COMPILE FAILED -- see", log)
+        # Distinguish "no compiler on PATH" from "the generated code does not
+        # compile". Both used to print the same COMPILE FAILED, so a run without
+        # a developer prompt looked like an environment hiccup -- and it silently
+        # skipped the half of this test that RUNS the lifted code. Fifteen real
+        # VMX conformance failures hid behind that for as long as it took someone
+        # to run it from a vcvars shell.
+        if "is not recognized as an internal or external command" in tail:
+            print("SKIPPED: no MSVC `cl` on PATH -- the generated code was NOT",
+                  "compiled or run, so the conformance checks above did not",
+                  "execute. Run this from a Visual Studio developer prompt",
+                  "(or after vcvars64.bat) for real coverage.")
+            sys.exit(0 if decode_ok else 1)
+        print("COMPILE FAILED (the lifted C is broken) -- see", log)
     sys.exit(0 if (r.returncode == 0 and decode_ok) else 1)
 
 if __name__ == "__main__":
