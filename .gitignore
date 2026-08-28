@@ -93,3 +93,6 @@ _drill/
 
 # Local Claude Code settings
 .claude/
+
+# macOS packaging output
+*.dmg

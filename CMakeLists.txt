@@ -43,6 +43,13 @@ file(GLOB_RECURSE HLE_SOURCES
 # Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 
+# The Metal backend is Objective-C and Apple-only, so it is added explicitly
+# rather than globbed. It needs no platform #ifdef of its own as a result.
+if(APPLE)
+    enable_language(OBJC)
+    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m")
+endif()
+
 # Runtime core (syscalls, PPU, SPU, memory)
 file(GLOB_RECURSE RUNTIME_SOURCES
     "runtime/*.c"
@@ -121,6 +128,19 @@ else()
     target_link_libraries(ps3recomp_runtime PRIVATE Threads::Threads)
 endif()
 
+if(APPLE)
+    target_link_libraries(ps3recomp_runtime PUBLIC
+        "-framework Metal"
+        "-framework QuartzCore"
+        "-framework Foundation"
+        "-framework AppKit"
+    )
+    set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    message(STATUS "  Metal:        RSX backend enabled (rsx_metal_backend.m)")
+endif()
+
 # ---------------------------------------------------------------------------
 # Compiler flags
 # ---------------------------------------------------------------------------
@@ -155,6 +175,25 @@ if(PS3RECOMP_BUILD_TESTS)
     else()
         message(STATUS "  sync_stress:  skipped (Win32-only threading API)")
     endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# POSIX host harness
+# ---------------------------------------------------------------------------
+# Drives the cellGcm -> RSX -> backend bridge with no lifted game, so a backend
+# can be brought up and regression-tested without a game binary or a recompiler
+# run. Currently Apple-only because the Metal backend is the only non-Windows
+# backend that renders; it will build anywhere once another one lands.
+if(APPLE)
+    add_executable(ps3recomp_host
+        runtime/host/host_posix.c
+        runtime/host/host_stubs.c
+    )
+    target_link_libraries(ps3recomp_host PRIVATE ps3recomp_runtime)
+    target_include_directories(ps3recomp_host PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
 endif()
 
 # ---------------------------------------------------------------------------
