@@ -28,7 +28,8 @@
 #include "sys_event.h"
 
 #include <stdio.h>
-#include <string.h>
+#include <string.h>
+#include "../platform/darwin_compat.h"   /* QueryPerformanceCounter shim for the SPU_SPEED timing */
 
 /* ---------------------------------------------------------------------------
  * TTY syscalls (used by PS3 CRT for debug output)

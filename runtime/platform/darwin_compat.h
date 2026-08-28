@@ -21,6 +21,31 @@
  * resolution the guest timeout APIs actually express. */
 #define PS3_TIMEDWAIT_POLL_NS  200000L
 
+/* QueryPerformanceCounter/Frequency, for the timing DIAGNOSTICS that measure
+ * SPU interpreter throughput. Those call sites are not Windows-specific in
+ * intent -- they just used the Win32 clock because that is where they were
+ * written -- so shim the three names onto CLOCK_MONOTONIC rather than fence
+ * every use site off with #ifdef and lose the diagnostic on macOS.
+ *
+ * Frequency is reported in nanoseconds so the counter is a plain ns count;
+ * callers only ever divide one by the other. */
+typedef struct { long long QuadPart; } PS3_LARGE_INTEGER;
+#define LARGE_INTEGER PS3_LARGE_INTEGER
+
+static inline int QueryPerformanceCounter(PS3_LARGE_INTEGER* v)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    v->QuadPart = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    return 1;
+}
+
+static inline int QueryPerformanceFrequency(PS3_LARGE_INTEGER* v)
+{
+    v->QuadPart = 1000000000LL;
+    return 1;
+}
+
 static inline int ps3__deadline_passed(const struct timespec* abs)
 {
     struct timespec now;
