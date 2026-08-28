@@ -17,7 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
-#include <windows.h>        /* CRITICAL_SECTION for real lwmutex exclusion */
+#include <windows.h>        /* CRITICAL_SECTION for real lwmutex exclusion */
 #include "../memory/vm.h"                 /* VM_HLE_INJECT_BASE */
 #endif
 
