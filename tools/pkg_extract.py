@@ -4,6 +4,7 @@ Handles both finalized (retail, AES-128-CTR with the public PS3_GPKG key) and
 non-finalized/debug (SHA-1 keystream) packages. DRM-free (type 3) content needs
 no per-title RAP/klicensee, so the whole PlayStation Minis catalog opens up.
 
+Files are written under out_dir with the package's own directory tree intact.
 Auto-detects the keystream by checking that the decrypted file table yields ASCII
 filenames. Both keystreams are per-block seekable, so with --only we decrypt just the
 file table plus the one requested file (a few MB) instead of the whole package -- and the
@@ -102,6 +103,25 @@ def _keystream(used, riv, hdr60, start_block, nblocks) -> bytes:
     return bytes(out)
 
 
+def out_path(outd, name):
+    """Map a PKG entry name onto a path under `outd`, keeping its directories.
+
+    Basenames are not unique: PDIPFS stores files as A/YG, B/YG, C/YG ..., so
+    flattening silently overwrites most of the package. Entry names come from
+    the (decrypted, but unauthenticated) file table, so components that would
+    escape `outd` -- "..", a drive letter, a leading slash -- are dropped.
+    """
+    parts = []
+    for p in name.replace("\\", "/").split("/"):
+        p = p.strip()
+        if not p or p in (".", "..") or os.path.splitdrive(p)[0]:
+            continue
+        parts.append(p)
+    if not parts:
+        raise ValueError(f"package entry has no usable name: {name!r}")
+    return os.path.join(outd, *parts)
+
+
 def main():
     inp, outd = sys.argv[1], sys.argv[2]
     only = None
@@ -165,7 +185,8 @@ def main():
         if fs <= 0:
             continue
         blob = decrypt_range(used, fo, fs)
-        op = os.path.join(outd, os.path.basename(nm))
+        op = out_path(outd, nm)
+        os.makedirs(os.path.dirname(op), exist_ok=True)
         open(op, "wb").write(blob)
         tag = "  <-- SELF" if blob[:4] == b"SCE\x00" else ""
         print(f"  {nm}  ({fs} bytes){tag}")
