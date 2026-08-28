@@ -9,6 +9,7 @@
  */
 
 #include "cellGcmSys.h"
+#include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
@@ -508,7 +509,9 @@ void cellGcmSetWaitFlip(void)
      * via cellGcmTickFlip, ~once per display refresh). This throttles the title
      * to vsync; without it the guest loops unthrottled and many frames batch
      * into a single host present -> the console text stacks/duplicates. */
+#ifdef _WIN32
     __declspec(dllimport) void __stdcall Sleep(unsigned long);
+#endif  /* elsewhere: runtime/platform/win32_compat.h */
     for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
         Sleep(1);
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;

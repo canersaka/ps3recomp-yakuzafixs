@@ -8,6 +8,7 @@
 
 #include "cellSync2.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host pointer */
+#include "../../runtime/platform/darwin_compat.h"
 #include <stdio.h>
 #include <string.h>
 

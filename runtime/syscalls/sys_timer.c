@@ -7,6 +7,7 @@
 #include "../memory/vm.h"
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
+#include <stdlib.h>
 
 /* ---------------------------------------------------------------------------
  * Globals

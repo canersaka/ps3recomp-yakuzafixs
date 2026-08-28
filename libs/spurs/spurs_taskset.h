@@ -29,7 +29,11 @@
  * That stayed invisible while no title linked both this and the loader's
  * same-named (64-bit EA) family -- a static library only pulls in the objects
  * it needs. Tokyo Jungle references SPURS, which drags cellSpurs.c in, and the
- * link then failed with five duplicate symbols. */
+ * link then failed with five duplicate symbols.
+ *
+ * It is also a hard error on Clang, which rejects the non-static
+ * re-declaration outright where MSVC accepted it -- so this is what kept
+ * the tree from compiling on macOS at all. */
 #include "../../runtime/ppu/ppu_memory.h"
 
 /* ---- CellSpursTaskset (main memory, 128-byte aligned) --------------------
