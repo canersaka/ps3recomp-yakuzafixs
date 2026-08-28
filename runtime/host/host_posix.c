@@ -14,6 +14,7 @@
  * the backend intact -- so it works as a CI check.
  */
 #include "cellGcmSys.h"
+#include "../memory/vm.h"           /* VM_HLE_INJECT_BASE */
 #include "rsx_commands.h"
 #include "rsx_metal_backend.h"
 
@@ -26,11 +27,18 @@
 /* The guest address space this host hands to the HLE layer. */
 uint8_t* vm_base = NULL;
 
-#define VM_SIZE     (64u * 1024u * 1024u)
+/* Must reach VM_HLE_INJECT_BASE: cellGcmSetupContext plants the GCM label
+ * window, the control register and the IO<->EA offset tables there, so a VM
+ * that stops short of it segfaults the moment the context is built. calloc is
+ * lazy, so the extra range costs address space rather than memory. */
+#define VM_SIZE     (VM_HLE_INJECT_BASE + 0x10000u)
 #define IO_ADDR     0x00100000u          /* RSX IO window base                */
 #define IO_SIZE     0x00200000u
 #define CMD_SIZE    0x00010000u
-#define CTRL_ADDR   0x03002000u          /* DMA control: put @+0, get @+4     */
+/* DMA control: put @+0, get @+4. Derived, never spelled out -- a hardcoded
+ * copy of this address is exactly what broke the FIFO callback when the block
+ * moved (see the sentinel in ppu_sysprx.cpp). */
+#define CTRL_ADDR   (VM_HLE_INJECT_BASE + 0x2000u)
 #define HEAP_BASE   0x00400000u
 
 #define CLEAR_ARGB  0xFF101830u          /* what we expect to come out again  */
