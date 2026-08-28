@@ -293,7 +293,12 @@ extern "C" void ps3_hle_call(unsigned int nid, ppu_context* ctx);
 
 /* Trampoline function pointer for cross-fragment branches (TLS).
  * Must match the __declspec(thread) definition in indirect_dispatch. */
-extern "C" __declspec(thread) void (*g_trampoline_fn)(void*);
+#ifdef _MSC_VER
+#  define PPU_THREAD_LOCAL __declspec(thread)
+#else
+#  define PPU_THREAD_LOCAL __thread
+#endif
+extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
 
 /* Drain pending trampolines after any call that might set g_trampoline_fn.
  * Converts cross-fragment fallthrough chains into iterative loops. */

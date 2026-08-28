@@ -922,7 +922,8 @@ def main():
                 f.write("no C++ compiler found (set CXX)\n")
         else:
             with open(log, "w") as f:
-                cp = subprocess.run([cxx, "-O1", "-w", "-I", os.path.join("runtime", "ppu"),
+                cp = subprocess.run([cxx, "-std=c++17", "-O1", "-w",
+                                     "-I", os.path.join("runtime", "ppu"),
                                      "-o", epath, cpath],
                                     cwd=ROOT, stdout=f, stderr=subprocess.STDOUT)
             if cp.returncode != 0:
