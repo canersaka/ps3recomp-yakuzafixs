@@ -767,10 +767,19 @@ static void check_fpr(const char* name, int reg, uint64_t got, uint64_t want) {
 #include <stdlib.h>   /* MSVC _byteswap_* */
 static uint8_t g_vm_stub[65536];
 #define VMOFF(a) ((uint32_t)(a) & 0xFFFFu)
-extern "C" uint32_t vm_read32(uint64_t a) { uint32_t v; memcpy(&v, g_vm_stub + VMOFF(a), 4); return _byteswap_ulong(v); }
-extern "C" void vm_write32(uint64_t a, uint32_t v) { v = _byteswap_ulong(v); memcpy(g_vm_stub + VMOFF(a), &v, 4); }
-extern "C" uint64_t vm_read64(uint64_t a) { uint64_t v; memcpy(&v, g_vm_stub + VMOFF(a), 8); return _byteswap_uint64(v); }
-extern "C" void vm_write64(uint64_t a, uint64_t v) { v = _byteswap_uint64(v); memcpy(g_vm_stub + VMOFF(a), &v, 8); }
+/* _byteswap_* are MSVC intrinsics; this driver is built with plain cl on
+ * Windows and with clang/gcc everywhere else, so pick per compiler. */
+#ifdef _MSC_VER
+#  define CONF_BSWAP32 _byteswap_ulong
+#  define CONF_BSWAP64 _byteswap_uint64
+#else
+#  define CONF_BSWAP32 __builtin_bswap32
+#  define CONF_BSWAP64 __builtin_bswap64
+#endif
+extern "C" uint32_t vm_read32(uint64_t a) { uint32_t v; memcpy(&v, g_vm_stub + VMOFF(a), 4); return CONF_BSWAP32(v); }
+extern "C" void vm_write32(uint64_t a, uint32_t v) { v = CONF_BSWAP32(v); memcpy(g_vm_stub + VMOFF(a), &v, 4); }
+extern "C" uint64_t vm_read64(uint64_t a) { uint64_t v; memcpy(&v, g_vm_stub + VMOFF(a), 8); return CONF_BSWAP64(v); }
+extern "C" void vm_write64(uint64_t a, uint64_t v) { v = CONF_BSWAP64(v); memcpy(g_vm_stub + VMOFF(a), &v, 8); }
 """)
     out.append("int main(void) {")
     out.append("    ppu_context* ctx = &g_ctx;")
