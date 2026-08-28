@@ -32,3 +32,18 @@ void vm_write32(uint64_t addr, uint32_t v)
 
 /* ppu_fs.cpp - VFS root consulted by cellGame/cellFs path mapping. */
 const char* ppu_vfs_root = ".";
+
+/* Inline write-watch hooks. ppu_memory.h expands every vm_write* into a range
+ * test against g_ww_lo/g_ww_hi plus a call to ps3_ww_report_inline, and those
+ * live in runtime/ppu/ppu_loader.cpp -- which CMake excludes from the runtime
+ * library because it is compiled per-game. A game link therefore supplies them
+ * and this host does not, so it failed to link with three undefined symbols.
+ *
+ * lo == hi leaves the watch permanently empty, so the test is a compare that
+ * never fires and the reporter is never reached. */
+unsigned int g_ww_lo = 0, g_ww_hi = 0;
+
+void ps3_ww_report_inline(unsigned int addr, unsigned long long val, int width)
+{
+    (void)addr; (void)val; (void)width;
+}
