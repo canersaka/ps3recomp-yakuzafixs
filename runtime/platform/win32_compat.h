@@ -137,6 +137,12 @@ static inline LONG _InterlockedExchangeAdd(volatile LONG* target, LONG value)
     return __atomic_fetch_add(target, value, __ATOMIC_SEQ_CST);
 }
 
+/* Returns the NEW value, unlike the Exchange pair above. */
+static inline LONG InterlockedIncrement(volatile LONG* target)
+{
+    return __atomic_add_fetch(target, 1, __ATOMIC_SEQ_CST);
+}
+
 /* Spin hint: tells the core this is a wait loop, so it can back off rather
  * than burn the pipeline. Purely advisory -- doing nothing is correct, just
  * slower, which is why the fallback is empty rather than a syscall. */

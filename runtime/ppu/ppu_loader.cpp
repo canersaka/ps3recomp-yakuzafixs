@@ -22,6 +22,11 @@
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
+#ifndef _WIN32
+#include <sys/mman.h>   /* the guest-pointer trap reserves the low 4 GB */
+#include <signal.h>
+#include <unistd.h>
+#endif
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 
 /* Resolve the GUEST function on the host stack (closest lifted entry below
@@ -66,26 +71,40 @@ extern "C" void ppu_guest_caller(char* out, size_t n)
  * Deliberately does NOT swallow the exception: it reports and lets the normal
  * handling proceed, so a real bug still stops the run.
  * -----------------------------------------------------------------------*/
+/* The report is identical on both platforms; only the trap mechanism differs
+ * (vectored exception handler vs sigaction, VirtualAlloc vs mmap). Written
+ * once so the two cannot drift apart. */
+static void ps3_report_guest_ptr(uintptr_t at, const char* how)
+{
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) > 32) return;
+    char who[64]; ppu_guest_caller(who, sizeof who);
+    fprintf(stderr,
+            "\n[ps3] UNTRANSLATED GUEST POINTER: %s of guest 0x%08X as a host "
+            "address\n      (an HLE function dereferenced a pointer parameter without "
+            "vm_base)\n      guest caller: %s\n", how, (uint32_t)at, who);
+    fflush(stderr);
+}
+
+/* Guest addresses worth reporting: above the first page (a plain NULL deref is
+ * someone else's bug) and below 4 GB. */
+static inline int ps3_is_guest_ptr_fault(uintptr_t at)
+{
+    return at >= 0x10000u && at < 0x100000000ull;
+}
+
+#ifdef _WIN32
+
 static LONG WINAPI ps3_guest_ptr_veh(EXCEPTION_POINTERS* ep)
 {
     const EXCEPTION_RECORD* er = ep->ExceptionRecord;
     if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
         er->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
     uintptr_t at = (uintptr_t)er->ExceptionInformation[1];
-    if (at >= 0x100000000ull) return EXCEPTION_CONTINUE_SEARCH;   /* not a guest addr */
-    if (at < 0x10000u) return EXCEPTION_CONTINUE_SEARCH;          /* a plain NULL deref */
+    if (!ps3_is_guest_ptr_fault(at)) return EXCEPTION_CONTINUE_SEARCH;
 
-    static LONG n = 0;
-    if (InterlockedIncrement(&n) <= 32) {
-        char who[64]; ppu_guest_caller(who, sizeof who);
-        const char* how = er->ExceptionInformation[0] == 0 ? "read"
-                        : er->ExceptionInformation[0] == 1 ? "write" : "execute";
-        fprintf(stderr,
-                "\n[ps3] UNTRANSLATED GUEST POINTER: %s of guest 0x%08X as a host "
-                "address\n      (an HLE function dereferenced a pointer parameter without "
-                "vm_base)\n      guest caller: %s\n", how, (uint32_t)at, who);
-        fflush(stderr);
-    }
+    ps3_report_guest_ptr(at, er->ExceptionInformation[0] == 0 ? "read"
+                           : er->ExceptionInformation[0] == 1 ? "write" : "execute");
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -105,6 +124,86 @@ extern "C" void ps3_install_guest_ptr_trap(void)
     fprintf(stderr, "[ps3] guest-pointer trap armed (%zu MB of the low 4 GB reserved)\n",
             got >> 20);
 }
+
+#else  /* POSIX */
+
+static struct sigaction s_prev_segv;
+static int              s_prev_segv_valid = 0;
+
+/* Not async-signal-safe, and deliberately so: this runs on a path that is about
+ * to end the process anyway, and the whole value of the report is the guest
+ * function name -- which means walking the stack and formatting. The Windows
+ * handler makes exactly the same trade. */
+static void ps3_guest_ptr_sigsegv(int sig, siginfo_t* si, void* uctx)
+{
+    if (si && ps3_is_guest_ptr_fault((uintptr_t)si->si_addr)) {
+        /* si_code separates unmapped from protected, not read from write, so
+         * unlike the Windows report this cannot name the direction without
+         * decoding a machine-specific trap frame. The address and the guest
+         * caller are what actually locate the bug. */
+        ps3_report_guest_ptr((uintptr_t)si->si_addr, "access");
+    }
+
+    /* Do NOT swallow it, matching the Windows handler: hand back to whoever was
+     * installed before, or restore the default so the faulting instruction
+     * re-runs and the process dies exactly as it would have. */
+    if (s_prev_segv_valid) {
+        if ((s_prev_segv.sa_flags & SA_SIGINFO) && s_prev_segv.sa_sigaction) {
+            s_prev_segv.sa_sigaction(sig, si, uctx);
+            return;
+        }
+        if (s_prev_segv.sa_handler && s_prev_segv.sa_handler != SIG_DFL &&
+            s_prev_segv.sa_handler != SIG_IGN) {
+            s_prev_segv.sa_handler(sig);
+            return;
+        }
+    }
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof dfl);
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    sigaction(sig, &dfl, NULL);
+}
+
+extern "C" void ps3_install_guest_ptr_trap(void)
+{
+    if (getenv("PS3_NO_GUEST_PTR_TRAP")) return;
+
+    /* Leave the chunk holding the program break alone. Reserving the space just
+     * above it would stop brk from ever growing and silently push every small
+     * allocation onto mmap -- a steep price for a diagnostic. */
+    uintptr_t brk_now = (uintptr_t)sbrk(0);
+
+    size_t got = 0;
+    for (uintptr_t a = 0x10000u; a < 0x100000000ull; a += 0x10000000ull) {
+        size_t len = 0x10000000u;
+        if (a == 0x10000u) len -= 0x10000u;
+        if (brk_now >= a && brk_now < a + len) continue;
+
+        int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+#ifdef MAP_FIXED_NOREPLACE
+        flags |= MAP_FIXED_NOREPLACE;   /* fail rather than evict a live mapping */
+#endif
+        void* at = mmap((void*)a, len, PROT_NONE, flags, -1, 0);
+        if (at == MAP_FAILED) continue;                 /* chunk already in use */
+        if ((uintptr_t)at != a) { munmap(at, len); continue; }  /* hint ignored */
+        got += len;
+    }
+
+    /* PROT_NONE faults arrive as SIGSEGV on both Linux and Darwin; SIGBUS is for
+     * mapped-but-unbacked access, which this scheme never produces. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = ps3_guest_ptr_sigsegv;
+    sa.sa_flags     = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGSEGV, &sa, &s_prev_segv) == 0) s_prev_segv_valid = 1;
+
+    fprintf(stderr, "[ps3] guest-pointer trap armed (%zu MB of the low 4 GB reserved)\n",
+            got >> 20);
+}
+
+#endif /* _WIN32 */
 
 /* PS3_SCTRACE=1: every lv2 syscall with its arguments and RETURN VALUE.
  * An unimplemented syscall is loud (it logs "(stub)") but an IMPLEMENTED one

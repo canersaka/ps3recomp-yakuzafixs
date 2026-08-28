@@ -162,18 +162,25 @@ games really get — and compiles the scaffold against it. It does not link and
 runs nothing; it proves only that every declaration the scaffold reaches for
 exists on this platform.
 
-Because the POSIX port is unfinished, it is a **ratchet** rather than a
-pass/fail gate: `tools/ppu_scaffold_baseline.json` records the current error
-count per toolchain, and the check fails only if a number goes **up**. Windows
-sits near zero, so a regression there is a hard failure today; Linux starts
-high and every step of the port is expected to lower it. A toolchain with no
-baseline entry reports its numbers and passes, so a new platform's first CI
+It is a **ratchet** rather than a pass/fail gate:
+`tools/ppu_scaffold_baseline.json` records the current error count per
+toolchain, and the check fails only if a number goes **up**. A toolchain with
+no baseline entry reports its numbers and passes, so a new platform's first CI
 run tells you what to record.
 
-Known non-zero on every platform: `ppu_fs.cpp` includes `<dirent.h>`
-unguarded and uses `opendir`/`readdir` directly, which MSVC does not provide —
-game ports vendor their own shim to get around it. See the note under
-[Windows](#windows).
+Both Linux toolchains are now at **zero** — the whole scaffold compiles under
+GCC and Clang — so in practice the ratchet is a hard gate there: any new error
+fails the build. Windows sits at 1, for the `<dirent.h>` reason below.
+
+Compiling is not the same as running. The scaffold is not linked or executed by
+anything in this repository (that needs a lifted game), and `boot_main.cpp`
+still starts its vblank ticker, hang watchdog and profiler inside
+`#ifdef _WIN32` with no `#else`, so a POSIX host has no frame clock. Those are
+the remaining gaps between "builds" and "runs a title".
+
+Known non-zero: `ppu_fs.cpp` includes `<dirent.h>` unguarded and uses
+`opendir`/`readdir` directly, which MSVC does not provide — game ports vendor
+their own shim to get around it. See the note under [Windows](#windows).
 
 ### Compile Definitions
 
