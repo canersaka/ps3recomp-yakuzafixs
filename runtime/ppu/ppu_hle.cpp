@@ -223,6 +223,24 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 nid, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
                 (uint32_t)ctx->gpr[5], (uint32_t)ctx->lr);
     }
+    /* PS3_HLE_ARGS=<nid-hex>: dump the full PPC64 argument register set (r3-r10)
+     * for one import. PS3_HLE_TRACE only shows r3-r5, which is not enough to tell
+     * a MISDECLARED HLE prototype from a guest passing bad values -- the two look
+     * identical from the callee side, and getting it wrong silently shifts every
+     * argument after the mistake. */
+    { static long s_ha = -1;
+      if (s_ha < 0) { const char* e = getenv("PS3_HLE_ARGS");
+                      s_ha = e ? (long)strtoul(e, 0, 16) : 0; }
+      if (s_ha && nid == (uint32_t)s_ha) {
+        static int _n = 0;
+        if (_n++ < 6)
+          fprintf(stderr, "[hle-args] nid=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X "
+                          "r7=0x%08X r8=0x%08X r9=0x%08X r10=0x%08X lr=0x%08X\n",
+                  nid, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5],
+                  (uint32_t)ctx->gpr[6], (uint32_t)ctx->gpr[7], (uint32_t)ctx->gpr[8],
+                  (uint32_t)ctx->gpr[9], (uint32_t)ctx->gpr[10], (uint32_t)ctx->lr);
+      } }
+
     /* Bad-lock locator (FLOW_BADLOCK): sys_lwmutex_lock (0x1573DC3F) on a garbage/null
      * object (r3 < 0x10000 or high-bit set) in m_InitEntityHierarchy — host backtrace
      * to find the null global it dereferences. Map RVAs via flow.map. */

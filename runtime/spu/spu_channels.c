@@ -293,8 +293,13 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             fprintf(stderr, "[atomcnt] %llu atomic ops; last cmd=0x%X ea=0x%08X\n",
                     (unsigned long long)s_n, cmd, ea);
           s_lastea = ea; } } }
-    { static int s_at = -1; if (s_at < 0) s_at = getenv("YDKJ_ATOMTRACE") ? 1 : 0;
-      if (s_at) { static int _a=0; if (_a++ < 40)
+    /* YDKJ_ATOMTRACE=1 keeps the old 40-line cap; =<N> raises it. A busy image
+     * (FMOD) exhausts 40 before a quieter one issues its first atomic, which
+     * reads as "that image never does atomics" when it simply never got a line. */
+    { static int s_at = -1;
+      if (s_at < 0) { const char* e = getenv("YDKJ_ATOMTRACE");
+                      int v = e ? atoi(e) : 0; s_at = e ? (v > 1 ? v : 40) : 0; }
+      if (s_at) { static int _a=0; if (_a++ < s_at)
         fprintf(stderr, "[atom] cmd=0x%02X ea=0x%08X (img=%d)\n", cmd, ea, ctx->image_id); } }
     /* cri task (img22) atomic on the taskset: dump the loaded bitset line so we can
      * see if the task reads MY taskset (0x4005E000) with my READY bit, or elsewhere. */
@@ -353,9 +358,13 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
           if (_n++ < 48) {
               extern uint8_t* vm_base;
               const uint8_t* r = vm_base + ((uint32_t)ea & ~127u);
-              fprintf(stderr, "[atom-ea] cmd=0x%X img=%d pc=0x%05X ea=0x%08X "
+              /* lr (gpr[0]) too: these atomics sit in generic inc/dec helpers, so
+               * pc names the HELPER and only the link register names the caller
+               * that gives the counter its meaning. */
+              fprintf(stderr, "[atom-ea] cmd=0x%X img=%d pc=0x%05X lr=0x%05X ea=0x%08X "
                       "RAM=%02X%02X%02X%02X %02X%02X%02X%02X",
-                      cmd, ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK, (uint32_t)ea,
+                      cmd, ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
+                      ctx->gpr[0]._u32[0] & SPU_LS_MASK, (uint32_t)ea,
                       r[0],r[1],r[2],r[3], r[4],r[5],r[6],r[7]);
               if (cmd == MFC_PUTLLC_CMD) {
                   fprintf(stderr, " STORE=%02X%02X%02X%02X %02X%02X%02X%02X",
