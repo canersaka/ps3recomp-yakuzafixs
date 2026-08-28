@@ -168,9 +168,9 @@ toolchain, and the check fails only if a number goes **up**. A toolchain with
 no baseline entry reports its numbers and passes, so a new platform's first CI
 run tells you what to record.
 
-Both Linux toolchains are now at **zero** — the whole scaffold compiles under
-GCC and Clang — so in practice the ratchet is a hard gate there: any new error
-fails the build. Windows sits at 1, for the `<dirent.h>` reason below.
+Every recorded toolchain is now at **zero** — the whole scaffold compiles under
+GCC, Clang and clang-cl — so in practice this is a hard gate: any new error
+fails the build.
 
 Compiling is not the same as running. The scaffold is not linked or executed by
 anything in this repository (that needs a lifted game), and `boot_main.cpp`
@@ -178,9 +178,9 @@ still starts its vblank ticker, hang watchdog and profiler inside
 `#ifdef _WIN32` with no `#else`, so a POSIX host has no frame clock. Those are
 the remaining gaps between "builds" and "runs a title".
 
-Known non-zero: `ppu_fs.cpp` includes `<dirent.h>` unguarded and uses
-`opendir`/`readdir` directly, which MSVC does not provide — game ports vendor
-their own shim to get around it. See the note under [Windows](#windows).
+It compiles the four scaffold translation units. `boot_main.cpp` is excluded:
+it also pulls in the per-game SPU recomp header and the generated function
+table, which a stub cannot stand in for.
 
 ### Compile Definitions
 
@@ -218,14 +218,12 @@ cmake -B build -DPS3_MODULE_MAX_FUNCS=1024
 **Definitions:**
 - `_CRT_SECURE_NO_WARNINGS` — Suppress MSVC CRT security warnings
 
-> **`ppu_fs.cpp` needs a `dirent.h`.** The PPU boot scaffold's filesystem
-> layer includes `<dirent.h>` unguarded and calls `opendir`/`readdir`/
-> `closedir` directly, none of which MSVC ships. Every game port therefore
-> vendors its own Win32 `dirent.h` shim on the include path. Nothing in this
-> repository supplies one, which is why
-> [the scaffold check](#checking-the-ppu-boot-scaffold) reports one error for
-> that file even on Windows. Guarding the include and providing an in-tree
-> shim would remove that duplication from every port.
+> **`dirent.h` is supplied in-tree.** The PPU boot scaffold's filesystem layer
+> walks host directories with `opendir`/`readdir`/`closedir`, none of which
+> MSVC ships, so game ports used to vendor their own Win32 shim on the include
+> path. `runtime/platform/win32_dirent.h` provides one (`FindFirstFileA`
+> behind the POSIX names, passing straight through to the system header off
+> Windows) — a port carrying its own copy can drop it.
 
 ### Linux
 

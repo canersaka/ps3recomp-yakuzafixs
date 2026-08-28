@@ -21,7 +21,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/stat.h>
-#include <dirent.h>
+#include "../platform/win32_dirent.h"   /* <dirent.h>, or a Win32 stand-in */
 
 /* Guest-resolving host backtrace (ppu_loader.cpp). Must be declared at file scope:
  * `extern "C"` inside a function body is ill-formed in C++. */
