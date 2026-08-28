@@ -16,10 +16,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef _WIN32
-#include <windows.h>        /* CRITICAL_SECTION for real lwmutex exclusion */
-#include "../memory/vm.h"                 /* VM_HLE_INJECT_BASE */
-#endif
+/* win32_compat.h is <windows.h> on Windows (CRITICAL_SECTION for the real
+ * lwmutex exclusion) and the POSIX shims elsewhere -- Sleep, DWORD, QPC. */
+#include "../platform/win32_compat.h"
+#include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
 
 extern "C" uint8_t* vm_base;
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));

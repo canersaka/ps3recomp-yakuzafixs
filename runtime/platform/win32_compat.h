@@ -1,10 +1,17 @@
 /*
- * ps3recomp - Win32 sync/timing compatibility shim for POSIX hosts
+ * ps3recomp - Win32 sync/timing/type compatibility shim for POSIX hosts
  *
- * A handful of translation units were written directly against the Win32
- * synchronisation and timing API (SRWLOCK, CONDITION_VARIABLE, QPC, events).
- * This header supplies those names on POSIX so the call sites compile
- * unchanged. On Windows it is a no-op passthrough to <windows.h>.
+ * A good deal of this tree was written directly against Win32: the
+ * synchronisation and timing API (SRWLOCK, CONDITION_VARIABLE, QPC, events),
+ * the interlocked intrinsics behind the PPU reservation spinlock, and the
+ * scalar typedefs (DWORD, ULONGLONG, SIZE_T, ...) those call sites use. This
+ * header supplies all of it on POSIX so the call sites compile unchanged. On
+ * Windows it is a no-op passthrough to <windows.h>.
+ *
+ * Usable from C AND C++. That is deliberate: the runtime library is C but the
+ * PPU boot scaffold is C++, and both need these names. Nothing in here may use
+ * a C-only construct -- see the note on ps3_lazy_obj below for the one that
+ * did, and how far it got before anyone noticed.
  *
  * IMPORTANT -- storage size. Win32 SRWLOCK and CONDITION_VARIABLE are exactly
  * pointer-sized and zero-initialise validly, so several structs (notably
@@ -26,7 +33,6 @@
 
 #include <pthread.h>
 #include <limits.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <time.h>
@@ -46,6 +52,10 @@
 typedef uint32_t           DWORD;
 typedef int                BOOL;
 typedef long long          LONGLONG;
+typedef unsigned long long ULONGLONG;
+typedef long               LONG;
+typedef unsigned long      ULONG;
+typedef size_t             SIZE_T;
 typedef void*              HANDLE;
 typedef union { LONGLONG QuadPart; } LARGE_INTEGER;
 
@@ -55,20 +65,25 @@ typedef void*  CONDITION_VARIABLE;
 #define SRWLOCK_INIT            NULL
 #define CONDITION_VARIABLE_INIT NULL
 
-/* --- lazy, race-free materialisation of the pthread object into a void* slot -- */
+/* --- lazy, race-free materialisation of the pthread object into a void* slot --
+ *
+ * __atomic builtins rather than C11 <stdatomic.h>: _Atomic and
+ * atomic_load_explicit are C-only spellings, so the C11 version restricted
+ * this whole header to .c files. The PPU boot scaffold is C++, and including
+ * it from there failed under GCC (Clang accepts _Atomic in C++ as an
+ * extension, which is exactly the kind of difference that hides until the
+ * other compiler tries). The builtins mean the same thing in both languages. */
 static inline void* ps3_lazy_obj(void** slot, size_t sz,
                                  void (*init)(void*))
 {
-    _Atomic(void*)* a = (_Atomic(void*)*)slot;
-    void* cur = atomic_load_explicit(a, memory_order_acquire);
+    void* cur = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
     if (cur) return cur;
     void* fresh = calloc(1, sz);
     if (!fresh) return NULL;
     init(fresh);
     void* expected = NULL;
-    if (atomic_compare_exchange_strong_explicit(a, &expected, fresh,
-                                                memory_order_acq_rel,
-                                                memory_order_acquire))
+    if (__atomic_compare_exchange_n(slot, &expected, fresh, 0 /* strong */,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
         return fresh;
     free(fresh);                 /* lost the race; use the winner's object */
     return expected;
@@ -105,6 +120,33 @@ static inline BOOL SleepConditionVariableSRW(CONDITION_VARIABLE* c, SRWLOCK* l,
     ts.tv_nsec += (long)(ms % 1000u) * 1000000L;
     if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
     return pthread_cond_timedwait(cv, mx, &ts) == 0;
+}
+
+/* --- interlocked ops and the spin hint ------------------------------------
+ * The PPU reservation slots (lwarx/stwcx) are guarded by an open-coded
+ * spinlock written against the MSVC intrinsics. Both are plain sequentially
+ * consistent RMWs, which is exactly what the __atomic builtins give, and both
+ * return the PREVIOUS value the way the Win32 ones do. */
+static inline LONG _InterlockedExchange(volatile LONG* target, LONG value)
+{
+    return __atomic_exchange_n(target, value, __ATOMIC_SEQ_CST);
+}
+
+static inline LONG _InterlockedExchangeAdd(volatile LONG* target, LONG value)
+{
+    return __atomic_fetch_add(target, value, __ATOMIC_SEQ_CST);
+}
+
+/* Spin hint: tells the core this is a wait loop, so it can back off rather
+ * than burn the pipeline. Purely advisory -- doing nothing is correct, just
+ * slower, which is why the fallback is empty rather than a syscall. */
+static inline void YieldProcessor(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield" ::: "memory");
+#endif
 }
 
 /* --- timing ------------------------------------------------------------- */
