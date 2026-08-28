@@ -367,6 +367,30 @@ for who did what — thank you, everyone.
 
 ## Changelog
 
+### v0.9.1 — *"Downloads"* (August 2026)
+
+*A packaging release. No runtime or lifter behaviour changes: the same tree as*
+*v0.9.0, plus the CI and release plumbing that makes it downloadable.*
+
+- **Releases now ship binaries.** A `v*` tag builds an SDK bundle per platform
+  — the runtime library, its public headers, the full Python pipeline and the
+  docs — and attaches it with checksums. Previously a release was source-only,
+  so trying the project meant reproducing the whole toolchain setup first.
+  `lib/` and `include/` come from the project's own install rules, so the
+  bundle cannot drift from what a local `cmake --install` produces.
+- The test suites **re-run in the release job**. A tag can point at any commit,
+  including one that never went through CI; without this, "downloaded from a
+  release" would mean less than "green on master".
+- **Windows CI.** The macOS job guarded the POSIX paths, but nothing
+  guarded the platform everything actually ships on — a change made to satisfy
+  Clang could have broken the clang-cl build with nobody noticing until someone
+  tried to build a port.
+- Bundles are built for **Windows and macOS only**: those are the two platforms
+  with CI proving they compile. Shipping an untested Linux binary would repeat
+  the mistake this release series started by fixing.
+- Docs now point at **[ReXGlue](https://github.com/Sewer56/ReXGlue)** for the
+  Xbox 360 side rather than a tool collection of our own.
+
 ### v0.9.0 — *"Second Platform"* (August 2026)
 
 *The first tagged release, and the first that another platform can verify.*
@@ -422,8 +446,8 @@ for who did what — thank you, everyone.
   hundreds of instructions earlier.
 - The VFS now tolerates a flattened extracted tree (no `PS3_GAME` level).
 
-*Earlier versions in this changelog predate tagging and have no release
-artifacts; v0.9.0 is where that starts.*
+*Earlier versions in this changelog predate tagging. v0.9.0 was the first
+tagged release; v0.9.1 is the first with downloadable artifacts.*
 
 ### v0.8.0 — *"Ground Truth"* (August 2026)
 <!-- TODO(maintainer): codename is a suggestion -- rename freely. -->
