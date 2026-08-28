@@ -85,6 +85,26 @@ def stub_header() -> str:
     )
 
 
+def compiler_family(cxx: str) -> str:
+    """Ask the compiler what it is, rather than guessing from its filename.
+
+    macOS's `c++` is Apple Clang, and a name-based guess called it gcc -- so the
+    first macOS CI run recorded itself under a key that names the wrong
+    compiler. `cc` on Linux is ambiguous the same way.
+    """
+    try:
+        out = subprocess.run([cxx, "--version"], capture_output=True, text=True,
+                             timeout=15)
+        text = (out.stdout + out.stderr).lower()
+        if "clang" in text:
+            return "clang"
+        if "gcc" in text or "free software foundation" in text:
+            return "gcc"
+    except Exception:
+        pass
+    return "clang" if "clang" in os.path.basename(cxx) else "gcc"
+
+
 def pick_toolchain(explicit=None):
     """Return (key, argv-prefix). The key names the row in the baseline."""
     if explicit:
@@ -111,7 +131,7 @@ def pick_toolchain(explicit=None):
 
     if not cxx:
         cxx = "c++"
-    family = "clang" if "clang" in os.path.basename(cxx) else "gcc"
+    family = compiler_family(cxx)
     osname = "darwin" if sys.platform == "darwin" else "linux"
     argv = [cxx, "-std=c++20", "-fsyntax-only", "-w"]
     if family == "clang":
