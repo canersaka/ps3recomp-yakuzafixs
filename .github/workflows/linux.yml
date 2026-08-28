@@ -98,6 +98,16 @@ jobs:
             -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c
           /tmp/test_spu_helpers
 
+      # runtime/ppu/ is the one part of the runtime no CMake target builds --
+      # it needs the lifter's per-game ppu_recomp.h -- so nothing here ever
+      # compiled it and the POSIX port is unfinished. This ratchets the error
+      # count: it fails if the scaffold gets WORSE, which is what keeps the
+      # port from sliding backwards while it is being done.
+      - name: Check the PPU boot scaffold (ratchet)
+        env:
+          CXX: ${{ matrix.compiler == 'clang' && 'clang++' || 'g++' }}
+        run: python tools/check_ppu_scaffold.py
+
       # Drives a real NV4097 command buffer through cellGcm -> RSX -> the null
       # backend's headless software path and asserts the presented pixel. No
       # display and no GPU are involved, so exit 0 means the whole graphics

@@ -143,6 +143,38 @@ The test build currently registers the deterministic synchronization stress
 suite. It can still be configured directly from `tests/sync_stress` when
 testing an alternate runtime tree with `PS3RECOMP_TREE_ROOT`.
 
+### Checking the PPU boot scaffold
+
+`runtime/ppu/` is the one part of the runtime no CMake target builds. Those
+files `#include "ppu_recomp.h"`, which the lifter generates per game, so
+`CMakeLists.txt` excludes them from the library and they are only ever
+compiled inside somebody's game port — historically, on Windows.
+
+```bash
+python tools/check_ppu_scaffold.py            # check against the baseline
+python tools/check_ppu_scaffold.py --verbose  # show the diagnostics
+python tools/check_ppu_scaffold.py --update   # re-record after improving it
+```
+
+It synthesises a stub `ppu_recomp.h` from the lifter's own `HEADER_PREAMBLE`
+— imported from `ppu_lifter.py`, not copied, so it cannot drift from what
+games really get — and compiles the scaffold against it. It does not link and
+runs nothing; it proves only that every declaration the scaffold reaches for
+exists on this platform.
+
+Because the POSIX port is unfinished, it is a **ratchet** rather than a
+pass/fail gate: `tools/ppu_scaffold_baseline.json` records the current error
+count per toolchain, and the check fails only if a number goes **up**. Windows
+sits near zero, so a regression there is a hard failure today; Linux starts
+high and every step of the port is expected to lower it. A toolchain with no
+baseline entry reports its numbers and passes, so a new platform's first CI
+run tells you what to record.
+
+Known non-zero on every platform: `ppu_fs.cpp` includes `<dirent.h>`
+unguarded and uses `opendir`/`readdir` directly, which MSVC does not provide —
+game ports vendor their own shim to get around it. See the note under
+[Windows](#windows).
+
 ### Compile Definitions
 
 | Definition | Default | Description |
@@ -178,6 +210,15 @@ cmake -B build -DPS3_MODULE_MAX_FUNCS=1024
 
 **Definitions:**
 - `_CRT_SECURE_NO_WARNINGS` — Suppress MSVC CRT security warnings
+
+> **`ppu_fs.cpp` needs a `dirent.h`.** The PPU boot scaffold's filesystem
+> layer includes `<dirent.h>` unguarded and calls `opendir`/`readdir`/
+> `closedir` directly, none of which MSVC ships. Every game port therefore
+> vendors its own Win32 `dirent.h` shim on the include path. Nothing in this
+> repository supplies one, which is why
+> [the scaffold check](#checking-the-ppu-boot-scaffold) reports one error for
+> that file even on Windows. Guarding the include and providing an in-tree
+> shim would remove that duplication from every port.
 
 ### Linux
 

@@ -1,0 +1,20 @@
+{
+  "linux-clang": {
+    "runtime/ppu/ppu_fs.cpp": 0,
+    "runtime/ppu/ppu_hle.cpp": 1,
+    "runtime/ppu/ppu_loader.cpp": 54,
+    "runtime/ppu/ppu_sysprx.cpp": 4
+  },
+  "linux-gcc": {
+    "runtime/ppu/ppu_fs.cpp": 1,
+    "runtime/ppu/ppu_hle.cpp": 2,
+    "runtime/ppu/ppu_loader.cpp": 124,
+    "runtime/ppu/ppu_sysprx.cpp": 7
+  },
+  "windows-clang-cl": {
+    "runtime/ppu/ppu_fs.cpp": 1,
+    "runtime/ppu/ppu_hle.cpp": 0,
+    "runtime/ppu/ppu_loader.cpp": 0,
+    "runtime/ppu/ppu_sysprx.cpp": 0
+  }
+}

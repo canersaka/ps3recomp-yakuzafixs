@@ -77,3 +77,10 @@ jobs:
           # and the draw path, not just the clear.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw --frames=60
+
+      # runtime/ppu/ is the one part of the runtime no CMake target builds --
+      # it needs the lifter's per-game ppu_recomp.h. macOS has no recorded
+      # baseline yet, so this reports its numbers and passes; the first run's
+      # output is what to record with --update.
+      - name: Check the PPU boot scaffold (ratchet)
+        run: python tools/check_ppu_scaffold.py

@@ -80,3 +80,11 @@ jobs:
             echo "--- $t"
             python "$t"
           done
+
+      # runtime/ppu/ is the one part of the runtime no CMake target builds --
+      # it needs the lifter's per-game ppu_recomp.h -- so it was only ever
+      # compiled inside somebody's game port. Windows is where it works, so
+      # this is a real gate here: the baseline is near zero and any new error
+      # fails the job.
+      - name: Check the PPU boot scaffold (ratchet)
+        run: python tools/check_ppu_scaffold.py
