@@ -784,7 +784,7 @@ static volatile sig_atomic_t g_conf_armed = 0;
 static void conf_trap_handler(int sig) {
     (void)sig;
     if (g_conf_armed) { g_conf_armed = 0; siglongjmp(g_conf_jmp, 1); }
-    _exit(3);
+    abort();   /* <stdlib.h>, already included */
 }
 #  define CONF_TRY                                                          \
      { struct sigaction _sa, _ofpe, _osegv, _oill;                          \
@@ -802,7 +802,6 @@ static void conf_trap_handler(int sig) {
        sigaction(SIGFPE,  &_ofpe,  0);                                      \
        sigaction(SIGSEGV, &_osegv, 0);                                      \
        sigaction(SIGILL,  &_oill,  0); }
-#  include <unistd.h>   /* _exit */
 #endif
 /* _byteswap_* are MSVC intrinsics; this driver is built with plain cl on
  * Windows and with clang/gcc everywhere else, so pick per compiler. */
