@@ -38,8 +38,8 @@ Verified by CI on every push unless noted.
 
 | | Windows | macOS (arm64) | Linux |
 |---|---|---|---|
-| Runtime library builds | yes | yes | untested |
-| Lifter + 8 test suites | yes | yes | untested |
+| Runtime library builds | yes | yes | yes |
+| Lifter + 8 test suites | yes | yes | yes |
 | Render backend | D3D12 | Metal | none |
 | Runs a recompiled game | **yes** | **no** | no |
 
@@ -51,9 +51,11 @@ suite, but cannot yet load and run a title. `ps3recomp_host` drives
 cellGcm → RSX → Metal end to end without a game, which is what makes further
 graphics work possible there.
 
-Linux has no CI and no render backend. The POSIX paths exist and the library
-may well build; nobody has checked, so it is listed as untested rather than
-supported.
+Linux now builds and passes the same suites, under both GCC and Clang, on
+every push. It has no render backend — Metal is Apple-only and D3D12 is
+Windows-only — so it is one portable backend plus the same PPU boot scaffold
+away from where macOS stands. Until then there is nothing for `ps3recomp_host`
+to drive, so the Linux job has no end-to-end graphics step.
 
 ## The Challenge
 

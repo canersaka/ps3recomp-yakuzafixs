@@ -30,6 +30,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 
 #ifndef FALSE
 #  define FALSE 0
@@ -116,11 +118,26 @@ static inline unsigned long long GetTickCount64(void) { return ps3__mono_ns() / 
 static inline BOOL QueryPerformanceFrequency(LARGE_INTEGER* f) { f->QuadPart = 1000000000LL; return TRUE; }
 static inline BOOL QueryPerformanceCounter  (LARGE_INTEGER* c) { c->QuadPart = (LONGLONG)ps3__mono_ns(); return TRUE; }
 
+/* A stable, per-thread integer id. Only ever logged or hashed, never handed
+ * back to the OS, so any injective-per-thread value will do. Darwin and Linux
+ * both offer the real kernel tid, which is what a debugger and the guest-side
+ * logs show; elsewhere pthread_self is the only portable handle there is.
+ *
+ * pthread_threadid_np is Darwin-only. Calling it unguarded built fine under
+ * GCC -- an implicit declaration into a static archive, which links nothing --
+ * and only failed once Clang rejected it. Hence the CI symbol check. */
 static inline DWORD GetCurrentThreadId(void)
 {
+#if defined(__APPLE__)
     uint64_t tid = 0;
-    pthread_threadid_np(NULL, &tid);      /* Darwin; see below for other POSIX */
+    pthread_threadid_np(NULL, &tid);
     return (DWORD)tid;
+#elif defined(__linux__)
+    /* Not gettid(3): that wrapper only appeared in glibc 2.30. */
+    return (DWORD)syscall(SYS_gettid);
+#else
+    return (DWORD)(uintptr_t)pthread_self();
+#endif
 }
 
 /* --- auto-reset event (only the create/set/wait subset used in-tree) ------ */

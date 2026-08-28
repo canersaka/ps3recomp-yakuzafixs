@@ -181,9 +181,14 @@ cmake -B build -DPS3_MODULE_MAX_FUNCS=1024
 
 ### Linux
 
-> **Untested.** There is no Linux CI and no render backend for it. The POSIX
-> paths exist and the library may build, but nobody has verified it — treat
-> the notes below as a starting point rather than a supported configuration.
+Builds and is covered by CI (`.github/workflows/linux.yml`, x86-64, GCC and
+Clang, Debug and Release on every push). That workflow builds the runtime
+library and runs all eight lifter suites plus the SPU helper tests.
+
+> **No render backend.** Metal is Apple-only and D3D12 is Windows-only, so
+> nothing on Linux draws yet and `ps3recomp_host` is not built there. Running
+> a recompiled title additionally needs the PPU boot scaffold ported off
+> Win32 — the same gap macOS has.
 
 **Compiler Flags (GCC/Clang):**
 - `-Wall -Wextra` — Enable warnings
