@@ -872,6 +872,26 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
      * whose lsPattern doesn't cover its stack (0x8041090F). */
     attr->lsPattern_ea = (u32)(uintptr_t)lsPattern;
     attr->argument_ea  = (u32)(uintptr_t)argument;
+
+    /* SPURS_TASKATTR_R8: some callers use a SIX-argument form, passing only
+     * r3..r8 -- r9/r10 then hold caller leftovers, not arguments. YDKJ is one:
+     * func_00331DA4 sets r3..r8 and nothing else, so our 8-parameter prototype
+     * reads lsPattern=r9 (a size, 0x0003D400) and argument=r10 (0x2E, the ASCII
+     * terminator its hex-string parser stopped on). r8 is the real 16-byte
+     * CellSpursTaskArgument -- proven by its contents matching the quadword the
+     * SPU task later receives in r3. A zero/garbage argument makes the SPU task
+     * library refuse every blocking wait (0x8041090F), which is exactly how the
+     * CRI tasks end up parked in WAIT_SIGNAL forever.
+     * Opt-in while the true prototype is being confirmed: getting this wrong
+     * shifts every later argument, and LBP uses this same path. */
+    { static int s_r8 = -1;
+      if (s_r8 < 0) s_r8 = getenv("SPURS_TASKATTR_R8") ? 1 : 0;
+      if (s_r8) {
+          attr->argument_ea  = (u32)sizeContext;   /* r8 */
+          attr->lsPattern_ea = 0;                  /* r9 was a leftover */
+          printf("[cellSpurs] TaskAttr R8-form: argument_ea=0x%08X (was 0x%08X)\n",
+                 attr->argument_ea, (u32)(uintptr_t)argument);
+      } }
     printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X szctx=%u lsp=0x%08X arg=0x%08X)\n",
            (u32)eaElf, (u32)eaContext, sizeContext,
            attr->lsPattern_ea, attr->argument_ea);
