@@ -70,11 +70,9 @@ def stub_header() -> str:
 
     Imported from ppu_lifter.py rather than copied: if the ppu_context layout
     changes, this stub changes with it and the check keeps testing the truth.
-
-    PPU_THREAD_LOCAL is deliberately NOT defined here. The lifter emits it into
-    SOURCE_PREAMBLE -- the generated .cpp -- not the header, so the scaffold
-    (separate translation units) genuinely cannot see it today. Defining it
-    here would hide that.
+    PPU_THREAD_LOCAL arrives the same way, now that it lives in the header
+    rather than the generated source -- so this check also verifies the
+    scaffold and the lifted code agree on how to spell thread-local.
     """
     spec = importlib.util.spec_from_file_location(
         "ppu_lifter", os.path.join(ROOT, "tools", "ppu_lifter.py"))

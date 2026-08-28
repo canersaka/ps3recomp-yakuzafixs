@@ -103,6 +103,18 @@ extern "C"
 #endif
 void lv2_syscall(ppu_context* ctx);
 
+/* Thread-local storage qualifier. The runtime's boot scaffold declares the
+ * same objects the generated code does (g_active_ctx, g_trampoline_fn), so
+ * this has to live in the HEADER both sides include -- not in the generated
+ * source, where only the lifted code could see it. */
+#ifndef PPU_THREAD_LOCAL
+#  ifdef _MSC_VER
+#    define PPU_THREAD_LOCAL __declspec(thread)
+#  else
+#    define PPU_THREAD_LOCAL __thread
+#  endif
+#endif
+
 /* Function table (defined in the generated source, sentinel-terminated).
  * The game project's indirect-call dispatcher builds its lookup from this. */
 typedef struct { uint64_t addr; void (*func)(ppu_context*); const char* name; } func_entry;
@@ -292,12 +304,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx);
 extern "C" void ps3_hle_call(unsigned int nid, ppu_context* ctx);
 
 /* Trampoline function pointer for cross-fragment branches (TLS).
- * Must match the __declspec(thread) definition in indirect_dispatch. */
-#ifdef _MSC_VER
-#  define PPU_THREAD_LOCAL __declspec(thread)
-#else
-#  define PPU_THREAD_LOCAL __thread
-#endif
+ * PPU_THREAD_LOCAL comes from ppu_recomp.h, included above. */
 extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
 
 /* Drain pending trampolines after any call that might set g_trampoline_fn.

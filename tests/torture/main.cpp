@@ -42,7 +42,7 @@ void     ps3_load_prx_modules(void) {}
 
 extern "C" uint32_t    g_last_hle_nid;    /* ppu_hle.cpp breadcrumb */
 extern "C" const char* g_last_hle_name;
-extern "C" __declspec(thread) ppu_context* g_active_ctx;
+extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 
 static LONG WINAPI torture_crash_filter(EXCEPTION_POINTERS* ep)
 {
