@@ -143,6 +143,45 @@ The test build currently registers the deterministic synchronization stress
 suite. It can still be configured directly from `tests/sync_stress` when
 testing an alternate runtime tree with `PS3RECOMP_TREE_ROOT`.
 
+### Checking the PPU boot scaffold
+
+`runtime/ppu/` is the one part of the runtime no CMake target builds. Those
+files `#include "ppu_recomp.h"`, which the lifter generates per game, so
+`CMakeLists.txt` excludes them from the library and they are only ever
+compiled inside somebody's game port — historically, on Windows.
+
+```bash
+python tools/check_ppu_scaffold.py            # check against the baseline
+python tools/check_ppu_scaffold.py --verbose  # show the diagnostics
+python tools/check_ppu_scaffold.py --update   # re-record after improving it
+```
+
+It synthesises a stub `ppu_recomp.h` from the lifter's own `HEADER_PREAMBLE`
+— imported from `ppu_lifter.py`, not copied, so it cannot drift from what
+games really get — and compiles the scaffold against it. It does not link and
+runs nothing; it proves only that every declaration the scaffold reaches for
+exists on this platform.
+
+It is a **ratchet** rather than a pass/fail gate:
+`tools/ppu_scaffold_baseline.json` records the current error count per
+toolchain, and the check fails only if a number goes **up**. A toolchain with
+no baseline entry reports its numbers and passes, so a new platform's first CI
+run tells you what to record.
+
+Every recorded toolchain is now at **zero** — the whole scaffold compiles under
+GCC, Clang and clang-cl — so in practice this is a hard gate: any new error
+fails the build.
+
+Compiling is not the same as running. The scaffold is not linked or executed by
+anything in this repository (that needs a lifted game), and `boot_main.cpp`
+still starts its vblank ticker, hang watchdog and profiler inside
+`#ifdef _WIN32` with no `#else`, so a POSIX host has no frame clock. Those are
+the remaining gaps between "builds" and "runs a title".
+
+It compiles the four scaffold translation units. `boot_main.cpp` is excluded:
+it also pulls in the per-game SPU recomp header and the generated function
+table, which a stub cannot stand in for.
+
 ### Compile Definitions
 
 | Definition | Default | Description |
@@ -179,11 +218,25 @@ cmake -B build -DPS3_MODULE_MAX_FUNCS=1024
 **Definitions:**
 - `_CRT_SECURE_NO_WARNINGS` — Suppress MSVC CRT security warnings
 
+> **`dirent.h` is supplied in-tree.** The PPU boot scaffold's filesystem layer
+> walks host directories with `opendir`/`readdir`/`closedir`, none of which
+> MSVC ships, so game ports used to vendor their own Win32 shim on the include
+> path. `runtime/platform/win32_dirent.h` provides one (`FindFirstFileA`
+> behind the POSIX names, passing straight through to the system header off
+> Windows) — a port carrying its own copy can drop it.
+
 ### Linux
 
-> **Untested.** There is no Linux CI and no render backend for it. The POSIX
-> paths exist and the library may build, but nobody has verified it — treat
-> the notes below as a starting point rather than a supported configuration.
+Builds and is covered by CI (`.github/workflows/linux.yml`, x86-64, GCC and
+Clang, Debug and Release on every push). That workflow builds the runtime
+library, runs all eight lifter suites plus the SPU helper tests, and drives
+`ps3recomp_host` end to end against the headless software backend.
+
+> **No hardware render backend.** Metal is Apple-only and D3D12 is
+> Windows-only. Linux falls back to the null backend's headless software path
+> (`libs/video/rsx_null_backend.c`), which rasterises into host memory — a
+> correctness probe, not a renderer. Running a recompiled title additionally
+> needs the PPU boot scaffold ported off Win32 — the same gap macOS has.
 
 **Compiler Flags (GCC/Clang):**
 - `-Wall -Wextra` — Enable warnings

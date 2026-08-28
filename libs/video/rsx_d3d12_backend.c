@@ -18,6 +18,8 @@
 
 #include "rsx_d3d12_backend.h"
 #include "rsx_primitives.h"
+#include "rsx_vertex_fetch.h"
+#include "rsx_texture_layout.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -2388,18 +2390,6 @@ static u32 rsx_remap_to_d3d(u32 c1, u32 basef)
  * bits run out, then the larger dimension's remaining bits ride above -- the
  * NV40 layout (matches RPCS3 convert_linear_swizzle). POT dims only, which is
  * what the hardware requires for swizzled textures. */
-static inline u32 rsx_swz_off(u32 x, u32 y, u32 log2w, u32 log2h)
-{
-    u32 off = 0, shift = 0;
-    while (log2w && log2h) {
-        off |= (x & 1u) << shift; x >>= 1; shift++;
-        off |= (y & 1u) << shift; y >>= 1; shift++;
-        log2w--; log2h--;
-    }
-    off |= (x | y) << shift;     /* only one of x/y still has bits */
-    return off;
-}
-static inline u32 rsx_log2u(u32 v) { u32 l = 0; while ((1u << l) < v) l++; return l; }
 
 /* Sparse FNV-1a over a texture's source bytes -- enough to notice an animated
  * surface changing, cheap enough to run on every bind. Kept a function rather
@@ -2426,25 +2416,28 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * 0x85 A8R8G8B8 (swizzled UI art), 0x8B G8B8 (the 1024x2048 linear FONT
      * atlas -- without it no text renders at all), 0x86/87/88 DXT1/23/45
      * (512x512 detail/LUT layers bound at t1/t3 on every draw). */
-    u32 basef = fmt & 0x9F;
-    int argb = (basef == 0x85);
-    int g8b8 = (basef == 0x8B);
-    int dxt  = (basef == 0x86 || basef == 0x87 || basef == 0x88);
-    u32 bpp = argb ? 4u : g8b8 ? 2u : 1u;
-    DXGI_FORMAT dxfmt = argb ? DXGI_FORMAT_R8G8B8A8_UNORM
-                      : g8b8 ? DXGI_FORMAT_R8G8_UNORM
-                      : (basef == 0x86) ? DXGI_FORMAT_BC1_UNORM
-                      : (basef == 0x87) ? DXGI_FORMAT_BC2_UNORM
-                      : (basef == 0x88) ? DXGI_FORMAT_BC3_UNORM
+    /* Format class, row sizes and swizzling are RSX semantics: rsx_texture_
+     * layout.c owns them so the Metal backend can read a guest texture without
+     * re-deriving any of it. Only the DXGI mapping below is ours. */
+    rsx_tex_layout tl;
+    rsx_texture_layout(fmt, w, h, &tl);
+    u32 basef = fmt & 0x9F;              /* still needed for the SRV remap */
+    int argb = (tl.fmt == RSX_TEXFMT_R8G8B8A8);
+    int g8b8 = (tl.fmt == RSX_TEXFMT_R8G8);
+    int dxt  = tl.compressed;
+    /* Compressed rows are counted in blocks, so keep bpp at 1 for the byte
+     * arithmetic the diagnostics below do. */
+    u32 bpp = tl.compressed ? 1u : tl.bytes_per_texel;
+    DXGI_FORMAT dxfmt = (tl.fmt == RSX_TEXFMT_R8G8B8A8) ? DXGI_FORMAT_R8G8B8A8_UNORM
+                      : (tl.fmt == RSX_TEXFMT_R8G8)     ? DXGI_FORMAT_R8G8_UNORM
+                      : (tl.fmt == RSX_TEXFMT_BC1)      ? DXGI_FORMAT_BC1_UNORM
+                      : (tl.fmt == RSX_TEXFMT_BC2)      ? DXGI_FORMAT_BC2_UNORM
+                      : (tl.fmt == RSX_TEXFMT_BC3)      ? DXGI_FORMAT_BC3_UNORM
                       : DXGI_FORMAT_R8_UNORM;
     /* DXT data is stored as linear 4x4 block rows (compressed formats are
      * never Morton-swizzled on RSX). Row of blocks = (w/4)*blocksize. */
-    u32 blkrow = 0, blkrows = 0;
-    if (dxt) {
-        u32 bs = (basef == 0x86) ? 8u : 16u;
-        blkrow  = ((w + 3) / 4) * bs;
-        blkrows = (h + 3) / 4;
-    }
+    u32 blkrow  = dxt ? tl.row_bytes : 0;
+    u32 blkrows = dxt ? tl.rows      : 0;
     const u32 key_off = off;         /* lookup key: the offset as bound */
     /* Sparse checksum of a texture's source bytes -- enough to notice an
      * animated surface changing, cheap enough to run on every bind. */
@@ -2627,8 +2620,8 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * Uploading them as linear rows produced the diagonal-stripe garbage on
      * LBP's loading screen (every texture there is 0x85 swizzled). POT dims
      * only -- the hardware requires that for swizzled textures anyway. */
-    int swz = !dxt && !(fmt & 0x20) && (w & (w - 1)) == 0 && (h & (h - 1)) == 0;
-    u32 l2w = rsx_log2u(w), l2h = rsx_log2u(h);
+    int swz = tl.swizzled;
+    u32 l2w = rsx_log2_ceil(w), l2h = rsx_log2_ceil(h);
     /* Cube textures store their 6 faces consecutively. Convert each into its own
      * slice of the upload buffer; the conversion below is unchanged and simply
      * runs once per face with off/mapped rebased. */
@@ -2670,7 +2663,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
             u8* drow = (u8*)mapped + (u64)y * pitch;
             if (swz) {
                 for (u32 x = 0; x < w; x++) {
-                    const u8* s = sbase + (u64)rsx_swz_off(x, y, l2w, l2h) * 2;
+                    const u8* s = sbase + (u64)rsx_swizzle_offset(x, y, l2w, l2h) * 2;
                     drow[x*2+0] = s[0]; drow[x*2+1] = s[1];
                 }
             } else {
@@ -2701,7 +2694,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         for (u32 y = 0; y < h; y++) {
             u8* drow = (u8*)mapped + (u64)y * pitch;
             for (u32 x = 0; x < w; x++) {
-                const u8* s = sbase + (u64)(swz ? rsx_swz_off(x, y, l2w, l2h)
+                const u8* s = sbase + (u64)(swz ? rsx_swizzle_offset(x, y, l2w, l2h)
                                                 : y * w + x) * 4;
                 if (rgba) {
                     drow[x*4+0] = s[0]; drow[x*4+1] = s[1];
@@ -2717,7 +2710,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         for (u32 y = 0; y < h; y++) {
             u8* drow = (u8*)mapped + (u64)y * pitch;
             for (u32 x = 0; x < w; x++)
-                drow[x] = sbase[rsx_swz_off(x, y, l2w, l2h)];
+                drow[x] = sbase[rsx_swizzle_offset(x, y, l2w, l2h)];
         }
     } else {
         for (u32 y = 0; y < h; y++)
@@ -4983,14 +4976,6 @@ static void d3d12_set_viewport(void* ud, const rsx_state* state)
  * + texcoord (uv), 36 bytes. (The real VP path feeds raw float4 attrib0.) */
 typedef struct { float x, y, z; float r, g, b, a; float u, v; } BasicVertex;
 
-/* Read a big-endian 32-bit float from guest memory. */
-static float rd_bef(const u8* src)
-{
-    u32 w;
-    memcpy(&w, src, 4);
-    w = ((w>>24)&0xFF)|((w>>8)&0xFF00)|((w<<8)&0xFF0000)|((w<<24)&0xFF000000);
-    float f; memcpy(&f, &w, 4); return f;
-}
 
 /* Read one RSX vertex (by absolute vertex index) from guest memory into our
  * host layout. Position is attrib 0 (float3+), color is attrib 3 (ubyte4 or
@@ -5009,9 +4994,9 @@ static void read_rsx_vertex(const rsx_state* state, u32 vindex, BasicVertex* out
     const rsx_vertex_attrib* pos = &state->vertex_attribs[0];
     if (pos->enabled && pos->type == 2 /* float */ && pos->size >= 2) {
         u8* src = vm_base + cellGcmResolveOffset(pos->offset + vindex * pos->stride);
-        out->x = rd_bef(src);
-        out->y = rd_bef(src + 4);
-        if (pos->size >= 3) out->z = rd_bef(src + 8);
+        out->x = rsx_rd_bef(src);
+        out->y = rsx_rd_bef(src + 4);
+        if (pos->size >= 3) out->z = rsx_rd_bef(src + 8);
 
         /* dbgfont (and similar 2D overlays) store screen positions biased far
          * outside clip space; their vertex program folds them back to clip
@@ -5029,8 +5014,8 @@ static void read_rsx_vertex(const rsx_state* state, u32 vindex, BasicVertex* out
             out->y = 1.0f - sy * 2.0f;
             out->z = 0.0f;
             if (pos->size >= 4) {
-                out->u = rd_bef(src + 8);   /* U */
-                out->v = rd_bef(src + 12);  /* V */
+                out->u = rsx_rd_bef(src + 8);   /* U */
+                out->v = rsx_rd_bef(src + 12);  /* V */
             }
         }
     }
@@ -5106,104 +5091,21 @@ static u32 upload_quads_from_rsx(u32 first, u32 count)
 typedef struct { float v[4]; } VPSlot;
 #define VP_VERT_STRIDE (16 * sizeof(VPSlot))   /* 256 */
 
-static float rd_half_be(const u8* p)
-{
-    u16 h = (u16)((p[0] << 8) | p[1]);
-    u32 sgn = (h >> 15) & 1, exp = (h >> 10) & 0x1F, man = h & 0x3FF;
-    u32 f;
-    if (exp == 0)       f = (sgn << 31);                                    /* +-0 / denorm->0 */
-    else if (exp == 31) f = (sgn << 31) | 0x7F800000u | (man << 13);        /* inf/nan */
-    else                f = (sgn << 31) | ((exp - 15 + 127) << 23) | (man << 13);
-    float out; memcpy(&out, &f, 4); return out;
-}
 
+void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n);
+
+/* Fill all 16 attribute slots for one vertex. The per-attribute work lives in
+ * rsx_vertex_fetch.c so the Metal and null backends read guest vertices the
+ * same way this one does, rather than each porting the logic again. */
 static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
 {
-    extern uint8_t* vm_base;
-    extern u32 cellGcmResolveOffset(u32);
-    extern u32 cellGcmResolveLocated(int, u32);
     for (int i = 0; i < 16; i++) {
-        VPSlot* o = &out16[i];
-        /* A disabled attribute array feeds the CONSTANT vertex attribute
-         * register (NV4097_SET_VERTEX_DATA4F_M), not zero -- same rule as
-         * glColor4f with the colour array off. Defaulting these to black
-         * multiplied Rubber Ducky's duck texture away in the fragment program. */
-        o->v[0] = state->vertex_data4f[i][0];
-        o->v[1] = state->vertex_data4f[i][1];
-        o->v[2] = state->vertex_data4f[i][2];
-        o->v[3] = state->vertex_data4f[i][3];
-        const rsx_vertex_attrib* a = &state->vertex_attribs[i];
-        if (!a->enabled || a->stride == 0) continue;
-        /* Vertex frequency divisor (instancing). freq 0/1 = per-vertex. For
-         * freq > 1 the element index is either vertex/freq (DIVIDE: per-instance
-         * data advances once per freq verts) or vertex%freq (MODULO: a mesh
-         * repeats every freq verts). NV4097_SET_FREQUENCY_DIVIDER_OPERATION's
-         * per-attribute bit selects MODULO. DeferredShading's cube rings need
-         * this: the shared cube mesh is MODULO, the per-instance transform in
-         * attrib9 is DIVIDE -- without it attrib9 advanced every vertex and the
-         * instanced cubes drew with garbage transforms (only the baseplate,
-         * which isn't instanced, survived). */
-        u32 ei = vi;
-        if (a->frequency > 1 && !getenv("VP_NOFREQ")) {   /* VP_NOFREQ: instancing kill-switch */
-            ei = (state->frequency_divider_op & (1u << i))
-                     ? (vi % a->frequency)      /* MODULO: repeat mesh */
-                     : (vi / a->frequency);     /* DIVIDE: per-instance */
+        rsx_fetch_attrib(state, i, vi, out16[i].v);
+        if (i == 0) {
+            const rsx_vertex_attrib* a = &state->vertex_attribs[0];
+            u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
+            rsx_vtx_pos_dbg(state, out16[0].v, n);
         }
-        /* The vertex-array OFFSET register (NV4097_SET_VERTEX_DATA_ARRAY_OFFSET)
-         * carries the context-DMA location in bit 31: 0 = LOCAL (VRAM), 1 = MAIN
-         * (IO-mapped system memory). DeferredShading is the first sample to put
-         * its meshes in the main heap -- passing the raw 0x80xxxxxx offset to
-         * cellGcmResolveOffset made page = 0x80x and resolved to garbage VRAM
-         * (vertices read as -7.992 => degenerate => empty G-buffer). Strip the
-         * bit and resolve MAIN explicitly; local offsets keep the old path. */
-        u32 off = (a->offset & 0x7FFFFFFFu) + ei * a->stride;
-        /* Bit 31 of the vertex-array OFFSET selects the context DMA: 0 = LOCAL
-         * (VRAM), 1 = MAIN. Resolve LOCAL as local -- routing it through
-         * cellGcmResolveOffset lets the IO table win for any offset whose page
-         * the IO region also covers. This title's vertex arrays sit at offsets
-         * like 0x4480, shadowed by its 1MB IO window at 0x11100000: the array
-         * was uploaded to VRAM 0xC0004480 but resolved to main 0x11104480,
-         * which is empty -- so every INDEXED mesh fetched zeros and collapsed
-         * to the origin, while non-indexed geometry whose arrays lie outside
-         * the shadowed pages drew fine. */
-        const u8* p = vm_base + ((a->offset & 0x80000000u)
-            ? cellGcmResolveLocated(0, off)   /* MAIN: IO offset table */
-            : cellGcmResolveLocated(1, off)); /* LOCAL: VRAM, never the IO table */
-        u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
-        switch (a->type) {
-        case 2: /* CELL_GCM_VERTEX_F: float32 BE */
-            for (u32 k = 0; k < n; k++) o->v[k] = rd_bef(p + k * 4);
-            break;
-        case 3: /* SF: half float BE */
-            for (u32 k = 0; k < n; k++) o->v[k] = rd_half_be(p + k * 2);
-            break;
-        case 4: /* UB: u8 normalized [0,1] */
-            for (u32 k = 0; k < n; k++) o->v[k] = p[k] / 255.0f;
-            break;
-        case 1: /* S1: s16 normalized [-1,1] */
-            for (u32 k = 0; k < n; k++) {
-                s16 s = (s16)((p[k*2] << 8) | p[k*2+1]);
-                o->v[k] = (float)s / 32767.0f;
-            }
-            break;
-        case 5: /* S32K: s16 integer */
-            for (u32 k = 0; k < n; k++)
-                o->v[k] = (float)(s16)((p[k*2] << 8) | p[k*2+1]);
-            break;
-        case 7: /* UB256: u8 unnormalized */
-            for (u32 k = 0; k < n; k++) o->v[k] = (float)p[k];
-            break;
-        default:
-            { static int _t = -1; if (_t < 0) _t = getenv("VTX_TYPEDBG") ? 1 : 0;
-              if (_t) { static u32 seen = 0;
-                  if (!(seen & (1u << (a->type & 31)))) { seen |= 1u << (a->type & 31);
-                      fprintf(stderr, "[VTXTYPE] UNHANDLED type=%u attr=%d size=%u stride=%u%c",
-                              a->type, i, a->size, a->stride, 10); } } }
-            for (u32 k = 0; k < n; k++) o->v[k] = rd_bef(p + k * 4);
-            break;
-        }
-        if (i == 0) { void rsx_vtx_pos_dbg(const rsx_state*, const float*, u32);
-                      rsx_vtx_pos_dbg(state, o->v, n); }
     }
 }
 
@@ -5273,13 +5175,13 @@ static void vp_attrs_dbg(const rsx_state* state)
               const u8* rp = vm_base + (a->offset & 0x7FFFFFFFu);   /* raw, unresolved */
               fprintf(stderr, "[VPDUMP] a%d off=0x%X  LOCAL@0x%X=(%g,%g,%g)  MAIN@0x%X=(%g,%g,%g)"
                               "  RAW@0x%X=(%g,%g,%g)%c",
-                      ai, aoff, la, rd_bef(lp), rd_bef(lp+4), rd_bef(lp+8),
-                      ma, rd_bef(mp), rd_bef(mp+4), rd_bef(mp+8),
-                      (a->offset & 0x7FFFFFFFu), rd_bef(rp), rd_bef(rp+4), rd_bef(rp+8), 10);
+                      ai, aoff, la, rsx_rd_bef(lp), rsx_rd_bef(lp+4), rsx_rd_bef(lp+8),
+                      ma, rsx_rd_bef(mp), rsx_rd_bef(mp+4), rsx_rd_bef(mp+8),
+                      (a->offset & 0x7FFFFFFFu), rsx_rd_bef(rp), rsx_rd_bef(rp+4), rsx_rd_bef(rp+8), 10);
           }
           u32 nc = a->size ? a->size : 3; if (nc > 3) nc = 3;
           float f[3] = {0,0,0};
-          for (u32 k = 0; k < nc; k++) f[k] = rd_bef(q + k * 4);
+          for (u32 k = 0; k < nc; k++) f[k] = rsx_rd_bef(q + k * 4);
           if (v < 12)
               fprintf(stderr, "[VPDUMP] a%d[%d] = (%g, %g, %g)%c", ai, v, f[0], f[1], f[2], 10);
           int allz = 1; for (u32 k = 0; k < nc; k++) if (f[k] != 0.f) allz = 0;
@@ -5294,14 +5196,14 @@ static void vp_attrs_dbg(const rsx_state* state)
       { float f0[3]; u32 o0 = (a->offset & 0x7FFFFFFFu);
         const u8* q0 = vm_base + ((a->offset & 0x80000000u)
                        ? cellGcmResolveLocated(0, o0) : cellGcmResolveLocated(1, o0));
-        for (int k = 0; k < 3; k++) f0[k] = rd_bef(q0 + k * 4);
+        for (int k = 0; k < 3; k++) f0[k] = rsx_rd_bef(q0 + k * 4);
         u32 diff = 0;
         for (int v = 1; v < cnt; v++) {
             u32 ao = o0 + (u32)v * a->stride;
             const u8* q = vm_base + ((a->offset & 0x80000000u)
                           ? cellGcmResolveLocated(0, ao) : cellGcmResolveLocated(1, ao));
             for (int k = 0; k < 3; k++)
-                if (rd_bef(q + k * 4) != f0[k]) { diff++; break; }
+                if (rsx_rd_bef(q + k * 4) != f0[k]) { diff++; break; }
         }
         fprintf(stderr, "[VPDUMP] a%d: %u/%d entries differ from entry 0 (%g,%g,%g)%c",
                 ai, diff, cnt, f0[0], f0[1], f0[2], 10);
@@ -5312,7 +5214,7 @@ static void vp_attrs_dbg(const rsx_state* state)
               u32 ao = o0 + (u32)v * a->stride;
               const u8* q = vm_base + ((a->offset & 0x80000000u)
                             ? cellGcmResolveLocated(0, ao) : cellGcmResolveLocated(1, ao));
-              for (int k = 0; k < 3; k++) { float f = rd_bef(q + k * 4);
+              for (int k = 0; k < 3; k++) { float f = rsx_rd_bef(q + k * 4);
                   if (f < lo[k]) lo[k] = f; if (f > hi[k]) hi[k] = f; } }
           u32 nnan = 0, nfin = 0;
           for (int v = 0; v < cnt; v++) {
@@ -5320,7 +5222,7 @@ static void vp_attrs_dbg(const rsx_state* state)
               const u8* q = vm_base + ((a->offset & 0x80000000u)
                             ? cellGcmResolveLocated(0, ao) : cellGcmResolveLocated(1, ao));
               int bad = 0;
-              for (int k = 0; k < 3; k++) { float f = rd_bef(q + k * 4);
+              for (int k = 0; k < 3; k++) { float f = rsx_rd_bef(q + k * 4);
                   if (!(f == f) || f > 1e30f || f < -1e30f) bad = 1; }
               if (bad) nnan++; else nfin++;
           }

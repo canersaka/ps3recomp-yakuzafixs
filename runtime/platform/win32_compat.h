@@ -1,10 +1,17 @@
 /*
- * ps3recomp - Win32 sync/timing compatibility shim for POSIX hosts
+ * ps3recomp - Win32 sync/timing/type compatibility shim for POSIX hosts
  *
- * A handful of translation units were written directly against the Win32
- * synchronisation and timing API (SRWLOCK, CONDITION_VARIABLE, QPC, events).
- * This header supplies those names on POSIX so the call sites compile
- * unchanged. On Windows it is a no-op passthrough to <windows.h>.
+ * A good deal of this tree was written directly against Win32: the
+ * synchronisation and timing API (SRWLOCK, CONDITION_VARIABLE, QPC, events),
+ * the interlocked intrinsics behind the PPU reservation spinlock, and the
+ * scalar typedefs (DWORD, ULONGLONG, SIZE_T, ...) those call sites use. This
+ * header supplies all of it on POSIX so the call sites compile unchanged. On
+ * Windows it is a no-op passthrough to <windows.h>.
+ *
+ * Usable from C AND C++. That is deliberate: the runtime library is C but the
+ * PPU boot scaffold is C++, and both need these names. Nothing in here may use
+ * a C-only construct -- see the note on ps3_lazy_obj below for the one that
+ * did, and how far it got before anyone noticed.
  *
  * IMPORTANT -- storage size. Win32 SRWLOCK and CONDITION_VARIABLE are exactly
  * pointer-sized and zero-initialise validly, so several structs (notably
@@ -26,10 +33,11 @@
 
 #include <pthread.h>
 #include <limits.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 
 #ifndef FALSE
 #  define FALSE 0
@@ -44,6 +52,10 @@
 typedef uint32_t           DWORD;
 typedef int                BOOL;
 typedef long long          LONGLONG;
+typedef unsigned long long ULONGLONG;
+typedef long               LONG;
+typedef unsigned long      ULONG;
+typedef size_t             SIZE_T;
 typedef void*              HANDLE;
 typedef union { LONGLONG QuadPart; } LARGE_INTEGER;
 
@@ -53,20 +65,25 @@ typedef void*  CONDITION_VARIABLE;
 #define SRWLOCK_INIT            NULL
 #define CONDITION_VARIABLE_INIT NULL
 
-/* --- lazy, race-free materialisation of the pthread object into a void* slot -- */
+/* --- lazy, race-free materialisation of the pthread object into a void* slot --
+ *
+ * __atomic builtins rather than C11 <stdatomic.h>: _Atomic and
+ * atomic_load_explicit are C-only spellings, so the C11 version restricted
+ * this whole header to .c files. The PPU boot scaffold is C++, and including
+ * it from there failed under GCC (Clang accepts _Atomic in C++ as an
+ * extension, which is exactly the kind of difference that hides until the
+ * other compiler tries). The builtins mean the same thing in both languages. */
 static inline void* ps3_lazy_obj(void** slot, size_t sz,
                                  void (*init)(void*))
 {
-    _Atomic(void*)* a = (_Atomic(void*)*)slot;
-    void* cur = atomic_load_explicit(a, memory_order_acquire);
+    void* cur = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
     if (cur) return cur;
     void* fresh = calloc(1, sz);
     if (!fresh) return NULL;
     init(fresh);
     void* expected = NULL;
-    if (atomic_compare_exchange_strong_explicit(a, &expected, fresh,
-                                                memory_order_acq_rel,
-                                                memory_order_acquire))
+    if (__atomic_compare_exchange_n(slot, &expected, fresh, 0 /* strong */,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
         return fresh;
     free(fresh);                 /* lost the race; use the winner's object */
     return expected;
@@ -105,6 +122,39 @@ static inline BOOL SleepConditionVariableSRW(CONDITION_VARIABLE* c, SRWLOCK* l,
     return pthread_cond_timedwait(cv, mx, &ts) == 0;
 }
 
+/* --- interlocked ops and the spin hint ------------------------------------
+ * The PPU reservation slots (lwarx/stwcx) are guarded by an open-coded
+ * spinlock written against the MSVC intrinsics. Both are plain sequentially
+ * consistent RMWs, which is exactly what the __atomic builtins give, and both
+ * return the PREVIOUS value the way the Win32 ones do. */
+static inline LONG _InterlockedExchange(volatile LONG* target, LONG value)
+{
+    return __atomic_exchange_n(target, value, __ATOMIC_SEQ_CST);
+}
+
+static inline LONG _InterlockedExchangeAdd(volatile LONG* target, LONG value)
+{
+    return __atomic_fetch_add(target, value, __ATOMIC_SEQ_CST);
+}
+
+/* Returns the NEW value, unlike the Exchange pair above. */
+static inline LONG InterlockedIncrement(volatile LONG* target)
+{
+    return __atomic_add_fetch(target, 1, __ATOMIC_SEQ_CST);
+}
+
+/* Spin hint: tells the core this is a wait loop, so it can back off rather
+ * than burn the pipeline. Purely advisory -- doing nothing is correct, just
+ * slower, which is why the fallback is empty rather than a syscall. */
+static inline void YieldProcessor(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield" ::: "memory");
+#endif
+}
+
 /* --- timing ------------------------------------------------------------- */
 static inline unsigned long long ps3__mono_ns(void)
 {
@@ -116,11 +166,26 @@ static inline unsigned long long GetTickCount64(void) { return ps3__mono_ns() / 
 static inline BOOL QueryPerformanceFrequency(LARGE_INTEGER* f) { f->QuadPart = 1000000000LL; return TRUE; }
 static inline BOOL QueryPerformanceCounter  (LARGE_INTEGER* c) { c->QuadPart = (LONGLONG)ps3__mono_ns(); return TRUE; }
 
+/* A stable, per-thread integer id. Only ever logged or hashed, never handed
+ * back to the OS, so any injective-per-thread value will do. Darwin and Linux
+ * both offer the real kernel tid, which is what a debugger and the guest-side
+ * logs show; elsewhere pthread_self is the only portable handle there is.
+ *
+ * pthread_threadid_np is Darwin-only. Calling it unguarded built fine under
+ * GCC -- an implicit declaration into a static archive, which links nothing --
+ * and only failed once Clang rejected it. Hence the CI symbol check. */
 static inline DWORD GetCurrentThreadId(void)
 {
+#if defined(__APPLE__)
     uint64_t tid = 0;
-    pthread_threadid_np(NULL, &tid);      /* Darwin; see below for other POSIX */
+    pthread_threadid_np(NULL, &tid);
     return (DWORD)tid;
+#elif defined(__linux__)
+    /* Not gettid(3): that wrapper only appeared in glibc 2.30. */
+    return (DWORD)syscall(SYS_gettid);
+#else
+    return (DWORD)(uintptr_t)pthread_self();
+#endif
 }
 
 /* --- auto-reset event (only the create/set/wait subset used in-tree) ------ */

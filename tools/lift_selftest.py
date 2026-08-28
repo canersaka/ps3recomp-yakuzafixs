@@ -87,7 +87,7 @@ def gen_driver(cases_meta):
         "  void vm_write32(uint64_t,uint32_t){} void vm_write64(uint64_t,uint64_t){}",
         "  void ps3_indirect_call(ppu_context*){} void ps3_hle_call(unsigned,ppu_context*){}",
         "  uint64_t ppu_timebase_now(){return 0;} void lv2_syscall(ppu_context*){}",
-        "  __declspec(thread) void (*g_trampoline_fn)(void*) = nullptr;",
+        "  PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*) = nullptr;",
         "}",
         "",
     ]
