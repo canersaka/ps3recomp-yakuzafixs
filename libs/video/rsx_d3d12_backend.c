@@ -19,6 +19,7 @@
 #include "rsx_d3d12_backend.h"
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
+#include "rsx_texture_layout.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -2389,18 +2390,6 @@ static u32 rsx_remap_to_d3d(u32 c1, u32 basef)
  * bits run out, then the larger dimension's remaining bits ride above -- the
  * NV40 layout (matches RPCS3 convert_linear_swizzle). POT dims only, which is
  * what the hardware requires for swizzled textures. */
-static inline u32 rsx_swz_off(u32 x, u32 y, u32 log2w, u32 log2h)
-{
-    u32 off = 0, shift = 0;
-    while (log2w && log2h) {
-        off |= (x & 1u) << shift; x >>= 1; shift++;
-        off |= (y & 1u) << shift; y >>= 1; shift++;
-        log2w--; log2h--;
-    }
-    off |= (x | y) << shift;     /* only one of x/y still has bits */
-    return off;
-}
-static inline u32 rsx_log2u(u32 v) { u32 l = 0; while ((1u << l) < v) l++; return l; }
 
 /* Sparse FNV-1a over a texture's source bytes -- enough to notice an animated
  * surface changing, cheap enough to run on every bind. Kept a function rather
@@ -2427,25 +2416,28 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * 0x85 A8R8G8B8 (swizzled UI art), 0x8B G8B8 (the 1024x2048 linear FONT
      * atlas -- without it no text renders at all), 0x86/87/88 DXT1/23/45
      * (512x512 detail/LUT layers bound at t1/t3 on every draw). */
-    u32 basef = fmt & 0x9F;
-    int argb = (basef == 0x85);
-    int g8b8 = (basef == 0x8B);
-    int dxt  = (basef == 0x86 || basef == 0x87 || basef == 0x88);
-    u32 bpp = argb ? 4u : g8b8 ? 2u : 1u;
-    DXGI_FORMAT dxfmt = argb ? DXGI_FORMAT_R8G8B8A8_UNORM
-                      : g8b8 ? DXGI_FORMAT_R8G8_UNORM
-                      : (basef == 0x86) ? DXGI_FORMAT_BC1_UNORM
-                      : (basef == 0x87) ? DXGI_FORMAT_BC2_UNORM
-                      : (basef == 0x88) ? DXGI_FORMAT_BC3_UNORM
+    /* Format class, row sizes and swizzling are RSX semantics: rsx_texture_
+     * layout.c owns them so the Metal backend can read a guest texture without
+     * re-deriving any of it. Only the DXGI mapping below is ours. */
+    rsx_tex_layout tl;
+    rsx_texture_layout(fmt, w, h, &tl);
+    u32 basef = fmt & 0x9F;              /* still needed for the SRV remap */
+    int argb = (tl.fmt == RSX_TEXFMT_R8G8B8A8);
+    int g8b8 = (tl.fmt == RSX_TEXFMT_R8G8);
+    int dxt  = tl.compressed;
+    /* Compressed rows are counted in blocks, so keep bpp at 1 for the byte
+     * arithmetic the diagnostics below do. */
+    u32 bpp = tl.compressed ? 1u : tl.bytes_per_texel;
+    DXGI_FORMAT dxfmt = (tl.fmt == RSX_TEXFMT_R8G8B8A8) ? DXGI_FORMAT_R8G8B8A8_UNORM
+                      : (tl.fmt == RSX_TEXFMT_R8G8)     ? DXGI_FORMAT_R8G8_UNORM
+                      : (tl.fmt == RSX_TEXFMT_BC1)      ? DXGI_FORMAT_BC1_UNORM
+                      : (tl.fmt == RSX_TEXFMT_BC2)      ? DXGI_FORMAT_BC2_UNORM
+                      : (tl.fmt == RSX_TEXFMT_BC3)      ? DXGI_FORMAT_BC3_UNORM
                       : DXGI_FORMAT_R8_UNORM;
     /* DXT data is stored as linear 4x4 block rows (compressed formats are
      * never Morton-swizzled on RSX). Row of blocks = (w/4)*blocksize. */
-    u32 blkrow = 0, blkrows = 0;
-    if (dxt) {
-        u32 bs = (basef == 0x86) ? 8u : 16u;
-        blkrow  = ((w + 3) / 4) * bs;
-        blkrows = (h + 3) / 4;
-    }
+    u32 blkrow  = dxt ? tl.row_bytes : 0;
+    u32 blkrows = dxt ? tl.rows      : 0;
     const u32 key_off = off;         /* lookup key: the offset as bound */
     /* Sparse checksum of a texture's source bytes -- enough to notice an
      * animated surface changing, cheap enough to run on every bind. */
@@ -2628,8 +2620,8 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * Uploading them as linear rows produced the diagonal-stripe garbage on
      * LBP's loading screen (every texture there is 0x85 swizzled). POT dims
      * only -- the hardware requires that for swizzled textures anyway. */
-    int swz = !dxt && !(fmt & 0x20) && (w & (w - 1)) == 0 && (h & (h - 1)) == 0;
-    u32 l2w = rsx_log2u(w), l2h = rsx_log2u(h);
+    int swz = tl.swizzled;
+    u32 l2w = rsx_log2_ceil(w), l2h = rsx_log2_ceil(h);
     /* Cube textures store their 6 faces consecutively. Convert each into its own
      * slice of the upload buffer; the conversion below is unchanged and simply
      * runs once per face with off/mapped rebased. */
@@ -2671,7 +2663,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
             u8* drow = (u8*)mapped + (u64)y * pitch;
             if (swz) {
                 for (u32 x = 0; x < w; x++) {
-                    const u8* s = sbase + (u64)rsx_swz_off(x, y, l2w, l2h) * 2;
+                    const u8* s = sbase + (u64)rsx_swizzle_offset(x, y, l2w, l2h) * 2;
                     drow[x*2+0] = s[0]; drow[x*2+1] = s[1];
                 }
             } else {
@@ -2702,7 +2694,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         for (u32 y = 0; y < h; y++) {
             u8* drow = (u8*)mapped + (u64)y * pitch;
             for (u32 x = 0; x < w; x++) {
-                const u8* s = sbase + (u64)(swz ? rsx_swz_off(x, y, l2w, l2h)
+                const u8* s = sbase + (u64)(swz ? rsx_swizzle_offset(x, y, l2w, l2h)
                                                 : y * w + x) * 4;
                 if (rgba) {
                     drow[x*4+0] = s[0]; drow[x*4+1] = s[1];
@@ -2718,7 +2710,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         for (u32 y = 0; y < h; y++) {
             u8* drow = (u8*)mapped + (u64)y * pitch;
             for (u32 x = 0; x < w; x++)
-                drow[x] = sbase[rsx_swz_off(x, y, l2w, l2h)];
+                drow[x] = sbase[rsx_swizzle_offset(x, y, l2w, l2h)];
         }
     } else {
         for (u32 y = 0; y < h; y++)
