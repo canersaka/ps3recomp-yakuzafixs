@@ -31,6 +31,7 @@ can grow with later memory-op tranches.
 import argparse
 import os
 import random
+import shutil
 import struct
 import subprocess
 import sys
@@ -887,22 +888,49 @@ def main():
 
     os.makedirs(os.path.join(ROOT, "scratch"), exist_ok=True)
     cpath = os.path.join(ROOT, "scratch", "ppu_conformance.cpp")   # preamble is C++ (extern "C")
-    epath = os.path.join(ROOT, "scratch", "ppu_conformance.exe")
+    epath = os.path.join(ROOT, "scratch", "ppu_conformance.exe"
+                         if os.name == "nt" else "ppu_conformance")
     emit_c(cpath)
     if args.emit:
         return
 
-    vcvars = r"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
-    bat = os.path.join(ROOT, "scratch", "ppu_conformance_run.bat")
     log = os.path.join(ROOT, "scratch", "ppu_conformance.log")
-    with open(bat, "w") as f:
-        f.write("@echo off\n")
-        f.write(f'call "{vcvars}" >nul 2>nul\n')
-        f.write(f'cd /d "{ROOT}"\n')
-        f.write(f'cl /nologo /O1 /W3 /I runtime\\ppu /Fe:"{epath}" "{cpath}" > "{log}" 2>&1\n')
-        f.write("if errorlevel 1 exit /b 2\n")
-        f.write(f'"{epath}" >> "{log}" 2>&1\n')
-    r = subprocess.run(["cmd", "/c", bat], cwd=ROOT)
+
+    # The generated driver has to be COMPILED AND RUN to be worth anything:
+    # decoding and lifting alone never executes a single lifted statement, and
+    # for a long time a missing compiler silently reduced this suite to that.
+    # On Windows cl is usually not on PATH, so self-launch vcvars; everywhere
+    # else use the system compiler directly, so CI runs the same 1300+ checks
+    # on macOS and Linux rather than only on a developer's Windows box.
+    if os.name == "nt":
+        vcvars = r"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
+        bat = os.path.join(ROOT, "scratch", "ppu_conformance_run.bat")
+        with open(bat, "w") as f:
+            f.write("@echo off\n")
+            f.write(f'call "{vcvars}" >nul 2>nul\n')
+            f.write(f'cd /d "{ROOT}"\n')
+            f.write(f'cl /nologo /O1 /W3 /I runtime\\ppu /Fe:"{epath}" "{cpath}" > "{log}" 2>&1\n')
+            f.write("if errorlevel 1 exit /b 2\n")
+            f.write(f'"{epath}" >> "{log}" 2>&1\n')
+        rc = subprocess.run(["cmd", "/c", bat], cwd=ROOT).returncode
+    else:
+        cxx = (os.environ.get("CXX") or shutil.which("c++")
+               or shutil.which("clang++") or shutil.which("g++"))
+        if not cxx:
+            rc = 2
+            with open(log, "w") as f:
+                f.write("no C++ compiler found (set CXX)\n")
+        else:
+            with open(log, "w") as f:
+                cp = subprocess.run([cxx, "-O1", "-w", "-I", os.path.join("runtime", "ppu"),
+                                     "-o", epath, cpath],
+                                    cwd=ROOT, stdout=f, stderr=subprocess.STDOUT)
+            if cp.returncode != 0:
+                rc = 2
+            else:
+                with open(log, "a") as f:
+                    rc = subprocess.run([epath], cwd=ROOT, stdout=f,
+                                        stderr=subprocess.STDOUT).returncode
     tail = open(log).read() if os.path.exists(log) else ""
     fails = [ln for ln in tail.splitlines() if ln.startswith("FAIL")]
     for ln in fails[:40]:
@@ -912,21 +940,30 @@ def main():
     for ln in tail.splitlines():
         if "[ppu-conformance]" in ln or "error C" in ln:
             print(ln)
-    if r.returncode == 2:
+    if rc == 2:
         # Distinguish "no compiler on PATH" from "the generated code does not
         # compile". Both used to print the same COMPILE FAILED, so a run without
         # a developer prompt looked like an environment hiccup -- and it silently
         # skipped the half of this test that RUNS the lifted code. Fifteen real
         # VMX conformance failures hid behind that for as long as it took someone
         # to run it from a vcvars shell.
-        if "is not recognized as an internal or external command" in tail:
-            print("SKIPPED: no MSVC `cl` on PATH -- the generated code was NOT",
-                  "compiled or run, so the conformance checks above did not",
-                  "execute. Run this from a Visual Studio developer prompt",
-                  "(or after vcvars64.bat) for real coverage.")
+        no_compiler = ("is not recognized as an internal or external command" in tail
+                       or "no C++ compiler found" in tail)
+        if no_compiler:
+            print("SKIPPED: no C++ compiler available -- the generated code was",
+                  "NOT compiled or run, so the conformance checks above did not",
+                  "execute. Install a compiler (or run from a Visual Studio",
+                  "developer prompt) for real coverage.")
+            # Under CI a skip is a FALSE GREEN: the whole point of the run is to
+            # execute the lifted code, and a tick that means "compiled nothing"
+            # is worse than a red one. Locally, staying quiet is reasonable.
+            if os.environ.get("CI"):
+                print("...and this is CI, where skipping the only test that runs",
+                      "lifted code is a failure, not a pass.")
+                sys.exit(1)
             sys.exit(0 if decode_ok else 1)
         print("COMPILE FAILED (the lifted C is broken) -- see", log)
-    sys.exit(0 if (r.returncode == 0 and decode_ok) else 1)
+    sys.exit(0 if (rc == 0 and decode_ok) else 1)
 
 if __name__ == "__main__":
     main()

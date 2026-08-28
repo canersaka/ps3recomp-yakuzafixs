@@ -38,6 +38,26 @@ jobs:
           lipo -info build/libps3recomp_runtime.a
           lipo -info build/libps3recomp_runtime.a | grep -q arm64
 
+      # The Python suites are the project's real correctness net -- the
+      # conformance one COMPILES AND RUNS 1300+ lifted instruction cases and has
+      # caught silent miscompiles that a build check never would (15 VMX
+      # endianness bugs most recently). Running them here means they guard both
+      # platforms, not just whoever last ran them on Windows.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run the lifter test suites
+        env:
+          CI: "1"          # makes a skipped conformance run fail instead of passing
+        run: |
+          set -e
+          for t in tools/test_*.py; do
+            echo "--- $t"
+            python "$t"
+          done
+
       - name: Run self-contained SPU helper tests
         run: |
           clang -std=gnu17 -I include -I runtime/spu \
