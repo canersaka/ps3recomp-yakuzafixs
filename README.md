@@ -40,7 +40,7 @@ Verified by CI on every push unless noted.
 |---|---|---|---|
 | Runtime library builds | yes | yes | yes |
 | Lifter + 8 test suites | yes | yes | yes |
-| Render backend | D3D12 | Metal | none |
+| Render backend | D3D12 | Metal | null (headless software) |
 | Runs a recompiled game | **yes** | **no** | no |
 
 The gap on macOS is the PPU boot scaffold — `ppu_loader.cpp`, `boot_main.cpp`
@@ -51,11 +51,13 @@ suite, but cannot yet load and run a title. `ps3recomp_host` drives
 cellGcm → RSX → Metal end to end without a game, which is what makes further
 graphics work possible there.
 
-Linux now builds and passes the same suites, under both GCC and Clang, on
-every push. It has no render backend — Metal is Apple-only and D3D12 is
-Windows-only — so it is one portable backend plus the same PPU boot scaffold
-away from where macOS stands. Until then there is nothing for `ps3recomp_host`
-to drive, so the Linux job has no end-to-end graphics step.
+Linux builds and passes the same suites under both GCC and Clang, and runs
+`ps3recomp_host` end to end, on every push. Its backend is the null backend's
+headless software path: a host-memory framebuffer with a CPU triangle filler,
+enough to prove the guest's command stream produced the pixels it asked for on
+a runner with no display and no GPU. It is not a renderer — no depth, no
+blending, no textures — so Linux is still one real backend, plus the same PPU
+boot scaffold macOS needs, away from running a title.
 
 ## The Challenge
 

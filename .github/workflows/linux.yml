@@ -12,9 +12,9 @@
 # something finally linked it; Clang rejected it outright. A single-compiler
 # matrix would have shipped that bug.
 #
-# No graphics step yet, unlike the macOS job: ps3recomp_host is gated on APPLE
-# in CMakeLists.txt because Metal is the only non-Windows backend that renders.
-# This job grows one the moment a portable backend lands.
+# The graphics step runs against the null backend's headless software path,
+# which is what gives Linux an end-to-end check without a GPU, a display, or a
+# render backend of its own.
 name: Linux
 
 on:
@@ -97,3 +97,17 @@ jobs:
             -std=gnu17 -I include -I runtime/spu \
             -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c
           /tmp/test_spu_helpers
+
+      # Drives a real NV4097 command buffer through cellGcm -> RSX -> the null
+      # backend's headless software path and asserts the presented pixel. No
+      # display and no GPU are involved, so exit 0 means the whole graphics
+      # bridge is intact on Linux, not merely that it compiled.
+      - name: Run the POSIX host (headless end-to-end)
+        run: |
+          # Clear + flip: asserts the guest clear colour reaches the framebuffer.
+          ./build/ps3recomp_host
+          # Clear + a real NV4097 draw: asserts the triangle covers the centre
+          # pixel, which exercises guest vertex fetch, primitive expansion and
+          # the draw path, not just the clear.
+          ./build/ps3recomp_host --draw
+          ./build/ps3recomp_host --draw --frames=60

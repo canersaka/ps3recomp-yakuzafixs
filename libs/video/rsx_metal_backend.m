@@ -24,6 +24,7 @@
 
 #include "rsx_commands.h"
 #include "rsx_metal_backend.h"
+#include "rsx_vertex_fetch.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -205,71 +206,20 @@ static int create_window(const char* title)
 #endif
 
 /* ---- guest vertex fetch --------------------------------------------------
- * Ported from the D3D12 backend's read_vp_vertex: every RSX component is
- * big-endian, and the vertex-array OFFSET register carries the context-DMA
- * location in bit 31 (0 = LOCAL/VRAM, 1 = MAIN/IO-mapped).
+ * Was a port of the D3D12 backend's read_vp_vertex, kept here as a second
+ * copy. It had already drifted from the original in two ways that matter --
+ * it fed caller literals rather than the constant vertex attribute register
+ * for a disabled array, and it resolved LOCAL offsets through the IO table --
+ * so both copies are now gone and rsx_vertex_fetch.c holds the one definition.
  * --------------------------------------------------------------------------*/
-
-extern uint8_t* vm_base;
-extern u32 cellGcmResolveOffset(u32);
-extern u32 cellGcmResolveLocated(int, u32);
-
-static float rd_bef(const u8* p)
-{
-    u32 w; memcpy(&w, p, 4);
-    w = ((w >> 24) & 0xFFu) | ((w >> 8) & 0xFF00u) |
-        ((w << 8) & 0xFF0000u) | ((w << 24) & 0xFF000000u);
-    float f; memcpy(&f, &w, 4); return f;
-}
-
-static float rd_half_be(const u8* p)
-{
-    u16 h = (u16)((p[0] << 8) | p[1]);
-    u32 sgn = (h >> 15) & 1u, exp = (h >> 10) & 0x1Fu, man = h & 0x3FFu, f;
-    if (exp == 0)        f = sgn << 31;
-    else if (exp == 31)  f = (sgn << 31) | 0x7F800000u | (man << 13);
-    else                 f = (sgn << 31) | ((exp - 15u + 127u) << 23) | (man << 13);
-    float o; memcpy(&o, &f, 4); return o;
-}
-
-/* Read one attribute of one vertex as float4. */
-static void fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4],
-                         float d0, float d1, float d2, float d3)
-{
-    out[0] = d0; out[1] = d1; out[2] = d2; out[3] = d3;
-    const rsx_vertex_attrib* a = &st->vertex_attribs[idx];
-    if (!a->enabled || a->stride == 0 || !vm_base) return;
-
-    u32 ei = vi;
-    if (a->frequency > 1)
-        ei = (st->frequency_divider_op & (1u << idx)) ? (vi % a->frequency)
-                                                      : (vi / a->frequency);
-
-    u32 off = (a->offset & 0x7FFFFFFFu) + ei * a->stride;
-    u32 ea  = (a->offset & 0x80000000u) ? cellGcmResolveLocated(0, off)
-                                        : cellGcmResolveOffset(off);
-    const u8* p = vm_base + ea;
-    u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
-
-    switch (a->type) {
-    case 2: for (u32 k = 0; k < n; k++) out[k] = rd_bef(p + k * 4);            break;
-    case 3: for (u32 k = 0; k < n; k++) out[k] = rd_half_be(p + k * 2);        break;
-    case 4: for (u32 k = 0; k < n; k++) out[k] = (float)p[k] / 255.0f;         break;  /* UB norm */
-    case 1: for (u32 k = 0; k < n; k++) {                                              /* S16 norm */
-                s16 v = (s16)((p[k*2] << 8) | p[k*2+1]);
-                out[k] = (float)v / 32767.0f;
-            } break;
-    default: break;
-    }
-}
 
 /* Position is attrib 0, diffuse colour attrib 3, texcoord0 attrib 8 -- the same
  * slots the D3D12 fallback path assumes. */
 static void fetch_vertex(const rsx_state* st, u32 vi, MtlVertex* out)
 {
-    fetch_attrib(st, 0, vi, out->pos, 0.0f, 0.0f, 0.0f, 1.0f);
-    fetch_attrib(st, 3, vi, out->col, 1.0f, 1.0f, 1.0f, 1.0f);
-    fetch_attrib(st, 8, vi, out->tc,  0.0f, 0.0f, 0.0f, 0.0f);
+    rsx_fetch_attrib(st, 0, vi, out->pos);
+    rsx_fetch_attrib(st, 3, vi, out->col);
+    rsx_fetch_attrib(st, 8, vi, out->tc);
 }
 
 /* ---- primitive conversion -------------------------------------------------

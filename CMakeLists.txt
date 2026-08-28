@@ -182,9 +182,10 @@ endif()
 # ---------------------------------------------------------------------------
 # Drives the cellGcm -> RSX -> backend bridge with no lifted game, so a backend
 # can be brought up and regression-tested without a game binary or a recompiler
-# run. Currently Apple-only because the Metal backend is the only non-Windows
-# backend that renders; it will build anywhere once another one lands.
-if(APPLE)
+# run. Builds on any POSIX host: it picks Metal on Apple and the null backend's
+# headless software path everywhere else, so Linux -- which has no real backend
+# yet -- can still run the whole guest command stream end to end in CI.
+if(UNIX)
     add_executable(ps3recomp_host
         runtime/host/host_posix.c
         runtime/host/host_stubs.c

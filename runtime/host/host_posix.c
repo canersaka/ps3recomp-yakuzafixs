@@ -16,7 +16,30 @@
 #include "cellGcmSys.h"
 #include "../memory/vm.h"           /* VM_HLE_INJECT_BASE */
 #include "rsx_commands.h"
-#include "rsx_metal_backend.h"
+
+/* Backend selection. Metal where there is one, otherwise the null backend's
+ * headless software path -- which is what lets this harness run on Linux,
+ * where no real backend exists yet. Both expose the same four entry points
+ * plus the same two test hooks, so the body below is backend-agnostic. */
+#if defined(__APPLE__)
+#  include "rsx_metal_backend.h"
+#  define HOST_BACKEND_NAME     "Metal"
+#  define host_backend_init     rsx_metal_backend_init
+#  define host_backend_shutdown rsx_metal_backend_shutdown
+#  define host_backend_pump     rsx_metal_backend_pump_messages
+#  define host_backend_present  rsx_metal_backend_present
+#  define host_backend_color    rsx_metal_backend_debug_color
+#  define host_backend_center   rsx_metal_backend_readback_center
+#else
+#  include "rsx_null_backend.h"
+#  define HOST_BACKEND_NAME     "null (headless software)"
+#  define host_backend_init     rsx_null_backend_init
+#  define host_backend_shutdown rsx_null_backend_shutdown
+#  define host_backend_pump     rsx_null_backend_pump_messages
+#  define host_backend_present  rsx_null_backend_present
+#  define host_backend_color    rsx_null_backend_debug_color
+#  define host_backend_center   rsx_null_backend_readback_center
+#endif
 
 #include <ps3emu/guest_call.h>
 #include <stdint.h>
@@ -111,11 +134,18 @@ static void upload_triangle(void)
 /* type[3:0]=2 (float32), size[7:4], stride[15:8] */
 #define VFMT(size, stride) (2u | ((u32)(size) << 4) | ((u32)(stride) << 8))
 
+/* Bit 31 of a vertex-array offset selects the context DMA: 0 = LOCAL (VRAM),
+ * 1 = MAIN (IO-mapped system memory). This harness writes its vertices into
+ * the IO window, so they are MAIN and must say so. Leaving the bit clear used
+ * to work by accident: one backend resolved LOCAL through the IO offset table,
+ * which happens to be right for these vertices and wrong for a real title's. */
+#define VTX_MAIN(off)  (0x80000000u | (u32)(off))
+
 static void emit_triangle_draw(void)
 {
-    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, VTX_OFFSET +  0);  /* position */
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, VTX_MAIN(VTX_OFFSET +  0));  /* position */
     emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0 * 4, VFMT(4, 32));
-    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4, VTX_OFFSET + 16);  /* colour   */
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4, VTX_MAIN(VTX_OFFSET + 16));  /* colour   */
     emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 3 * 4, VFMT(4, 32));
 
     emit(NV4097_SET_BEGIN_END, 5u);                       /* TRIANGLES        */
@@ -150,7 +180,8 @@ int main(int argc, char** argv)
     vm_base = (uint8_t*)calloc(1, VM_SIZE);
     if (!vm_base) { fprintf(stderr, "[host] guest VM alloc failed\n"); return 1; }
 
-    if (rsx_metal_backend_init(1280, 720, "ps3recomp") != 0) {
+    printf("[host] backend: %s\n", HOST_BACKEND_NAME);
+    if (host_backend_init(1280, 720, "ps3recomp") != 0) {
         fprintf(stderr, "[host] backend init failed\n");
         free(vm_base);
         return 1;
@@ -167,7 +198,7 @@ int main(int argc, char** argv)
     if (do_draw) upload_triangle();
     submit_frame(do_draw);
 
-    u32 got = rsx_metal_backend_debug_color();
+    u32 got = host_backend_color();
     printf("[host] clear colour through the FIFO: 0x%08X (expected 0x%08X) %s\n",
            got, CLEAR_ARGB, got == CLEAR_ARGB ? "OK" : "MISMATCH");
 
@@ -175,18 +206,18 @@ int main(int argc, char** argv)
     cellGcmSetFlipCommand(0);
     int presented = 0;
     for (int i = 0; frames == 0 || i < frames; i++) {
-        if (rsx_metal_backend_pump_messages() < 0) { printf("[host] window closed\n"); break; }
+        if (host_backend_pump() < 0) { printf("[host] window closed\n"); break; }
         /* Re-submit every frame, as a title does: the backend records draws
          * per frame and clears the record when it presents. */
         if (i > 0) submit_frame(do_draw);
         cellGcmTickVBlank();
         cellGcmTickFlip();
         if (cellGcm_take_flip_pending_synced()) presented++;
-        rsx_metal_backend_present();
+        host_backend_present();
     }
     printf("[host] presented %d frame(s)\n", presented);
 
-    u32 back = rsx_metal_backend_readback_center();
+    u32 back = host_backend_center();
     int rc = (got == CLEAR_ARGB) ? 0 : 2;
     if (back) {
         /* Headless: the drawable is ours, so verify what actually landed.
@@ -200,7 +231,7 @@ int main(int argc, char** argv)
         if ((back & 0x00FFFFFFu) != (want & 0x00FFFFFFu)) rc = 3;
     }
 
-    rsx_metal_backend_shutdown();
+    host_backend_shutdown();
     free(vm_base);
     return rc;
 }
