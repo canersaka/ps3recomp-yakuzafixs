@@ -102,8 +102,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd,
                                     uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7);
 /* Weak: builds that don't link cellGcmSys.c (test harnesses) get a null and skip. */
 extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
-extern "C" __declspec(dllimport) void* __stdcall GetModuleHandleA(const char*);
-static inline void* ps3_GetModuleHandleA(const char* m){ return GetModuleHandleA(m); }
+#include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 
 /* An unresolved NID is a firmware import we never registered. Returning
  * CELL_OK "so the game keeps going" is the single biggest source of
@@ -231,7 +230,6 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
       if(_bl && nid==0x1573DC3Fu){ uint32_t r3=(uint32_t)ctx->gpr[3];
         if(r3<0x00010000u || r3>=0x80000000u){ static int _n=0; if(_n++<3){
 #ifdef _WIN32
-          extern unsigned short __stdcall RtlCaptureStackBackTrace(unsigned long,unsigned long,void**,unsigned long*);
           void* bt[44]; unsigned short fr=RtlCaptureStackBackTrace(0,44,bt,0);
           (void)bt;(void)fr;
           /* Guest-stack code-ptr scan (EXACT: a lifted func name IS its guest addr) —
@@ -285,9 +283,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
               if(v!=prev){ p+=snprintf(b+p,sizeof(b)-p," %08X",v); prev=v; found++; } } }
           fprintf(stderr,"%s\n",b); }
 #ifdef _WIN32
-        { extern unsigned short __stdcall RtlCaptureStackBackTrace(unsigned long,unsigned long,void**,unsigned long*);
-          extern void* __stdcall GetModuleHandleA(const char*);
-          void* bt[40]; unsigned short fr=RtlCaptureStackBackTrace(0,40,bt,0);
+        { void* bt[40]; unsigned short fr=RtlCaptureStackBackTrace(0,40,bt,0);
           char* mb=(char*)GetModuleHandleA(0); char line[1100]; int p=snprintf(line,sizeof line,"[exit-chain] HOST-bt rva:");
           for(int i=0;i<fr;i++) p+=snprintf(line+p,sizeof(line)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
           fprintf(stderr,"%s\n",line); }
@@ -301,7 +297,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * loads (the C++ ctor list, globals, ...) read garbage -> boot corruption. */
     { static int _h=-1; if(_h<0)_h=getenv("FLOW_HLETOC")?1:0;
       if(_h && (uint32_t)(ctx->gpr[1]+0x28)==0x0FEFF268u){ static int _n=0; if(_n++<6){
-        char* mb=(char*)ps3_GetModuleHandleA(0); void* ra0=__builtin_return_address(0); void* ra1=__builtin_return_address(1);
+        char* mb=(char*)GetModuleHandleA(0); void* ra0=__builtin_return_address(0); void* ra1=__builtin_return_address(1);
         fprintf(stderr,"[HLETOC] corrupt nid=0x%08X name=%s r1=0x%08X  host_ra0_rva=0x%llX ra1_rva=0x%llX\n",
           nid,g_last_hle_name?g_last_hle_name:"?",(uint32_t)ctx->gpr[1],
           (unsigned long long)((char*)ra0-mb),(unsigned long long)((char*)ra1-mb)); } } }

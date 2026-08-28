@@ -19,6 +19,7 @@
  * otherwise).
  */
 #include "ppu_recomp.h"
+#include "../../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 /* The lifted ppu_recomp.h already defines `struct ppu_context` (identical to
  * runtime/ppu/ppu_context.h by design -- "keep the two in sync"). A syscall
  * header included later (sys_ppu_thread.h -> lv2_syscall_table.h -> ppu_context.h)
