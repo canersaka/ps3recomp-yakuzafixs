@@ -1046,6 +1046,36 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
                          ((uint32_t)ctx->ls[0x2FDD] << 16) |
                          ((uint32_t)ctx->ls[0x2FDE] << 8)  |
                           (uint32_t)ctx->ls[0x2FDF]) & ~0xFu;
+        /* SPURS_EF_SPU_REPLY=1 -- DIAGNOSTIC BISECT, NOT A FIX.
+         *
+         * The guest task is supposed to set its SPU->PPU flag (object+0x100)
+         * when a work cycle completes; it never does, so the PPU blocks on that
+         * flag forever and can never enqueue the next unit of work. That is a
+         * cycle: we cannot see what the PPU would do next without breaking it.
+         *
+         * On RE-ENTRY to WAIT_SIGNAL for the same object the previous cycle has
+         * finished, so set the flag on the task`s behalf and watch where the PPU
+         * goes. This FABRICATES guest state -- the repo`s own history says faked
+         * success is the most expensive kind of bug (see the unresolved-NID note
+         * in ppu_hle.cpp), so it stays opt-in and must never become the default.
+         * If the PPU advances, the answer is what the task must do to earn it. */
+        { static int s_rp = -1;
+          if (s_rp < 0) s_rp = getenv("SPURS_EF_SPU_REPLY") ? 1 : 0;
+          if (s_rp && wobj) {
+              static uint32_t seen[8]; static int seen_n = 0;
+              int again = 0;
+              for (int i = 0; i < seen_n; i++) if (seen[i] == wobj) { again = 1; break; }
+              if (!again) { if (seen_n < 8) seen[seen_n++] = wobj; }
+              else {
+                  extern void spurs_ef_set_from_spu(uint32_t, uint16_t);
+                  spurs_ef_set_from_spu(wobj + 0x100u, 1);
+                  static int _n = 0;
+                  if (_n++ < 8)
+                      fprintf(stderr, "[spu] SPU-REPLY: set flag 0x%08X for object "
+                                      "0x%08X (cycle complete)\n", wobj + 0x100u, wobj);
+              }
+          } }
+
         if (ts) {
             extern int spu_taskset_wait_signal(uint32_t, uint32_t);
             /* Park = OS-level wait on this SPU's host thread. Under the lockstep
