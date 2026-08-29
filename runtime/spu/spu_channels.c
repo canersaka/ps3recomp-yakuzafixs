@@ -1060,11 +1060,13 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
          * in ppu_hle.cpp), so it stays opt-in and must never become the default.
          * If the PPU advances, the answer is what the task must do to earn it. */
         { static int s_rp = -1;
-          if (s_rp < 0) s_rp = getenv("SPURS_EF_SPU_REPLY") ? 1 : 0;
+          if (s_rp < 0) { const char* e = getenv("SPURS_EF_SPU_REPLY");
+                          s_rp = e ? atoi(e) : 0; }   /* 2 = reply on EVERY entry */
           if (s_rp && wobj) {
               static uint32_t seen[8]; static int seen_n = 0;
               int again = 0;
               for (int i = 0; i < seen_n; i++) if (seen[i] == wobj) { again = 1; break; }
+              if (s_rp >= 2) again = 1;   /* force: answer "would the PPU move at all?" */
               if (!again) { if (seen_n < 8) seen[seen_n++] = wobj; }
               else {
                   extern void spurs_ef_set_from_spu(uint32_t, uint16_t);
