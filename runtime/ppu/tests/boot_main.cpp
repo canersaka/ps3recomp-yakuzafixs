@@ -19,6 +19,11 @@
  * otherwise).
  */
 #include "ppu_recomp.h"
+/* PPU_THREAD_LOCAL only -- NOT ppu_context.h, which would redefine the struct
+ * a generated ppu_recomp.h already declares. Ports generated before the
+ * qualifier existed do not define it, so the scaffold must carry its own
+ * reachable definition. */
+#include "../ppu_tls.h"
 #include "../../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 /* The lifted ppu_recomp.h already defines `struct ppu_context` (identical to
  * runtime/ppu/ppu_context.h by design -- "keep the two in sync"). A syscall
@@ -54,6 +59,10 @@ void     ps3_load_prx_modules(void) {}
 
 #ifdef _WIN32
 #include <windows.h>
+/* timeBeginPeriod: windows.h is included with WIN32_LEAN_AND_MEAN, which
+ * excludes the multimedia timer API, so it must be asked for by name -- and
+ * AFTER windows.h, since timeapi.h uses UINT and friends. */
+#include <timeapi.h>
 /* Last-chance crash reporter: vm_base accesses are bounds-guarded, so a real
  * access violation means a HOST pointer deref (e.g. a bad function pointer or a
  * runtime-struct walk). Print the faulting address and the RIP as a module
