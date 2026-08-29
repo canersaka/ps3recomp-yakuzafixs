@@ -66,6 +66,42 @@ u32 rsx_swizzle_offset(u32 x, u32 y, u32 log2w, u32 log2h);
 /* ceil(log2(v)); 0 for v <= 1. */
 u32 rsx_log2_ceil(u32 v);
 
+/* Convert one face/level of a guest texture into host-ready rows.
+ *
+ *   dst       destination, at least dst_pitch * tl->rows bytes
+ *   dst_pitch destination row stride (the host API's alignment, >= row_bytes)
+ *   src       guest bytes for this face, already resolved to a host pointer
+ *   w, h      texel dimensions
+ *   tl        layout from rsx_texture_layout() for the same w/h/format
+ *   argb_as_rgba  see rsx_texture_argb_is_rgba()
+ *
+ * Undoes Morton ordering where the layout says the source is swizzled, and
+ * converts the guest's big-endian A8R8G8B8 byte order (A,R,G,B) to the R,G,B,A
+ * every host API wants. Compressed formats are copied block-row by block-row
+ * without touching the payload, because BC1/2/3 are bit-identical to DXT1/23/45.
+ *
+ * Output is always tightly packed within each row, so a backend only supplies
+ * the destination and its pitch -- it needs to know nothing about swizzling,
+ * channel order or block sizes.
+ */
+void rsx_texture_decode(void* dst, u32 dst_pitch,
+                        const u8* src, u32 w, u32 h,
+                        const rsx_tex_layout* tl, int argb_as_rgba);
+
+/* TEX_RGBA: treat A8R8G8B8 source bytes as already R,G,B,A and copy them
+ * straight through.
+ *
+ * PSGL uploads its converted textures as GL_RGBA/GL_UNSIGNED_INT_8_8_8_8,
+ * which on the big-endian PPU lays the bytes down R,G,B,A even though the GCM
+ * format field says A8R8G8B8 -- and the format field alone cannot tell the two
+ * apart. Off by default: what looked like a channel rotation turned out to be
+ * the TEXTURE_CONTROL1 crossbar being read backwards, and with the crossbar
+ * decoded correctly this applies the rotation a second time.
+ *
+ * Read once and cached. Lives here rather than in each backend so they cannot
+ * disagree about it. */
+int rsx_texture_argb_is_rgba(void);
+
 #ifdef __cplusplus
 }
 #endif

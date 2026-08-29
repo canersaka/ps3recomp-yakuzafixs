@@ -12,6 +12,7 @@
 #include "rsx_texture_layout.h"
 
 #include <stdio.h>
+#include <string.h>
 
 static int g_fail = 0;
 
@@ -167,6 +168,140 @@ static void test_log2_ceil(void)
     CHECK_EQ(rsx_log2_ceil(1024), 10);
 }
 
+/* --- decode ------------------------------------------------------------- */
+
+/* A8R8G8B8 source is A,R,G,B per texel; the host wants R,G,B,A. */
+static void test_decode_argb_linear(void)
+{
+    rsx_tex_layout L;
+    rsx_texture_layout(FMT_A8R8G8B8 | FMT_LN, 2, 2, &L);
+    CHECK(!L.swizzled);
+
+    /* four texels, each A,R,G,B */
+    const u8 src[16] = {
+        0x11,0x22,0x33,0x44,   0x55,0x66,0x77,0x88,
+        0x99,0xAA,0xBB,0xCC,   0xDD,0xEE,0xFF,0x01,
+    };
+    u8 dst[2 * 16];                    /* pitch deliberately > row_bytes */
+    memset(dst, 0xA5, sizeof dst);
+    rsx_texture_decode(dst, 16, src, 2, 2, &L, 0);
+
+    /* row 0: R,G,B,A of each source texel */
+    CHECK_EQ(dst[0], 0x22); CHECK_EQ(dst[1], 0x33);
+    CHECK_EQ(dst[2], 0x44); CHECK_EQ(dst[3], 0x11);
+    CHECK_EQ(dst[4], 0x66); CHECK_EQ(dst[5], 0x77);
+    CHECK_EQ(dst[6], 0x88); CHECK_EQ(dst[7], 0x55);
+    /* row 1 starts at the PITCH, not at row_bytes */
+    CHECK_EQ(dst[16], 0xAA); CHECK_EQ(dst[19], 0x99);
+    /* padding between row_bytes and pitch is left alone */
+    CHECK_EQ(dst[8], 0xA5);
+
+    /* TEX_RGBA: bytes are already R,G,B,A and pass straight through. */
+    memset(dst, 0xA5, sizeof dst);
+    rsx_texture_decode(dst, 16, src, 2, 2, &L, 1);
+    CHECK_EQ(dst[0], 0x11); CHECK_EQ(dst[1], 0x22);
+    CHECK_EQ(dst[2], 0x33); CHECK_EQ(dst[3], 0x44);
+}
+
+/* A swizzled image must come out in raster order. Build the source so that
+ * texel (x,y) holds a known value AT ITS MORTON OFFSET, then check the decode
+ * lays it back out row by row. */
+static void test_decode_swizzled(void)
+{
+    rsx_tex_layout L;
+    rsx_texture_layout(0x81u, 4, 4, &L);          /* one byte per texel */
+    CHECK_EQ(L.bytes_per_texel, 1);
+    CHECK(L.swizzled);                            /* no LN bit, POT dims */
+
+    u8 src[16];
+    for (u32 y = 0; y < 4; y++)
+        for (u32 x = 0; x < 4; x++)
+            src[rsx_swizzle_offset(x, y, 2, 2)] = (u8)(y * 4 + x);
+
+    u8 dst[4 * 8];
+    memset(dst, 0xA5, sizeof dst);
+    rsx_texture_decode(dst, 8, src, 4, 4, &L, 0);
+
+    for (u32 y = 0; y < 4; y++)
+        for (u32 x = 0; x < 4; x++)
+            CHECK_EQ(dst[y * 8 + x], y * 4 + x);
+
+    /* Same bytes read as LINEAR must NOT come out in raster order -- otherwise
+     * the swizzled path is not doing anything and the test proves nothing. */
+    rsx_tex_layout Lin;
+    rsx_texture_layout(0x81u | FMT_LN, 4, 4, &Lin);
+    CHECK(!Lin.swizzled);
+    u8 dst2[4 * 8];
+    rsx_texture_decode(dst2, 8, src, 4, 4, &Lin, 0);
+    int differs = 0;
+    for (u32 y = 0; y < 4; y++)
+        for (u32 x = 0; x < 4; x++)
+            if (dst2[y * 8 + x] != dst[y * 8 + x]) differs = 1;
+    CHECK(differs);
+}
+
+/* Two-byte texels deswizzle as a unit: both bytes move together. */
+static void test_decode_g8b8_swizzled(void)
+{
+    rsx_tex_layout L;
+    rsx_texture_layout(FMT_G8B8, 4, 4, &L);
+    CHECK_EQ(L.bytes_per_texel, 2);
+    CHECK(L.swizzled);
+
+    u8 src[32];
+    for (u32 y = 0; y < 4; y++)
+        for (u32 x = 0; x < 4; x++) {
+            u32 o = rsx_swizzle_offset(x, y, 2, 2) * 2;
+            src[o + 0] = (u8)(0x10 + y * 4 + x);
+            src[o + 1] = (u8)(0x80 + y * 4 + x);
+        }
+
+    u8 dst[4 * 16];
+    rsx_texture_decode(dst, 16, src, 4, 4, &L, 0);
+    for (u32 y = 0; y < 4; y++)
+        for (u32 x = 0; x < 4; x++) {
+            CHECK_EQ(dst[y * 16 + x * 2 + 0], 0x10 + y * 4 + x);
+            CHECK_EQ(dst[y * 16 + x * 2 + 1], 0x80 + y * 4 + x);
+        }
+}
+
+/* Compressed payload is copied verbatim -- BC1/2/3 are bit-identical to
+ * DXT1/23/45 -- with only the row stride changing. */
+static void test_decode_compressed_is_verbatim(void)
+{
+    rsx_tex_layout L;
+    rsx_texture_layout(FMT_DXT1, 8, 8, &L);
+    CHECK_EQ(L.row_bytes, 16);        /* 2 blocks of 8 bytes */
+    CHECK_EQ(L.rows, 2);
+
+    u8 src[32];
+    for (u32 i = 0; i < sizeof src; i++) src[i] = (u8)(i * 7 + 1);
+
+    u8 dst[2 * 24];
+    memset(dst, 0xA5, sizeof dst);
+    rsx_texture_decode(dst, 24, src, 8, 8, &L, 0);
+
+    for (u32 y = 0; y < 2; y++)
+        for (u32 b = 0; b < 16; b++)
+            CHECK_EQ(dst[y * 24 + b], src[y * 16 + b]);
+    CHECK_EQ(dst[16], 0xA5);          /* padding untouched */
+}
+
+/* Nothing should be written through a null or zero-sized request. */
+static void test_decode_rejects_nonsense(void)
+{
+    rsx_tex_layout L;
+    rsx_texture_layout(FMT_A8R8G8B8 | FMT_LN, 2, 2, &L);
+    u8 dst[16];
+    memset(dst, 0xA5, sizeof dst);
+    const u8 src[16] = {0};
+    rsx_texture_decode(NULL, 8, src, 2, 2, &L, 0);
+    rsx_texture_decode(dst, 8, NULL, 2, 2, &L, 0);
+    rsx_texture_decode(dst, 8, src, 0, 2, &L, 0);
+    rsx_texture_decode(dst, 8, src, 2, 2, NULL, 0);
+    for (u32 i = 0; i < sizeof dst; i++) CHECK_EQ(dst[i], 0xA5);
+}
+
 int main(void)
 {
     test_argb();
@@ -175,6 +310,11 @@ int main(void)
     test_unknown_format_degrades();
     test_swizzle_offset();
     test_log2_ceil();
+    test_decode_argb_linear();
+    test_decode_swizzled();
+    test_decode_g8b8_swizzled();
+    test_decode_compressed_is_verbatim();
+    test_decode_rejects_nonsense();
 
     if (g_fail) { printf("\nRSX texture layout: %d FAILED\n", g_fail); return 1; }
     printf("RSX texture layout tests: all passed\n");

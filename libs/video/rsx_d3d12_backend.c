@@ -2423,7 +2423,6 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     rsx_texture_layout(fmt, w, h, &tl);
     u32 basef = fmt & 0x9F;              /* still needed for the SRV remap */
     int argb = (tl.fmt == RSX_TEXFMT_R8G8B8A8);
-    int g8b8 = (tl.fmt == RSX_TEXFMT_R8G8);
     int dxt  = tl.compressed;
     /* Compressed rows are counted in blocks, so keep bpp at 1 for the byte
      * arithmetic the diagnostics below do. */
@@ -2621,7 +2620,6 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * LBP's loading screen (every texture there is 0x85 swizzled). POT dims
      * only -- the hardware requires that for swizzled textures anyway. */
     int swz = tl.swizzled;
-    u32 l2w = rsx_log2_ceil(w), l2h = rsx_log2_ceil(h);
     /* Cube textures store their 6 faces consecutively. Convert each into its own
      * slice of the upload buffer; the conversion below is unchanged and simply
      * runs once per face with off/mapped rebased. */
@@ -2651,70 +2649,15 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         fprintf(stderr, "[CUBEFACE] f=%u off=0x%X bytes=%u bpp=%u swz=%d csum=%08X%c",
                 _f, off, _face_bytes, bpp, swz, _s, 10); }
     mapped = _map0 + (u64)_f * pitch * _face_rows;
-    if (dxt) {
-        /* DXT: linear rows of 4x4 blocks, copied straight into BC1/2/3. */
-        for (u32 y = 0; y < blkrows; y++)
-            memcpy((u8*)mapped + (u64)y * pitch, vm_base + off + (u64)y * blkrow, blkrow);
-    } else if (g8b8) {
-        /* G8B8: 2 bytes/texel -> R8G8; channel placement is done by the SRV
-         * remap (native vector {G,R,G,R}, see rsx_remap_to_d3d). */
-        const u8* sbase = vm_base + off;
-        for (u32 y = 0; y < h; y++) {
-            u8* drow = (u8*)mapped + (u64)y * pitch;
-            if (swz) {
-                for (u32 x = 0; x < w; x++) {
-                    const u8* s = sbase + (u64)rsx_swizzle_offset(x, y, l2w, l2h) * 2;
-                    drow[x*2+0] = s[0]; drow[x*2+1] = s[1];
-                }
-            } else {
-                memcpy(drow, sbase + (u64)y * w * 2, (u64)w * 2);
-            }
-        }
-    } else if (argb) {
-        /* guest big-endian A8R8G8B8 (bytes A,R,G,B) -> DXGI R8G8B8A8 (R,G,B,A).
-         *
-         * TEX_RGBA=1: the source is already R,G,B,A, so copy straight through.
-         * PSGL uploads its converted textures as GL_RGBA/GL_UNSIGNED_INT_8_8_8_8,
-         * which on the big-endian PPU lays the bytes down R,G,B,A even though it
-         * declares the GCM format as A8R8G8B8 -- so the A,R,G,B reading rotates
-         * every channel by one. Measured: duck.tga averages (243,191,23) and its
-         * bound texture reads back (191,23,254) under the ARGB interpretation,
-         * i.e. exactly one channel over, with the 255 alpha landing in blue.
-         * SUPERSEDED: that measurement was the reversed TEXTURE_CONTROL1 crossbar
-         * (see rsx_remap_to_d3d), not the upload. PSGL asks for the rotation
-         * with a crossbar word of its own; with the crossbar decoded correctly
-         * this option applies it a SECOND time. Leave it off unless a title is
-         * shown to need it.
-         * ponytail: env-gated rather than unconditional -- other titles'
-         * textures really are A,R,G,B, and the GCM format field alone cannot
-         * tell them apart. */
-        static int rgba = -1;
-        if (rgba < 0) { const char* e = getenv("TEX_RGBA"); rgba = e ? atoi(e) : 0; }
-        const u8* sbase = vm_base + off;
-        for (u32 y = 0; y < h; y++) {
-            u8* drow = (u8*)mapped + (u64)y * pitch;
-            for (u32 x = 0; x < w; x++) {
-                const u8* s = sbase + (u64)(swz ? rsx_swizzle_offset(x, y, l2w, l2h)
-                                                : y * w + x) * 4;
-                if (rgba) {
-                    drow[x*4+0] = s[0]; drow[x*4+1] = s[1];
-                    drow[x*4+2] = s[2]; drow[x*4+3] = s[3];
-                } else {
-                    drow[x*4+0] = s[1]; drow[x*4+1] = s[2];
-                    drow[x*4+2] = s[3]; drow[x*4+3] = s[0];
-                }
-            }
-        }
-    } else if (swz) {
-        const u8* sbase = vm_base + off;
-        for (u32 y = 0; y < h; y++) {
-            u8* drow = (u8*)mapped + (u64)y * pitch;
-            for (u32 x = 0; x < w; x++)
-                drow[x] = sbase[rsx_swizzle_offset(x, y, l2w, l2h)];
-        }
-    } else {
-        for (u32 y = 0; y < h; y++)
-            memcpy((u8*)mapped + (u64)y * pitch, vm_base + off + (u64)y * w, w);
+    /* Pixel conversion -- deswizzle, channel order, block copy -- is RSX
+     * semantics and lives in rsx_texture_layout.c, so a second backend gets
+     * it by calling this rather than porting the loops again. */
+    rsx_texture_decode(mapped, pitch, vm_base + off, w, h, &tl,
+                       rsx_texture_argb_is_rgba());
+
+    /* The diagnostics below only apply to the linear 8-bit case (Bink video
+     * planes); they used to sit inside that branch of the conversion. */
+    if (!tl.compressed && tl.bytes_per_texel == 1 && !tl.swizzled) {
         /* MOVIE_FIND=1: when a 640x360 movie plane uploads ZERO, scan a wide
          * guest window for the REAL frame (a 640-wide region with content) so
          * we learn where the video decode actually wrote vs where the texture
