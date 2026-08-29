@@ -286,8 +286,25 @@ static void spurs_ef_set_locked(uint32_t ea, u16 bits)
      * Initialize having already run, and the CRI flags are Set before that --
      * so the post silently never happened. An unclaimed post is harmless: it is
      * only ever consumed by a task that names this exact object in its wait. */
-    { extern void spu_ef_bits_post(uint32_t, uint16_t);
-      if (ea > 0x80u) spu_ef_bits_post(ea - 0x80u, bits); }
+    if (ea > 0x80u) {
+        uint32_t obj = ea - 0x80u;
+        /* Write NOW *and* record for consume time. The two orderings are both
+         * real and neither alone is enough: if the task has not read yet the
+         * immediate write is what it sees, and if it is parked (or took the
+         * latched-wake path and never parked at all) the WAIT_SIGNAL handler
+         * replays it just before returning. Writing the same bits twice is
+         * idempotent, so covering both costs nothing and removes the race that
+         * made this fire in only 1 of 4 runs. */
+        { static int s_od = -1;
+          if (s_od < 0) s_od = getenv("SPURS_EF_OBJ_DELIVER") ? 1 : 0;
+          if (s_od) {
+              vm_write16(obj + EF_EVENTS, bits);
+              for (uint32_t s = 0; s < 16; s++)
+                  vm_write16(obj + EF_PENDING_RECV_EVT + 2u * s, bits);
+          } }
+        { extern void spu_ef_bits_post(uint32_t, uint16_t);
+          spu_ef_bits_post(obj, bits); }
+    }
     if (!pendingRecv) {
         static int s_wp = -1;
         if (s_wp < 0) s_wp = getenv("SPURS_EF_WAKE_PARKED") ? 1 : 0;
