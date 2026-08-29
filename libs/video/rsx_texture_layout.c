@@ -3,6 +3,9 @@
  */
 #include "rsx_texture_layout.h"
 
+#include <stdlib.h>   /* getenv, atoi */
+#include <string.h>   /* memcpy       */
+
 u32 rsx_log2_ceil(u32 v)
 {
     u32 l = 0;
@@ -65,4 +68,73 @@ void rsx_texture_layout(u32 rsx_fmt, u32 w, u32 h, rsx_tex_layout* out)
     }
 
     out->face_bytes = out->row_bytes * out->rows;
+}
+
+int rsx_texture_argb_is_rgba(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = getenv("TEX_RGBA");
+        cached = e ? atoi(e) : 0;
+    }
+    return cached;
+}
+
+void rsx_texture_decode(void* dst, u32 dst_pitch,
+                        const u8* src, u32 w, u32 h,
+                        const rsx_tex_layout* tl, int argb_as_rgba)
+{
+    if (!dst || !src || !tl || !w || !h) return;
+
+    u8* d = (u8*)dst;
+
+    if (tl->compressed) {
+        /* BC1/2/3 are bit-identical to DXT1/23/45, so the payload is copied
+         * rather than converted -- only the row stride changes. */
+        for (u32 y = 0; y < tl->rows; y++)
+            memcpy(d + (size_t)y * dst_pitch,
+                   src + (size_t)y * tl->row_bytes, tl->row_bytes);
+        return;
+    }
+
+    /* Morton order interleaves the low bits of x and y, so a swizzled image has
+     * to be walked texel by texel. A linear one is a straight row copy, which is
+     * worth keeping as a separate path: it is the common case and by far the
+     * faster one. */
+    const u32 l2w = rsx_log2_ceil(w), l2h = rsx_log2_ceil(h);
+    const u32 bpp = tl->bytes_per_texel;
+
+    if (tl->fmt == RSX_TEXFMT_R8G8B8A8) {
+        for (u32 y = 0; y < h; y++) {
+            u8* drow = d + (size_t)y * dst_pitch;
+            for (u32 x = 0; x < w; x++) {
+                const u8* s = src + (size_t)(tl->swizzled
+                                  ? rsx_swizzle_offset(x, y, l2w, l2h)
+                                  : (size_t)y * w + x) * 4;
+                if (argb_as_rgba) {
+                    drow[x*4+0] = s[0]; drow[x*4+1] = s[1];
+                    drow[x*4+2] = s[2]; drow[x*4+3] = s[3];
+                } else {
+                    /* guest A,R,G,B -> host R,G,B,A */
+                    drow[x*4+0] = s[1]; drow[x*4+1] = s[2];
+                    drow[x*4+2] = s[3]; drow[x*4+3] = s[0];
+                }
+            }
+        }
+        return;
+    }
+
+    /* R8G8 and R8: no channel reordering. G8B8's placement is done by the
+     * sampler's component remap, not here. */
+    for (u32 y = 0; y < h; y++) {
+        u8* drow = d + (size_t)y * dst_pitch;
+        if (tl->swizzled) {
+            for (u32 x = 0; x < w; x++) {
+                const u8* s = src + (size_t)rsx_swizzle_offset(x, y, l2w, l2h) * bpp;
+                for (u32 b = 0; b < bpp; b++) drow[x * bpp + b] = s[b];
+            }
+        } else {
+            memcpy(drow, src + (size_t)y * w * bpp, (size_t)w * bpp);
+        }
+    }
 }
