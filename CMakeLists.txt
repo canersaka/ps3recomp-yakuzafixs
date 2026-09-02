@@ -149,6 +149,12 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(ps3recomp_runtime PRIVATE
         -Wall -Wextra -Wno-unused-parameter
         -fno-strict-aliasing
+        # No spontaneous fused multiply-add. MSVC never contracts, and x86-64
+        # without -mfma has nothing to contract into, so every validated
+        # result came from separate multiplies and adds; arm64 has FMA in
+        # the base ISA and Clang fuses by default there. A PPC fmadd is
+        # spelt as one where the lifter means one.
+        -ffp-contract=off
     )
 elseif(MSVC)
     target_compile_options(ps3recomp_runtime PRIVATE
