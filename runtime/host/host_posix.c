@@ -72,7 +72,8 @@ uint8_t* vm_base = NULL;
 #define CLEAR_ARGB  0xFF101830u          /* what we expect to come out again  */
 #define VTX_OFFSET  0x00010000u          /* RSX offset of our vertex buffer   */
 #define TEX_OFFSET  0x00020000u          /* RSX offset of our test texture    */
-#define FP_OFFSET   0x00030000u          /* RSX offset of our fragment program */
+#define FP_OFFSET   0x00030000u          /* RSX offset of our fragment programs */
+#define TFP_OFFSET  (FP_OFFSET + 0x1000u) /* ... the texturing one            */
 #define TEX_W       4u
 #define TEX_H       4u
 #define TEX_ARGB    0xFF20C040u          /* what a textured pixel must read   */
@@ -200,14 +201,44 @@ static void upload_shader_triangle(void)
             guest_f32(IO_ADDR + SVTX_OFFSET + (uint32_t)(i * 32 + k * 4), v[i][k]);
 }
 
-/* The fragment program lives in guest memory, where SET_SHADER_PROGRAM points
- * the RSX at it: MOV r0, COL0.zyxw ; END. One instruction, 16 bytes, stored
- * the way rsx_fp_read_word expects (big-endian, half-words swapped). The
- * unit test test_shader_msl decompiles exactly these words and checks the
- * HLSL reads (input.col0).zyxw. */
-static void upload_fragment_program(void)
+/* The fragment programs live in guest memory, where SET_SHADER_PROGRAM points
+ * the RSX at them, stored the way rsx_fp_read_word expects (big-endian,
+ * half-words swapped). Each is one instruction, 16 bytes:
+ *   FP_OFFSET   MOV r0, COL0.zyxw ; END    (--shader: swaps red and blue)
+ *   TFP_OFFSET  TEX r0, TC0 ; END          (--tex: samples unit 0 at texcoord0)
+ * The unit test test_shader_msl decompiles exactly these words and checks
+ * the HLSL reads (input.col0).zyxw and rsx_tex[0].Sample(rsx_samp[0], ...). */
+static void upload_fragment_programs(void)
 {
     rsx_test_fp_mov_r0_col0(vm_base + IO_ADDR + FP_OFFSET, RSX_TEST_FP_SWZ(2, 1, 0, 3));
+    rsx_test_fp_tex_r0_tc0(vm_base + IO_ADDR + TFP_OFFSET, 0);
+}
+
+/* Load a vertex program and select a fragment program the way a title does.
+ *
+ * The vertex program goes into the RSX's instruction store as data words:
+ * SET_TRANSFORM_PROGRAM_LOAD sets the write cursor (in instructions), and
+ * each write to SET_TRANSFORM_PROGRAM + 4k stores one word and advances.
+ * SET_TRANSFORM_PROGRAM_START then says which instruction the program begins
+ * at. The fragment program is addressed by SET_SHADER_PROGRAM, whose low two
+ * bits are the location: 1 = local (VRAM), 2 = main memory -- our bytes sit
+ * in the IO window, so main. SET_SHADER_CONTROL's 0x40 says the program's
+ * colour comes out of r0 (32-bit exports), which is the register both of
+ * ours write.
+ *
+ * Both programs are re-sent every frame, as a title's command list would;
+ * the backend's caches are what keep that from recompiling anything. */
+static void emit_programs(const u8* vp, u32 vp_bytes, u32 fp_offset)
+{
+    emit(NV4097_SET_TRANSFORM_PROGRAM_LOAD, 0u);
+    for (u32 k = 0; k < vp_bytes / 4u; k++) {
+        const u8* w = vp + k * 4;
+        emit(NV4097_SET_TRANSFORM_PROGRAM + k * 4,
+             (u32)w[0] | ((u32)w[1] << 8) | ((u32)w[2] << 16) | ((u32)w[3] << 24));
+    }
+    emit(NV4097_SET_TRANSFORM_PROGRAM_START, 0u);
+    emit(NV4097_SET_SHADER_PROGRAM, fp_offset | 2u);
+    emit(NV4097_SET_SHADER_CONTROL, CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS);
 }
 
 /* type[3:0]=2 (float32), size[7:4], stride[15:8] */
@@ -232,16 +263,29 @@ static void emit_triangle_draw(void)
     emit(NV4097_SET_BEGIN_END, 0u);                       /* end              */
 }
 
-/* Bind the test texture on unit 0 and draw the quad. The vertex colour is
- * deliberately GREEN while the texture is a different colour, so a pass that
- * ignored the texture would still produce a plausible-looking frame -- and
- * the assertion would catch it. */
+/* Bind the test texture on unit 0 and draw the quad through a guest vertex
+ * program that passes position, colour and texcoord0 through (MOV o0,v0 ;
+ * MOV o1,v3 ; MOV o7,v8) and the TEX r0, TC0 fragment program, which is how
+ * a title samples a texture. A backend with no guest-program path ignores
+ * the programs and samples in its own way. The vertex colour is deliberately
+ * GREEN while the texture is a different colour, so a pass that ignored the
+ * texture would still produce a plausible-looking frame -- and the assertion
+ * would catch it. */
 static void emit_textured_draw(void)
 {
+    u8 vp[48];
+    rsx_test_vp_mov_out(vp +  0, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);   /* MOV o0, v0      */
+    rsx_test_vp_mov_out(vp + 16, 3, RSX_TEST_VP_SWZ_IDENT, 1, 0);   /* MOV o1, v3      */
+    rsx_test_vp_mov_out(vp + 32, 8, RSX_TEST_VP_SWZ_IDENT, 7, 1);   /* MOV o7, v8, END */
+    emit_programs(vp, sizeof vp, TFP_OFFSET);
+
     /* NV4097_SET_TEXTURE_* are 0x20 apart per unit; unit 0 is the base. */
-    emit(NV4097_SET_TEXTURE_OFFSET     + 0, VTX_MAIN(TEX_OFFSET));
-    /* format: A8R8G8B8 (0x85) | LN (0x20) -- linear, not swizzled. */
-    emit(NV4097_SET_TEXTURE_FORMAT     + 0, 0x85u | 0x20u);
+    emit(NV4097_SET_TEXTURE_OFFSET     + 0, TEX_OFFSET);
+    /* SET_TEXTURE_FORMAT as cellGcmSetTexture packs it: location in [1:0]
+     * (2 = main memory, where the IO window is), 2D in [7:4], the format
+     * byte in [15:8] -- A8R8G8B8 (0x85) with LN (0x20), linear rather than
+     * swizzled -- and one mip level in [19:16]. */
+    emit(NV4097_SET_TEXTURE_FORMAT     + 0, 2u | (2u << 4) | ((0x85u | 0x20u) << 8) | (1u << 16));
     emit(NV4097_SET_TEXTURE_CONTROL0   + 0, 0x80000000u);   /* unit enable */
     emit(NV4097_SET_TEXTURE_CONTROL1   + 0, 0xAAE4u);       /* identity crossbar */
     emit(NV4097_SET_TEXTURE_IMAGE_RECT + 0, (TEX_W << 16) | TEX_H);
@@ -258,35 +302,15 @@ static void emit_textured_draw(void)
     emit(NV4097_SET_BEGIN_END, 0u);
 }
 
-/* Load a vertex program and select a fragment program the way a title does,
- * then draw the blue triangle through them.
- *
- * The vertex program is MOV o0, v0 ; MOV o1, v3 (END): position and diffuse
- * colour straight through. It goes into the RSX's instruction store as data
- * words: SET_TRANSFORM_PROGRAM_LOAD sets the write cursor (in instructions),
- * and each write to SET_TRANSFORM_PROGRAM + 4k stores one word and advances.
- * SET_TRANSFORM_PROGRAM_START then says which instruction the program begins
- * at. The fragment program is addressed by SET_SHADER_PROGRAM, whose low two
- * bits are the location: 1 = local (VRAM), 2 = main memory -- our bytes sit
- * in the IO window, so main. SET_SHADER_CONTROL's 0x40 says the program's
- * colour comes out of r0 (32-bit exports), which is the register it writes.
- *
- * Both programs are re-sent every frame, as a title's command list would;
- * the backend's caches are what keep that from recompiling anything. */
+/* Draw the blue triangle through MOV o0, v0 ; MOV o1, v3 (END) -- position
+ * and diffuse colour straight through -- and the red/blue-swapping fragment
+ * program, so it must come out red. */
 static void emit_shader_draw(void)
 {
     u8 vp[32];
     rsx_test_vp_mov_out(vp +  0, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);   /* MOV o0, v0      */
     rsx_test_vp_mov_out(vp + 16, 3, RSX_TEST_VP_SWZ_IDENT, 1, 1);   /* MOV o1, v3, END */
-    emit(NV4097_SET_TRANSFORM_PROGRAM_LOAD, 0u);
-    for (u32 k = 0; k < 8; k++) {
-        const u8* w = vp + k * 4;
-        emit(NV4097_SET_TRANSFORM_PROGRAM + k * 4,
-             (u32)w[0] | ((u32)w[1] << 8) | ((u32)w[2] << 16) | ((u32)w[3] << 24));
-    }
-    emit(NV4097_SET_TRANSFORM_PROGRAM_START, 0u);
-    emit(NV4097_SET_SHADER_PROGRAM, FP_OFFSET | 2u);
-    emit(NV4097_SET_SHADER_CONTROL, CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS);
+    emit_programs(vp, sizeof vp, FP_OFFSET);
 
     emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, VTX_MAIN(SVTX_OFFSET +  0));  /* position */
     emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0 * 4, VFMT(4, 32));
@@ -359,7 +383,8 @@ int main(int argc, char** argv)
     guest_w32(CTRL_ADDR + 4, 0);            /* get: start of ring */
     if (do_draw == 1) upload_triangle();
     if (do_draw == 2) { upload_texture(); upload_textured_quad(); }
-    if (do_draw == 3) { upload_shader_triangle(); upload_fragment_program(); }
+    if (do_draw == 3) upload_shader_triangle();
+    if (do_draw >= 2) upload_fragment_programs();
     submit_frame(do_draw);
 
     u32 got = host_backend_color();
@@ -400,7 +425,7 @@ int main(int argc, char** argv)
                back, want, (back & 0x00FFFFFFu) == (want & 0x00FFFFFFu) ? "OK" : "MISMATCH");
         if ((back & 0x00FFFFFFu) != (want & 0x00FFFFFFu)) rc = 3;
     }
-    if (do_draw == 3) {
+    if (do_draw >= 2 && HOST_BACKEND_GUEST_SHADERS) {
         /* The pixel alone cannot prove the programs ran: a backend that
          * ignored them would draw the triangle blue, which the check above
          * catches, but one that ran the vertex program and dropped the
