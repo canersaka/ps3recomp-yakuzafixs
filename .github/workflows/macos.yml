@@ -8,7 +8,7 @@ name: macOS
 
 on:
   push:
-    branches: [ master, main ]
+    branches: [ '**' ]     # fork: every branch, so port work is checked before a PR
   pull_request:
   workflow_dispatch:
 
