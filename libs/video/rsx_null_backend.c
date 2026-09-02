@@ -638,4 +638,6 @@ u32 rsx_null_backend_readback_center(void)
     return s_soft.presented ? (0xFF000000u | s_soft.last_present) : 0u;
 }
 
+u32 rsx_null_backend_guest_draws(void) { return 0; }
+
 #endif /* _WIN32 */

@@ -24,22 +24,27 @@
 #if defined(__APPLE__)
 #  include "rsx_metal_backend.h"
 #  define HOST_BACKEND_NAME     "Metal"
+#  define HOST_BACKEND_GUEST_SHADERS 1
 #  define host_backend_init     rsx_metal_backend_init
 #  define host_backend_shutdown rsx_metal_backend_shutdown
 #  define host_backend_pump     rsx_metal_backend_pump_messages
 #  define host_backend_present  rsx_metal_backend_present
 #  define host_backend_color    rsx_metal_backend_debug_color
 #  define host_backend_center   rsx_metal_backend_readback_center
+#  define host_backend_guest_draws rsx_metal_backend_guest_draws
 #else
 #  include "rsx_null_backend.h"
 #  define HOST_BACKEND_NAME     "null (headless software)"
+#  define HOST_BACKEND_GUEST_SHADERS 0
 #  define host_backend_init     rsx_null_backend_init
 #  define host_backend_shutdown rsx_null_backend_shutdown
 #  define host_backend_pump     rsx_null_backend_pump_messages
 #  define host_backend_present  rsx_null_backend_present
 #  define host_backend_color    rsx_null_backend_debug_color
 #  define host_backend_center   rsx_null_backend_readback_center
+#  define host_backend_guest_draws rsx_null_backend_guest_draws
 #endif
+#include "rsx_test_programs.h"
 
 #include <ps3emu/guest_call.h>
 #include <stdint.h>
@@ -67,6 +72,7 @@ uint8_t* vm_base = NULL;
 #define CLEAR_ARGB  0xFF101830u          /* what we expect to come out again  */
 #define VTX_OFFSET  0x00010000u          /* RSX offset of our vertex buffer   */
 #define TEX_OFFSET  0x00020000u          /* RSX offset of our test texture    */
+#define FP_OFFSET   0x00030000u          /* RSX offset of our fragment program */
 #define TEX_W       4u
 #define TEX_H       4u
 #define TEX_ARGB    0xFF20C040u          /* what a textured pixel must read   */
@@ -176,6 +182,34 @@ static void upload_textured_quad(void)
             guest_f32(IO_ADDR + TVTX_OFFSET + (uint32_t)(i * 48 + k * 4), v[i][k]);
 }
 
+/* The guest-shader draw's vertex block: the same full-viewport triangle, but
+ * BLUE. Its vertex program passes position and colour through unchanged and
+ * its fragment program swaps red and blue, so the pixel that must come out is
+ * red -- a draw that quietly fell back to the built-in shader would produce
+ * blue and fail. Layout as upload_triangle: float4 pos, float4 colour. */
+#define SVTX_OFFSET (VTX_OFFSET + 0x2000u)
+static void upload_shader_triangle(void)
+{
+    static const float v[3][8] = {
+        { -1.0f, -1.0f, 0.0f, 1.0f,   0.0f, 0.0f, 1.0f, 1.0f },
+        {  3.0f, -1.0f, 0.0f, 1.0f,   0.0f, 0.0f, 1.0f, 1.0f },
+        { -1.0f,  3.0f, 0.0f, 1.0f,   0.0f, 0.0f, 1.0f, 1.0f },
+    };
+    for (int i = 0; i < 3; i++)
+        for (int k = 0; k < 8; k++)
+            guest_f32(IO_ADDR + SVTX_OFFSET + (uint32_t)(i * 32 + k * 4), v[i][k]);
+}
+
+/* The fragment program lives in guest memory, where SET_SHADER_PROGRAM points
+ * the RSX at it: MOV r0, COL0.zyxw ; END. One instruction, 16 bytes, stored
+ * the way rsx_fp_read_word expects (big-endian, half-words swapped). The
+ * unit test test_shader_msl decompiles exactly these words and checks the
+ * HLSL reads (input.col0).zyxw. */
+static void upload_fragment_program(void)
+{
+    rsx_test_fp_mov_r0_col0(vm_base + IO_ADDR + FP_OFFSET, RSX_TEST_FP_SWZ(2, 1, 0, 3));
+}
+
 /* type[3:0]=2 (float32), size[7:4], stride[15:8] */
 #define VFMT(size, stride) (2u | ((u32)(size) << 4) | ((u32)(stride) << 8))
 
@@ -224,6 +258,46 @@ static void emit_textured_draw(void)
     emit(NV4097_SET_BEGIN_END, 0u);
 }
 
+/* Load a vertex program and select a fragment program the way a title does,
+ * then draw the blue triangle through them.
+ *
+ * The vertex program is MOV o0, v0 ; MOV o1, v3 (END): position and diffuse
+ * colour straight through. It goes into the RSX's instruction store as data
+ * words: SET_TRANSFORM_PROGRAM_LOAD sets the write cursor (in instructions),
+ * and each write to SET_TRANSFORM_PROGRAM + 4k stores one word and advances.
+ * SET_TRANSFORM_PROGRAM_START then says which instruction the program begins
+ * at. The fragment program is addressed by SET_SHADER_PROGRAM, whose low two
+ * bits are the location: 1 = local (VRAM), 2 = main memory -- our bytes sit
+ * in the IO window, so main. SET_SHADER_CONTROL's 0x40 says the program's
+ * colour comes out of r0 (32-bit exports), which is the register it writes.
+ *
+ * Both programs are re-sent every frame, as a title's command list would;
+ * the backend's caches are what keep that from recompiling anything. */
+static void emit_shader_draw(void)
+{
+    u8 vp[32];
+    rsx_test_vp_mov_out(vp +  0, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);   /* MOV o0, v0      */
+    rsx_test_vp_mov_out(vp + 16, 3, RSX_TEST_VP_SWZ_IDENT, 1, 1);   /* MOV o1, v3, END */
+    emit(NV4097_SET_TRANSFORM_PROGRAM_LOAD, 0u);
+    for (u32 k = 0; k < 8; k++) {
+        const u8* w = vp + k * 4;
+        emit(NV4097_SET_TRANSFORM_PROGRAM + k * 4,
+             (u32)w[0] | ((u32)w[1] << 8) | ((u32)w[2] << 16) | ((u32)w[3] << 24));
+    }
+    emit(NV4097_SET_TRANSFORM_PROGRAM_START, 0u);
+    emit(NV4097_SET_SHADER_PROGRAM, FP_OFFSET | 2u);
+    emit(NV4097_SET_SHADER_CONTROL, CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS);
+
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, VTX_MAIN(SVTX_OFFSET +  0));  /* position */
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0 * 4, VFMT(4, 32));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4, VTX_MAIN(SVTX_OFFSET + 16));  /* colour   */
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 3 * 4, VFMT(4, 32));
+
+    emit(NV4097_SET_BEGIN_END, 5u);                       /* TRIANGLES        */
+    emit(NV4097_DRAW_ARRAYS,   0u | ((3u - 1u) << 24));   /* first=0 count=3  */
+    emit(NV4097_SET_BEGIN_END, 0u);                       /* end              */
+}
+
 /* Append this frame's commands to the ring and advance `put`, exactly as a
  * title does. The RSX's `get` pointer lives inside cellGcmSys and chases `put`;
  * it is never rewound, so each frame must occupy fresh ring space rather than
@@ -232,7 +306,8 @@ static void submit_frame(int with_draw)
 {
     emit(NV4097_SET_COLOR_CLEAR_VALUE, CLEAR_ARGB);
     emit(NV4097_CLEAR_SURFACE,         0xF0u);
-    if (with_draw == 2)      emit_textured_draw();
+    if (with_draw == 3)      emit_shader_draw();
+    else if (with_draw == 2) emit_textured_draw();
     else if (with_draw == 1) emit_triangle_draw();
 
     guest_w32(CTRL_ADDR + 0, g_fifo_len);   /* put */
@@ -252,6 +327,16 @@ int main(int argc, char** argv)
          * test. The vertex colour differs from the texture colour, so a
          * backend that ignored the texture fails the assertion below. */
         else if (strcmp(argv[i], "--tex") == 0)    do_draw = 2;
+        /* --shader: load a guest vertex program and a guest fragment program
+         * through the FIFO and draw with them, which exercises the whole
+         * decompile -> translate -> compile -> bind path a real title's
+         * draws take. Only a backend with that path can pass it. */
+        else if (strcmp(argv[i], "--shader") == 0) do_draw = 3;
+    }
+    if (do_draw == 3 && !HOST_BACKEND_GUEST_SHADERS) {
+        printf("[host] --shader: the %s backend runs no guest programs; nothing to check\n",
+               HOST_BACKEND_NAME);
+        return 0;
     }
 
     vm_base = (uint8_t*)calloc(1, VM_SIZE);
@@ -274,6 +359,7 @@ int main(int argc, char** argv)
     guest_w32(CTRL_ADDR + 4, 0);            /* get: start of ring */
     if (do_draw == 1) upload_triangle();
     if (do_draw == 2) { upload_texture(); upload_textured_quad(); }
+    if (do_draw == 3) { upload_shader_triangle(); upload_fragment_program(); }
     submit_frame(do_draw);
 
     u32 got = host_backend_color();
@@ -306,12 +392,23 @@ int main(int argc, char** argv)
          * the TEXTURE's colour, not the quad's green -- so it also proves the
          * texture reached the sampler through layout, decode and the crossbar.
          */
-        u32 want = (do_draw == 2) ? TEX_ARGB
+        u32 want = (do_draw == 3) ? 0xFFFF0000u   /* blue vertices, FP swaps r/b */
+                 : (do_draw == 2) ? TEX_ARGB
                  : (do_draw == 1) ? 0xFFFF0000u
                                   : CLEAR_ARGB;
         printf("[host] presented pixel: 0x%08X (expected 0x%08X) %s\n",
                back, want, (back & 0x00FFFFFFu) == (want & 0x00FFFFFFu) ? "OK" : "MISMATCH");
         if ((back & 0x00FFFFFFu) != (want & 0x00FFFFFFu)) rc = 3;
+    }
+    if (do_draw == 3) {
+        /* The pixel alone cannot prove the programs ran: a backend that
+         * ignored them would draw the triangle blue, which the check above
+         * catches, but one that ran the vertex program and dropped the
+         * fragment program to a passthrough would also be blue -- so ask
+         * the backend which path the draw took as well. */
+        u32 gd = host_backend_guest_draws();
+        printf("[host] draws through guest programs: %u %s\n", gd, gd ? "OK" : "NONE");
+        if (!gd) rc = 4;
     }
 
     host_backend_shutdown();

@@ -80,6 +80,18 @@ jobs:
           # and the draw path, not just the clear.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw --frames=60
+          # Guest programs: a vertex program and a fragment program loaded
+          # through the FIFO, decompiled, translated to MSL, compiled and
+          # bound. The fragment program swaps the triangle's red and blue,
+          # and the host asks the backend how many draws ran guest code, so
+          # a fall-back to the built-in shader cannot pass. The forced
+          # built-in run proves the check has teeth: it must fail.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader --frames=60
+          if PS3RECOMP_METAL_FIXED_FUNCTION=1 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader; then
+            echo "--shader passed with the built-in shader forced; the check is not checking"
+            exit 1
+          fi
 
       # Guest vertex and fragment programs through the decompilers, glslang
       # and spirv-cross: asserts the MSL carries the buffer, texture, sampler
