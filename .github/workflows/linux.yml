@@ -42,12 +42,14 @@ jobs:
       # glslang and spirv-cross are what the Metal backend's guest-shader path
       # translates with. There is no Metal here, but the translation itself
       # has no GPU in it, so Linux is where the decompilers' HLSL meets
-      # glslang's front end on every push.
+      # glslang's front end on every push. glslang-tools is not used, but
+      # Ubuntu's glslang CMake config declares the standalone binary as an
+      # imported target and refuses to load while /usr/bin/glslang is absent.
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build libsdl2-dev clang \
-            glslang-dev spirv-tools libspirv-cross-c-shared-dev
+            glslang-dev glslang-tools spirv-tools libspirv-cross-c-shared-dev
 
       - name: Configure
         run: |
