@@ -168,14 +168,10 @@ if(PS3RECOMP_BUILD_TESTS)
     include(CTest)
     # sync_stress is written directly against the Win32 threading API
     # (WaitForMultipleObjects, joinable HANDLEs, Interlocked*, CRITICAL_SECTION).
-    # runtime/platform/win32_compat.h covers the subset the runtime itself needs,
-    # but not joinable handles or multi-object waits -- porting this test needs a
-    # real handle table and is left as follow-up work.
-    if(WIN32)
-        add_subdirectory(tests/sync_stress)
-    else()
-        message(STATUS "  sync_stress:  skipped (Win32-only threading API)")
-    endif()
+    # Off Windows all of that comes from runtime/platform/win32_compat.h, so
+    # the suite runs everywhere -- and is the arm64 memory-model regression
+    # net for the lv2 sync primitives.
+    add_subdirectory(tests/sync_stress)
 endif()
 
 # ---------------------------------------------------------------------------
