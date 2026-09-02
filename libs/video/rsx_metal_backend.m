@@ -21,6 +21,12 @@
  * falls back to the built-in fixed-function shader, which is what the
  * clear/draw host checks use.
  *
+ * Guest textures. A guest-program draw binds the enabled texture units the
+ * way the D3D12 backend does: SET_TEXTURE_FORMAT's location bits say where
+ * the bytes are, rsx_texture_layout says what shape they are,
+ * rsx_texture_decode turns them into host rows, and the TEXTURE_CONTROL1
+ * crossbar becomes the texture's swizzle. Level 0 only for now.
+ *
  * Why Metal rather than SDL_Renderer: SDL2's renderer is a 2D sprite API with
  * no route to a custom vertex program, depth/stencil, MRT or render-to-texture,
  * so it cannot grow into the real pipeline.
@@ -38,6 +44,7 @@
 #include "rsx_vp_decompiler.h"
 #include "rsx_fp_decompiler.h"
 #include "rsx_shader_msl.h"
+#include "rsx_texture_layout.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -91,6 +98,10 @@ typedef struct {
     int vs_idx, fs_idx;
     u32 vp_cb_off;            /* VPConst block in s_cb                  */
     u32 fp_cb_off, fp_cb_len; /* PSConstants block in s_cb              */
+    /* Per texture unit: texture and sampler cache slots, or -1 for the
+     * zero texture / default sampler. Guest-program draws only. */
+    int tex[RSX_MAX_TEXTURES];
+    int samp[RSX_MAX_TEXTURES];
     float mvp[16];   /* built-in path: 4 rows of the RSX vertex-constant matrix */
 } MtlDraw;
 
@@ -164,6 +175,31 @@ static char s_log[8192];
  * texture on use, so zero is a real 1x1 texture here. */
 static id<MTLTexture>      s_null_tex;
 static id<MTLSamplerState> s_default_sampler;
+
+/* ---- guest textures ---------------------------------------------------------
+ * Keyed on where the bytes are and what the register says they are, plus a
+ * sparse checksum of the bytes themselves, because titles animate textures
+ * in place (the D3D12 backend's tex_csum exists for the same reason). A
+ * changed checksum gets a fresh MTLTexture rather than an in-place write: a
+ * frame in flight may still be sampling the old one. Same slot-stability
+ * rule as the shader caches. Samplers are keyed on the wrap and filter
+ * registers. Level 0 only; mip levels and cube faces are still to come.
+ * --------------------------------------------------------------------------*/
+
+#define MTL_TEX_CACHE   1024
+#define MTL_SAMP_CACHE  64
+
+typedef struct {
+    u32 ea, w, h, format, control1, csum;
+    id<MTLTexture> tex;
+} MtlTexEntry;
+typedef struct { u32 key; id<MTLSamplerState> samp; } MtlSampEntry;
+
+static MtlTexEntry  s_tex_cache[MTL_TEX_CACHE];
+static MtlSampEntry s_samp_cache[MTL_SAMP_CACHE];
+static u32 s_tex_count, s_samp_count;
+static u8* s_tex_staging;
+static u32 s_tex_staging_cap;
 
 /* Frames the CPU may run ahead of the GPU.
  *
@@ -654,6 +690,178 @@ static int guest_programs_for(const rsx_state* st, MtlDraw* d)
     return 1;
 }
 
+/* ---- guest textures ------------------------------------------------------ */
+
+static MTLPixelFormat texfmt_to_metal(rsx_texfmt f)
+{
+    switch (f) {
+    case RSX_TEXFMT_R8G8:     return MTLPixelFormatRG8Unorm;
+    case RSX_TEXFMT_R8G8B8A8: return MTLPixelFormatRGBA8Unorm;
+    case RSX_TEXFMT_BC1:      return MTLPixelFormatBC1_RGBA;
+    case RSX_TEXFMT_BC2:      return MTLPixelFormatBC2_RGBA;
+    case RSX_TEXFMT_BC3:      return MTLPixelFormatBC3_RGBA;
+    default:                  return MTLPixelFormatR8Unorm;
+    }
+}
+
+/* A crossbar selector (0..3 = the uploaded R,G,B,A; RSX_REMAP_ZERO/ONE) as
+ * a Metal swizzle source. */
+static MTLTextureSwizzle swizzle_sel(u8 sel)
+{
+    switch (sel) {
+    case 0: return MTLTextureSwizzleRed;
+    case 1: return MTLTextureSwizzleGreen;
+    case 2: return MTLTextureSwizzleBlue;
+    case 3: return MTLTextureSwizzleAlpha;
+    case RSX_REMAP_ONE: return MTLTextureSwizzleOne;
+    default: return MTLTextureSwizzleZero;
+    }
+}
+
+/* Sparse FNV-1a over a texture's source bytes: enough to notice an animated
+ * surface changing, cheap enough to run on every draw that binds it. */
+static u32 tex_csum(const u8* base, u32 nbytes)
+{
+    u32 h = 2166136261u;
+    const u32 step = nbytes > 4096u ? nbytes / 1024u : 4u;
+    for (u32 i = 0; i + 3 < nbytes; i += step) {
+        u32 w32; memcpy(&w32, base + i, sizeof w32);
+        h ^= w32; h *= 16777619u;
+    }
+    return h;
+}
+
+/* Decode one level-0 image out of guest memory into a new texture whose
+ * swizzle applies the TEXTURE_CONTROL1 crossbar. `fmt` is the format byte
+ * with its LN/UN flags. */
+static id<MTLTexture> upload_texture(const u8* src, u32 w, u32 h, u32 fmt, u32 control1)
+{
+    rsx_tex_layout tl;
+    rsx_texture_layout(fmt, w, h, &tl);
+    if (tl.face_bytes == 0) return nil;
+    if (s_tex_staging_cap < tl.face_bytes) {
+        u8* n = (u8*)realloc(s_tex_staging, tl.face_bytes);
+        if (!n) return nil;
+        s_tex_staging = n; s_tex_staging_cap = tl.face_bytes;
+    }
+    rsx_texture_decode(s_tex_staging, tl.row_bytes, src, w, h, &tl,
+                       tl.fmt == RSX_TEXFMT_R8G8B8A8 ? rsx_texture_argb_is_rgba() : 0);
+
+    MTLTextureDescriptor* td =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:texfmt_to_metal(tl.fmt)
+                                                           width:w height:h mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    /* The crossbar's selectors arrive in its own field order A,R,G,B; the
+     * D3D12 backend maps them to destR = out[1], destG = out[2],
+     * destB = out[3], destA = out[0], and so does this. */
+    u8 remap[4];
+    rsx_texture_component_remap(control1, fmt & 0x9Fu, remap);
+    td.swizzle = MTLTextureSwizzleChannelsMake(swizzle_sel(remap[1]), swizzle_sel(remap[2]),
+                                               swizzle_sel(remap[3]), swizzle_sel(remap[0]));
+    id<MTLTexture> tex = [s_dev newTextureWithDescriptor:td];
+    if (!tex) return nil;
+    [tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
+             withBytes:s_tex_staging bytesPerRow:tl.row_bytes];
+    return tex;
+}
+
+/* The texture a unit samples: a slot in s_tex_cache, or -1 for the zero
+ * texture (unit disabled, unresolvable, or a full cache). Resolved as the
+ * D3D12 backend's bind_texture does it: the location is SET_TEXTURE_FORMAT's
+ * low two bits (1 = local, 2 = main), the format byte its bits [15:8]. */
+static int tex_slot_for(const rsx_texture_state* t)
+{
+    if (!(t->control0 & 0x80000000u) || !vm_base) return -1;
+    const u32 w = (t->image_rect >> 16) & 0xFFFFu, h = t->image_rect & 0xFFFFu;
+    if (!w || !h || w > 4096u || h > 4096u) return -1;
+    const u32 ea = cellGcmResolveLocated((t->format & 3u) == 1u, t->offset);
+    if (ea == 0xFFFFFFFFu) return -1;
+    const u32 fmt = (t->format >> 8) & 0xFFu;
+    rsx_tex_layout tl;
+    rsx_texture_layout(fmt, w, h, &tl);
+    const u32 csum = tex_csum(vm_base + ea, tl.face_bytes);
+
+    for (u32 i = 0; i < s_tex_count; i++) {
+        MtlTexEntry* e = &s_tex_cache[i];
+        if (e->ea != ea || e->w != w || e->h != h || e->format != t->format ||
+            e->control1 != t->control1)
+            continue;
+        if (e->csum != csum) {
+            id<MTLTexture> fresh = upload_texture(vm_base + ea, w, h, fmt, t->control1);
+            if (!fresh) return -1;
+            e->tex = fresh; e->csum = csum;
+        }
+        return e->tex ? (int)i : -1;
+    }
+    if (s_tex_count >= MTL_TEX_CACHE) { s_caches_full = 1; return -1; }
+
+    id<MTLTexture> tex = upload_texture(vm_base + ea, w, h, fmt, t->control1);
+    { static int n = 0; if (n++ < 16)
+        fprintf(stderr, "[RSX metal] texture %ux%u fmt 0x%02X at 0x%08X (%s) -> %s\n",
+                w, h, fmt, ea, (t->format & 3u) == 1u ? "local" : "main",
+                tex ? "ok" : "FAILED"); }
+    const int slot = (int)s_tex_count++;
+    MtlTexEntry* e = &s_tex_cache[slot];
+    e->ea = ea; e->w = w; e->h = h; e->format = t->format; e->control1 = t->control1;
+    e->csum = csum; e->tex = tex;
+    return tex ? slot : -1;
+}
+
+/* NV4097_SET_TEXTURE_ADDRESS wrap field (one per axis): 1 = WRAP, 2 =
+ * MIRROR, 3 = CLAMP_TO_EDGE, 4 = BORDER, 5 = CLAMP, 6..8 = the MIRROR_ONCE
+ * family. The same table the live draw engine's gcm_wrap uses. */
+static MTLSamplerAddressMode gcm_wrap_to_metal(u32 w)
+{
+    switch (w & 0xFu) {
+    case 1:  return MTLSamplerAddressModeRepeat;
+    case 2:  return MTLSamplerAddressModeMirrorRepeat;
+    case 4:  return MTLSamplerAddressModeClampToBorderColor;
+    case 6: case 7: case 8:
+             return MTLSamplerAddressModeMirrorClampToEdge;
+    default: return MTLSamplerAddressModeClampToEdge;   /* 3, 5, unset */
+    }
+}
+
+/* Sampler from the unit's wrap and filter registers, as the live draw
+ * engine's decode_sampler reads them: SET_TEXTURE_FILTER min at [18:16]
+ * (1 NEAREST, 2 LINEAR, 3..6 with a mip filter), mag at [26:24]. One
+ * level is uploaded, so the mip filter is left off. */
+static int samp_slot_for(const rsx_texture_state* t)
+{
+    const u32 minf = (t->filter >> 16) & 7u, magf = (t->filter >> 24) & 7u;
+    const u32 key = minf | (magf << 3) | ((t->address & 0x000F0F0Fu) << 6);
+    for (u32 i = 0; i < s_samp_count; i++)
+        if (s_samp_cache[i].key == key) return (int)i;
+    if (s_samp_count >= MTL_SAMP_CACHE) return -1;
+
+    MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
+    sd.minFilter = (minf == 2 || minf == 4 || minf == 6) ? MTLSamplerMinMagFilterLinear
+                                                         : MTLSamplerMinMagFilterNearest;
+    sd.magFilter = (magf == 2) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+    sd.mipFilter = MTLSamplerMipFilterNotMipmapped;
+    sd.sAddressMode = gcm_wrap_to_metal(t->address);
+    sd.tAddressMode = gcm_wrap_to_metal(t->address >> 8);
+    sd.rAddressMode = gcm_wrap_to_metal(t->address >> 16);
+    sd.borderColor  = MTLSamplerBorderColorTransparentBlack;
+    id<MTLSamplerState> samp = [s_dev newSamplerStateWithDescriptor:sd];
+    if (!samp) return -1;
+    const int slot = (int)s_samp_count++;
+    s_samp_cache[slot].key  = key;
+    s_samp_cache[slot].samp = samp;
+    return slot;
+}
+
+/* Resolve every enabled texture unit for a guest-program draw. */
+static void textures_for(const rsx_state* st, MtlDraw* d)
+{
+    for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
+        const rsx_texture_state* t = &st->textures[u];
+        if (!(t->control0 & 0x80000000u)) continue;
+        d->tex[u]  = tex_slot_for(t);
+        d->samp[u] = samp_slot_for(t);
+    }
+}
+
 /* Guest face culling, packed as the D3D12 backend's rsx_cull_key reads it:
  * CULL_FACE FRONT=0x0404 BACK=0x0405 FRONT_AND_BACK=0x0408 (FRONT here, as
  * there); FRONT_FACE CW=0x0900 CCW=0x0901. rsx_commands seeds cull_face and
@@ -680,12 +888,14 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     MtlDraw* d = &s_draws[s_draw_count];
     memset(d, 0, sizeof *d);
     d->vs_idx = d->fs_idx = -1;
+    for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) d->tex[u] = d->samp[u] = -1;
 
     /* Programs first: their translation is what can fail, and a draw that
      * drops to the built-in shader must still fetch its vertices the same
      * way. Constant staging reserved here for a draw that then fails on
      * vertices is simply left unused until the frame resets it. */
     const int guest = s_guest_shaders && guest_programs_for(st, d);
+    if (guest) textures_for(st, d);
 
     u32 first_vert = s_vert_count;
     u32 wrote = emit_vertices(st, prim, count, resolve, &base);
@@ -867,10 +1077,12 @@ static id<MTLRenderPipelineState> pso_for(const MtlDraw* d)
 
 static void clear_caches(void)
 {
-    for (u32 i = 0; i < s_vp_count;  i++) s_vp_cache[i].fn   = nil;
-    for (u32 i = 0; i < s_fp_count;  i++) s_fp_cache[i].fn   = nil;
-    for (u32 i = 0; i < s_pso_count; i++) s_pso_cache[i].pso = nil;
-    s_vp_count = s_fp_count = s_pso_count = 0;
+    for (u32 i = 0; i < s_vp_count;   i++) s_vp_cache[i].fn     = nil;
+    for (u32 i = 0; i < s_fp_count;   i++) s_fp_cache[i].fn     = nil;
+    for (u32 i = 0; i < s_pso_count;  i++) s_pso_cache[i].pso   = nil;
+    for (u32 i = 0; i < s_tex_count;  i++) s_tex_cache[i].tex   = nil;
+    for (u32 i = 0; i < s_samp_count; i++) s_samp_cache[i].samp = nil;
+    s_vp_count = s_fp_count = s_pso_count = s_tex_count = s_samp_count = 0;
     s_caches_full = 0;
 }
 
@@ -970,6 +1182,7 @@ void rsx_metal_backend_shutdown(void)
 #endif
         free(s_verts); s_verts = NULL;
         free(s_cb); s_cb = NULL; s_cb_used = s_cb_cap = 0;
+        free(s_tex_staging); s_tex_staging = NULL; s_tex_staging_cap = 0;
         s_vert_count = s_draw_count = 0;
         s_guest_draws = s_last_guest_draws = 0;
         clear_caches();
@@ -1045,11 +1258,15 @@ void rsx_metal_backend_present(void)
             if (s_cb_used)
                 cbuf = [s_dev newBufferWithBytes:s_cb length:s_cb_used
                                          options:MTLResourceStorageModeShared];
-            /* Every fragment texture unit reads the zero texture until guest
-             * textures are bound; a guest program may sample any of them. */
+            /* Every fragment texture unit starts on the zero texture -- a
+             * guest program may sample a unit nothing was bound to, and
+             * Metal validation rejects a nil texture on use. Units are then
+             * rebound per draw only where the draw's slot differs. */
+            int bound_tex[RSX_MAX_TEXTURES], bound_samp[RSX_MAX_TEXTURES];
             for (int u = 0; u < RSX_MAX_TEXTURES; u++) {
                 [enc setFragmentTexture:s_null_tex atIndex:(NSUInteger)u];
                 [enc setFragmentSamplerState:s_default_sampler atIndex:(NSUInteger)u];
+                bound_tex[u] = bound_samp[u] = -1;
             }
             MTLViewport vp = { 0.0, 0.0, (double)s_width, (double)s_height, 0.0, 1.0 };
             [enc setViewport:vp];
@@ -1064,6 +1281,20 @@ void rsx_metal_backend_present(void)
                 if (d->vs_idx >= 0 && cbuf) {
                     [enc setVertexBuffer:cbuf offset:d->vp_cb_off atIndex:0];
                     [enc setFragmentBuffer:cbuf offset:d->fp_cb_off atIndex:1];
+                    for (int u = 0; u < RSX_MAX_TEXTURES; u++) {
+                        if (d->tex[u] != bound_tex[u]) {
+                            [enc setFragmentTexture:(d->tex[u] >= 0 ? s_tex_cache[d->tex[u]].tex
+                                                                    : s_null_tex)
+                                            atIndex:(NSUInteger)u];
+                            bound_tex[u] = d->tex[u];
+                        }
+                        if (d->samp[u] != bound_samp[u]) {
+                            [enc setFragmentSamplerState:(d->samp[u] >= 0 ? s_samp_cache[d->samp[u]].samp
+                                                                          : s_default_sampler)
+                                                 atIndex:(NSUInteger)u];
+                            bound_samp[u] = d->samp[u];
+                        }
+                    }
                 } else {
                     [enc setVertexBytes:d->mvp length:sizeof(d->mvp) atIndex:0];
                 }
@@ -1100,8 +1331,8 @@ void rsx_metal_backend_present(void)
         /* The frame's records are gone, so slots may move now. The command
          * buffer keeps its own references to whatever it still runs. */
         if (s_caches_full) {
-            fprintf(stderr, "[RSX metal] shader cache full (%u VP, %u FP, %u PSO); cleared\n",
-                    s_vp_count, s_fp_count, s_pso_count);
+            fprintf(stderr, "[RSX metal] cache full (%u VP, %u FP, %u PSO, %u textures); cleared\n",
+                    s_vp_count, s_fp_count, s_pso_count, s_tex_count);
             clear_caches();
         }
 
