@@ -136,3 +136,21 @@ jobs:
           /tmp/test_texture_layout
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_primitives libs/video/tests/test_rsx_primitives.c
           /tmp/test_rsx_primitives
+
+      # The Win32 shim every POSIX host runs the runtime through: interlocked
+      # widths and return conventions, SRW/CS/condition variables, events,
+      # semaphores, joinable threads, WaitOnAddress, timers, VirtualAlloc.
+      - name: Run the Win32 compatibility layer tests
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I runtime/platform -o /tmp/test_win32_compat runtime/platform/tests/test_win32_compat.c runtime/platform/win32_compat.c -lpthread
+          /tmp/test_win32_compat
+
+      # The lv2 sync-primitive stress suite (mutex, cond, semaphore, event
+      # queue) on host threads. It was Windows-only until the shim grew joinable
+      # handles and multi-object waits; here it is the memory-model regression
+      # net for the same primitives a game hammers.
+      - name: Build and run sync_stress
+        run: |
+          cmake -S tests/sync_stress -B build-sync-stress -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          cmake --build build-sync-stress
+          ./build-sync-stress/sync_stress
