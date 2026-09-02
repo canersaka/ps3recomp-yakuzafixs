@@ -515,15 +515,27 @@ static int test1_no_lost_wakeup(void)
     HANDLE watchdog = (HANDLE)_beginthreadex(NULL, 0, t1_watchdog, &sh, 0, NULL);
 
     WaitForMultipleObjects(T1_PRODUCERS, producers, TRUE, INFINITE);
-    InterlockedExchange(&sh.done_producing, 1);
     /* Wake every consumer once: with an infinite per-consumer wait, only
      * signal_all (unmutated by the seeded-bug self-test) reliably drains the
      * "no more work" tail; sys_cond_signal alone (mutated in the self-test)
      * would leave any consumer that raced past the produced>consumed check
      * parked forever, which is exactly what the watchdog above exists to
-     * catch mid-run. */
+     * catch mid-run.
+     *
+     * Under the lv2 mutex, like the producers' signals. A consumer reads
+     * done_producing under that mutex and decides to wait on it; the flag
+     * must flip and the broadcast go out under the same mutex, or a consumer
+     * that has decided but not yet parked misses the only wake it will ever
+     * get. Issued outside the mutex this parked one consumer forever on a
+     * loaded Linux runner. That is also how a title has to use lv2: nothing
+     * is remembered for a thread that is not waiting yet. */
     ppu_context wctx; ctx_init_for_thread(&wctx, alloc_tid());
+    rc = call2((int64_t(*)(ppu_context*))sys_mutex_lock, &wctx, mutex_id, 0);
+    if (rc != CELL_OK) fail(name, "tail lock rc=0x%08X", (unsigned)rc);
+    InterlockedExchange(&sh.done_producing, 1);
     call1((int64_t(*)(ppu_context*))sys_cond_signal_all, &wctx, cond_id);
+    rc = call1((int64_t(*)(ppu_context*))sys_mutex_unlock, &wctx, mutex_id);
+    if (rc != CELL_OK) fail(name, "tail unlock rc=0x%08X", (unsigned)rc);
 
     DWORD wr = WaitForMultipleObjects(T1_CONSUMERS, consumers, TRUE, 10000);
     if (wr == WAIT_TIMEOUT) {
