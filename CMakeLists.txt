@@ -158,7 +158,11 @@ endif()
 # decompilers' HLSL meets glslang's front end on every push.
 #
 #   macOS:  brew install glslang spirv-cross
-#   Debian: apt install glslang-dev spirv-tools libspirv-cross-c-shared-dev
+#   Debian: apt install glslang-dev glslang-tools spirv-tools \
+#                       libspirv-cross-c-shared-dev
+#           (glslang-tools only because the packaged CMake config declares
+#           the standalone binary as an imported target and fails to load
+#           without it)
 set(PS3RECOMP_MSL_TRANSLATION OFF)
 if(UNIX)
     find_package(glslang CONFIG QUIET)
