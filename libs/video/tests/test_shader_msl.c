@@ -1,7 +1,8 @@
 /*
  * ps3recomp - guest shader -> MSL translation test
  *
- * Hand-assembles the two smallest programs the Metal backend has to run,
+ * Hand-assembles the smallest programs the Metal backend has to run (the
+ * encoders live in rsx_test_programs.h, shared with the host harness),
  * pushes each through its decompiler, then through rsx_hlsl_to_msl, and
  * checks the MSL carries the bindings the backend depends on. Needs no GPU,
  * so it runs on Linux CI too -- which is the point: glslang's HLSL front end
@@ -11,12 +12,13 @@
  * Programs:
  *   VP  MOV o0, v0 ; MOV o1, v3 (END)      position through, colour through
  *   FP  MOV r0, COL0 (END)                 colour out
+ *   FP  MOV r0, COL0.zyxw (END)            colour out, red and blue swapped:
+ *                                          what the host's --shader mode runs
  *   FP  TEX r0, TC0 unit 0 (END)           texture unit 0 sampled at texcoord0
  *
- * The VP encoding is written out field by field below. It is the same layout
- * the decompiler documents in its header, and the test first checks the HLSL
- * says what was meant before translating it, so a wrong bit shows up as a
- * decompiler-level failure rather than a mysterious MSL one.
+ * Each program's HLSL is checked for what was meant before the MSL is looked
+ * at, so a wrong bit in an encoder shows up as a decompiler-level failure
+ * rather than a mysterious MSL one.
  *
  * Built as a CMake target (test_shader_msl) because it links glslang and
  * spirv-cross. -v prints the HLSL and MSL of every program.
@@ -24,6 +26,7 @@
 #include "../rsx_vp_decompiler.h"
 #include "../rsx_fp_decompiler.h"
 #include "../rsx_shader_msl.h"
+#include "../rsx_test_programs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,71 +45,10 @@ static void check(const char* what, const char* text, const char* needle)
     }
 }
 
-/* ---- NV40 vertex program encoding ---------------------------------------- */
-
-static void put_le(u8* p, u32 w)
+static void check_count(const char* what, int got, int want)
 {
-    p[0] = (u8)w; p[1] = (u8)(w >> 8); p[2] = (u8)(w >> 16); p[3] = (u8)(w >> 24);
-}
-
-/* A 17-bit source field: reg_type [0:1], reg [2:7], swizzle w/z/y/x [8:15]
- * two bits each (so identity is x=0 at [14:15], y=1 at [12:13], z=2 at
- * [10:11], w=3 at [8:9]), neg [16]. */
-#define VP_SRC_INPUT  2u
-#define VP_SRC_TEMP   1u
-#define VP_SWZ_IDENT  ((3u << 8) | (2u << 10) | (1u << 12) | (0u << 14))
-static u32 vp_src(u32 type, u32 reg) { return type | ((reg & 0x3Fu) << 2) | VP_SWZ_IDENT; }
-
-/* One instruction: vector op `vec_op` reading input register `input` as src0,
- * writing all four lanes of output register `o`, no temp write, scalar NOP. */
-static void vp_instr(u8* p, u32 vec_op, u32 input, u32 o, int end)
-{
-    const u32 src0 = vp_src(VP_SRC_INPUT, 0);   /* v[input_src], index from D1 */
-    const u32 src1 = vp_src(VP_SRC_TEMP, 0);
-    const u32 src2 = vp_src(VP_SRC_TEMP, 0);
-    u32 d0 = (0x3Fu << 15)            /* dst_tmp: none            */
-           | (1u << 30);              /* vec_result: write o[dst] */
-    u32 d1 = (src0 >> 9)              /* src0 high 8 bits         */
-           | ((input & 0xFu) << 8)    /* input_src                */
-           | ((vec_op & 0x1Fu) << 22) /* vec_opcode               */
-           | (0u << 27);              /* sca_opcode: NOP          */
-    u32 d2 = (src2 >> 11)             /* src2 high 6 bits         */
-           | ((src1 & 0x1FFFFu) << 6) /* src1                     */
-           | ((src0 & 0x1FFu) << 23); /* src0 low 9 bits          */
-    u32 d3 = (end ? 1u : 0u)          /* end                      */
-           | ((o & 0x1Fu) << 2)       /* dst (output register)    */
-           | (0x3Fu << 7)             /* sca_dst_tmp: none        */
-           | (0xFu << 13)             /* vec_writemask xyzw       */
-           | (0u << 17)               /* sca_writemask: none      */
-           | ((src2 & 0x7FFu) << 21); /* src2 low 11 bits         */
-    put_le(p + 0, d0); put_le(p + 4, d1); put_le(p + 8, d2); put_le(p + 12, d3);
-}
-
-/* ---- NV40 fragment program encoding -------------------------------------- */
-
-/* rsx_fp_read_word does a big-endian load then a 16-bit half swap; store the
- * inverse so the decoder sees host word `h`. */
-static void put_fp_word(u8* p, u32 h)
-{
-    u32 be = (h << 16) | (h >> 16);
-    p[0] = (u8)(be >> 24); p[1] = (u8)(be >> 16); p[2] = (u8)(be >> 8); p[3] = (u8)be;
-}
-#define FP_OPC(x)       ((u32)(x) << 24)
-#define FP_MASK_XYZW    (0xFu << 9)
-#define FP_END          1u
-#define FP_INSRC(x)     ((u32)(x) << 13)
-#define FP_TEXU(x)      ((u32)(x) << 17)
-#define FP_SWZ_IDENT    ((0u << 9) | (1u << 11) | (2u << 13) | (3u << 15))
-#define FP_T_INPUT      1u
-/* The execution condition lives in the SRC0 word: exec_if lt/eq/gt at bits
- * 18..20 (all three set = unconditional, none = never, which is what an
- * all-zero word means), cond swizzle x/y/z/w at 21..28. */
-#define FP_EXEC_ALWAYS  ((7u << 18) | (0u << 21) | (1u << 23) | (2u << 25) | (3u << 27))
-
-static void fp_instr(u8* p, u32 w0, u32 w1)
-{
-    put_fp_word(p + 0, w0); put_fp_word(p + 4, w1);
-    put_fp_word(p + 8, 0);  put_fp_word(p + 12, 0);
+    if (got == want) { printf("[PASS] %s: %d instruction(s)\n", what, got); g_pass++; }
+    else { printf("[FAIL] %s: decompile returned %d, expected %d\n", what, got, want); g_fail++; }
 }
 
 /* ---- the translation step, shared by every case -------------------------- */
@@ -144,14 +86,11 @@ int main(int argc, char** argv)
     /* ---- vertex program: MOV o0, v0 ; MOV o1, v3 ------------------------- */
     {
         u8 vp[32];
-        vp_instr(vp +  0, 0x01, 0, 0, 0);   /* MOV o0, v0 */
-        vp_instr(vp + 16, 0x01, 3, 1, 1);   /* MOV o1, v3, END */
+        rsx_test_vp_mov_out(vp +  0, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);   /* MOV o0, v0 */
+        rsx_test_vp_mov_out(vp + 16, 3, RSX_TEST_VP_SWZ_IDENT, 1, 1);   /* MOV o1, v3, END */
 
-        int n = rsx_vp_decompile(vp, sizeof vp, g_hlsl, sizeof g_hlsl);
-        if (n != 2) { printf("[FAIL] VP decompile returned %d, expected 2\n", n); g_fail++; }
-        else        { printf("[PASS] VP decompile: 2 instructions\n"); g_pass++; }
-        /* The HLSL must say o0 takes v0 and o1 takes v3, unswizzled, before
-         * the MSL is looked at. */
+        check_count("VP", rsx_vp_decompile(vp, sizeof vp, g_hlsl, sizeof g_hlsl), 2);
+        /* o0 takes v0 and o1 takes v3, unswizzled. */
         check("VP HLSL", g_hlsl, "(v[0]).xyzw");
         check("VP HLSL", g_hlsl, "o[0].xyzw = _v.xyzw;");
         check("VP HLSL", g_hlsl, "(v[3]).xyzw");
@@ -176,14 +115,11 @@ int main(int argc, char** argv)
     /* ---- fragment program: MOV r0, COL0 ---------------------------------- */
     {
         u8 fp[16];
-        fp_instr(fp, FP_OPC(0x01) | FP_MASK_XYZW | FP_INSRC(1) | FP_END,
-                     FP_T_INPUT | FP_SWZ_IDENT | FP_EXEC_ALWAYS);
+        rsx_test_fp_mov_r0_col0(fp, RSX_TEST_FP_SWZ_IDENT);
         u32 nconst = 0;
-        int n = rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u /* r0 exports */, 0,
-                                             g_hlsl, sizeof g_hlsl, &nconst);
-        if (n != 1) { printf("[FAIL] FP decompile returned %d, expected 1\n", n); g_fail++; }
-        else        { printf("[PASS] FP decompile: 1 instruction\n"); g_pass++; }
-        check("FP HLSL", g_hlsl, "input.col0");
+        check_count("FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u /* r0 exports */, 0,
+                                                       g_hlsl, sizeof g_hlsl, &nconst), 1);
+        check("FP HLSL", g_hlsl, "(input.col0).xyzw");
         check("FP HLSL", g_hlsl, "r[0].xyzw = _v.xyzw;");
         check("FP HLSL", g_hlsl, "cbuffer PSConstants : register(b1)");
         /* The alpha test patch must survive translation as well. */
@@ -202,15 +138,24 @@ int main(int argc, char** argv)
         }
     }
 
+    /* ---- fragment program: MOV r0, COL0.zyxw (the host's --shader FP) ---- */
+    {
+        u8 fp[16];
+        rsx_test_fp_mov_r0_col0(fp, RSX_TEST_FP_SWZ(2, 1, 0, 3));
+        check_count("swizzled FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
+                                                                g_hlsl, sizeof g_hlsl, NULL), 1);
+        check("swizzled FP HLSL", g_hlsl, "(input.col0).zyxw");
+        check("swizzled FP HLSL", g_hlsl, "r[0].xyzw = _v.xyzw;");
+        if (translate("swizzled FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
+            check("swizzled FP MSL", g_msl, "fragment ");
+    }
+
     /* ---- fragment program: TEX r0, TC0 (unit 0) --------------------------- */
     {
         u8 fp[16];
-        fp_instr(fp, FP_OPC(0x17) | FP_MASK_XYZW | FP_INSRC(4) | FP_TEXU(0) | FP_END,
-                     FP_T_INPUT | FP_SWZ_IDENT | FP_EXEC_ALWAYS);
-        int n = rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
-                                             g_hlsl, sizeof g_hlsl, NULL);
-        if (n != 1) { printf("[FAIL] TEX FP decompile returned %d, expected 1\n", n); g_fail++; }
-        else        { printf("[PASS] TEX FP decompile: 1 instruction\n"); g_pass++; }
+        rsx_test_fp_tex_r0_tc0(fp, 0);
+        check_count("TEX FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
+                                                           g_hlsl, sizeof g_hlsl, NULL), 1);
         check("TEX FP HLSL", g_hlsl, "rsx_tex[0].Sample(rsx_samp[0]");
         check("TEX FP HLSL", g_hlsl, "r[0].xyzw = _v.xyzw;");
 

@@ -1,20 +1,29 @@
 /*
  * ps3recomp - RSX -> Metal backend (macOS / Apple Silicon)
  *
- * The first non-Windows render path in the project. It implements the subset of
- * the rsx_backend vtable needed to drive a guest clear/flip loop: `clear`
- * captures the colour written by NV4097_CLEAR_SURFACE, `set_render_target`
- * tracks the guest's surface dimensions, and present paints a drawable with it.
- * The remaining callbacks stay NULL -- every dispatch site in rsx_commands.c is
- * guarded (`if (s_backend && s_backend->x)`), so a partial vtable is the
+ * The first non-Windows render path in the project. It implements the subset
+ * of the rsx_backend vtable needed to drive a guest clear/draw/flip loop:
+ * `clear` captures the colour written by NV4097_CLEAR_SURFACE,
+ * `set_render_target` tracks the guest's surface dimensions, the draw
+ * callbacks record draws with their vertices fetched out of guest memory, and
+ * present replays them into a drawable. Every dispatch site in rsx_commands.c
+ * is guarded (`if (s_backend && s_backend->x)`), so a partial vtable is the
  * intended way to bring a backend up incrementally.
+ *
+ * Guest shaders. A draw runs the guest's own vertex and fragment programs
+ * when both translate: the NV40 microcode goes through the RSX decompilers
+ * (HLSL), then rsx_hlsl_to_msl (glslang + spirv-cross), then
+ * -newLibraryWithSource:. What the D3D12 backend does with those programs is
+ * mirrored here field for field -- where the vertex program starts, how the
+ * fragment program is located and keyed, the viewport epilogue, the per-draw
+ * constant blocks -- because that is the path real titles have exercised.
+ * With no vertex program loaded, or with the translator compiled out, a draw
+ * falls back to the built-in fixed-function shader, which is what the
+ * clear/draw host checks use.
  *
  * Why Metal rather than SDL_Renderer: SDL2's renderer is a 2D sprite API with
  * no route to a custom vertex program, depth/stencil, MRT or render-to-texture,
- * so it cannot grow into the real pipeline. The shader path this backend will
- * need is already proven end to end -- the existing rsx_fp/vp decompilers emit
- * HLSL, glslang lowers it to SPIR-V, spirv-cross emits MSL, and
- * -newLibraryWithSource: compiles it at runtime with no full Xcode install.
+ * so it cannot grow into the real pipeline.
  */
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -26,8 +35,12 @@
 #include "rsx_metal_backend.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_primitives.h"
+#include "rsx_vp_decompiler.h"
+#include "rsx_fp_decompiler.h"
+#include "rsx_shader_msl.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* ------------------------------------------------------------------------- */
 
@@ -42,19 +55,27 @@ static int                 s_ready;
 static u32                 s_width  = 1280;
 static u32                 s_height = 720;
 
-/* ---- draw recording -------------------------------------------------------
+/* ---- vertex layout ----------------------------------------------------------
+ * Every draw carries all 16 RSX vertex attributes as float4, fetched on the
+ * CPU by rsx_fetch_attrib: 256 bytes per vertex, attribute i at offset i*16.
+ * That is the layout a decompiled vertex program expects (ATTRn arrives at
+ * [[attribute(n)]]), and the built-in shader reads slots 0, 3 and 8 of the
+ * same layout, so one staging buffer and one vertex descriptor serve both.
+ * --------------------------------------------------------------------------*/
+
+#define MTL_ATTRIBS        16
+#define MTL_MAX_DRAWS      4096
+#define MTL_MAX_VERTS      (256u * 1024u)
+#define MTL_VB_INDEX       30      /* buffer(0) and buffer(1) are the constant blocks */
+
+typedef struct { float a[MTL_ATTRIBS][4]; } MtlVertex;
+
+/* ---- draw recording ---------------------------------------------------------
  * RSX draws arrive while the guest builds its frame; the flip comes later. So
  * draws are recorded with their vertices already fetched out of guest memory,
  * then replayed inside a single render pass at present time. This mirrors the
  * D3D12 backend's D3D12DrawRecord / render_frame split.
  * --------------------------------------------------------------------------*/
-
-#define MTL_MAX_DRAWS      4096
-#define MTL_MAX_VERTS      (256u * 1024u)
-#define MTL_VB_INDEX       30      /* buffer(0) is the constant buffer */
-
-/* Matches the built-in shader's stage_in layout. */
-typedef struct { float pos[4]; float col[4]; float tc[4]; } MtlVertex;
 
 typedef struct {
     u32 base;        /* first vertex in s_verts               */
@@ -62,7 +83,15 @@ typedef struct {
     MTLPrimitiveType topology;
     int blend_enable;
     u32 blend_sfactor, blend_dfactor, blend_equation;
-    float mvp[16];   /* 4 rows of the RSX vertex-constant matrix */
+    u32 color_mask;  /* NV4097_SET_COLOR_MASK word              */
+    MTLCullMode cull;
+    MTLWinding  winding;
+    /* Guest programs: cache slots, or -1 when the draw uses the built-in
+     * shader. Slots are stable for the whole frame (see s_caches_full). */
+    int vs_idx, fs_idx;
+    u32 vp_cb_off;            /* VPConst block in s_cb                  */
+    u32 fp_cb_off, fp_cb_len; /* PSConstants block in s_cb              */
+    float mvp[16];   /* built-in path: 4 rows of the RSX vertex-constant matrix */
 } MtlDraw;
 
 static MtlVertex* s_verts;
@@ -70,8 +99,71 @@ static u32        s_vert_count;
 static MtlDraw    s_draws[MTL_MAX_DRAWS];
 static u32        s_draw_count;
 static u32        s_dropped_draws;
+static u32        s_guest_draws;       /* draws through guest programs this frame */
+static u32        s_last_guest_draws;  /* ... in the last presented frame        */
 
-static id<MTLLibrary> s_shader_lib;
+static id<MTLLibrary> s_shader_lib;    /* built-in fixed-function shaders */
+
+/* ---- per-draw constant blocks -----------------------------------------------
+ * VPConst is the 512 float4 transform constants plus the viewport epilogue's
+ * posscale/posoffset (8224 bytes); PSConstants is the fragment program's
+ * inline constants plus fp_alpha. Constants change between draws in a frame,
+ * so each draw snapshots its own blocks -- the D3D12 backend keeps a per-draw
+ * VP_CB_STRIDE slot for the same reason. Both blocks are past the 4 KB limit
+ * of setVertexBytes:, and Metal wants setVertexBuffer:offset: 256-aligned,
+ * so they are appended here at record time and uploaded once per frame in
+ * one buffer, exactly like the vertices.
+ * --------------------------------------------------------------------------*/
+
+#define MTL_VP_CB_BYTES  ((RSX_MAX_VERTEX_CONSTANTS + 2) * 16)
+#define MTL_CB_ALIGN     256u
+#define MTL_CB_MAX       (256u << 20)
+static u8* s_cb;
+static u32 s_cb_used, s_cb_cap;
+
+/* ---- guest shader caches ----------------------------------------------------
+ * Vertex programs are keyed on their microcode bytes, fragment programs on
+ * rsx_fp_structural_hash (the code, not the inline constants, which live in
+ * PSConstants and change per draw) plus the export width and the alpha test
+ * that gets patched into the source. A slot with a nil function is a program
+ * that failed to translate: it is remembered so the draw does not retry the
+ * whole pipeline on every frame.
+ *
+ * Draw records hold slot indices, so slots must not move while a frame is
+ * being recorded. When a cache fills, translation stops for the rest of the
+ * frame (those draws use the built-in shader) and every cache is emptied
+ * after the frame presents, rather than evicting under a live record.
+ * --------------------------------------------------------------------------*/
+
+#define MTL_VP_CACHE     1024
+#define MTL_FP_CACHE     2048
+#define MTL_PSO_CACHE    2048
+#define MTL_FP_MAX_BYTES 4096u     /* bound on a fragment program, as D3D12 */
+
+typedef struct { u32 hash; id<MTLFunction> fn; } MtlVpEntry;
+typedef struct { u64 key;  id<MTLFunction> fn; u32 nconst; } MtlFpEntry;
+typedef struct { int vs, fs; u32 blend; u32 cmask; } MtlPsoKey;
+typedef struct { MtlPsoKey key; id<MTLRenderPipelineState> pso; } MtlPsoEntry;
+
+static MtlVpEntry  s_vp_cache[MTL_VP_CACHE];
+static MtlFpEntry  s_fp_cache[MTL_FP_CACHE];
+static MtlPsoEntry s_pso_cache[MTL_PSO_CACHE];
+static u32 s_vp_count, s_fp_count, s_pso_count;
+static int s_caches_full;
+static int s_guest_shaders;            /* translator present and not disabled */
+static rsx_fp_constant_block s_fp_consts;
+
+/* The decompilers' HLSL and the MSL made from it. The VP decompiler builds
+ * bodies up to 192 KB, and the legalized MSL runs longer than its HLSL. */
+static char s_hlsl[512 * 1024];
+static char s_msl[512 * 1024];
+static char s_log[8192];
+
+/* What a fragment program samples before guest textures are bound (task:
+ * textures). A D3D12 null SRV reads zero; Metal validation rejects a nil
+ * texture on use, so zero is a real 1x1 texture here. */
+static id<MTLTexture>      s_null_tex;
+static id<MTLSamplerState> s_default_sampler;
 
 /* Frames the CPU may run ahead of the GPU.
  *
@@ -87,12 +179,6 @@ static id<MTLLibrary> s_shader_lib;
  * finished frame -- there the stall is the point. */
 #define MTL_MAX_INFLIGHT 3
 static dispatch_semaphore_t s_inflight;
-
-/* PSO cache. Keyed on the blend state, which is all the built-in shader path
- * varies; a guest-shader key (vp/fp ucode hash) joins it when that lands. */
-typedef struct { u32 key; id<MTLRenderPipelineState> pso; } MtlPsoEntry;
-static MtlPsoEntry s_pso_cache[64];
-static u32         s_pso_count;
 
 /* RSX clear colour, ARGB8888, as written by NV4097_SET_COLOR_CLEAR_VALUE. */
 static u32 s_clear_argb = 0xFF000000u;
@@ -123,27 +209,27 @@ static void mtl_set_render_target(void* ud, const rsx_state* state)
     if (s_layer) s_layer.drawableSize = CGSizeMake((CGFloat)w, (CGFloat)h);
 }
 
-static void mtl_set_vertex_attribs(void* ud, const rsx_state* state)
-{ (void)ud; if (state) s_state = state; }
-
-static void mtl_set_blend(void* ud, const rsx_state* state)
-{ (void)ud; if (state) s_state = state; }
-
-static void mtl_set_viewport(void* ud, const rsx_state* state)
+static void mtl_latch_state(void* ud, const rsx_state* state)
 { (void)ud; if (state) s_state = state; }
 
 static void mtl_draw_arrays(void*, u32, u32, u32);
 static void mtl_draw_indexed(void*, u32, u32, u32);
 
 static rsx_backend s_backend_vtable = {
-    .userdata          = NULL,
-    .clear             = mtl_clear,
-    .set_render_target = mtl_set_render_target,
-    .set_vertex_attribs = mtl_set_vertex_attribs,
-    .set_blend          = mtl_set_blend,
-    .set_viewport       = mtl_set_viewport,
-    .draw_arrays       = mtl_draw_arrays,
-    .draw_indexed      = mtl_draw_indexed,
+    .userdata           = NULL,
+    .clear              = mtl_clear,
+    .set_render_target  = mtl_set_render_target,
+    .set_vertex_attribs = mtl_latch_state,
+    .set_blend          = mtl_latch_state,
+    .set_viewport       = mtl_latch_state,
+    .set_color_mask     = mtl_latch_state,
+    .set_alpha_test     = mtl_latch_state,
+    /* Programs are resolved when the draw is recorded, from the live state:
+     * SET_SHADER_PROGRAM, the transform program words and SHADER_CONTROL
+     * all land there before BEGIN_END fires this. */
+    .set_shader         = mtl_latch_state,
+    .draw_arrays        = mtl_draw_arrays,
+    .draw_indexed       = mtl_draw_indexed,
 };
 
 /* ---- helpers ------------------------------------------------------------- */
@@ -158,6 +244,20 @@ static MTLClearColor clear_color_from_rsx(void)
     const double g = (double)((s_clear_argb >>  8) & 0xFF) / 255.0;
     const double b = (double)( s_clear_argb        & 0xFF) / 255.0;
     return MTLClearColorMake(r, g, b, a);
+}
+
+static u32 fnv1a32(const u8* p, u32 n)
+{
+    u32 h = 2166136261u;
+    for (u32 i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+
+static u64 fnv1a64(const void* data, u32 n, u64 h)
+{
+    const u8* p = (const u8*)data;
+    for (u32 i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
 }
 
 static int create_offscreen(void)
@@ -206,21 +306,38 @@ static int create_window(const char* title)
 }
 #endif
 
+static int create_placeholders(void)
+{
+    MTLTextureDescriptor* td =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                           width:1 height:1 mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    s_null_tex = [s_dev newTextureWithDescriptor:td];
+    if (!s_null_tex) return -1;
+    u32 zero = 0;
+    [s_null_tex replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0
+                    withBytes:&zero bytesPerRow:4];
+
+    MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
+    sd.minFilter = MTLSamplerMinMagFilterLinear;
+    sd.magFilter = MTLSamplerMinMagFilterLinear;
+    sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
+    sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    s_default_sampler = [s_dev newSamplerStateWithDescriptor:sd];
+    return s_default_sampler ? 0 : -1;
+}
+
 /* ---- guest vertex fetch --------------------------------------------------
- * Was a port of the D3D12 backend's read_vp_vertex, kept here as a second
- * copy. It had already drifted from the original in two ways that matter --
- * it fed caller literals rather than the constant vertex attribute register
- * for a disabled array, and it resolved LOCAL offsets through the IO table --
- * so both copies are now gone and rsx_vertex_fetch.c holds the one definition.
+ * rsx_vertex_fetch.c holds the one definition of how a vertex comes out of
+ * guest memory (this file used to carry a drifted copy). Every attribute is
+ * fetched, used or not: a disabled array yields the constant attribute
+ * register, which is what the hardware feeds a program that reads it.
  * --------------------------------------------------------------------------*/
 
-/* Position is attrib 0, diffuse colour attrib 3, texcoord0 attrib 8 -- the same
- * slots the D3D12 fallback path assumes. */
 static void fetch_vertex(const rsx_state* st, u32 vi, MtlVertex* out)
 {
-    rsx_fetch_attrib(st, 0, vi, out->pos);
-    rsx_fetch_attrib(st, 3, vi, out->col);
-    rsx_fetch_attrib(st, 8, vi, out->tc);
+    for (int i = 0; i < MTL_ATTRIBS; i++)
+        rsx_fetch_attrib(st, i, vi, out->a[i]);
 }
 
 /* ---- primitive conversion -------------------------------------------------
@@ -296,6 +413,262 @@ static u32 resolve_indexed(const rsx_state* st, u32 seq, void* ctx)
                    : (u32)((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]);
 }
 
+/* ---- guest shader translation -------------------------------------------- */
+
+/* PS3RECOMP_METAL_SHADER_DUMP=<dir>: write every translated program's HLSL and
+ * MSL there, named by the cache key. The first thing to look at when a title
+ * draws wrong. */
+static void dump_shader(const char* name, const char* text)
+{
+    static const char* dir = (const char*)1;
+    if (dir == (const char*)1) dir = getenv("PS3RECOMP_METAL_SHADER_DUMP");
+    if (!dir || !*dir) return;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    FILE* f = fopen(path, "w");
+    if (!f) return;
+    fputs(text, f);
+    fclose(f);
+}
+
+static MTLCompileOptions* guest_compile_options(void)
+{
+    MTLCompileOptions* o = [MTLCompileOptions new];
+    /* IEEE comparisons. The decompilers flush a NaN result to zero with
+     * `x == x`, and the alpha test compares with isunordered; Metal's default
+     * fast math is free to fold both away. */
+#if defined(MAC_OS_VERSION_15_0) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_VERSION_15_0
+    if (@available(macOS 15.0, *)) {
+        o.mathMode = MTLMathModeSafe;
+        return o;
+    }
+#endif
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    o.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+    return o;
+}
+
+/* MSL source -> its `main0` function, or nil with the compiler's diagnostic
+ * on stderr. */
+static id<MTLFunction> compile_guest_function(const char* msl, const char* what)
+{
+    NSError* err = nil;
+    id<MTLLibrary> lib = [s_dev newLibraryWithSource:[NSString stringWithUTF8String:msl]
+                                             options:guest_compile_options()
+                                               error:&err];
+    if (!lib) {
+        fprintf(stderr, "[RSX metal] %s: MSL compile failed: %s\n", what,
+                [[err localizedDescription] UTF8String]);
+        return nil;
+    }
+    id<MTLFunction> fn = [lib newFunctionWithName:@"main0"];
+    if (!fn) fprintf(stderr, "[RSX metal] %s: no main0 in the compiled MSL\n", what);
+    return fn;
+}
+
+/* The vertex program the draw would run: a slot in s_vp_cache, or -1 when
+ * there is none, it could not be translated, or the cache is full. Follows
+ * the D3D12 backend's vp_get_vs: the program starts at the instruction
+ * SET_TRANSFORM_PROGRAM_START selects (the store holds every resident
+ * program), falling back to 0 when that lies past what was uploaded. */
+static int vp_slot_for(const rsx_state* st)
+{
+    if (st->vp_ucode_bytes < 16) return -1;
+    u32 vstart = st->transform_program_start * 16u;
+    if (vstart >= st->vp_ucode_bytes) vstart = 0;
+    const u8* uc = st->vp_ucode + vstart;
+    const u32 avail = st->vp_ucode_bytes - vstart;
+    /* Hash the program's own bytes, to its end bit, not everything after it
+     * in the store: another program uploaded behind it must not miss. */
+    const u32 instrs = rsx_vp_program_size_instrs(uc, avail);
+    const u32 len = instrs ? instrs * 16u : avail;
+    const u32 hash = fnv1a32(uc, len);
+
+    for (u32 i = 0; i < s_vp_count; i++)
+        if (s_vp_cache[i].hash == hash) return s_vp_cache[i].fn ? (int)i : -1;
+    if (s_vp_count >= MTL_VP_CACHE) { s_caches_full = 1; return -1; }
+
+    char name[64];
+    snprintf(name, sizeof name, "vertex program %08X", hash);
+    id<MTLFunction> fn = nil;
+    const int ni = rsx_vp_decompile(uc, len, s_hlsl, sizeof s_hlsl);
+    if (ni <= 0) {
+        fprintf(stderr, "[RSX metal] %s: decompile failed (%d)\n", name, ni);
+    } else {
+        snprintf(name, sizeof name, "vp_%08x.hlsl", hash); dump_shader(name, s_hlsl);
+        if (rsx_hlsl_to_msl(s_hlsl, RSX_SHADER_STAGE_VERTEX, s_msl, sizeof s_msl,
+                            s_log, sizeof s_log) != 0) {
+            fprintf(stderr, "[RSX metal] vertex program %08X: %s\n", hash, s_log);
+        } else {
+            snprintf(name, sizeof name, "vp_%08x.msl", hash); dump_shader(name, s_msl);
+            snprintf(name, sizeof name, "vertex program %08X", hash);
+            fn = compile_guest_function(s_msl, name);
+        }
+    }
+    { static int n = 0; if (n++ < 32)
+        fprintf(stderr, "[RSX metal] vertex program %08X: %d instrs -> %s\n",
+                hash, ni, fn ? "ok" : "FAILED (built-in shader instead)"); }
+
+    const int slot = (int)s_vp_count++;
+    s_vp_cache[slot].hash = hash;
+    s_vp_cache[slot].fn   = fn;
+    return fn ? slot : -1;
+}
+
+/* The fragment program the draw would run, resolved as the D3D12 backend's
+ * vp_get_fp_pso does: SET_SHADER_PROGRAM's low bits are the location (1 =
+ * local, 2 = main), the rest the offset. Keyed on the program's structure
+ * (its inline constants are hoisted into PSConstants, so the compiled shader
+ * is invariant under constant changes), the export width from
+ * SHADER_CONTROL, and the alpha test patched into the source. Returns the
+ * slot or -1; `*uc` receives the program bytes for the constant collection. */
+static int fp_slot_for(const rsx_state* st, const u8** uc)
+{
+    if (!vm_base || st->shader_program == 0) return -1;
+    const u32 off = cellGcmResolveLocated((st->shader_program & 3u) == 1u,
+                                          st->shader_program & ~3u);
+    if (off == 0xFFFFFFFFu) return -1;
+    *uc = vm_base + off;
+
+    u64 key = rsx_fp_structural_hash(*uc, MTL_FP_MAX_BYTES, 1469598103934665603ull);
+    if (!key) return -1;                    /* malformed or unterminated */
+    const u32 ctrl      = st->shader_control;
+    const u32 ctrl_key  = ctrl & CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS;
+    const u32 alpha_en  = (st->alpha_test_enable && st->alpha_func != 0x0207u) ? 1u : 0u;
+    const u32 alpha_fn  = alpha_en ? st->alpha_func : 0u;
+    key = fnv1a64(&ctrl_key, sizeof ctrl_key, key);
+    key = fnv1a64(&alpha_en, sizeof alpha_en, key);
+    key = fnv1a64(&alpha_fn, sizeof alpha_fn, key);
+
+    for (u32 i = 0; i < s_fp_count; i++)
+        if (s_fp_cache[i].key == key) return s_fp_cache[i].fn ? (int)i : -1;
+    if (s_fp_count >= MTL_FP_CACHE) { s_caches_full = 1; return -1; }
+
+    char name[64];
+    id<MTLFunction> fn = nil;
+    u32 nconst = 0;
+    int ni = rsx_fp_decompile_buffered_ex(*uc, MTL_FP_MAX_BYTES, ctrl, 0 /* all 2D */,
+                                          s_hlsl, sizeof s_hlsl, &nconst);
+    if (ni > 0 && alpha_en &&
+        rsx_fp_apply_alpha_test_buffered(s_hlsl, sizeof s_hlsl, st->alpha_func) < 0)
+        ni = -1;
+    if (ni <= 0) {
+        fprintf(stderr, "[RSX metal] fragment program %016llX: decompile failed (%d)\n",
+                (unsigned long long)key, ni);
+    } else {
+        snprintf(name, sizeof name, "fp_%016llx.hlsl", (unsigned long long)key);
+        dump_shader(name, s_hlsl);
+        if (rsx_hlsl_to_msl(s_hlsl, RSX_SHADER_STAGE_FRAGMENT, s_msl, sizeof s_msl,
+                            s_log, sizeof s_log) != 0) {
+            fprintf(stderr, "[RSX metal] fragment program %016llX: %s\n",
+                    (unsigned long long)key, s_log);
+        } else {
+            snprintf(name, sizeof name, "fp_%016llx.msl", (unsigned long long)key);
+            dump_shader(name, s_msl);
+            snprintf(name, sizeof name, "fragment program %016llX", (unsigned long long)key);
+            fn = compile_guest_function(s_msl, name);
+        }
+    }
+    { static int n = 0; if (n++ < 32)
+        fprintf(stderr, "[RSX metal] fragment program %016llX: %d instrs, %u constants -> %s\n",
+                (unsigned long long)key, ni, nconst,
+                fn ? "ok" : "FAILED (built-in shader instead)"); }
+
+    const int slot = (int)s_fp_count++;
+    s_fp_cache[slot].key    = key;
+    s_fp_cache[slot].fn     = fn;
+    s_fp_cache[slot].nconst = nconst;
+    return fn ? slot : -1;
+}
+
+/* Reserve `bytes` of constant staging at a 256-byte boundary. */
+static int cb_alloc(u32 bytes, u32* off)
+{
+    const u32 start = (s_cb_used + MTL_CB_ALIGN - 1u) & ~(MTL_CB_ALIGN - 1u);
+    if (start + bytes > s_cb_cap) {
+        u32 cap = s_cb_cap ? s_cb_cap : (4u << 20);
+        while (start + bytes > cap) {
+            if (cap >= MTL_CB_MAX) return 0;
+            cap *= 2u;
+        }
+        u8* n = (u8*)realloc(s_cb, cap);
+        if (!n) return 0;
+        s_cb = n; s_cb_cap = cap;
+    }
+    *off = start;
+    s_cb_used = start + bytes;
+    return 1;
+}
+
+/* Resolve both guest programs for a draw and snapshot their constant blocks.
+ * Returns 1 with the record's shader fields filled in, 0 when the draw must
+ * use the built-in shader (no vertex program loaded, a translation failure,
+ * or a full cache). Both programs or neither: a guest vertex program's
+ * outputs do not link with the built-in fragment shader's inputs. */
+static int guest_programs_for(const rsx_state* st, MtlDraw* d)
+{
+    const int vs = vp_slot_for(st);
+    if (vs < 0) return 0;
+    const u8* fp_uc = NULL;
+    const int fs = fp_slot_for(st, &fp_uc);
+    if (fs < 0) return 0;
+
+    /* PSConstants: the program's inline constants as host-order bit patterns,
+     * one float4 per slot, then fp_alpha. The count must match what the
+     * shader was compiled against. */
+    if (rsx_fp_collect_constants(fp_uc, MTL_FP_MAX_BYTES, &s_fp_consts) < 0 ||
+        s_fp_consts.count != s_fp_cache[fs].nconst)
+        return 0;
+    const u32 nslots = s_fp_consts.count ? s_fp_consts.count : 1u;
+    const u32 fp_len = (nslots + 1u) * 16u;
+
+    u32 vp_off, fp_off;
+    if (!cb_alloc(MTL_VP_CB_BYTES, &vp_off)) return 0;
+    if (!cb_alloc(fp_len, &fp_off)) return 0;
+
+    /* VPConst: the 512 transform constants, then the viewport epilogue
+     * (see the D3D12 backend's vp_record_cb): x/y identity, and the z lane
+     * remaps GL clip z to [0,1] when the guest programmed a z scale. Metal
+     * clip space matches D3D's here, so the mapping transfers unchanged. */
+    u8* vp = s_cb + vp_off;
+    memcpy(vp, st->vertex_constants, RSX_MAX_VERTEX_CONSTANTS * 16);
+    float* vpx = (float*)(vp + RSX_MAX_VERTEX_CONSTANTS * 16);
+    vpx[0] = vpx[1] = vpx[3] = 1.0f;
+    vpx[4] = vpx[5] = vpx[7] = 0.0f;
+    if (st->viewport_scale[2] != 0.0f) { vpx[2] = st->viewport_scale[2]; vpx[6] = st->viewport_offset[2]; }
+    else                                { vpx[2] = 1.0f;                  vpx[6] = 0.0f; }
+
+    u8* fp = s_cb + fp_off;
+    memset(fp, 0, fp_len);
+    if (s_fp_consts.count)
+        memcpy(fp, s_fp_consts.values, s_fp_consts.count * 16u);
+    float* alpha = (float*)(fp + nslots * 16u);
+    alpha[0] = rsx_fp_alpha_ref(st->alpha_ref, st->surface_format & 0x1Fu);
+    alpha[1] = alpha[2] = alpha[3] = 0.0f;
+
+    d->vs_idx = vs; d->fs_idx = fs;
+    d->vp_cb_off = vp_off;
+    d->fp_cb_off = fp_off; d->fp_cb_len = fp_len;
+    return 1;
+}
+
+/* Guest face culling, packed as the D3D12 backend's rsx_cull_key reads it:
+ * CULL_FACE FRONT=0x0404 BACK=0x0405 FRONT_AND_BACK=0x0408 (FRONT here, as
+ * there); FRONT_FACE CW=0x0900 CCW=0x0901. rsx_commands seeds cull_face and
+ * front_face with plain 1/0 before any register arrives, which reads as
+ * BACK/CW. Metal's default winding is clockwise, so the mapping is direct. */
+static void cull_from_state(const rsx_state* st, MtlDraw* d)
+{
+    d->cull = MTLCullModeNone;
+    if (st->cull_face_enable)
+        d->cull = (st->cull_face == 0x0404u || st->cull_face == 0x0408u)
+                      ? MTLCullModeFront : MTLCullModeBack;
+    d->winding = (st->front_face == 0x0901u) ? MTLWindingCounterClockwise
+                                             : MTLWindingClockwise;
+}
+
 /* ---- draw recording ------------------------------------------------------ */
 
 static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
@@ -304,11 +677,22 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     if (!s_ready || !s_verts || !st || count == 0) return;
     if (s_draw_count >= MTL_MAX_DRAWS) { s_dropped_draws++; return; }
 
+    MtlDraw* d = &s_draws[s_draw_count];
+    memset(d, 0, sizeof *d);
+    d->vs_idx = d->fs_idx = -1;
+
+    /* Programs first: their translation is what can fail, and a draw that
+     * drops to the built-in shader must still fetch its vertices the same
+     * way. Constant staging reserved here for a draw that then fails on
+     * vertices is simply left unused until the frame resets it. */
+    const int guest = s_guest_shaders && guest_programs_for(st, d);
+
     u32 first_vert = s_vert_count;
     u32 wrote = emit_vertices(st, prim, count, resolve, &base);
     if (wrote == 0) { s_dropped_draws++; return; }
+    s_draw_count++;
+    if (guest) s_guest_draws++;
 
-    MtlDraw* d = &s_draws[s_draw_count++];
     d->base  = first_vert;
     d->count = wrote;
     /* Expanded primitives always come out as a triangle list. */
@@ -318,10 +702,12 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     d->blend_sfactor  = st->blend_sfactor;
     d->blend_dfactor  = st->blend_dfactor;
     d->blend_equation = st->blend_equation;
+    d->color_mask     = st->color_mask;
+    cull_from_state(st, d);
 
-    /* RSX vertex constant slots 0..3 hold the MVP rows when no vertex program
-     * has been translated. An all-zero matrix would collapse every vertex to
-     * the origin, so fall back to identity. */
+    /* Built-in path: RSX vertex constant slots 0..3 hold the MVP rows when no
+     * vertex program has been translated. An all-zero matrix would collapse
+     * every vertex to the origin, so fall back to identity. */
     int nonzero = 0;
     for (int r = 0; r < 4; r++)
         for (int c = 0; c < 4; c++) {
@@ -378,14 +764,27 @@ static MTLBlendOperation blend_equation_to_metal(u32 e)
     }
 }
 
+/* NV4097_SET_COLOR_MASK: bit 0 = B, 8 = G, 16 = R, 24 = A. */
+static MTLColorWriteMask color_mask_to_metal(u32 m)
+{
+    MTLColorWriteMask w = MTLColorWriteMaskNone;
+    if (m & 0x00010000u) w |= MTLColorWriteMaskRed;
+    if (m & 0x00000100u) w |= MTLColorWriteMaskGreen;
+    if (m & 0x00000001u) w |= MTLColorWriteMaskBlue;
+    if (m & 0x01000000u) w |= MTLColorWriteMaskAlpha;
+    return w;
+}
+
 /* Built-in shaders: transform by the RSX vertex-constant matrix and interpolate
  * the diffuse colour. The rows are dotted explicitly rather than using float4x4
  * so there is no column-major/row-major ambiguity with the guest's layout.
- * The translated-guest-shader path replaces this, it does not extend it. */
+ * Reads position, diffuse colour and texcoord0 from RSX attribute slots 0, 3
+ * and 8 of the shared vertex layout. The guest-shader path replaces this, it
+ * does not extend it. */
 static NSString* const kBuiltinMSL = @
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
-"struct VIn  { float4 pos [[attribute(0)]]; float4 col [[attribute(1)]]; float4 tc [[attribute(2)]]; };\n"
+"struct VIn  { float4 pos [[attribute(0)]]; float4 col [[attribute(3)]]; float4 tc [[attribute(8)]]; };\n"
 "struct VOut { float4 pos [[position]]; float4 col; float4 tc; };\n"
 "struct VU   { float4 mvp[4]; };\n"
 "vertex VOut vs_main(VIn v [[stage_in]], constant VU& u [[buffer(0)]]) {\n"
@@ -397,7 +796,7 @@ static NSString* const kBuiltinMSL = @
 "}\n"
 "fragment float4 fs_main(VOut in [[stage_in]]) { return in.col; }\n";
 
-static u32 pso_key(const MtlDraw* d)
+static u32 blend_key(const MtlDraw* d)
 {
     if (!d->blend_enable) return 0u;
     return 1u | ((d->blend_sfactor & 0xFFFu) << 1)
@@ -405,28 +804,44 @@ static u32 pso_key(const MtlDraw* d)
               | ((d->blend_equation & 0x7u) << 25);
 }
 
-static id<MTLRenderPipelineState> pso_for(const MtlDraw* d)
+/* All 16 RSX attributes as float4 at i*16, stride 256, from MTL_VB_INDEX.
+ * A guest program declares only the attributes it reads; Metal ignores the
+ * rest of the descriptor. */
+static MTLVertexDescriptor* vertex_descriptor(void)
 {
-    u32 key = pso_key(d);
-    for (u32 i = 0; i < s_pso_count; i++)
-        if (s_pso_cache[i].key == key) return s_pso_cache[i].pso;
-    if (s_pso_count >= (u32)(sizeof(s_pso_cache) / sizeof(s_pso_cache[0]))) return nil;
-
     MTLVertexDescriptor* vd = [MTLVertexDescriptor vertexDescriptor];
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < MTL_ATTRIBS; i++) {
         vd.attributes[i].format      = MTLVertexFormatFloat4;
         vd.attributes[i].offset      = (NSUInteger)(i * 16);
         vd.attributes[i].bufferIndex = MTL_VB_INDEX;
     }
     vd.layouts[MTL_VB_INDEX].stride = sizeof(MtlVertex);
+    return vd;
+}
+
+static id<MTLRenderPipelineState> pso_for(const MtlDraw* d)
+{
+    MtlPsoKey key;
+    memset(&key, 0, sizeof key);
+    key.vs = d->vs_idx; key.fs = d->fs_idx;
+    key.blend = blend_key(d); key.cmask = d->color_mask;
+    for (u32 i = 0; i < s_pso_count; i++)
+        if (memcmp(&s_pso_cache[i].key, &key, sizeof key) == 0) return s_pso_cache[i].pso;
+    if (s_pso_count >= MTL_PSO_CACHE) { s_caches_full = 1; return nil; }
 
     MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
-    pd.vertexFunction   = [s_shader_lib newFunctionWithName:@"vs_main"];
-    pd.fragmentFunction = [s_shader_lib newFunctionWithName:@"fs_main"];
-    pd.vertexDescriptor = vd;
-    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    if (d->vs_idx >= 0) {
+        pd.vertexFunction   = s_vp_cache[d->vs_idx].fn;
+        pd.fragmentFunction = s_fp_cache[d->fs_idx].fn;
+    } else {
+        pd.vertexFunction   = [s_shader_lib newFunctionWithName:@"vs_main"];
+        pd.fragmentFunction = [s_shader_lib newFunctionWithName:@"fs_main"];
+    }
+    pd.vertexDescriptor = vertex_descriptor();
+    MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[0];
+    ca.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    ca.writeMask   = color_mask_to_metal(d->color_mask);
     if (d->blend_enable) {
-        MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[0];
         ca.blendingEnabled             = YES;
         ca.sourceRGBBlendFactor        = blend_factor_to_metal(d->blend_sfactor);
         ca.destinationRGBBlendFactor   = blend_factor_to_metal(d->blend_dfactor);
@@ -440,14 +855,23 @@ static id<MTLRenderPipelineState> pso_for(const MtlDraw* d)
     id<MTLRenderPipelineState> pso =
         [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
     if (!pso) {
-        fprintf(stderr, "[RSX metal] pipeline state failed: %s\n",
-                [[err localizedDescription] UTF8String]);
+        fprintf(stderr, "[RSX metal] pipeline state failed (vs %d, fs %d): %s\n",
+                d->vs_idx, d->fs_idx, [[err localizedDescription] UTF8String]);
         return nil;
     }
     s_pso_cache[s_pso_count].key = key;
     s_pso_cache[s_pso_count].pso = pso;
     s_pso_count++;
     return pso;
+}
+
+static void clear_caches(void)
+{
+    for (u32 i = 0; i < s_vp_count;  i++) s_vp_cache[i].fn   = nil;
+    for (u32 i = 0; i < s_fp_count;  i++) s_fp_cache[i].fn   = nil;
+    for (u32 i = 0; i < s_pso_count; i++) s_pso_cache[i].pso = nil;
+    s_vp_count = s_fp_count = s_pso_count = 0;
+    s_caches_full = 0;
 }
 
 /* ---- public API ---------------------------------------------------------- */
@@ -483,6 +907,10 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
             fprintf(stderr, "[RSX metal] surface creation failed\n");
             return -1;
         }
+        if (create_placeholders() != 0) {
+            fprintf(stderr, "[RSX metal] placeholder texture creation failed\n");
+            return -1;
+        }
 
         s_verts = (MtlVertex*)malloc(sizeof(MtlVertex) * MTL_MAX_VERTS);
         if (!s_verts) {
@@ -498,6 +926,12 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
             return -1;
         }
 
+        /* PS3RECOMP_METAL_FIXED_FUNCTION=1 pins every draw to the built-in
+         * shader: the first switch to flip when a title's draws vanish, to
+         * tell a translation problem from a fetch or state one. */
+        const char* ff = getenv("PS3RECOMP_METAL_FIXED_FUNCTION");
+        s_guest_shaders = rsx_hlsl_to_msl_available() && !(ff && *ff && *ff != '0');
+
         s_inflight = dispatch_semaphore_create(MTL_MAX_INFLIGHT);
         if (!s_inflight) {
             fprintf(stderr, "[RSX metal] semaphore creation failed\n");
@@ -507,9 +941,10 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
         rsx_set_backend(&s_backend_vtable);
         s_ready  = 1;
         s_closed = 0;
-        fprintf(stderr, "[RSX metal] %s on %s (%ux%u)\n",
+        fprintf(stderr, "[RSX metal] %s on %s (%ux%u), guest shaders %s\n",
                 s_headless ? "headless" : "windowed",
-                [[s_dev name] UTF8String], s_width, s_height);
+                [[s_dev name] UTF8String], s_width, s_height,
+                s_guest_shaders ? "on" : (rsx_hlsl_to_msl_available() ? "off (env)" : "off (translator not built)"));
         return 0;
     }
 }
@@ -534,10 +969,13 @@ void rsx_metal_backend_shutdown(void)
         if (s_window) { [s_window close]; s_window = nil; }
 #endif
         free(s_verts); s_verts = NULL;
-        s_vert_count = s_draw_count = s_pso_count = 0;
-        for (u32 i = 0; i < (u32)(sizeof(s_pso_cache)/sizeof(s_pso_cache[0])); i++)
-            s_pso_cache[i].pso = nil;
+        free(s_cb); s_cb = NULL; s_cb_used = s_cb_cap = 0;
+        s_vert_count = s_draw_count = 0;
+        s_guest_draws = s_last_guest_draws = 0;
+        clear_caches();
         s_shader_lib = nil;
+        s_null_tex   = nil;
+        s_default_sampler = nil;
         s_layer     = nil;
         s_offscreen = nil;
         s_queue     = nil;
@@ -603,6 +1041,16 @@ void rsx_metal_backend_present(void)
                                                   length:sizeof(MtlVertex) * s_vert_count
                                                  options:MTLResourceStorageModeShared];
             [enc setVertexBuffer:vb offset:0 atIndex:MTL_VB_INDEX];
+            id<MTLBuffer> cbuf = nil;
+            if (s_cb_used)
+                cbuf = [s_dev newBufferWithBytes:s_cb length:s_cb_used
+                                         options:MTLResourceStorageModeShared];
+            /* Every fragment texture unit reads the zero texture until guest
+             * textures are bound; a guest program may sample any of them. */
+            for (int u = 0; u < RSX_MAX_TEXTURES; u++) {
+                [enc setFragmentTexture:s_null_tex atIndex:(NSUInteger)u];
+                [enc setFragmentSamplerState:s_default_sampler atIndex:(NSUInteger)u];
+            }
             MTLViewport vp = { 0.0, 0.0, (double)s_width, (double)s_height, 0.0, 1.0 };
             [enc setViewport:vp];
 
@@ -611,7 +1059,14 @@ void rsx_metal_backend_present(void)
                 id<MTLRenderPipelineState> pso = pso_for(d);
                 if (!pso) continue;
                 [enc setRenderPipelineState:pso];
-                [enc setVertexBytes:d->mvp length:sizeof(d->mvp) atIndex:0];
+                [enc setCullMode:d->cull];
+                [enc setFrontFacingWinding:d->winding];
+                if (d->vs_idx >= 0 && cbuf) {
+                    [enc setVertexBuffer:cbuf offset:d->vp_cb_off atIndex:0];
+                    [enc setFragmentBuffer:cbuf offset:d->fp_cb_off atIndex:1];
+                } else {
+                    [enc setVertexBytes:d->mvp length:sizeof(d->mvp) atIndex:0];
+                }
                 [enc drawPrimitives:d->topology vertexStart:d->base vertexCount:d->count];
             }
         }
@@ -639,6 +1094,16 @@ void rsx_metal_backend_present(void)
         }
         s_draw_count = 0;
         s_vert_count = 0;
+        s_cb_used    = 0;
+        s_last_guest_draws = s_guest_draws;
+        s_guest_draws = 0;
+        /* The frame's records are gone, so slots may move now. The command
+         * buffer keeps its own references to whatever it still runs. */
+        if (s_caches_full) {
+            fprintf(stderr, "[RSX metal] shader cache full (%u VP, %u FP, %u PSO); cleared\n",
+                    s_vp_count, s_fp_count, s_pso_count);
+            clear_caches();
+        }
 
         if (s_headless && s_offscreen) {
             u32 px = 0;
@@ -651,3 +1116,4 @@ void rsx_metal_backend_present(void)
 
 u32 rsx_metal_backend_debug_color(void)     { return s_clear_argb; }
 u32 rsx_metal_backend_readback_center(void) { return s_last_present_bgra; }
+u32 rsx_metal_backend_guest_draws(void)     { return s_last_guest_draws; }
