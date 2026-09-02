@@ -286,13 +286,13 @@ extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;   /* fwd (defined below) 
 #define PPU_RESV_MAX 128
 #define PPU_RESV_INVALID 0x100000000ull   /* out of (uint32_t) ea range */
 static ppu_context* g_resv_ctxs[PPU_RESV_MAX];
-static volatile long g_resv_ctx_n = 0;
+static volatile LONG g_resv_ctx_n = 0;
 /* Sharded by address: a single global lock convoyed all stwcx (workers spinning
  * on a descheduled holder -> loader too slow to finish jobs). Shard by the
  * 16-byte-block of ea so unrelated structures never serialize; same-structure
  * contention (which is inherent) still serializes on one slot. */
 #define PPU_RESV_LOCKS 1024
-static volatile long g_resv_locks[PPU_RESV_LOCKS];
+static volatile LONG g_resv_locks[PPU_RESV_LOCKS];
 /* PPU_RESV_STORE=1 -> also invalidate reservations on PLAIN stores (vm_write32/64)
  * to a reserved word, matching real PPC (any store to the reservation granule
  * kills it). stwcx-break alone covers stwcx-vs-stwcx ABA, but a value that returns
@@ -320,9 +320,9 @@ extern "C" void ppu_resv_break_store(uint64_t ea)
             c->reserve_addr = PPU_RESV_INVALID;
     }
 }
-static inline volatile long* resv_slot(uint64_t ea) { return &g_resv_locks[((uint32_t)ea >> 4) & (PPU_RESV_LOCKS - 1)]; }
-static inline void resv_lock(volatile long* L)   { while (_InterlockedExchange(L, 1)) { while (*L) YieldProcessor(); } }
-static inline void resv_unlock(volatile long* L) { _InterlockedExchange(L, 0); }
+static inline volatile LONG* resv_slot(uint64_t ea) { return &g_resv_locks[((uint32_t)ea >> 4) & (PPU_RESV_LOCKS - 1)]; }
+static inline void resv_lock(volatile LONG* L)   { while (_InterlockedExchange(L, 1)) { while (*L) YieldProcessor(); } }
+static inline void resv_unlock(volatile LONG* L) { _InterlockedExchange(L, 0); }
 static inline void ppu_resv_break(uint64_t addr)   /* MUST hold g_resv_lock */
 {
     uint64_t a = (uint32_t)addr;   /* match the inline guard: reserve_addr holds (uint32_t)ea */
@@ -363,7 +363,7 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
                                            0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     ppu_context* self = g_active_ctx;
     if (resv_diag() && self) resv_check_reg(self);
-    volatile long* L = resv_slot(ea);
+    volatile LONG* L = resv_slot(ea);
     resv_lock(L);
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }   /* reservation lost */
     int ok = __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
@@ -381,7 +381,7 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
                                            0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     ppu_context* self = g_active_ctx;
     if (resv_diag() && self) resv_check_reg(self);
-    volatile long* L = resv_slot(ea);   /* ea and ea+4 share a 16-byte-block slot */
+    volatile LONG* L = resv_slot(ea);   /* ea and ea+4 share a 16-byte-block slot */
     resv_lock(L);
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
     int ok = __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
