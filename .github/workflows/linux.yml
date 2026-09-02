@@ -39,10 +39,15 @@ jobs:
       # SDL2 is not optional off Windows: cellPad and cellAudio select their
       # SDL2 backends unconditionally there, and CMakeLists.txt hard-fails
       # without it.
+      # glslang and spirv-cross are what the Metal backend's guest-shader path
+      # translates with. There is no Metal here, but the translation itself
+      # has no GPU in it, so Linux is where the decompilers' HLSL meets
+      # glslang's front end on every push.
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libsdl2-dev clang
+          sudo apt-get install -y ninja-build libsdl2-dev clang \
+            glslang-dev spirv-tools libspirv-cross-c-shared-dev
 
       - name: Configure
         run: |
@@ -97,6 +102,15 @@ jobs:
             -std=gnu17 -I include -I runtime/spu \
             -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c
           /tmp/test_spu_helpers
+
+      # Guest vertex and fragment programs through the decompilers, glslang
+      # and spirv-cross: asserts the MSL carries the buffer, texture, sampler
+      # and attribute slots the Metal backend binds to. The binary missing
+      # means the shader tools were not found, which must fail, not skip.
+      - name: Run the guest shader translation test
+        run: |
+          test -x build/test_shader_msl
+          ./build/test_shader_msl
 
       # runtime/ppu/ is the one part of the runtime no CMake target builds --
       # it needs the lifter's per-game ppu_recomp.h -- so nothing here ever

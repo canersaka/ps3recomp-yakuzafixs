@@ -24,8 +24,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # glslang and spirv-cross turn the decompilers' HLSL into MSL for the
+      # Metal backend's guest-shader path; without them CMake builds the
+      # fixed-function backend only.
       - name: Install dependencies
-        run: brew install ninja sdl2
+        run: brew install ninja sdl2 glslang spirv-cross
 
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
@@ -77,6 +80,15 @@ jobs:
           # and the draw path, not just the clear.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw --frames=60
+
+      # Guest vertex and fragment programs through the decompilers, glslang
+      # and spirv-cross: asserts the MSL carries the buffer, texture, sampler
+      # and attribute slots the Metal backend binds to. The binary missing
+      # means the shader tools were not found, which must fail, not skip.
+      - name: Run the guest shader translation test
+        run: |
+          test -x build/test_shader_msl
+          ./build/test_shader_msl
 
       # runtime/ppu/ is the one part of the runtime no CMake target builds --
       # it needs the lifter's per-game ppu_recomp.h. macOS has no recorded
