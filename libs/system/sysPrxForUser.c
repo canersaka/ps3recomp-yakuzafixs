@@ -7,6 +7,7 @@
  */
 
 #include "sysPrxForUser.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32: translate + byte-swap */
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -40,6 +41,19 @@ typedef struct {
 
 static LwMutexSlot s_lwmutex[MAX_LWMUTEX];
 static u32 s_lwmutex_next = 0;
+
+/* Guards slot allocation in the create paths now that guest threads are
+ * real host threads. Lock/unlock/signal stay lock-free: they only touch
+ * the slot the caller already owns. */
+#ifdef _WIN32
+static SRWLOCK s_slot_lock = SRWLOCK_INIT;
+static void slot_lock(void)   { AcquireSRWLockExclusive(&s_slot_lock); }
+static void slot_unlock(void) { ReleaseSRWLockExclusive(&s_slot_lock); }
+#else
+static pthread_mutex_t s_slot_lock = PTHREAD_MUTEX_INITIALIZER;
+static void slot_lock(void)   { pthread_mutex_lock(&s_slot_lock); }
+static void slot_unlock(void) { pthread_mutex_unlock(&s_slot_lock); }
+#endif
 
 /* Reset all lwmutex/lwcond state — call before CRT redirect to game main */
 void sys_lwmutex_reset_all(void)
@@ -143,6 +157,28 @@ static u32 s_next_heap_id = 1;
 void sys_process_exit(s32 exitcode)
 {
     printf("[sysPrxForUser] sys_process_exit(code=%d)\n", exitcode);
+#ifdef _WIN32
+    /* The RSX present thread runs at ~60Hz; a title that finishes in a few ms
+     * would tear down before the first frame is ever presented. Hold
+     * indefinitely with CELLMARK_HOLD so the last rendered frame is
+     * visible / capturable. */
+    if (getenv("CELLMARK_HOLD")) { for (;;) Sleep(1000); }
+#endif
+    /* YDKJ_NOEXIT (diagnostic): the title self-exits after ~2 frames on a
+     * teardown assert triggered by incomplete SPU/SPURS state (a timing race).
+     * Ignoring the exit on the calling thread lets the render loop keep running
+     * so we can see whether sustained execution produces on-screen content. */
+    if (getenv("YDKJ_NOEXIT")) {
+        printf("[sysPrxForUser] sys_process_exit IGNORED (YDKJ_NOEXIT) -- parking thread\n");
+        fflush(stdout);
+        for (;;) {
+#ifdef _WIN32
+            Sleep(1000);
+#else
+            struct timespec ts = {1,0}; nanosleep(&ts,0);
+#endif
+        }
+    }
     exit(exitcode);
 }
 
@@ -154,7 +190,7 @@ s32 sys_process_getpid(void)
 s32 sys_process_get_number_of_object(u32 object_type, u32* count)
 {
     (void)object_type;
-    if (count) *count = 0;
+    if (count) vm_write32((u32)(uintptr_t)count, 0);
     return CELL_OK;
 }
 
@@ -168,73 +204,158 @@ s32 sys_process_is_spu_lock_line_reservation_address(u32 addr, u64 flags)
  * String/memory functions
  * -----------------------------------------------------------------------*/
 
+/* libsre and other system PRXs reach these sysPrxForUser CRT shims through
+ * ps3_hle_call, which forwards the raw GUEST effective address in the arg
+ * registers. Translate guest EA -> host pointer (vm_base + 32-bit EA; guest
+ * NULL stays NULL) before touching memory. The title itself inlines its own
+ * memcpy/memset/str*, so this path first appears once the real libsre is
+ * loaded -- without translation memset(guest_ea, ...) writes to a bare host
+ * address and AVs (observed: _sys_memset write fault during SPURS init). */
+extern u8* vm_base;
+static inline void* yz_g2h(const void* g)
+{
+    u32 ea = (u32)(uintptr_t)g;
+    return ea ? (void*)(vm_base + ea) : (void*)0;
+}
+
+/* Guest-aware printf core: the varargs reach us as raw 64-bit register values
+ * (the generic HLE adapter forwards gpr3..10), so a %s argument is a GUEST
+ * effective address -- passing it straight to the host vprintf derefs it as a
+ * host pointer and AVs (observed crashing the libspurs assert printer on the
+ * "handler.c" filename). Walk the (already host-translated) format and emit each
+ * conversion via the host snprintf, but translate %s args through vm_base. */
+static int yz_format(char* out, size_t cap, const char* fmt, va_list ap)
+{
+    extern u8* vm_base;
+    size_t p = 0;
+    if (!fmt) { if (cap) out[0] = 0; return 0; }
+    while (*fmt && p + 1 < cap) {
+        if (*fmt != '%') { out[p++] = *fmt++; continue; }
+        char spec[40]; int si = 0; spec[si++] = *fmt++;          /* '%' */
+        while (*fmt && strchr("-+ #0123456789.*lhLqjzt", *fmt) && si < 38) spec[si++] = *fmt++;
+        char c = *fmt ? *fmt++ : 0; spec[si++] = c; spec[si] = 0;
+        char tmp[1024]; int n = 0;
+        if (c == '%') { out[p++] = '%'; continue; }
+        else if (c == 's') {
+            u32 g = (u32)va_arg(ap, unsigned long long);
+            const char* hs = g ? (const char*)(vm_base + g) : "(null)";
+            n = snprintf(tmp, sizeof tmp, spec, hs);
+        } else if (c == 'c') {
+            int v = (int)va_arg(ap, unsigned long long); n = snprintf(tmp, sizeof tmp, spec, v);
+        } else if (c == 'p') {
+            u32 v = (u32)va_arg(ap, unsigned long long); n = snprintf(tmp, sizeof tmp, "0x%08X", v);
+        } else if (c == 'f' || c == 'F' || c == 'g' || c == 'G' || c == 'e' || c == 'E') {
+            union { unsigned long long u; double d; } u; u.u = va_arg(ap, unsigned long long);
+            n = snprintf(tmp, sizeof tmp, spec, u.d);
+        } else if (c) {
+            unsigned long long v = va_arg(ap, unsigned long long);
+            if (strstr(spec, "ll") || strstr(spec, "q")) n = snprintf(tmp, sizeof tmp, spec, (long long)v);
+            else n = snprintf(tmp, sizeof tmp, spec, (int)v);
+        }
+        for (int k = 0; k < n && p + 1 < cap; k++) out[p++] = tmp[k];
+    }
+    out[p] = 0;
+    return (int)p;
+}
+
 s32 _sys_printf(const char* fmt, ...)
 {
-    va_list ap;
-    va_start(ap, fmt);
-    printf("[PS3] ");
-    int ret = vprintf(fmt, ap);
+    va_list ap; va_start(ap, fmt);
+    char buf[2048];
+    int ret = yz_format(buf, sizeof buf, (const char*)yz_g2h(fmt), ap);
     va_end(ap);
+    printf("[PS3] %s", buf);
     return ret;
 }
 
 s32 _sys_sprintf(char* buf, const char* fmt, ...)
 {
-    va_list ap;
-    va_start(ap, fmt);
-    int ret = vsprintf(buf, fmt, ap);
+    va_list ap; va_start(ap, fmt);
+    int ret = yz_format((char*)yz_g2h(buf), 0x10000, (const char*)yz_g2h(fmt), ap);
     va_end(ap);
     return ret;
 }
 
 s32 _sys_snprintf(char* buf, u32 size, const char* fmt, ...)
 {
-    va_list ap;
-    va_start(ap, fmt);
-    int ret = vsnprintf(buf, size, fmt, ap);
+    va_list ap; va_start(ap, fmt);
+    int ret = yz_format((char*)yz_g2h(buf), size ? size : 1, (const char*)yz_g2h(fmt), ap);
     va_end(ap);
     return ret;
 }
 
 s32 _sys_strlen(const char* str)
 {
-    if (!str) return 0;
-    return (s32)strlen(str);
+    char* s = (char*)yz_g2h(str);
+    if (!s) return 0;
+    return (s32)strlen(s);
 }
 
 s32 _sys_strncpy(char* dst, const char* src, u32 size)
 {
-    if (!dst || !src) return CELL_EFAULT;
-    strncpy(dst, src, size);
+    char* d = (char*)yz_g2h(dst); const char* s = (const char*)yz_g2h(src);
+    if (!d || !s) return CELL_EFAULT;
+    strncpy(d, s, size);
     return CELL_OK;
 }
 
 s32 _sys_strcat(char* dst, const char* src)
 {
-    if (!dst || !src) return CELL_EFAULT;
-    strcat(dst, src);
+    char* d = (char*)yz_g2h(dst); const char* s = (const char*)yz_g2h(src);
+    if (!d || !s) return CELL_EFAULT;
+    strcat(d, s);
     return CELL_OK;
 }
 
 s32 _sys_strcmp(const char* s1, const char* s2)
 {
-    if (!s1 || !s2) return -1;
-    return strcmp(s1, s2);
+    const char* a = (const char*)yz_g2h(s1); const char* b = (const char*)yz_g2h(s2);
+    if (!a || !b) return -1;
+    return strcmp(a, b);
+}
+
+/* Returns the destination GUEST pointer (callers such as cellSpurs use the
+ * return value), not the host pointer. */
+char* _sys_strcpy(char* dst, const char* src)
+{
+    char* d = (char*)yz_g2h(dst); const char* s = (const char*)yz_g2h(src);
+    if (d && s) strcpy(d, s);
+    return dst;
+}
+
+char* _sys_strncat(char* dst, const char* src, u32 size)
+{
+    char* d = (char*)yz_g2h(dst); const char* s = (const char*)yz_g2h(src);
+    if (d && s) strncat(d, s, size);
+    return dst;
+}
+
+s32 _sys_strncmp(const char* s1, const char* s2, u32 size)
+{
+    const char* a = (const char*)yz_g2h(s1); const char* b = (const char*)yz_g2h(s2);
+    if (!a || !b) return -1;
+    return strncmp(a, b, size);
 }
 
 void* _sys_memset(void* dst, s32 val, u32 size)
 {
-    return memset(dst, val, size);
+    void* d = yz_g2h(dst);
+    if (d) memset(d, val, size);
+    return dst;
 }
 
 void* _sys_memcpy(void* dst, const void* src, u32 size)
 {
-    return memcpy(dst, src, size);
+    void* d = yz_g2h(dst); const void* s = yz_g2h(src);
+    if (d && s) memcpy(d, s, size);
+    return dst;
 }
 
 s32 _sys_memcmp(const void* s1, const void* s2, u32 size)
 {
-    return memcmp(s1, s2, size);
+    const void* a = yz_g2h(s1); const void* b = yz_g2h(s2);
+    if (!a || !b) return 0;
+    return memcmp(a, b, size);
 }
 
 s32 _sys_toupper(s32 c) { return toupper(c); }
@@ -244,14 +365,33 @@ s32 _sys_tolower(s32 c) { return tolower(c); }
  * Lightweight mutex
  * -----------------------------------------------------------------------*/
 
+extern u8* vm_base;  /* for guest-address diagnostics in the boot log */
+#define YZ_GUEST_ADDR(p) ((u32)((u8*)(p) - vm_base))
+
+/* Pointer PARAMETERS arrive as raw 32-bit guest EAs -- translate before any
+ * deref. Everything below then works on host pointers, and YZ_GUEST_ADDR
+ * round-trips correctly again. NULL is preserved so "attr ? ... : \"???\""
+ * still means what it reads like.
+ *
+ * NOTE runtime/ppu/ppu_sysprx.cpp implements these SAME NIDs as ctx handlers
+ * using vm_read32/vm_write32, and lbp/gen/ppu_hle_nids.cpp registers the ones
+ * here -- whichever registers last wins. Both are now correct about
+ * translation, so the order no longer decides whether it crashes. */
+#define YZ_XLAT(p, T) ((p) = (p) ? (T)(void*)(vm_base + (u32)(uintptr_t)(p)) : (T)0)
+
 s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t* attr)
 {
-    printf("[sysPrxForUser] sys_lwmutex_create(name='%.8s')\n",
-           attr ? attr->name : "???");
+    YZ_XLAT(lwmutex, sys_lwmutex_t_hle*);
+    YZ_XLAT(attr, const sys_lwmutex_attribute_t*);
+    printf("[sysPrxForUser] sys_lwmutex_create(name='%.8s', guest=0x%08X)\n",
+           attr ? attr->name : "???", YZ_GUEST_ADDR(lwmutex));
+    { extern char* getenv(const char*); static int _lt=-1; if(_lt<0)_lt=getenv("FLOW_LWMTRACE")?1:0;
+      if(_lt){ extern unsigned int ppu_active_lr(void); printf("[LWMTRACE] create guest=0x%08X caller_lr=0x%08X\n", YZ_GUEST_ADDR(lwmutex), ppu_active_lr()); } }
 
     if (!lwmutex)
         return CELL_EFAULT;
 
+    slot_lock();
     u32 idx = s_lwmutex_next;
     for (u32 i = 0; i < MAX_LWMUTEX; i++) {
         u32 slot = (idx + i) % MAX_LWMUTEX;
@@ -276,23 +416,46 @@ s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t
             memset(lwmutex, 0, sizeof(*lwmutex));
             lwmutex->sleep_queue = slot + 1; /* 1-based ID */
             s_lwmutex_next = (slot + 1) % MAX_LWMUTEX;
+            slot_unlock();
             return CELL_OK;
         }
     }
+    slot_unlock();
     return CELL_EAGAIN;
 }
 
 s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
 {
     (void)timeout;
+    YZ_XLAT(lwmutex, sys_lwmutex_t_hle*);
     if (!lwmutex) return CELL_EFAULT;
 
     u32 slot = lwmutex->sleep_queue - 1;
-    if (slot >= MAX_LWMUTEX || !s_lwmutex[slot].in_use)
+    if (slot >= MAX_LWMUTEX || !s_lwmutex[slot].in_use) {
+#ifdef _WIN32
+        printf("[sysPrxForUser] sys_lwmutex_lock FAIL guest=0x%08X "
+               "sleep_queue=0x%08X (%s) [host tid %lu] -> ESRCH\n",
+               YZ_GUEST_ADDR(lwmutex), lwmutex->sleep_queue,
+               slot >= MAX_LWMUTEX ? "bad slot" : "slot not in use",
+               GetCurrentThreadId());
+#else
+        printf("[sysPrxForUser] sys_lwmutex_lock FAIL guest=0x%08X "
+               "sleep_queue=0x%08X (%s) -> ESRCH\n",
+               YZ_GUEST_ADDR(lwmutex), lwmutex->sleep_queue,
+               slot >= MAX_LWMUTEX ? "bad slot" : "slot not in use");
+#endif
+        { extern char* getenv(const char*); static int _lk=-1; if(_lk<0)_lk=getenv("FLOW_LOCKOK")?1:0;
+          if(_lk) return CELL_OK; }   /* diag: treat uninit lwmutex as acquired, see if boot proceeds */
         return CELL_ESRCH;
+    }
 
 #ifdef _WIN32
-    EnterCriticalSection(&s_lwmutex[slot].cs);
+    if (!TryEnterCriticalSection(&s_lwmutex[slot].cs)) {
+        fprintf(stderr, "[LWMTX] tid %lu BLOCKING on lwmutex slot %u (guest 0x%08X)\n",
+                GetCurrentThreadId(), slot, YZ_GUEST_ADDR(lwmutex));
+        EnterCriticalSection(&s_lwmutex[slot].cs);
+        fprintf(stderr, "[LWMTX] tid %lu acquired slot %u\n", GetCurrentThreadId(), slot);
+    }
 #else
     pthread_mutex_lock(&s_lwmutex[slot].mtx);
 #endif
@@ -304,6 +467,7 @@ s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
 
 s32 sys_lwmutex_trylock(sys_lwmutex_t_hle* lwmutex)
 {
+    YZ_XLAT(lwmutex, sys_lwmutex_t_hle*);
     if (!lwmutex) return CELL_EFAULT;
 
     u32 slot = lwmutex->sleep_queue - 1;
@@ -325,6 +489,7 @@ s32 sys_lwmutex_trylock(sys_lwmutex_t_hle* lwmutex)
 
 s32 sys_lwmutex_unlock(sys_lwmutex_t_hle* lwmutex)
 {
+    YZ_XLAT(lwmutex, sys_lwmutex_t_hle*);
     if (!lwmutex) return CELL_EFAULT;
 
     u32 slot = lwmutex->sleep_queue - 1;
@@ -345,21 +510,43 @@ s32 sys_lwmutex_unlock(sys_lwmutex_t_hle* lwmutex)
 
 s32 sys_lwmutex_destroy(sys_lwmutex_t_hle* lwmutex)
 {
-    printf("[sysPrxForUser] sys_lwmutex_destroy()\n");
+    YZ_XLAT(lwmutex, sys_lwmutex_t_hle*);
+#ifdef _WIN32
+    printf("[sysPrxForUser] sys_lwmutex_destroy(guest=0x%08X) [host tid %lu]\n",
+           lwmutex ? YZ_GUEST_ADDR(lwmutex) : 0, GetCurrentThreadId());
+#else
+    printf("[sysPrxForUser] sys_lwmutex_destroy(guest=0x%08X)\n",
+           lwmutex ? YZ_GUEST_ADDR(lwmutex) : 0);
+#endif
 
     if (!lwmutex) return CELL_EFAULT;
 
     u32 slot = lwmutex->sleep_queue - 1;
-    if (slot < MAX_LWMUTEX && s_lwmutex[slot].in_use) {
-#ifdef _WIN32
-        DeleteCriticalSection(&s_lwmutex[slot].cs);
-#else
-        pthread_mutex_destroy(&s_lwmutex[slot].mtx);
-#endif
-        s_lwmutex[slot].in_use = 0;
+    if (slot >= MAX_LWMUTEX || !s_lwmutex[slot].in_use) {
+        printf("[sysPrxForUser] sys_lwmutex_destroy -> ESRCH\n");
+        return CELL_ESRCH;   /* already destroyed / never created */
     }
 
+    /* lv2 refuses to destroy a held lwmutex (CELL_EBUSY) - games rely on
+     * this when tearing down a heap another thread is still allocating
+     * from: the EBUSY keeps the lock (and the heap) alive. */
+#ifdef _WIN32
+    if (!TryEnterCriticalSection(&s_lwmutex[slot].cs)) {
+        printf("[sysPrxForUser] sys_lwmutex_destroy -> EBUSY\n");
+        return CELL_EBUSY;
+    }
+    LeaveCriticalSection(&s_lwmutex[slot].cs);
+    DeleteCriticalSection(&s_lwmutex[slot].cs);
+#else
+    if (pthread_mutex_trylock(&s_lwmutex[slot].mtx) != 0)
+        return CELL_EBUSY;
+    pthread_mutex_unlock(&s_lwmutex[slot].mtx);
+    pthread_mutex_destroy(&s_lwmutex[slot].mtx);
+#endif
+    s_lwmutex[slot].in_use = 0;
+
     memset(lwmutex, 0, sizeof(*lwmutex));
+    printf("[sysPrxForUser] sys_lwmutex_destroy -> OK\n");
     return CELL_OK;
 }
 
@@ -370,12 +557,16 @@ s32 sys_lwmutex_destroy(sys_lwmutex_t_hle* lwmutex)
 s32 sys_lwcond_create(sys_lwcond_t_hle* lwcond, sys_lwmutex_t_hle* lwmutex,
                       const sys_lwcond_attribute_t* attr)
 {
+    YZ_XLAT(lwcond, sys_lwcond_t_hle*);
+    YZ_XLAT(lwmutex, sys_lwmutex_t_hle*);
+    YZ_XLAT(attr, const sys_lwcond_attribute_t*);
     printf("[sysPrxForUser] sys_lwcond_create(name='%.8s')\n",
            attr ? attr->name : "???");
 
     if (!lwcond || !lwmutex)
         return CELL_EFAULT;
 
+    slot_lock();
     u32 idx = s_lwcond_next;
     for (u32 i = 0; i < MAX_LWCOND; i++) {
         u32 slot = (idx + i) % MAX_LWCOND;
@@ -392,14 +583,17 @@ s32 sys_lwcond_create(sys_lwcond_t_hle* lwcond, sys_lwmutex_t_hle* lwmutex,
 
             lwcond->lwcond_queue = slot + 1;
             s_lwcond_next = (slot + 1) % MAX_LWCOND;
+            slot_unlock();
             return CELL_OK;
         }
     }
+    slot_unlock();
     return CELL_EAGAIN;
 }
 
 s32 sys_lwcond_signal(sys_lwcond_t_hle* lwcond)
 {
+    YZ_XLAT(lwcond, sys_lwcond_t_hle*);
     if (!lwcond) return CELL_EFAULT;
 
     u32 slot = lwcond->lwcond_queue - 1;
@@ -416,6 +610,7 @@ s32 sys_lwcond_signal(sys_lwcond_t_hle* lwcond)
 
 s32 sys_lwcond_signal_all(sys_lwcond_t_hle* lwcond)
 {
+    YZ_XLAT(lwcond, sys_lwcond_t_hle*);
     if (!lwcond) return CELL_EFAULT;
 
     u32 slot = lwcond->lwcond_queue - 1;
@@ -432,6 +627,8 @@ s32 sys_lwcond_signal_all(sys_lwcond_t_hle* lwcond)
 
 s32 sys_lwcond_wait(sys_lwcond_t_hle* lwcond, u64 timeout)
 {
+    YZ_XLAT(lwcond, sys_lwcond_t_hle*);
+    fprintf(stderr, "[WAIT] lwcond_wait(timeout=%llu)\n", (unsigned long long)timeout);
     if (!lwcond) return CELL_EFAULT;
 
     u32 cslot = lwcond->lwcond_queue - 1;
@@ -475,6 +672,7 @@ s32 sys_lwcond_wait(sys_lwcond_t_hle* lwcond, u64 timeout)
 
 s32 sys_lwcond_destroy(sys_lwcond_t_hle* lwcond)
 {
+    YZ_XLAT(lwcond, sys_lwcond_t_hle*);
     printf("[sysPrxForUser] sys_lwcond_destroy()\n");
 
     if (!lwcond) return CELL_EFAULT;
@@ -509,7 +707,7 @@ s32 sys_heap_create_heap(sys_heap_t* heap, u32 start_addr, u32 size,
         if (!s_heaps[i].in_use) {
             s_heaps[i].in_use = 1;
             s_heaps[i].id = s_next_heap_id++;
-            *heap = s_heaps[i].id;
+            vm_write32((u32)(uintptr_t)heap, s_heaps[i].id);
             return CELL_OK;
         }
     }
@@ -529,22 +727,42 @@ s32 sys_heap_destroy_heap(sys_heap_t heap)
     return CELL_ESRCH;
 }
 
+/* Guest-address bump allocator for the _sys_heap_* API. These return a GUEST
+ * effective address (the caller writes to it through the VM), so a host malloc
+ * pointer is wrong -- the guest would treat it as a 32-bit EA and fault. Hand
+ * out addresses from a dedicated guest window above the sys_memory window. */
+#define YZ_HEAP_BASE 0x50000000u
+#define YZ_HEAP_END  0x58000000u
+static u32 s_heap_bump = 0;
+
+static u32 yz_heap_alloc(u32 size, u32 align)
+{
+    if (s_heap_bump == 0) s_heap_bump = YZ_HEAP_BASE;
+    if (align < 16) align = 16;
+    s_heap_bump = (s_heap_bump + align - 1) & ~(align - 1);
+    u32 ea = s_heap_bump;
+    s_heap_bump += (size + 15) & ~15u;
+    if (s_heap_bump > YZ_HEAP_END) return 0;
+    return ea;   /* guest EA; flat VM commits pages on first access */
+}
+
 void* sys_heap_malloc(sys_heap_t heap, u32 size)
 {
     (void)heap;
-    return malloc(size);
+    return (void*)(uintptr_t)yz_heap_alloc(size, 16);
 }
 
 s32 sys_heap_free(sys_heap_t heap, void* ptr)
 {
-    (void)heap;
-    free(ptr);
+    (void)heap; (void)ptr;   /* bump allocator: no per-alloc free */
     return CELL_OK;
 }
 
 void* sys_heap_memalign(sys_heap_t heap, u32 align, u32 size)
 {
     (void)heap;
+    return (void*)(uintptr_t)yz_heap_alloc(size, align);
+#if 0
 #ifdef _WIN32
     return _aligned_malloc(size, align);
 #else
@@ -553,6 +771,17 @@ void* sys_heap_memalign(sys_heap_t heap, u32 align, u32 size)
         return NULL;
     return ptr;
 #endif
+#endif
+}
+
+/* _sys_heap_create_heap (libdbgfont / dinkum ABI): RETURNS a non-zero heap id
+ * in r3 (args name/type/blocksize/flags in r3..r6). Distinct from the out-param
+ * sys_heap_create_heap above; _sys_heap_malloc bump-allocs regardless of id. */
+u32 sys_heap_create_heap_ret(u32 name, u32 type, u32 blocksize, u32 flags)
+{
+    (void)name; (void)type; (void)blocksize; (void)flags;
+    static u32 s_hid = 0x100;
+    return s_hid++;
 }
 
 /* ---------------------------------------------------------------------------
@@ -568,11 +797,18 @@ s32 sys_prx_exitspawn_with_level(void)
 s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id)
 {
     (void)flags;
+    /* name/id arrive as raw GUEST effective addresses (the generic HLE adapter
+     * forwards gpr3.. untranslated). Translate before touching memory -- else
+     * printf("%s", name) derefs a bare host address and AVs. This path first
+     * appears once real libsre is loaded (its name string lives in the libsre
+     * image at 0x3000xxxx). Same bug class as the _sys_memset fix above. */
+    const char* hname = (const char*)yz_g2h(name);
+    u32* hid = (u32*)yz_g2h(id);
     printf("[sysPrxForUser] sys_prx_get_module_id_by_name('%s')\n",
-           name ? name : "(null)");
+           hname ? hname : "(null)");
 
-    if (!id) return CELL_EFAULT;
-    *id = 0; /* fake module ID */
+    if (!hid) return CELL_EFAULT;
+    *hid = 0; /* fake module ID */
     return CELL_OK;
 }
 
@@ -586,6 +822,7 @@ s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id)
 s32 sys_get_random_number(void* buf, u64 size)
 {
     if (!buf || size == 0) return CELL_EFAULT;
+    buf = yz_g2h(buf);   /* guest EA -> host pointer before the OS fills it */
 
 #ifdef _WIN32
     /* Use BCryptGenRandom on Windows */
@@ -644,6 +881,6 @@ s32 sys_process_get_paramsfo(void* buf)
 {
     /* PARAM.SFO data — return a minimal valid SFO with title ID */
     if (!buf) return CELL_EFAULT;
-    memset(buf, 0, 256);
+    memset(yz_g2h(buf), 0, 256);
     return CELL_OK;
 }

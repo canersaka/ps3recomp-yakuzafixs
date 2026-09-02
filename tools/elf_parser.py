@@ -50,6 +50,14 @@ PT_NULL = 0
 PT_LOAD = 1
 PT_NOTE = 4
 PT_SCE_PPURELA = 0x700000A4
+# Main-executable (ET_EXEC) process param segments. The PRX param segment
+# points at the sys_proc_prx_param structure that describes the lib entry
+# (export) and lib stub (import) tables for a fixed EBOOT.
+PT_PROC_PARAM = 0x60000001
+PT_PROC_PRX_PARAM = 0x60000002
+
+# Magic in sys_proc_prx_param ("PRX param")
+PROC_PRX_PARAM_MAGIC = 0x1B434CEC
 
 # Section header types
 SHT_NULL = 0
@@ -92,6 +100,8 @@ PT_TYPE_NAMES = {
     PT_LOAD: "PT_LOAD",
     PT_NOTE: "PT_NOTE",
     PT_SCE_PPURELA: "PT_SCE_PPURELA",
+    PT_PROC_PARAM: "PT_PROC_PARAM",
+    PT_PROC_PRX_PARAM: "PT_PROC_PRX_PARAM",
 }
 
 # ---------------------------------------------------------------------------
@@ -489,11 +499,13 @@ class PRXModuleInfo:
         m.attributes = rd.u16(offset)
         m.version = (rd.u8(offset + 2), rd.u8(offset + 3))
         m.name = rd.cstring(offset + 4, 28)
+        # PS3 user PRX module_info uses 32-bit pointers (PPU32 prx_module_info_t):
+        #   off 0x20 gp(toc), 0x24 ent_top, 0x28 ent_end, 0x2C stub_top, 0x30 stub_end.
         m.toc = rd.u32(offset + 32)
-        m.exports_start = rd.u64(offset + 36)
-        m.exports_end = rd.u64(offset + 44)
-        m.imports_start = rd.u64(offset + 52)
-        m.imports_end = rd.u64(offset + 60)
+        m.exports_start = rd.u32(offset + 36)
+        m.exports_end = rd.u32(offset + 40)
+        m.imports_start = rd.u32(offset + 44)
+        m.imports_end = rd.u32(offset + 48)
         return m
 
     def to_dict(self) -> dict:
@@ -529,6 +541,7 @@ class PRXExportEntry:
         self.stub_table_ptr = 0
         self.name_str = ""
         self.nids: list[int] = []
+        self.addrs: list[int] = []   # stub-table entry per NID (OPD vaddr for funcs)
 
     @classmethod
     def parse(cls, data: bytes, offset: int, big_endian: bool = True) -> "PRXExportEntry":
@@ -574,6 +587,7 @@ class PRXImportEntry:
         self.stub_table_ptr = 0
         self.name_str = ""
         self.nids: list[int] = []
+        self.addrs: list[int] = []   # stub-table entry per NID (OPD vaddr for funcs)
 
     @classmethod
     def parse(cls, data: bytes, offset: int, big_endian: bool = True) -> "PRXImportEntry":
@@ -651,9 +665,13 @@ class ELFFile:
         self._parse_section_headers()
         self._resolve_section_names()
 
-        # If this is a PRX, parse module info
+        # If this is a PRX, parse module info. If it is a fixed main
+        # executable (EBOOT), locate its import/export tables via the
+        # PT_PROC_PRX_PARAM segment instead.
         if self.elf_header.e_type == ET_SCE_PPURELEXEC:
             self._parse_prx_module_info()
+        else:
+            self._parse_proc_prx_param()
 
         self._parse_relocations()
 
@@ -699,8 +717,10 @@ class ELFFile:
         """Extract module info from the first PT_LOAD segment of a PRX."""
         for ph in self.program_headers:
             if ph.p_type == PT_LOAD and ph.p_filesz > 0:
-                # module info is at paddr offset within the segment for PRX
-                info_off = int(ph.p_offset + (ph.p_paddr & 0xFFFFFFFF))
+                # For SCE PRX, the first PT_LOAD's p_paddr holds the module_info
+                # as an absolute FILE offset (== module_info vaddr + p_offset),
+                # not a segment-relative vaddr. Use it directly.
+                info_off = int(ph.p_paddr & 0xFFFFFFFF)
                 if info_off + PRXModuleInfo.SIZE <= len(self.raw_data):
                     try:
                         self.module_info = PRXModuleInfo.parse(
@@ -710,6 +730,44 @@ class ELFFile:
                     except Exception:
                         pass
                 break
+
+    def _parse_proc_prx_param(self) -> None:
+        """Locate import/export tables for a fixed main executable (ET_EXEC).
+
+        A main EBOOT does not carry a PRX module_info at the head of its first
+        segment. Instead a PT_PROC_PRX_PARAM (0x60000002) program header points
+        at a sys_proc_prx_param structure:
+
+            u32 size;
+            u32 magic;         // 0x1B434CEC
+            u32 version;
+            u32 unk0;
+            u32 libentstart;   // exports (lib entry) table start vaddr
+            u32 libentend;     // exports table end vaddr
+            u32 libstubstart;  // imports (lib stub) table start vaddr
+            u32 libstubend;    // imports table end vaddr
+
+        We reuse PRXModuleInfo purely as a carrier for the four table pointers
+        and then run the shared export/import table walker.
+        """
+        rd = self._rd()
+        for ph in self.program_headers:
+            if ph.p_type != PT_PROC_PRX_PARAM or ph.p_filesz < 0x20:
+                continue
+            off = int(ph.p_offset)
+            if off + 0x20 > len(self.raw_data):
+                continue
+            if rd.u32(off + 4) != PROC_PRX_PARAM_MAGIC:
+                continue
+
+            mi = PRXModuleInfo()
+            mi.exports_start = rd.u32(off + 16)
+            mi.exports_end = rd.u32(off + 20)
+            mi.imports_start = rd.u32(off + 24)
+            mi.imports_end = rd.u32(off + 28)
+            self.module_info = mi
+            self._parse_exports_imports()
+            return
 
     def _parse_exports_imports(self) -> None:
         mi = self.module_info
@@ -733,10 +791,13 @@ class ELFFile:
                     total = entry.num_funcs + entry.num_vars + entry.num_tlsvars
                     if entry.nid_table_ptr and total > 0:
                         nid_off = vaddr_to_offset(self.program_headers, entry.nid_table_ptr)
+                        stub_off = vaddr_to_offset(self.program_headers, entry.stub_table_ptr)
                         if nid_off is not None:
                             for j in range(total):
                                 if nid_off + j * 4 + 4 <= len(self.raw_data):
                                     entry.nids.append(rd.u32(nid_off + j * 4))
+                                if stub_off is not None and stub_off + j * 4 + 4 <= len(self.raw_data):
+                                    entry.addrs.append(rd.u32(stub_off + j * 4))
                     self.exports.append(entry)
                     off += entry.size
 
@@ -756,10 +817,13 @@ class ELFFile:
                     total = entry.num_funcs + entry.num_vars + entry.num_tlsvars
                     if entry.nid_table_ptr and total > 0:
                         nid_off = vaddr_to_offset(self.program_headers, entry.nid_table_ptr)
+                        stub_off = vaddr_to_offset(self.program_headers, entry.stub_table_ptr)
                         if nid_off is not None:
                             for j in range(total):
                                 if nid_off + j * 4 + 4 <= len(self.raw_data):
                                     entry.nids.append(rd.u32(nid_off + j * 4))
+                                if stub_off is not None and stub_off + j * 4 + 4 <= len(self.raw_data):
+                                    entry.addrs.append(rd.u32(stub_off + j * 4))
                     self.imports.append(entry)
                     off += entry.size
 

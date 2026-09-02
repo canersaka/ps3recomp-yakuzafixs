@@ -5,6 +5,9 @@
 #include "sys_cond.h"
 #include "../memory/vm.h"
 #include <string.h>
+#include <stdlib.h>
+/* RtlCaptureStackBackTrace + GetModuleHandleA come from <windows.h> (pulled in
+ * by sys_cond.h for CRITICAL_SECTION) -- do not redeclare them. */
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -57,6 +60,12 @@ static void write_be32(uint32_t addr, uint32_t val)
  * r4 = mutex_id to associate with
  * r5 = pointer to attribute struct
  * -----------------------------------------------------------------------*/
+/* Guest address the cond id was written to, per id. A guest sync object
+ * usually embeds {flag, mutex, cond, count}, so the cond id lives at a known
+ * offset inside it and this recovers the object address -- enough to watch the
+ * counter a waiter is blocked on. */
+uint32_t g_cond_id_addr[SYS_COND_MAX + 1];
+
 int64_t sys_cond_create(ppu_context* ctx)
 {
     uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
@@ -64,10 +73,12 @@ int64_t sys_cond_create(ppu_context* ctx)
     uint32_t attr_addr   = LV2_ARG_PTR(ctx, 2);
 
     /* Validate the associated mutex */
-    if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-    if (!g_sys_mutexes[mutex_id - 1].active)
-        return (int64_t)(int32_t)CELL_ESRCH;
+    if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX) {
+        if(getenv("YDKJ_SYNCLOG")) fprintf(stderr,"[SYNC] sys_cond_create FAIL: mutex_id=%u out of range -> ESRCH (cond var not created -> worker will spin on null)\n",mutex_id);
+        return (int64_t)(int32_t)CELL_ESRCH; }
+    if (!g_sys_mutexes[mutex_id - 1].active) {
+        if(getenv("YDKJ_SYNCLOG")) fprintf(stderr,"[SYNC] sys_cond_create FAIL: mutex_id=%u INACTIVE -> ESRCH (cond var not created -> worker spins on null)\n",mutex_id);
+        return (int64_t)(int32_t)CELL_ESRCH; }
 
     cond_table_lock();
 
@@ -101,6 +112,7 @@ int64_t sys_cond_create(ppu_context* ctx)
     uint32_t cond_id = (uint32_t)(slot + 1);
     if (id_out_addr != 0) {
         write_be32(id_out_addr, cond_id);
+        if ((uint32_t)(slot + 1) <= SYS_COND_MAX) g_cond_id_addr[slot + 1] = id_out_addr;
     }
 
     cond_table_unlock();
@@ -147,6 +159,34 @@ int64_t sys_cond_wait(ppu_context* ctx)
 {
     uint32_t cond_id    = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
+    { static int s_ow = -1; if (s_ow < 0) s_ow = getenv("PS3_COND_OBJ") ? 1 : 0;
+      if (s_ow && cond_id <= SYS_COND_MAX && g_cond_id_addr[cond_id]) {
+          uint32_t obj = g_cond_id_addr[cond_id] - 8;   /* {flag,mutex,cond,count} */
+          extern uint8_t* vm_base;
+          static int _n = 0;
+          if (_n++ < 12 && vm_base) {
+              const uint8_t* o = vm_base + obj;
+              fprintf(stderr, "[cond-obj] cond=%u obj=0x%08X:", cond_id, obj);
+              for (int k = 0; k < 16; k++) fprintf(stderr, " %02X", o[k]);
+              fputc(10, stderr);
+          } } }
+    fprintf(stderr, "[WAIT] cond_wait(cond=%u timeout=%llu) tid=%llu lr=0x%08X\n", cond_id, (unsigned long long)timeout_us,
+            (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
+    /* YDKJ_THREADGATE: creating thread is blocking -> let gated workers run. */
+    { extern void ydkj_release_pending_threads(void); ydkj_release_pending_threads(); }
+#ifdef _WIN32
+    if (cond_id == 7) {
+        static int _n = 0;
+        if (_n++ < 1) {
+            void* bt[24]; unsigned short fr = RtlCaptureStackBackTrace(0, 24, bt, 0);
+            char* mb = (char*)GetModuleHandleA(0);
+            char line[640]; int p = snprintf(line, sizeof line, "[cond7-bt] fr=%u rva:", (unsigned)fr);
+            for (int i = 0; i < fr; i++)
+                p += snprintf(line+p, sizeof(line)-p, " %llX", (unsigned long long)((char*)bt[i]-mb));
+            fprintf(stderr, "%s\n", line); fflush(stderr);
+        }
+    }
+#endif
 
     if (cond_id == 0 || cond_id > SYS_COND_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -175,6 +215,11 @@ int64_t sys_cond_wait(ppu_context* ctx)
 #ifdef _WIN32
     DWORD ms = (timeout_us == 0) ? INFINITE : (DWORD)(timeout_us / 1000);
     if (ms == 0 && timeout_us > 0) ms = 1;
+    /* FLOW_CONDKICK (SPU-bring-up diagnostic): cond=7 is waited on but never
+     * signaled (its signaler is blocked on the dead SPU pipeline). Cap infinite
+     * waits and return CELL_OK so the engine can advance past spurious waits. */
+    static int s_kick = -1; if (s_kick < 0) s_kick = getenv("FLOW_CONDKICK") ? 1 : 0;
+    if (s_kick && ms == INFINITE) ms = 1500;
 
     BOOL ok = SleepConditionVariableCS(&c->cv, &m->cs, ms);
 
@@ -183,6 +228,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
     m->lock_count = saved_count;
 
     if (!ok && GetLastError() == ERROR_TIMEOUT) {
+        if (s_kick) return CELL_OK;   /* pretend signaled so the guest re-checks/proceeds */
         return (int64_t)(int32_t)CELL_ETIMEDOUT;
     }
 #else
@@ -225,6 +271,8 @@ int64_t sys_cond_wait(ppu_context* ctx)
 int64_t sys_cond_signal(ppu_context* ctx)
 {
     uint32_t cond_id = LV2_ARG_U32(ctx, 0);
+    { static int n=0; if(n++<80) fprintf(stderr,"[SIGNAL] cond_signal(cond=%u) tid=%llu lr=0x%08X\n", cond_id,
+            (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr); }
 
     if (cond_id == 0 || cond_id > SYS_COND_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -250,6 +298,7 @@ int64_t sys_cond_signal(ppu_context* ctx)
 int64_t sys_cond_signal_all(ppu_context* ctx)
 {
     uint32_t cond_id = LV2_ARG_U32(ctx, 0);
+    { static int n=0; if(n++<40) fprintf(stderr,"[SIGNAL] cond_signal_all(cond=%u)\n", cond_id); }
 
     if (cond_id == 0 || cond_id > SYS_COND_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;

@@ -5,9 +5,12 @@
  */
 
 #include "cellGame.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32 (guest mem) */
+#include "ps3emu/guest_call.h"              /* g_ps3_guest_caller (funcStat dispatch) */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <sys/stat.h>
 
 #ifdef _WIN32
@@ -30,6 +33,8 @@
 
 static char s_title_id[64]  = "BLES00000";
 static char s_title[256]    = "Unknown Title";
+static char s_version[16]   = "01.00";
+static char s_system_ver[16] = "00.0000";
 static char s_app_ver[16]   = "01.00";
 
 /* Content info / usrdir paths */
@@ -41,6 +46,15 @@ static char s_exit_param[256] = "";
 
 static int  s_boot_checked = 0;
 static u32  s_game_type = CELL_GAME_GAMETYPE_DISC;
+
+/* Current content-check session. BootCheck/DataCheck open a session naming
+ * some content; ContentPermit reports THAT content's paths and closes it.
+ * Disc sessions must yield /dev_bdvd/PS3_GAME -- always returning the
+ * game-data dir sent LBP hunting for data.farc on /dev_hdd0 (ENOENT), so
+ * every resource load failed and the loader stalled polling its completion
+ * semaphore forever. */
+static int  s_check_is_disc = 1;
+static char s_check_dir[64] = "";
 
 static void ensure_dirs(const char* path)
 {
@@ -100,6 +114,97 @@ void cellGame_set_content_path(const char* path)
  * API implementations
  * -----------------------------------------------------------------------*/
 
+/* ---------------------------------------------------------------------------
+ * PARAM.SFO -> title id (2026-06-21): the ROBUST fix for title-id paths.
+ *
+ * Root cause of the /dev_hdd0/game/BLES00000 bug: s_title_id was a hardcoded
+ * placeholder and cellGame_set_title_id() was never called, so EVERY title-id
+ * path (cellGameContentPermit/BootCheck/DataCheck/web + cellDiscGameGetBootDiscInfo)
+ * used the wrong id. Fix: read the real id from the game's PARAM.SFO once at boot
+ * (main.cpp -> cellGame_init_from_paramsfo) so it's correct for ANY title.
+ *
+ * SFO format is LITTLE-ENDIAN: header @0 (magic "\0PSF", key_table@0x08,
+ * data_table@0x0C, entries@0x10), then entries[0x10 each]: key_off(u16)@0,
+ * fmt(u16)@2, data_len(u32)@4, data_max(u32)@8, data_off(u32)@0xC.
+ * -----------------------------------------------------------------------*/
+static int sfo_read_string(const char* sfo_path, const char* key,
+                           char* out, int out_size)
+{
+    FILE* fp = fopen(sfo_path, "rb");
+    if (!fp) return -1;
+    fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
+    if (sz < 0x14 || sz > (1 << 20)) { fclose(fp); return -1; }
+    unsigned char* d = (unsigned char*)malloc((size_t)sz);
+    if (!d) { fclose(fp); return -1; }
+    int ok = (fread(d, 1, (size_t)sz, fp) == (size_t)sz);
+    fclose(fp);
+    if (!ok) { free(d); return -1; }
+
+    int ret = -1;
+    if (d[0]==0x00 && d[1]==0x50 && d[2]==0x53 && d[3]==0x46) {  /* "\0PSF" */
+        #define SFO_RD32(o) ((u32)d[o] | ((u32)d[(o)+1]<<8) | ((u32)d[(o)+2]<<16) | ((u32)d[(o)+3]<<24))
+        #define SFO_RD16(o) ((u16)d[o] | ((u16)d[(o)+1]<<8))
+        u32 key_tab  = SFO_RD32(0x08);
+        u32 data_tab = SFO_RD32(0x0C);
+        u32 n        = SFO_RD32(0x10);
+        for (u32 i = 0; i < n; i++) {
+            u32 e = 0x14 + i * 0x10;
+            if (e + 0x10 > (u32)sz) break;
+            u32 key_off  = SFO_RD16(e + 0x00);
+            u32 data_len = SFO_RD32(e + 0x04);
+            u32 data_off = SFO_RD32(e + 0x0C);
+            if (key_tab + key_off >= (u32)sz) continue;
+            if (strcmp((const char*)(d + key_tab + key_off), key) != 0) continue;
+            u32 src = data_tab + data_off;
+            if (src >= (u32)sz) break;
+            int copy = (int)data_len;
+            if (copy > (int)((u32)sz - src)) copy = (int)((u32)sz - src);
+            if (copy >= out_size) copy = out_size - 1;
+            if (copy < 0) copy = 0;
+            memcpy(out, d + src, (size_t)copy);
+            out[copy] = '\0';
+            ret = 0;
+            break;
+        }
+        #undef SFO_RD32
+        #undef SFO_RD16
+    }
+    free(d);
+    return ret;
+}
+
+/* Read title/version fields from the game's PARAM.SFO at boot. Call once
+ * from main.cpp before the guest runs. Falls back to the defaults if the SFO
+ * can't be read (keeps the game working without it). */
+void cellGame_init_from_paramsfo(const char* sfo_path)
+{
+    char tmp[256];
+    if (sfo_read_string(sfo_path, "TITLE_ID", tmp, sizeof(tmp)) == 0 && tmp[0]) {
+        strncpy(s_title_id, tmp, sizeof(s_title_id) - 1);
+        s_title_id[sizeof(s_title_id) - 1] = '\0';
+        printf("[cellGame] title id from PARAM.SFO ('%s'): '%s'\n", sfo_path, s_title_id);
+    } else {
+        printf("[cellGame] PARAM.SFO not read ('%s'); keeping title id '%s'\n",
+               sfo_path, s_title_id);
+    }
+    if (sfo_read_string(sfo_path, "TITLE", tmp, sizeof(tmp)) == 0 && tmp[0]) {
+        strncpy(s_title, tmp, sizeof(s_title) - 1); s_title[sizeof(s_title) - 1] = '\0';
+    }
+    if (sfo_read_string(sfo_path, "VERSION", tmp, sizeof(tmp)) == 0 && tmp[0]) {
+        strncpy(s_version, tmp, sizeof(s_version) - 1); s_version[sizeof(s_version) - 1] = '\0';
+    }
+    if (sfo_read_string(sfo_path, "PS3_SYSTEM_VER", tmp, sizeof(tmp)) == 0 && tmp[0]) {
+        strncpy(s_system_ver, tmp, sizeof(s_system_ver) - 1);
+        s_system_ver[sizeof(s_system_ver) - 1] = '\0';
+    }
+    if (sfo_read_string(sfo_path, "APP_VER", tmp, sizeof(tmp)) == 0 && tmp[0]) {
+        strncpy(s_app_ver, tmp, sizeof(s_app_ver) - 1); s_app_ver[sizeof(s_app_ver) - 1] = '\0';
+    }
+}
+
+/* Central title-id accessor so other modules (cellSysutil etc.) don't hardcode it. */
+const char* cellGame_get_title_id(void) { return s_title_id; }
+
 s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
                        char* dirName)
 {
@@ -119,45 +224,81 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
     for (char* p = s_tmp_path; *p; p++) if (*p == '/') *p = '\\';
 #endif
 
-    if (type)
-        *type = s_game_type;
+    /* The HLE bridge passes the GUEST addresses of these out-params (the PPC
+     * r3-r6 values), not host pointers. Translate through vm_base and write
+     * big-endian via vm_write32 -- dereferencing them directly would fault on
+     * the guest stack address (e.g. 0x0FEFFB60). */
+    uint32_t type_ea = (uint32_t)(uintptr_t)type;
+    uint32_t attr_ea = (uint32_t)(uintptr_t)attributes;
+    uint32_t size_ea = (uint32_t)(uintptr_t)size;
+    uint32_t dir_ea  = (uint32_t)(uintptr_t)dirName;
 
-    if (attributes)
-        *attributes = 0;
+    if (type_ea) vm_write32(type_ea, (uint32_t)s_game_type);
+    if (attr_ea) vm_write32(attr_ea, 0);
 
-    if (size) {
-        size->hddFreeSizeKB = 1024 * 1024; /* 1GB free */
-        size->sizeKB = CELL_GAME_SIZEKB_NOTCALC;
-        size->sysSizeKB = 0;
+    if (size_ea) {
+        vm_write32(size_ea + 0, 1024 * 1024);                 /* hddFreeSizeKB = 1 GB */
+        vm_write32(size_ea + 4, (uint32_t)CELL_GAME_SIZEKB_NOTCALC);
+        vm_write32(size_ea + 8, 0);                           /* sysSizeKB */
     }
 
-    if (dirName) {
-        strncpy(dirName, s_title_id, CELL_GAME_PATH_MAX - 1);
-        dirName[CELL_GAME_PATH_MAX - 1] = '\0';
+    if (dir_ea) {
+        size_t len = strlen(s_title_id);
+        if (len > CELL_GAME_DIRNAME_SIZE - 1) len = CELL_GAME_DIRNAME_SIZE - 1;
+        memcpy(vm_base + dir_ea, s_title_id, len);
+        vm_base[dir_ea + len] = '\0';
     }
 
     s_boot_checked = 1;
+    /* Open a check session for the BOOT content (disc titles boot from
+     * /dev_bdvd, not from the game-data dir). */
+    s_check_is_disc = (s_game_type == CELL_GAME_GAMETYPE_DISC);
+    strncpy(s_check_dir, s_title_id, sizeof(s_check_dir) - 1);
+    s_check_dir[sizeof(s_check_dir) - 1] = '\0';
     printf("[cellGame] BootCheck: type=%u, titleId='%s'\n", s_game_type, s_title_id);
     return CELL_OK;
 }
 
 s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath)
 {
-    printf("[cellGame] ContentPermit()\n");
+    printf("[cellGame] ContentPermit() -> %s\n",
+           s_check_is_disc ? "/dev_bdvd/PS3_GAME" : "game-data dir");
 
-    /* Ensure directories exist */
-    ensure_dirs(s_content_info_path);
-    ensure_dirs(s_usrdir_path);
-
-    if (contentInfoPath) {
-        /* Return PS3-style path */
-        snprintf(contentInfoPath, CELL_GAME_PATH_MAX,
-                 "/dev_hdd0/game/%s", s_title_id);
+    if (!s_check_is_disc) {
+        /* Ensure directories exist. IMPORTANT: also create them at the SAME host
+         * location the VFS (ppu_fs.cpp host_path) maps /dev_hdd0/game/<title>/ to,
+         * i.e. $ppu_vfs_root/game/<title>/. cellGame historically only created
+         * ./gamedata/dev_hdd0/game/... which cellFs never looks at, so a game that
+         * polls cellFsStat for its game-data USRDIR (LBP's boot bringup stage) stalls
+         * forever and exits. Create it where cellFs will actually find it. */
+        ensure_dirs(s_content_info_path);
+        ensure_dirs(s_usrdir_path);
+        {
+            extern const char* ppu_vfs_root;
+            char vpath[CELL_GAME_PATH_MAX];
+            snprintf(vpath, sizeof vpath, "%s/game/%s/USRDIR", ppu_vfs_root, s_check_dir);
+            ensure_dirs(vpath);
+        }
     }
 
-    if (usrdirPath) {
-        snprintf(usrdirPath, CELL_GAME_PATH_MAX,
-                 "/dev_hdd0/game/%s/USRDIR", s_title_id);
+    /* Both paths are GUEST addresses; format into a host temp, copy into the
+     * guest buffer through vm_base (a raw snprintf to the guest addr faults).
+     * The paths must match the content the current session checked: the disc
+     * for BootCheck/DataCheck(DISC), the game-data dir otherwise. */
+    char tmp[CELL_GAME_PATH_MAX];
+    uint32_t cip_ea = (uint32_t)(uintptr_t)contentInfoPath;
+    uint32_t usr_ea = (uint32_t)(uintptr_t)usrdirPath;
+    if (cip_ea) {
+        int n = s_check_is_disc
+              ? snprintf(tmp, sizeof tmp, "/dev_bdvd/PS3_GAME")
+              : snprintf(tmp, sizeof tmp, "/dev_hdd0/game/%s", s_check_dir);
+        memcpy(vm_base + cip_ea, tmp, (size_t)n + 1);
+    }
+    if (usr_ea) {
+        int n = s_check_is_disc
+              ? snprintf(tmp, sizeof tmp, "/dev_bdvd/PS3_GAME/USRDIR")
+              : snprintf(tmp, sizeof tmp, "/dev_hdd0/game/%s/USRDIR", s_check_dir);
+        memcpy(vm_base + usr_ea, tmp, (size_t)n + 1);
     }
 
     return CELL_OK;
@@ -165,51 +306,131 @@ s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath)
 
 s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
 {
-    printf("[cellGame] DataCheck(type=%u, dir='%s')\n",
-           type, dirName ? dirName : "<null>");
+    /* dirName is a GUEST address -- translate BEFORE any use. The old code
+     * printf'd the raw EA as a host char* and crashed (LBP: read fault at
+     * 0x94AEA0 = the guest EA of its dir string). */
+    uint32_t dir_ea = (uint32_t)(uintptr_t)dirName;   /* guest addr */
+    const char* check_dir = dir_ea ? (const char*)(vm_base + dir_ea) : s_title_id;
+    printf("[cellGame] DataCheck(type=%u, dir='%s')\n", type, check_dir);
 
-    const char* check_dir = dirName ? dirName : s_title_id;
+    /* Open a check session for this content; the next ContentPermit reports
+     * its paths (disc -> /dev_bdvd/PS3_GAME, else the game-data dir). */
+    s_check_is_disc = (type == CELL_GAME_GAMETYPE_DISC);
+    strncpy(s_check_dir, check_dir, sizeof(s_check_dir) - 1);
+    s_check_dir[sizeof(s_check_dir) - 1] = '\0';
+
     char path[CELL_GAME_PATH_MAX];
     snprintf(path, sizeof(path), "%s/%s", s_content_path, check_dir);
 
-    if (size) {
-        size->hddFreeSizeKB = 1024 * 1024;
-        size->sizeKB = CELL_GAME_SIZEKB_NOTCALC;
-        size->sysSizeKB = 0;
+    uint32_t size_ea = (uint32_t)(uintptr_t)size;
+    if (size_ea) {
+        vm_write32(size_ea + 0, 1024 * 1024);
+        vm_write32(size_ea + 4, (uint32_t)CELL_GAME_SIZEKB_NOTCALC);
+        vm_write32(size_ea + 8, 0);
     }
+
+    /* Disc-content check (type 1 = CELL_GAME_GAMETYPE_DISC): the disc is
+     * inherently present (mounted via the VFS root); a NOTFOUND here makes
+     * disc titles bail out of boot. */
+    if (type == 1)
+        return CELL_OK;
 
     if (dir_exists(path)) {
         return CELL_OK;
     }
 
-    return CELL_GAME_ERROR_NOTFOUND;
+    /* Missing game-data dir is NOT an error: firmware (and RPCS3) return
+     * CELL_GAME_RET_NONE (2) so the title knows to cellGameCreateGameData.
+     * Returning ERROR_NOTFOUND here made LBP treat first boot as fatal and
+     * exit(0) politely. sizeKB must read 0 (not NOTCALC) for the no-data case. */
+    if (size_ea)
+        vm_write32(size_ea + 4, 0);   /* sizeKB = 0 (no data yet) */
+    return CELL_GAME_RET_NONE;
+}
+
+/* cellGameDataCheckCreate2 (NID 0xC9645C41) -- check/prepare game data, invoking the
+ * title's funcStat callback (CellGameDataStatCallback) exactly like firmware so the
+ * save/boot state machine advances. Struct layout + behavior cross-referenced against
+ * RPCS3 cellGame.cpp. Demon's Souls's DsSaveLoadMan thread calls this; without the
+ * callback firing, its game-data check never completes, the sema/SLSession chain
+ * stalls, and the cellSaveDataAutoLoad2 (auto-save notice) dialog never appears.
+ *
+ * funcStat(cbResult, get, set): the title reads `get` (isNewData, free space, params)
+ * and writes cbResult->result. We report existing data (isNewData=0) + ample space;
+ * DeS's callback returns CELL_GAMEDATA_CBRESULT_OK_CANCEL (check-only) -> CELL_OK. */
+#define GAMEDATA_CB_BASE   0x02520000u   /* guest scratch (distinct from savedata's) */
+#define CELL_GAMEDATA_CBRESULT_OK_CANCEL  1
+#define CELL_GAMEDATA_CBRESULT_OK         0
+
+s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
+                             void* funcStat, u32 container)
+{
+    (void)errDialog; (void)container;
+    uint32_t dir_ea  = (uint32_t)(uintptr_t)dirName;
+    uint32_t func_opd = (uint32_t)(uintptr_t)funcStat;
+    const char* dir = dir_ea ? (const char*)(vm_base + dir_ea) : "";
+    printf("[cellGame] DataCheckCreate2(version=%u dir='%s' errDialog=%u funcStat=0x%08X)\n",
+           version, dir, errDialog, func_opd);
+
+    if (version != 0 || !dir_ea || !func_opd)
+        return CELL_GAME_ERROR_PARAM;
+    if (!g_ps3_guest_caller)
+        return CELL_OK;
+
+    /* Guest scratch for the 3 callback structs: CBResult(0x18)/StatGet(0xBE8)/StatSet(0x0C). */
+    uint32_t cb  = GAMEDATA_CB_BASE;
+    uint32_t get = cb + 0x20;
+    uint32_t set = get + 0xC00;
+    memset(vm_base + cb, 0, (set + 0x20) - cb);
+
+    /* CellGameDataStatGet (offsets per SDK, RPCS3-verified). */
+    vm_write32(get + 0x000, 40u * 1024u * 1024u - 256u);  /* hddFreeSizeKB (~40 GB) */
+    vm_write32(get + 0x004, 0);                            /* isNewData = 0 (data exists) */
+    snprintf((char*)(vm_base + get + 0x008), 96, "/dev_hdd0/game/%s", dir);          /* contentInfoPath */
+    snprintf((char*)(vm_base + get + 0x427), 96, "/dev_hdd0/game/%s/USRDIR", dir);   /* gameDataPath */
+    vm_write32(get + 0xB9C, 0xFFFFFFFFu);                  /* sizeKB = NOTCALC (-1) */
+    vm_write32(get + 0xBA0, 0);                            /* sysSizeKB */
+    /* getParam (CellGameDataSystemFileParam @0x860): title / titleId / dataVersion / attribute. */
+    uint32_t gp = get + 0x860;
+    snprintf((char*)(vm_base + gp + 0x000), 128, "%s", s_title);
+    snprintf((char*)(vm_base + gp + 0xA80), 10,  "%s", dir);        /* titleId = dir (e.g. BLUS30443) */
+    snprintf((char*)(vm_base + gp + 0xA8C), 6,   "%s", s_app_ver);  /* dataVersion */
+    vm_write32(gp + 0xA98, 0);                                      /* attribute = CELL_GAMEDATA_ATTR_NORMAL */
+
+    /* StatSet left zeroed (setParam = NULL: callback chooses whether to modify). */
+
+    g_ps3_guest_caller(func_opd, cb, get, set, 0, 0, 0, 0, 0);
+
+    s32 result = (s32)vm_read32(cb + 0x000);
+    printf("[cellGame] DataCheckCreate2: funcStat returned result=%d\n", result);
+    if (result < 0)
+        return CELL_GAME_ERROR_PARAM;   /* callback reported an error */
+    /* OK / OK_CANCEL: succeed (our HLE doesn't create/modify the on-disk data). */
+    return CELL_OK;
 }
 
 s32 cellGameGetParamInt(s32 id, s32* value)
 {
     printf("[cellGame] GetParamInt(id=%d)\n", id);
 
-    if (!value)
+    /* `value` is a GUEST address; write big-endian via vm_write32. */
+    uint32_t value_ea = (uint32_t)(uintptr_t)value;
+    if (!value_ea)
         return CELL_GAME_ERROR_PARAM;
 
+    uint32_t v = 0;
     switch (id) {
     case CELL_GAME_PARAMID_PARENTAL_LEVEL:
-        *value = 0;
-        break;
     case CELL_GAME_PARAMID_RESOLUTION:
-        *value = 0;
-        break;
     case CELL_GAME_PARAMID_SOUND_FORMAT:
-        *value = 0;
-        break;
-    case CELL_GAME_PARAMID_APP_VER:
-        *value = 100; /* 1.00 as integer */
+        v = 0;
         break;
     default:
         printf("[cellGame] WARNING: unknown param int id %d\n", id);
-        *value = 0;
+        v = 0;
         break;
     }
+    vm_write32(value_ea, v);
 
     return CELL_OK;
 }
@@ -218,39 +439,60 @@ s32 cellGameGetParamString(s32 id, char* buf, u32 bufsize)
 {
     printf("[cellGame] GetParamString(id=%d, bufsize=%u)\n", id, bufsize);
 
-    if (!buf || bufsize == 0)
+    /* `buf` is a GUEST address (raw r4); translate through vm_base. Strings are
+     * byte data, so no byte-swap -- just write into the guest buffer. A raw
+     * strncpy(buf, ...) faulted on the guest stack address. */
+    uint32_t buf_ea = (uint32_t)(uintptr_t)buf;
+    if (!buf_ea || bufsize == 0)
         return CELL_GAME_ERROR_PARAM;
+    char* hbuf = (char*)(vm_base + buf_ea);
 
-    switch (id) {
-    case CELL_GAME_PARAMID_TITLE:
-    case CELL_GAME_PARAMID_TITLE_DEFAULT:
-        strncpy(buf, s_title, bufsize - 1);
-        buf[bufsize - 1] = '\0';
-        break;
-    case CELL_GAME_PARAMID_TITLE_ID:
-        strncpy(buf, s_title_id, bufsize - 1);
-        buf[bufsize - 1] = '\0';
-        break;
-    case CELL_GAME_PARAMID_APP_VER_STR:
-    case CELL_GAME_PARAMID_VERSION:
-        strncpy(buf, s_app_ver, bufsize - 1);
-        buf[bufsize - 1] = '\0';
-        break;
-    default:
-        printf("[cellGame] WARNING: unknown param string id %d\n", id);
-        buf[0] = '\0';
-        break;
+    const char* src;
+    if (id >= CELL_GAME_PARAMID_TITLE && id <= CELL_GAME_PARAMID_TITLE_TURKISH) {
+        /* Localized TITLE_## fields are not tracked separately yet. */
+        src = s_title;
+    } else {
+        switch (id) {
+        case CELL_GAME_PARAMID_TITLE_ID:       src = s_title_id;   break;
+        case CELL_GAME_PARAMID_VERSION:        src = s_version;    break;
+        case CELL_GAME_PARAMID_PS3_SYSTEM_VER: src = s_system_ver; break;
+        case CELL_GAME_PARAMID_APP_VER:        src = s_app_ver;    break;
+        default:
+            printf("[cellGame] WARNING: unknown param string id %d\n", id);
+            src = "";
+            break;
+        }
     }
-
+    strncpy(hbuf, src, bufsize - 1);
+    hbuf[bufsize - 1] = '\0';
     return CELL_OK;
 }
 
-s32 cellGameCreateGameData(CellGameContentSize* size, char* dirName)
+s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPath,
+                            char* tmp_usrdirPath)
 {
     printf("[cellGame] CreateGameData()\n");
 
+    uint32_t init_ea = (uint32_t)(uintptr_t)init;   /* guest addrs */
+    if (!init_ea)
+        return CELL_GAME_ERROR_PARAM;
+
+    /* Create the directory the title ASKED for, not s_title_id.
+     *
+     * The install handshake is: cellGameDataCheck(type=GAMEDATA, dirName) ->
+     * CELL_GAME_RET_NONE ("no data yet") -> the title calls
+     * cellGameCreateGameData -> it checks again and expects to find it. This
+     * created <content>/s_title_id instead, and s_title_id is the placeholder
+     * "BLES00000" unless a PARAM.SFO set it -- so DataCheck kept looking for
+     * <content>/NPUA80523, never found it, and Tokyo Jungle's installer span
+     * DataCheck/CreateGameData forever.
+     *
+     * s_check_dir is the dirName from the check session that immediately
+     * precedes this call, which is exactly what firmware creates. */
+    const char* create_dir = s_check_dir[0] ? s_check_dir : s_title_id;
+
     char path[CELL_GAME_PATH_MAX];
-    snprintf(path, sizeof(path), "%s/%s", s_content_path, s_title_id);
+    snprintf(path, sizeof(path), "%s/%s", s_content_path, create_dir);
 
     ensure_dirs(path);
 
@@ -259,15 +501,19 @@ s32 cellGameCreateGameData(CellGameContentSize* size, char* dirName)
     snprintf(usrdir, sizeof(usrdir), "%s/USRDIR", path);
     ensure_dirs(usrdir);
 
-    if (dirName) {
-        strncpy(dirName, s_title_id, CELL_GAME_PATH_MAX - 1);
-        dirName[CELL_GAME_PATH_MAX - 1] = '\0';
+    uint32_t cip_ea = (uint32_t)(uintptr_t)tmp_contentInfoPath;
+    uint32_t usr_ea = (uint32_t)(uintptr_t)tmp_usrdirPath;
+    if (cip_ea) {
+        size_t len = strlen(path);
+        if (len > CELL_GAME_PATH_MAX - 1) len = CELL_GAME_PATH_MAX - 1;
+        memcpy(vm_base + cip_ea, path, len);
+        vm_base[cip_ea + len] = '\0';
     }
-
-    if (size) {
-        size->hddFreeSizeKB = 1024 * 1024;
-        size->sizeKB = 0;
-        size->sysSizeKB = 0;
+    if (usr_ea) {
+        size_t len = strlen(usrdir);
+        if (len > CELL_GAME_PATH_MAX - 1) len = CELL_GAME_PATH_MAX - 1;
+        memcpy(vm_base + usr_ea, usrdir, len);
+        vm_base[usr_ea + len] = '\0';
     }
 
     return CELL_OK;
@@ -293,12 +539,12 @@ s32 cellGameGetSizeKB(s32* sizeKB)
 {
     printf("[cellGame] GetSizeKB()\n");
 
-    if (!sizeKB)
+    uint32_t sizeKB_ea = (uint32_t)(uintptr_t)sizeKB;
+    if (!sizeKB_ea)
         return CELL_GAME_ERROR_PARAM;
 
-    /* Report the content directory's size.
-       For now, estimate or return 0. */
-    *sizeKB = 0;
+    /* Report the content directory's size (guest addr; 0 for now). */
+    vm_write32(sizeKB_ea, 0);
     return CELL_OK;
 }
 
@@ -309,7 +555,7 @@ s32 cellGameGetLocalWebContentPath(char* path)
     if (!path)
         return CELL_GAME_ERROR_PARAM;
 
-    snprintf(path, CELL_GAME_PATH_MAX,
+    snprintf(GUEST_PTR(path, char*), CELL_GAME_PATH_MAX,
              "/dev_hdd0/game/%s/USRDIR/web", s_title_id);
 
     return CELL_OK;

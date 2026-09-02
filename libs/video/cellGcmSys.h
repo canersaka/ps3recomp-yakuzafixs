@@ -93,12 +93,15 @@ typedef struct CellGcmControl {
 /* GCM context data — the game reads/writes this to submit RSX commands.
  * On PS3, gCellGcmCurrentContext points to one of these.
  * All pointer fields are guest addresses (u32) in the recomp.
- * Layout verified from compiled PS3 SDK inline functions: callback is at offset 0. */
+ * Layout verified against compiled SDK inline code (Yakuza: Dead Souls
+ * EBOOT, command-write helper at 0xEBC0C8) and RPCS3's CellGcmContextData:
+ * begin/end/current/callback, with callback LAST (offset 0xC). The fields
+ * are big-endian in guest memory — byte-swap on host access. */
 typedef struct CellGcmContextData {
-    u32 callback;   /* overflow callback function OPD (guest addr) */
     u32 begin;      /* start of command buffer (guest addr) */
     u32 end;        /* end of command buffer (guest addr) */
     u32 current;    /* current write position (guest addr) */
+    u32 callback;   /* overflow callback function OPD (guest addr) */
 } CellGcmContextData;
 
 /* Display buffer configuration */
@@ -185,7 +188,31 @@ typedef void (*CellGcmQueueHandler)(u32 head);
 /* NID: 0xB2E761D4 */
 s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress);
 
-/* NID: 0x15BAE46B */
+/* Reusable core of _cellGcmInitBody (NID 0x15BAE46B) — the function the SDK's
+ * cellGcmInit() macro actually calls, imported by virtually every PS3 game.
+ *
+ * It can't be a self-contained HLE function in this library because it must
+ * (a) allocate a guest CellGcmContextData and (b) write the game's
+ * context-out pointer in guest memory — both of which require the owning game
+ * project's vm. So the project's bridge supplies those as callbacks and this
+ * helper performs the proven, layout-correct setup:
+ *   - calls cellGcmInit(cmdSize, ioSize, ioAddress)
+ *   - allocates a 16-byte CellGcmContextData via `galloc`
+ *   - fills begin@+0, end@+4, current@+8, callback@+0xC (the layout verified in
+ *     the shipping Simpsons port; a wrong layout makes the game read `current`
+ *     as the callback OPD and stall) via `gwrite32` (which must byte-swap to BE)
+ *   - writes the context's guest address to *ctx_out_addr
+ * Returns the guest address of the new CellGcmContextData.
+ *
+ * Game bridge usage (gpr3=ctx_out, gpr4=cmdSize, gpr5=ioSize, gpr6=ioAddress):
+ *   ctx->gpr[3] = cellGcmSetupContext(gpr3, gpr4, gpr5, gpr6,
+ *                                     my_guest_alloc, my_vm_write32) ? 0 : err;
+ */
+typedef u32  (*CellGcmGuestAlloc)(u32 size, u32 align);
+typedef void (*CellGcmGuestWrite32)(u32 guest_addr, u32 value);
+u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress,
+                        CellGcmGuestAlloc galloc, CellGcmGuestWrite32 gwrite32);
+
 s32 cellGcmGetConfiguration(CellGcmConfig* config);
 
 /* Command buffer control */
@@ -276,7 +303,7 @@ s32 cellGcmIoOffsetToAddress(u32 ioOffset, u32* ea);
 
 /* Label / report / timestamp */
 
-/* NID: 0x21397818 */
+/* NID: 0xF80196C1 */
 u32* cellGcmGetLabelAddress(u8 index);
 
 /* NID: 0x8572ADE4 */
@@ -312,7 +339,7 @@ s32 cellGcmUnbindZcull(u8 index);
 /* Misc */
 
 /* NID: 0x107BF789 */
-s32 cellGcmGetTiledPitchSize(u32 size, u32* pitch);
+u32 cellGcmGetTiledPitchSize(u32 size);
 
 /* NID: 0xBC982946 */
 void cellGcmSetDebugOutputLevel(u32 level);
@@ -333,8 +360,8 @@ u32 cellGcmGetTimeStampLocation(u32 index, u32* location);
 s32 cellGcmSetDefaultFifoSize(u32 size);
 
 /* Internal flip commands (called by game code directly) */
-s32 _cellGcmSetFlipCommand(u32 bufferId);
-s32 _cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelValue);
+s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId);
+s32 _cellGcmSetFlipCommandWithWaitLabel(void* ctx, u32 bufferId, u32 labelIndex, u32 labelValue);
 
 /* --- Additional functions (RPCS3 parity) --- */
 

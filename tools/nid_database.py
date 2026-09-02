@@ -32,10 +32,12 @@ import sys
 # ---------------------------------------------------------------------------
 
 # The suffix that Sony appends before hashing.
-# This is the well-known suffix used for PS3 NID generation.
+# This is the well-known 16-byte suffix used for PS3 NID generation
+# (verified against a real EBOOT import table and RPCS3's ppu_generate_id;
+# matches PS3_NID_SUFFIX in include/ps3emu/nid.h).
 NID_SUFFIX = bytes([
-    0x67, 0x59, 0x65, 0x99, 0x04, 0x25, 0x04, 0x01,
-    0xC0, 0xA8, 0x43, 0x09,
+    0x67, 0x59, 0x65, 0x99, 0x04, 0x25, 0x04, 0x90,
+    0x56, 0x64, 0x27, 0x49, 0x94, 0x89, 0x74, 0x1A,
 ])
 
 
@@ -46,8 +48,9 @@ def compute_nid(name: str, suffix: bytes = NID_SUFFIX) -> int:
     """
     h = hashlib.sha1(name.encode("utf-8") + suffix)
     digest = h.digest()
-    # NID = first 4 bytes, big-endian
-    return struct.unpack(">I", digest[:4])[0]
+    # NID = first 4 bytes, LITTLE-endian (matches RPCS3 ppu_generate_id and
+    # the NIDs found in real import tables).
+    return struct.unpack("<I", digest[:4])[0]
 
 # ---------------------------------------------------------------------------
 # Built-in database
@@ -403,6 +406,54 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("cellSysmodule", "cellSysmoduleIsLoaded"),
     ("cellSysmodule", "cellSysmoduleInitialize"),
     ("cellSysmodule", "cellSysmoduleFinalize"),
+
+    # ---- Imported-but-unresolved NIDs named by exact-NID brute-force match
+    # against the harness corpus (June 2026). compute_nid(name) == the imported
+    # NID, so these names are definitive. Frequency = # of corpus titles. ----
+    ("cellGcmSys", "_cellGcmInitBody"),                       # 0x15bae46b x6
+    ("cellGcmSys", "_cellGcmFunc15"),                         # 0x3a33c1fd x6
+    ("cellNetCtl", "cellNetCtlNetStartDialogLoadAsync"),      # 0x04459230 x6
+    ("cellNetCtl", "cellNetCtlNetStartDialogUnloadAsync"),    # 0x0f1f13d3 x6
+    ("sysPrxForUser", "sys_initialize_tls"),                  # 0x744680a2 x6
+    ("sys_net", "socket"),                                    # 0x9c056962 x5
+    ("sys_net", "bind"),                                      # 0xb0a59804 x5
+    ("sys_net", "connect"),                                   # 0x64f66d35 x4
+    ("sys_net", "send"),                                      # 0xdc751b40 x4
+    ("sys_net", "recv"),                                      # 0xfba04f37 x4
+    ("sys_net", "sendto"),                                    # 0x9647570b x5
+    ("sys_net", "recvfrom"),                                  # 0x1f953b9f x5
+    ("sys_net", "setsockopt"),                                # 0x88f03575 x5
+    ("sys_net", "getsockopt"),                                # 0x5a045bd1 x3
+    ("sys_net", "socketclose"),                               # 0x6db6e8cd x5
+    ("sys_net", "accept"),                                    # 0xc94f6939 x3
+    ("sys_net", "listen"),                                    # 0x28e208bb x3
+    ("sys_net", "shutdown"),                                  # 0xa50777c6 x3
+    ("sys_net", "getsockname"),                               # 0x13efe7f5 x3
+    ("sys_net", "getpeername"),                               # 0xf9ec2db6 x1
+    ("sys_net", "gethostbyname"),                             # 0x71f4c717 x3
+    ("sys_net", "inet_addr"),                                 # 0xdabbc2c0 x3
+    ("sys_net", "inet_ntoa"),                                 # 0x858a930b x1
+    ("sys_net", "sys_net_free_thread_context"),              # 0xfdb8f926 x1
+    ("sysPrxForUser", "_sys_process_atexitspawn"),           # 0x2c847572 x4
+    ("sysPrxForUser", "_sys_process_at_Exitspawn"),          # 0x96328741 x3
+    ("sysPrxForUser", "sys_ppu_thread_once"),                # 0xa3e3be68 x2
+    ("sysPrxForUser", "_sys_heap_create_heap"),              # 0xb2fcf2c8 x2
+    ("sysPrxForUser", "_sys_heap_malloc"),                   # 0x35168520 x2
+    ("sysPrxForUser", "_sys_heap_free"),                     # 0x8a561d92 x2
+    ("sysPrxForUser", "_sys_heap_memalign"),                 # 0x44265c08 x2
+    ("sysPrxForUser", "sys_spu_image_close"),                # 0xe0da8efd x2
+    ("sysPrxForUser", "sys_mmapper_allocate_memory"),        # 0xb257540b x1
+    ("sceNp", "sceNpManagerGetStatus"),                      # 0xa7bff757 x5
+    ("sceNp", "sceNpManagerGetNpId"),                        # 0xfe37a7f4 x5
+    ("sceNp", "sceNpManagerRegisterCallback"),               # 0xe7dcd3b4 x5
+    ("sceNp", "sceNpManagerUnregisterCallback"),             # 0x52a6b523 x3
+    ("sceNp", "sceNpManagerGetOnlineId"),                    # 0xbe07c708 x1
+    ("sceNp", "sceNpManagerGetOnlineName"),                  # 0xf42c0df8 x2
+    ("sceNp", "sceNpManagerGetAccountAge"),                  # 0x168fcece x1
+    ("sceNp", "sceNpManagerGetTicket"),                      # 0x0968aa36 x2
+    ("sceNp", "sceNpBasicGetEvent"),                         # 0xe035f7d6 x4
+    ("sceNp", "sceNpBasicRegisterContextSensitiveHandler"),  # 0x4026eac5 x3
+    ("sceNp", "sceNpDrmIsAvailable"),                        # 0xad218faf x4
 ]
 
 # ---------------------------------------------------------------------------
@@ -432,9 +483,53 @@ class NIDDatabase:
         return nid
 
     def load_builtins(self) -> None:
-        """Populate with the built-in function list."""
+        """Populate with the curated built-in list, then auto-augment with every
+        function the repo actually implements (best-effort, keeps the resolver in
+        sync with the code without a generated file to drift)."""
         for module, name in _BUILTIN_FUNCTIONS:
             self.add(module, name)
+        try:
+            self.load_implemented()
+        except Exception:                          # repo not present / unreadable
+            pass
+        # Names recovered from debug-build symbol tables, each validated by
+        # compute_nid(name) == a NID the same builds actually import (see
+        # tools/nid_harvest.py). +371 firmware NIDs -> ~70% of the proto corpus.
+        proto_db = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "nid_from_protos.json")
+        try:
+            self.load_json(proto_db)
+        except Exception:                          # file absent / unreadable
+            pass
+
+    def load_implemented(self, repo_root: str | None = None) -> int:
+        """Add every exported (cell*/sys*/sce*) function DEFINED in the repo's
+        libs/ and runtime/ C sources, with its NID computed from the name. This
+        keeps the resolver aligned with what the toolkit actually implements.
+        Returns the number of definitions scanned. Best-effort: silently does
+        nothing if the source tree isn't found.
+        """
+        import glob
+        import os
+        import re
+        if repo_root is None:
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # non-static, top-level definitions of exported-looking functions
+        def_re = re.compile(
+            r"^(?!static)[A-Za-z_][\w \t\*]*?\b(_?(?:cell|sys|sce|_sys)\w+)\s*\([^;]*?\)\s*\{",
+            re.M)
+        count = 0
+        for sub in ("libs", "runtime"):
+            for path in glob.glob(os.path.join(repo_root, sub, "**", "*.c"), recursive=True):
+                try:
+                    txt = open(path, encoding="latin1").read()
+                except OSError:
+                    continue
+                module = os.path.splitext(os.path.basename(path))[0]
+                for m in def_re.finditer(txt):
+                    self.add(module, m.group(1))
+                    count += 1
+        return count
 
     def load_json(self, path: str) -> int:
         """Load entries from a JSON file. Returns count loaded.

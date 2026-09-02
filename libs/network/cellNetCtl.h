@@ -135,23 +135,44 @@ typedef union CellNetCtlInfo {
     u32                 upnp_config;
 } CellNetCtlInfo;
 
+/* Field order + the trailing mapped_addr verified against the DWARF in the
+ * Pirates / What-if debug builds (dwarf_abi.py): 20 bytes, not 16, and
+ * upnp_status/nat_type are NOT adjacent-after-size. */
 typedef struct CellNetCtlNatInfo {
     u32 size;
-    u32 nat_type;
-    u32 stun_status;
     u32 upnp_status;
+    u32 stun_status;
+    u32 nat_type;
+    u32 mapped_addr;   /* in_addr, network byte order; 0 when not NAT-mapped */
 } CellNetCtlNatInfo;
 
 /* Event handler callback */
 typedef void (*cellNetCtlHandler)(s32 prev_state, s32 new_state,
                                   s32 event, s32 error_code, void* arg);
 
+/* Net-start dialog completion is signalled through the cellSysutil callback
+ * queue with these status codes (delivered as the `status` argument). */
+#define CELL_SYSUTIL_NET_CTL_NETSTART_LOADED    0x0801
+#define CELL_SYSUTIL_NET_CTL_NETSTART_FINISHED  0x0802
+#define CELL_SYSUTIL_NET_CTL_NETSTART_UNLOADED  0x0803
+
+typedef struct CellNetCtlNetStartDialogParam {
+    s32 size;       /* caller-set: sizeof(struct) */
+    s32 type;       /* dialog type */
+    u32 cid;        /* context id */
+} CellNetCtlNetStartDialogParam;
+
+typedef struct CellNetCtlNetStartDialogResult {
+    s32 size;       /* caller-set: sizeof(struct) */
+    s32 result;     /* 0 = connected, negative = error/abort */
+} CellNetCtlNetStartDialogResult;
+
 /* ---------------------------------------------------------------------------
  * Functions
  * -----------------------------------------------------------------------*/
 
 s32 cellNetCtlInit(void);
-s32 cellNetCtlTerm(void);
+void cellNetCtlTerm(void);
 
 s32 cellNetCtlGetState(s32* state);
 s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info);
@@ -159,6 +180,12 @@ s32 cellNetCtlGetNatInfo(CellNetCtlNatInfo* natInfo);
 
 s32 cellNetCtlAddHandler(cellNetCtlHandler handler, void* arg, s32* hid);
 s32 cellNetCtlDelHandler(s32 hid);
+
+/* Net-start ("connect to PSN") dialog. In an offline native recomp we never
+ * show it — these report an immediate successful connection. */
+s32 cellNetCtlNetStartDialogLoadAsync(const CellNetCtlNetStartDialogParam* param);
+s32 cellNetCtlNetStartDialogAbortAsync(void);
+s32 cellNetCtlNetStartDialogUnloadAsync(CellNetCtlNetStartDialogResult* result);
 
 #ifdef __cplusplus
 }

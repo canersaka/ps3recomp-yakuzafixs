@@ -6,8 +6,17 @@
  */
 
 #include "cellNetCtl.h"
+#include "cellSysutil.h"   /* cellSysutilQueueEvent, CELL_SYSUTIL_MAX_CALLBACKS */
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32 (guest mem) */
+#include "ps3emu/endian.h" /* ps3_bswap32 -- CellNetCtlInfo/NatInfo integer fields are guest big-endian */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+
+/* The generic HLE adapter passes GUEST addresses for pointer args; translate to
+ * a host pointer (struct out-params) or write scalars big-endian via vm_write32. */
+#define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -25,6 +34,19 @@
  * -----------------------------------------------------------------------*/
 
 static int s_netctl_initialized = 0;
+
+/* Offline by default: titles gate their whole online boot path on this state
+ * and hang waiting on PSN jobs that can never complete if we claim a live
+ * connection. A real console with no link reports Disconnected and games take
+ * their offline path (verified against LBP's working RPCS3 boot, where
+ * GetState never reported a connection). PS3_NET_ONLINE=1 restores the old
+ * fake-connected behaviour for online experiments. */
+static int netctl_online(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("PS3_NET_ONLINE") ? 1 : 0;
+    return v;
+}
 
 typedef struct {
     int              in_use;
@@ -115,16 +137,12 @@ s32 cellNetCtlInit(void)
     return CELL_OK;
 }
 
-s32 cellNetCtlTerm(void)
+void cellNetCtlTerm(void)
 {
     printf("[cellNetCtl] Term()\n");
 
-    if (!s_netctl_initialized)
-        return CELL_NET_CTL_ERROR_NOT_INITIALIZED;
-
     memset(s_handlers, 0, sizeof(s_handlers));
     s_netctl_initialized = 0;
-    return CELL_OK;
 }
 
 s32 cellNetCtlGetState(s32* state)
@@ -135,9 +153,19 @@ s32 cellNetCtlGetState(s32* state)
     if (!state)
         return CELL_NET_CTL_ERROR_INVALID_ADDR;
 
-    /* Report that we have a full IP connection */
-    *state = CELL_NET_CTL_STATE_IPObtained;
+    if (!netctl_online()) {
+        /* Offline: FAIL the query rather than report state=Disconnected.
+         * LBP's connect job (sub_F433C(0)) polls GetState forever until
+         * IPObtained and only exits on ret<0 -- and the working RPCS3 boot
+         * shows exactly one GetState call failing with NOT_INITIALIZED,
+         * after which the game proceeds offline. Still write a sane state
+         * for callers that ignore the return value. */
+        vm_write32((uint32_t)(uintptr_t)state, CELL_NET_CTL_STATE_Disconnected);
+        printf("[cellNetCtl] GetState() -> error NOT_INITIALIZED (offline mode)\n");
+        return CELL_NET_CTL_ERROR_NOT_INITIALIZED;
+    }
 
+    vm_write32((uint32_t)(uintptr_t)state, CELL_NET_CTL_STATE_IPObtained);
     printf("[cellNetCtl] GetState() -> IPObtained\n");
     return CELL_OK;
 }
@@ -150,12 +178,13 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
     if (!info)
         return CELL_NET_CTL_ERROR_INVALID_ADDR;
 
+    info = GUEST_PTR(info, CellNetCtlInfo*);
     memset(info, 0, sizeof(CellNetCtlInfo));
 
     switch (code)
     {
     case CELL_NET_CTL_INFO_DEVICE:
-        info->device = CELL_NET_CTL_DEVICE_WIRED;
+        info->device = ps3_bswap32((u32)CELL_NET_CTL_DEVICE_WIRED);
         break;
 
     case CELL_NET_CTL_INFO_ETHER_ADDR:
@@ -169,15 +198,16 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
         break;
 
     case CELL_NET_CTL_INFO_MTU:
-        info->mtu = 1500;
+        info->mtu = ps3_bswap32(1500u);
         break;
 
     case CELL_NET_CTL_INFO_LINK:
-        info->link = CELL_NET_CTL_LINK_CONNECTED;
+        info->link = ps3_bswap32((u32)(netctl_online() ? CELL_NET_CTL_LINK_CONNECTED
+                                                       : CELL_NET_CTL_LINK_DISCONNECTED));
         break;
 
     case CELL_NET_CTL_INFO_LINK_TYPE:
-        info->link_type = CELL_NET_CTL_LINK_TYPE_1000BASE_FULL;
+        info->link_type = ps3_bswap32((u32)CELL_NET_CTL_LINK_TYPE_1000BASE_FULL);
         break;
 
     case CELL_NET_CTL_INFO_IP_ADDRESS:
@@ -211,7 +241,7 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
         break;
 
     case CELL_NET_CTL_INFO_UPNP_CONFIG:
-        info->upnp_config = 1; /* enabled */
+        info->upnp_config = ps3_bswap32(1u); /* enabled */
         break;
 
     default:
@@ -231,10 +261,12 @@ s32 cellNetCtlGetNatInfo(CellNetCtlNatInfo* natInfo)
     if (!natInfo)
         return CELL_NET_CTL_ERROR_INVALID_ADDR;
 
-    natInfo->size        = sizeof(CellNetCtlNatInfo);
-    natInfo->nat_type    = CELL_NET_CTL_NATINFO_NAT_TYPE_2; /* moderate */
-    natInfo->stun_status = 0;
+    natInfo = GUEST_PTR(natInfo, CellNetCtlNatInfo*);
+    natInfo->size        = ps3_bswap32((u32)sizeof(CellNetCtlNatInfo));
     natInfo->upnp_status = 0;
+    natInfo->stun_status = 0;
+    natInfo->nat_type    = ps3_bswap32((u32)CELL_NET_CTL_NATINFO_NAT_TYPE_2); /* moderate */
+    natInfo->mapped_addr = 0;
 
     printf("[cellNetCtl] GetNatInfo() -> NAT Type 2\n");
     return CELL_OK;
@@ -253,7 +285,7 @@ s32 cellNetCtlAddHandler(cellNetCtlHandler handler, void* arg, s32* hid)
             s_handlers[i].in_use  = 1;
             s_handlers[i].handler = handler;
             s_handlers[i].arg     = arg;
-            *hid = i;
+            vm_write32((uint32_t)(uintptr_t)hid, (uint32_t)i);   /* guest out-param */
             printf("[cellNetCtl] AddHandler(hid=%d)\n", i);
             return CELL_OK;
         }
@@ -278,5 +310,51 @@ s32 cellNetCtlDelHandler(s32 hid)
     s_handlers[hid].arg     = NULL;
 
     printf("[cellNetCtl] DelHandler(hid=%d)\n", hid);
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * Net-start ("connect to PSN") dialog
+ *
+ * Real hardware shows a system dialog and signals progress asynchronously
+ * through the cellSysutil callback queue (LOADED -> FINISHED), after which the
+ * game calls UnloadAsync to retrieve the result. In an offline native recomp
+ * there is nothing to show and we are already "connected", so we immediately
+ * post LOADED + FINISHED to every registered sysutil callback slot and report a
+ * successful result on unload. This unblocks the common boot-time "connecting
+ * to network" gate without requiring a real PSN session.
+ * -----------------------------------------------------------------------*/
+
+static void netstart_broadcast(u32 status)
+{
+    /* Sysutil events target a specific slot; the game may have registered its
+     * callback on any of them, so notify all and let it filter by status. */
+    for (int slot = 0; slot < CELL_SYSUTIL_MAX_CALLBACKS; ++slot)
+        cellSysutilQueueEvent(slot, status, 0);
+}
+
+s32 cellNetCtlNetStartDialogLoadAsync(const CellNetCtlNetStartDialogParam* param)
+{
+    (void)param;
+    printf("[cellNetCtl] NetStartDialogLoadAsync() -> auto-connect\n");
+    netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_LOADED);
+    netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_FINISHED);
+    return CELL_OK;
+}
+
+s32 cellNetCtlNetStartDialogAbortAsync(void)
+{
+    printf("[cellNetCtl] NetStartDialogAbortAsync()\n");
+    return CELL_OK;
+}
+
+s32 cellNetCtlNetStartDialogUnloadAsync(CellNetCtlNetStartDialogResult* result)
+{
+    if (result) {
+        result = GUEST_PTR(result, CellNetCtlNetStartDialogResult*);
+        result->result = 0;   /* 0 = connected; endian-safe */
+    }
+    printf("[cellNetCtl] NetStartDialogUnloadAsync() -> result=0 (connected)\n");
+    netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_UNLOADED);
     return CELL_OK;
 }

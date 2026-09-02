@@ -8,6 +8,9 @@
 #include "sceNp.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -23,7 +26,8 @@ static char s_fake_username[SCE_NP_ONLINEID_MAX_LENGTH + 1] = "PS3Player";
 void sceNpSetFakeUsername(const char* username)
 {
     if (username) {
-        strncpy(s_fake_username, username, SCE_NP_ONLINEID_MAX_LENGTH);
+        strncpy(s_fake_username, GUEST_PTR(username, const char*),
+            SCE_NP_ONLINEID_MAX_LENGTH);
         s_fake_username[SCE_NP_ONLINEID_MAX_LENGTH] = '\0';
     }
 }
@@ -83,6 +87,7 @@ s32 sceNpGetNpId(s32 userId, SceNpId* npId)
 
 s32 sceNpGetOnlineId(s32 userId, SceNpOnlineId* onlineId)
 {
+    onlineId = GUEST_PTR(onlineId, SceNpOnlineId*);
     (void)userId;
 
     if (!s_np_initialized)
@@ -101,6 +106,7 @@ s32 sceNpGetOnlineId(s32 userId, SceNpOnlineId* onlineId)
 
 s32 sceNpGetOnlineName(s32 userId, SceNpOnlineName* onlineName)
 {
+    onlineName = GUEST_PTR(onlineName, SceNpOnlineName*);
     (void)userId;
 
     if (!s_np_initialized)
@@ -120,6 +126,7 @@ s32 sceNpGetOnlineName(s32 userId, SceNpOnlineName* onlineName)
 
 s32 sceNpGetUserProfile(s32 userId, SceNpUserInfo* userInfo)
 {
+    userInfo = GUEST_PTR(userInfo, SceNpUserInfo*);
     (void)userId;
 
     if (!s_np_initialized)
@@ -150,7 +157,7 @@ s32 sceNpGetAccountRegion(s32 userId, u32* region)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
     /* Region: US (SCEA) = 0x5553 ('US') */
-    *region = 0x5553;
+    vm_write32((u32)(uintptr_t)region, (u32)0x5553);
 
     printf("[sceNp] GetAccountRegion(user=%d) -> US\n", userId);
     return CELL_OK;
@@ -166,8 +173,8 @@ s32 sceNpGetAccountAge(s32 userId, s32* age)
     if (!age)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
-    *age = 25; /* default adult age */
-    printf("[sceNp] GetAccountAge(user=%d) -> %d\n", userId, *age);
+    vm_write32((u32)(uintptr_t)age, 25); /* default adult age */
+    printf("[sceNp] GetAccountAge(user=%d) -> 25\n", userId);
     return CELL_OK;
 }
 
@@ -179,10 +186,63 @@ s32 sceNpGetMyLanguages(SceNpMyLanguages* langs)
     if (!langs)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
-    langs->language1 = SCE_NP_LANG_ENGLISH;
-    langs->language2 = 0;
-    langs->language3 = 0;
+    u32 langs_ea = (u32)(uintptr_t)langs;
+    vm_write32(langs_ea + 0, SCE_NP_LANG_ENGLISH);
+    vm_write32(langs_ea + 4, 0);
+    vm_write32(langs_ea + 8, 0);
 
     printf("[sceNp] GetMyLanguages() -> English\n");
     return CELL_OK;
 }
+
+/* ---------------------------------------------------------------------------
+ * NP Manager (sign-in state)
+ *
+ * The toolkit runs with a fake local profile but no live PSN connection. So the
+ * manager reports OFFLINE — games gate their online flows on GetStatus and skip
+ * them cleanly — while the identity getters still hand back the fake account,
+ * matching how NP behaves on a real signed-in-but-disconnected console.
+ * Imported by most online-capable titles.
+ * -----------------------------------------------------------------------*/
+
+static SceNpManagerCallback s_npmgr_cb = NULL;
+static void*                s_npmgr_cb_arg = NULL;
+
+s32 sceNpManagerGetStatus(s32* status)
+{
+    if (!s_np_initialized)
+        return SCE_NP_ERROR_NOT_INITIALIZED;
+    if (!status)
+        return SCE_NP_ERROR_INVALID_ARGUMENT;
+    /* `status` is a GUEST address -- the HLE ABI adapter passes pointer
+     * parameters straight through as guest values, so dereferencing one
+     * writes to whatever host address shares that number. Same trap as
+     * cellGcmSys had. Tokyo Jungle calls this during its online init. */
+    vm_write32((uint32_t)(uintptr_t)status, (uint32_t)SCE_NP_MANAGER_STATUS_OFFLINE);
+    printf("[sceNp] ManagerGetStatus() -> OFFLINE\n");
+    return CELL_OK;
+}
+
+s32 sceNpManagerRegisterCallback(SceNpManagerCallback callback, void* arg)
+{
+    if (!s_np_initialized)
+        return SCE_NP_ERROR_NOT_INITIALIZED;
+    /* Stored for bookkeeping; we never transition online so never fire it. */
+    s_npmgr_cb     = callback;
+    s_npmgr_cb_arg = arg;
+    printf("[sceNp] ManagerRegisterCallback()\n");
+    return CELL_OK;
+}
+
+s32 sceNpManagerUnregisterCallback(void)
+{
+    s_npmgr_cb     = NULL;
+    s_npmgr_cb_arg = NULL;
+    return CELL_OK;
+}
+
+/* Identity getters: reuse the fake-profile implementations (offline-with-account). */
+s32 sceNpManagerGetNpId(SceNpId* npId)               { return sceNpGetNpId(0, npId); }
+s32 sceNpManagerGetOnlineId(SceNpOnlineId* onlineId) { return sceNpGetOnlineId(0, onlineId); }
+s32 sceNpManagerGetOnlineName(SceNpOnlineName* name) { return sceNpGetOnlineName(0, name); }
+s32 sceNpManagerGetAccountAge(s32* age)              { return sceNpGetAccountAge(0, age); }

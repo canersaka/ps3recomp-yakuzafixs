@@ -7,6 +7,15 @@
 #include "cellUserInfo.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
+/* HLE args arrive as guest effective addresses; translate before deref. */
+#define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
+/* The guest is big-endian; u32 fields we write into guest structs must be stored
+ * byte-swapped or the guest reads them mangled (e.g. a count of 1 read as
+ * 0x01000000 = 16.7M, blowing up the caller's enumeration loop). */
+#define BE32(v) ( (((uint32_t)(v) & 0x000000FFu) << 24) | (((uint32_t)(v) & 0x0000FF00u) << 8) | \
+                  (((uint32_t)(v) & 0x00FF0000u) >> 8) | (((uint32_t)(v) & 0xFF000000u) >> 24) )
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -25,18 +34,18 @@ static u32 s_selected_user = EMU_USER_ID;
 
 s32 cellUserInfoGetStat(u32 id, CellUserInfoUserStat* stat)
 {
-    printf("[cellUserInfo] GetStat(id=%u)\n", id);
-
     if (!stat)
         return CELL_USERINFO_ERROR_PARAM;
+    stat = GUEST_PTR(stat, CellUserInfoUserStat*);
 
     if (id != EMU_USER_ID)
         return CELL_USERINFO_ERROR_NOUSER;
 
+    /* NOTE: write ONLY the real 68-byte struct (id+name). Anything more
+     * overflows the guest's stack buffer (see header comment). */
     memset(stat, 0, sizeof(CellUserInfoUserStat));
-    stat->id = EMU_USER_ID;
+    stat->id = BE32(EMU_USER_ID);
     strncpy(stat->name, EMU_USER_NAME, CELL_USERINFO_USERNAME_SIZE - 1);
-    strncpy(stat->homeDir, EMU_HOME_DIR, CELL_USERINFO_HOME_PATH_SIZE - 1);
 
     return CELL_OK;
 }
@@ -44,17 +53,20 @@ s32 cellUserInfoGetStat(u32 id, CellUserInfoUserStat* stat)
 s32 cellUserInfoGetList(u32* listNum, CellUserInfoUserList* list, u32* currentUser)
 {
     printf("[cellUserInfo] GetList()\n");
+    u32* listNum_h = GUEST_PTR(listNum, u32*);
+    CellUserInfoUserList* list_h = GUEST_PTR(list, CellUserInfoUserList*);
+    u32* currentUser_h = GUEST_PTR(currentUser, u32*);
 
-    if (listNum)
-        *listNum = 1;
+    if (listNum_h)
+        *listNum_h = BE32(1);
 
-    if (list) {
-        memset(list, 0, sizeof(CellUserInfoUserList));
-        list->userId[0] = EMU_USER_ID;
+    if (list_h) {
+        memset(list_h, 0, sizeof(CellUserInfoUserList));
+        list_h->userId[0] = BE32(EMU_USER_ID);
     }
 
-    if (currentUser)
-        *currentUser = EMU_USER_ID;
+    if (currentUser_h)
+        *currentUser_h = BE32(EMU_USER_ID);
 
     return CELL_OK;
 }
@@ -84,8 +96,9 @@ s32 cellUserInfoSelectUser_ListGet(u32* selectedUser)
 
     if (!selectedUser)
         return CELL_USERINFO_ERROR_PARAM;
+    selectedUser = GUEST_PTR(selectedUser, u32*);
 
-    *selectedUser = s_selected_user;
+    *selectedUser = BE32(s_selected_user);
     return CELL_OK;
 }
 
@@ -102,6 +115,7 @@ s32 cellUserInfoGetHomeDir(u32 id, char* homePath, u32 homePathSize)
 
     if (!homePath || homePathSize == 0)
         return CELL_USERINFO_ERROR_PARAM;
+    homePath = GUEST_PTR(homePath, char*);
 
     if (id != EMU_USER_ID)
         return CELL_USERINFO_ERROR_NOUSER;
