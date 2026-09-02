@@ -108,12 +108,12 @@ typedef uint32_t           ULONG;
 typedef uint32_t           UINT;
 typedef int32_t            LONG;      /* 32-bit, as on Windows -- see the header comment */
 typedef int32_t            INT;
-typedef int64_t            LONGLONG;
-typedef int64_t            LONG64;
-typedef uint64_t           ULONGLONG;
-typedef uint64_t           ULONG64;
-typedef uint64_t           DWORD64;
-typedef uint64_t           DWORDLONG;
+typedef long long          LONGLONG;  /* long long, not int64_t: distinct from `long` everywhere */
+typedef long long          LONG64;
+typedef unsigned long long ULONGLONG;
+typedef unsigned long long ULONG64;
+typedef unsigned long long DWORD64;
+typedef unsigned long long DWORDLONG;
 typedef size_t             SIZE_T;
 typedef size_t             ULONG_PTR;
 typedef size_t             DWORD_PTR;
@@ -277,34 +277,107 @@ static inline struct timespec ps3__deadline_ms(DWORD ms)
  * which is what the MSVC intrinsics (full-barrier forms) mean. The return
  * conventions are Win32's: Increment/Decrement/Add return the NEW value,
  * Exchange/ExchangeAdd/And/Or/Xor/CompareExchange return the PREVIOUS one.
+ *
+ * The public names accept a pointer to LONG (32-bit), to `long` or to
+ * `long long`, and operate at the width of the object they are given. Code
+ * written for MSVC spells interlocked targets `long` as often as LONG,
+ * because there the two are the same 32-bit type; on an LP64 host a `long`
+ * is 8 bytes, and the only correct atomic on an 8-byte object is an 8-byte
+ * one. A LONG target still gets a 4-byte operation, so a
+ * `(volatile LONG*)&some_u32` cast keeps meaning what it says. C selects by
+ * _Generic, C++ by overloading; the ps3__ilk* functions are the bodies.
  * -----------------------------------------------------------------------*/
-static inline LONG InterlockedIncrement(volatile LONG* t)            { return __atomic_add_fetch(t, 1, __ATOMIC_SEQ_CST); }
-static inline LONG InterlockedDecrement(volatile LONG* t)            { return __atomic_sub_fetch(t, 1, __ATOMIC_SEQ_CST); }
-static inline LONG InterlockedExchange(volatile LONG* t, LONG v)     { return __atomic_exchange_n(t, v, __ATOMIC_SEQ_CST); }
-static inline LONG InterlockedExchangeAdd(volatile LONG* t, LONG v)  { return __atomic_fetch_add(t, v, __ATOMIC_SEQ_CST); }
-static inline LONG InterlockedAdd(volatile LONG* t, LONG v)          { return __atomic_add_fetch(t, v, __ATOMIC_SEQ_CST); }
-static inline LONG InterlockedAnd(volatile LONG* t, LONG v)          { return __atomic_fetch_and(t, v, __ATOMIC_SEQ_CST); }
-static inline LONG InterlockedOr(volatile LONG* t, LONG v)           { return __atomic_fetch_or(t, v, __ATOMIC_SEQ_CST); }
-static inline LONG InterlockedXor(volatile LONG* t, LONG v)          { return __atomic_fetch_xor(t, v, __ATOMIC_SEQ_CST); }
-static inline LONG InterlockedCompareExchange(volatile LONG* t, LONG exchange, LONG comparand)
-{
-    __atomic_compare_exchange_n(t, &comparand, exchange, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-    return comparand;            /* holds the previous value either way */
-}
+#define PS3__ILK_DEFINE(SUF, T) \
+static inline T ps3__ilk_inc_##SUF(volatile T* t)            { return __atomic_add_fetch(t, 1, __ATOMIC_SEQ_CST); } \
+static inline T ps3__ilk_dec_##SUF(volatile T* t)            { return __atomic_sub_fetch(t, 1, __ATOMIC_SEQ_CST); } \
+static inline T ps3__ilk_xchg_##SUF(volatile T* t, T v)      { return __atomic_exchange_n(t, v, __ATOMIC_SEQ_CST); } \
+static inline T ps3__ilk_xadd_##SUF(volatile T* t, T v)      { return __atomic_fetch_add(t, v, __ATOMIC_SEQ_CST); } \
+static inline T ps3__ilk_add_##SUF(volatile T* t, T v)       { return __atomic_add_fetch(t, v, __ATOMIC_SEQ_CST); } \
+static inline T ps3__ilk_and_##SUF(volatile T* t, T v)       { return __atomic_fetch_and(t, v, __ATOMIC_SEQ_CST); } \
+static inline T ps3__ilk_or_##SUF(volatile T* t, T v)        { return __atomic_fetch_or(t, v, __ATOMIC_SEQ_CST); } \
+static inline T ps3__ilk_xor_##SUF(volatile T* t, T v)       { return __atomic_fetch_xor(t, v, __ATOMIC_SEQ_CST); } \
+static inline T ps3__ilk_cas_##SUF(volatile T* t, T x, T c)  \
+{ __atomic_compare_exchange_n(t, &c, x, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); return c; }
 
-static inline LONG64 InterlockedIncrement64(volatile LONG64* t)            { return __atomic_add_fetch(t, 1, __ATOMIC_SEQ_CST); }
-static inline LONG64 InterlockedDecrement64(volatile LONG64* t)            { return __atomic_sub_fetch(t, 1, __ATOMIC_SEQ_CST); }
-static inline LONG64 InterlockedExchange64(volatile LONG64* t, LONG64 v)   { return __atomic_exchange_n(t, v, __ATOMIC_SEQ_CST); }
-static inline LONG64 InterlockedExchangeAdd64(volatile LONG64* t, LONG64 v){ return __atomic_fetch_add(t, v, __ATOMIC_SEQ_CST); }
-static inline LONG64 InterlockedAdd64(volatile LONG64* t, LONG64 v)        { return __atomic_add_fetch(t, v, __ATOMIC_SEQ_CST); }
-static inline LONG64 InterlockedAnd64(volatile LONG64* t, LONG64 v)        { return __atomic_fetch_and(t, v, __ATOMIC_SEQ_CST); }
-static inline LONG64 InterlockedOr64(volatile LONG64* t, LONG64 v)         { return __atomic_fetch_or(t, v, __ATOMIC_SEQ_CST); }
-static inline LONG64 InterlockedXor64(volatile LONG64* t, LONG64 v)        { return __atomic_fetch_xor(t, v, __ATOMIC_SEQ_CST); }
-static inline LONG64 InterlockedCompareExchange64(volatile LONG64* t, LONG64 exchange, LONG64 comparand)
-{
-    __atomic_compare_exchange_n(t, &comparand, exchange, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-    return comparand;
-}
+PS3__ILK_DEFINE(i, int)          /* LONG */
+PS3__ILK_DEFINE(l, long)
+PS3__ILK_DEFINE(ll, long long)   /* LONG64 */
+#undef PS3__ILK_DEFINE
+
+#ifdef __cplusplus
+/* Overloads cannot carry C linkage, and this section sits inside extern "C". */
+extern "C++" {
+#define PS3__ILK_OVERLOADS(NAME, OP) \
+static inline int       NAME(volatile int* t)       { return ps3__ilk_##OP##_i(t); } \
+static inline long      NAME(volatile long* t)      { return ps3__ilk_##OP##_l(t); } \
+static inline long long NAME(volatile long long* t) { return ps3__ilk_##OP##_ll(t); }
+#define PS3__ILK_OVERLOADS2(NAME, OP) \
+static inline int       NAME(volatile int* t, int v)             { return ps3__ilk_##OP##_i(t, v); } \
+static inline long      NAME(volatile long* t, long v)           { return ps3__ilk_##OP##_l(t, v); } \
+static inline long long NAME(volatile long long* t, long long v) { return ps3__ilk_##OP##_ll(t, v); }
+#define PS3__ILK_OVERLOADS3(NAME) \
+static inline int       NAME(volatile int* t, int x, int c)                        { return ps3__ilk_cas_i(t, x, c); } \
+static inline long      NAME(volatile long* t, long x, long c)                     { return ps3__ilk_cas_l(t, x, c); } \
+static inline long long NAME(volatile long long* t, long long x, long long c)      { return ps3__ilk_cas_ll(t, x, c); }
+PS3__ILK_OVERLOADS(InterlockedIncrement, inc)
+PS3__ILK_OVERLOADS(InterlockedDecrement, dec)
+PS3__ILK_OVERLOADS2(InterlockedExchange, xchg)
+PS3__ILK_OVERLOADS2(InterlockedExchangeAdd, xadd)
+PS3__ILK_OVERLOADS2(InterlockedAdd, add)
+PS3__ILK_OVERLOADS2(InterlockedAnd, and)
+PS3__ILK_OVERLOADS2(InterlockedOr, or)
+PS3__ILK_OVERLOADS2(InterlockedXor, xor)
+PS3__ILK_OVERLOADS3(InterlockedCompareExchange)
+/* The 64 names: LONG64 is long long, and int64_t is `long` on Linux. */
+static inline long      InterlockedIncrement64(volatile long* t)                { return ps3__ilk_inc_l(t); }
+static inline long long InterlockedIncrement64(volatile long long* t)           { return ps3__ilk_inc_ll(t); }
+static inline long      InterlockedDecrement64(volatile long* t)                { return ps3__ilk_dec_l(t); }
+static inline long long InterlockedDecrement64(volatile long long* t)           { return ps3__ilk_dec_ll(t); }
+static inline long      InterlockedExchange64(volatile long* t, long v)         { return ps3__ilk_xchg_l(t, v); }
+static inline long long InterlockedExchange64(volatile long long* t, long long v){ return ps3__ilk_xchg_ll(t, v); }
+static inline long      InterlockedExchangeAdd64(volatile long* t, long v)      { return ps3__ilk_xadd_l(t, v); }
+static inline long long InterlockedExchangeAdd64(volatile long long* t, long long v){ return ps3__ilk_xadd_ll(t, v); }
+static inline long      InterlockedAdd64(volatile long* t, long v)              { return ps3__ilk_add_l(t, v); }
+static inline long long InterlockedAdd64(volatile long long* t, long long v)    { return ps3__ilk_add_ll(t, v); }
+static inline long      InterlockedAnd64(volatile long* t, long v)              { return ps3__ilk_and_l(t, v); }
+static inline long long InterlockedAnd64(volatile long long* t, long long v)    { return ps3__ilk_and_ll(t, v); }
+static inline long      InterlockedOr64(volatile long* t, long v)               { return ps3__ilk_or_l(t, v); }
+static inline long long InterlockedOr64(volatile long long* t, long long v)     { return ps3__ilk_or_ll(t, v); }
+static inline long      InterlockedXor64(volatile long* t, long v)              { return ps3__ilk_xor_l(t, v); }
+static inline long long InterlockedXor64(volatile long long* t, long long v)    { return ps3__ilk_xor_ll(t, v); }
+static inline long      InterlockedCompareExchange64(volatile long* t, long x, long c) { return ps3__ilk_cas_l(t, x, c); }
+static inline long long InterlockedCompareExchange64(volatile long long* t, long long x, long long c) { return ps3__ilk_cas_ll(t, x, c); }
+#undef PS3__ILK_OVERLOADS
+#undef PS3__ILK_OVERLOADS2
+#undef PS3__ILK_OVERLOADS3
+} /* extern "C++" */
+#else /* C */
+#define PS3__ILK_PICK(p, OP) _Generic((p), \
+    volatile int*:       ps3__ilk_##OP##_i,  int*:       ps3__ilk_##OP##_i,  \
+    volatile long*:      ps3__ilk_##OP##_l,  long*:      ps3__ilk_##OP##_l,  \
+    volatile long long*: ps3__ilk_##OP##_ll, long long*: ps3__ilk_##OP##_ll)
+#define PS3__ILK_PICK64(p, OP) _Generic((p), \
+    volatile long*:      ps3__ilk_##OP##_l,  long*:      ps3__ilk_##OP##_l,  \
+    volatile long long*: ps3__ilk_##OP##_ll, long long*: ps3__ilk_##OP##_ll)
+#define InterlockedIncrement(p)            PS3__ILK_PICK((p), inc)((p))
+#define InterlockedDecrement(p)            PS3__ILK_PICK((p), dec)((p))
+#define InterlockedExchange(p, v)          PS3__ILK_PICK((p), xchg)((p), (v))
+#define InterlockedExchangeAdd(p, v)       PS3__ILK_PICK((p), xadd)((p), (v))
+#define InterlockedAdd(p, v)               PS3__ILK_PICK((p), add)((p), (v))
+#define InterlockedAnd(p, v)               PS3__ILK_PICK((p), and)((p), (v))
+#define InterlockedOr(p, v)                PS3__ILK_PICK((p), or)((p), (v))
+#define InterlockedXor(p, v)               PS3__ILK_PICK((p), xor)((p), (v))
+#define InterlockedCompareExchange(p, x, c) PS3__ILK_PICK((p), cas)((p), (x), (c))
+#define InterlockedIncrement64(p)          PS3__ILK_PICK64((p), inc)((p))
+#define InterlockedDecrement64(p)          PS3__ILK_PICK64((p), dec)((p))
+#define InterlockedExchange64(p, v)        PS3__ILK_PICK64((p), xchg)((p), (v))
+#define InterlockedExchangeAdd64(p, v)     PS3__ILK_PICK64((p), xadd)((p), (v))
+#define InterlockedAdd64(p, v)             PS3__ILK_PICK64((p), add)((p), (v))
+#define InterlockedAnd64(p, v)             PS3__ILK_PICK64((p), and)((p), (v))
+#define InterlockedOr64(p, v)              PS3__ILK_PICK64((p), or)((p), (v))
+#define InterlockedXor64(p, v)             PS3__ILK_PICK64((p), xor)((p), (v))
+#define InterlockedCompareExchange64(p, x, c) PS3__ILK_PICK64((p), cas)((p), (x), (c))
+#endif
 
 static inline PVOID InterlockedExchangePointer(PVOID volatile* t, PVOID v) { return __atomic_exchange_n(t, v, __ATOMIC_SEQ_CST); }
 static inline PVOID InterlockedCompareExchangePointer(PVOID volatile* t, PVOID exchange, PVOID comparand)
