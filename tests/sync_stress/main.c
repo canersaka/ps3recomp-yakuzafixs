@@ -4,17 +4,22 @@
  * Deterministic lv2 sync-primitive stress suite.
  * Exercises runtime/syscalls/sys_mutex.c, sys_cond.c, sys_semaphore.c,
  * sys_event.c directly (as C functions taking a ppu_context*), on Win32
- * threads, with NO dependency on the yakuza runner or the recompiled game.
+ * threads -- real ones on Windows, runtime/platform/win32_compat.h's
+ * elsewhere -- with NO dependency on the yakuza runner or the recompiled game.
  *
- * Usage: sync_stress.exe [seed]   (default seed 0)
+ * Usage: sync_stress [seed]   (default seed 0)
  *
  * Exit code 0 = all tests passed. Nonzero = at least one test FAILed (see
  * stderr for the FAIL dump: which test, which thread/object, and counters).
  */
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+/* Win32 threads and interlocked ops on every host: a passthrough to
+ * <windows.h> on Windows, the runtime's own shim elsewhere. */
+#include "../../runtime/platform/win32_compat.h"
+#include "../../runtime/platform/msvc_compat.h"   /* __declspec(thread), __stdcall */
+#ifdef _WIN32
 #include <process.h>
+#endif
 
 #include <stdint.h>
 #include <stdio.h>
@@ -334,7 +339,7 @@ static unsigned __stdcall t1_watchdog(void* p)
             if (stalled_for > T1_STALL_MS) {
                 fprintf(stderr, "[FAIL] test1_no_lost_wakeup: STUCK: no consumption progress for "
                         ">%dms with produced=%ld consumed=%ld (possible lost wakeup)\n",
-                        T1_STALL_MS, sh->produced, sh->consumed);
+                        T1_STALL_MS, (long)sh->produced, (long)sh->consumed);
                 fflush(stderr);
                 InterlockedIncrement(&g_fail_count);
                 fflush(stdout);
@@ -460,7 +465,7 @@ static int test1b_rendezvous_park(void)
     if (!sh.woke) fail(name, "consumer did not report waking");
 
     int ok = (g_fail_count == before);
-    printf("[%s] woke=%ld -> %s\n", name, sh.woke, ok ? "PASS" : "FAIL");
+    printf("[%s] woke=%ld -> %s\n", name, (long)sh.woke, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -539,7 +544,7 @@ static int test1_no_lost_wakeup(void)
     }
 
     int ok = (g_fail_count == before);
-    printf("[%s] produced=%ld consumed=%ld -> %s\n", name, sh.produced, sh.consumed, ok ? "PASS" : "FAIL");
+    printf("[%s] produced=%ld consumed=%ld -> %s\n", name, (long)sh.produced, (long)sh.consumed, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -803,7 +808,7 @@ static int test3_semaphore_counting(void)
 
     int ok = (g_fail_count == before);
     printf("[%s] posted=%ld waited=%ld final_value=%d violations=%ld -> %s\n",
-           name, sh.posted_units, sh.waited_units, final_val, sh.invariant_violations, ok ? "PASS" : "FAIL");
+           name, (long)sh.posted_units, (long)sh.waited_units, final_val, (long)sh.invariant_violations, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -948,7 +953,7 @@ static int test4a_fifo_per_source(void)
 
     int ok = (g_fail_count == before);
     printf("[%s] total_events=%ld order_violations=%ld -> %s\n",
-           name, sh.total_events, sh.order_violations, ok ? "PASS" : "FAIL");
+           name, (long)sh.total_events, (long)sh.order_violations, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -1077,7 +1082,7 @@ static int test4b_exactly_once_delivery(void)
 
     int ok = (g_fail_count == before);
     printf("[%s] total_events=%ld total_received=%ld dup_violations=%ld missing=%d -> %s\n",
-           name, sh.total_events, sh.total_received, sh.duplicate_violations, missing, ok ? "PASS" : "FAIL");
+           name, (long)sh.total_events, (long)sh.total_received, (long)sh.duplicate_violations, missing, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -1113,6 +1118,6 @@ int main(int argc, char** argv)
     printf("=== total wall time: %llums ===\n", (unsigned long long)total_ms);
 
     int failed = rc1a || rc1 || rc2 || rc3 || rc4 || (g_fail_count != 0);
-    printf("=== RESULT: %s (fail_count=%ld) ===\n", failed ? "FAIL" : "PASS", g_fail_count);
+    printf("=== RESULT: %s (fail_count=%ld) ===\n", failed ? "FAIL" : "PASS", (long)g_fail_count);
     return failed ? 1 : 0;
 }
