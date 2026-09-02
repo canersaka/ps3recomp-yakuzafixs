@@ -50,6 +50,10 @@ if(APPLE)
     enable_language(OBJC)
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m")
 endif()
+# The HLSL -> MSL translator is C++ (it drives glslang's C++ API) and compiles
+# to a stub wherever the shader tools are absent, so it is part of the
+# library everywhere. See the "Guest shaders on Metal" section below.
+list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_msl.cpp")
 
 # Runtime core (syscalls, PPU, SPU, memory)
 file(GLOB_RECURSE RUNTIME_SOURCES
@@ -143,6 +147,85 @@ if(APPLE)
 endif()
 
 # ---------------------------------------------------------------------------
+# Guest shaders on Metal: HLSL -> SPIR-V -> MSL
+# ---------------------------------------------------------------------------
+# The RSX decompilers emit HLSL for the D3D12 backend. Metal cannot compile
+# that, so libs/video/rsx_shader_msl.cpp lowers it with glslang (HLSL ->
+# SPIR-V) and spirv-cross (SPIR-V -> MSL). Both are optional: without them the
+# module compiles to a stub, rsx_hlsl_to_msl_available() says so, and the
+# Metal backend stays on its fixed-function path. The translation has no GPU
+# in it, so it is built and tested on Linux as well -- that is where the
+# decompilers' HLSL meets glslang's front end on every push.
+#
+#   macOS:  brew install glslang spirv-cross
+#   Debian: apt install glslang-dev spirv-tools libspirv-cross-c-shared-dev
+set(PS3RECOMP_MSL_TRANSLATION OFF)
+if(UNIX)
+    find_package(glslang CONFIG QUIET)
+
+    # spirv-cross's C API. Debian ships it as a shared library and Homebrew as
+    # a static one, under different pkg-config names -- and pkg-config itself
+    # is not a given on a Mac, so fall back to a plain header + library search.
+    set(SPVC_OK OFF)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(SPVC QUIET spirv-cross-c-shared)
+        if(NOT SPVC_FOUND)
+            pkg_check_modules(SPVC QUIET spirv-cross-c)
+        endif()
+        if(SPVC_FOUND)
+            set(SPVC_INC     ${SPVC_INCLUDE_DIRS})
+            set(SPVC_LIBS    ${SPVC_LINK_LIBRARIES})
+            set(SPVC_LIBDIRS ${SPVC_LIBRARY_DIRS})
+            set(SPVC_OK ON)
+        endif()
+    endif()
+    if(NOT SPVC_OK)
+        find_path(SPVC_INC_DIR spirv_cross_c.h PATH_SUFFIXES spirv_cross)
+        find_library(SPVC_LIB NAMES spirv-cross-c-shared spirv-cross-c)
+        if(SPVC_INC_DIR AND SPVC_LIB)
+            set(SPVC_INC  ${SPVC_INC_DIR})
+            set(SPVC_LIBS ${SPVC_LIB})
+            get_filename_component(SPVC_LIBDIRS "${SPVC_LIB}" DIRECTORY)
+            set(SPVC_OK ON)
+        endif()
+    endif()
+
+    if(glslang_FOUND AND SPVC_OK
+       AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
+        add_library(ps3recomp_msl_translation INTERFACE)
+        target_compile_definitions(ps3recomp_msl_translation INTERFACE
+            PS3RECOMP_HAVE_MSL_TRANSLATION=1)
+        target_include_directories(ps3recomp_msl_translation INTERFACE ${SPVC_INC})
+        target_link_libraries(ps3recomp_msl_translation INTERFACE
+            glslang::glslang glslang::SPIRV ${SPVC_LIBS})
+        if(TARGET glslang::glslang-default-resource-limits)
+            target_link_libraries(ps3recomp_msl_translation INTERFACE
+                glslang::glslang-default-resource-limits)
+        endif()
+        # A static spirv-cross C API (Homebrew's) needs the backends it was
+        # built from, and neither pkg-config nor the library name says so:
+        # pick up the static siblings next to it. The shared one carries
+        # its own.
+        if(SPVC_LIBS MATCHES "\\.a$")
+            foreach(part msl glsl hlsl cpp reflect util core)
+                find_library(SPVC_PART_${part} NAMES spirv-cross-${part}
+                    HINTS ${SPVC_LIBDIRS} NO_DEFAULT_PATH)
+                if(SPVC_PART_${part})
+                    target_link_libraries(ps3recomp_msl_translation INTERFACE
+                        ${SPVC_PART_${part}})
+                endif()
+            endforeach()
+        endif()
+        target_link_libraries(ps3recomp_runtime PRIVATE ps3recomp_msl_translation)
+        set(PS3RECOMP_MSL_TRANSLATION ON)
+        message(STATUS "  Shaders:      guest programs translated to MSL (glslang ${glslang_VERSION}, ${SPVC_LIBS})")
+    else()
+        message(STATUS "  Shaders:      glslang/spirv-cross not found; Metal backend stays fixed-function")
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Compiler flags
 # ---------------------------------------------------------------------------
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
@@ -198,6 +281,25 @@ if(UNIX)
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
     )
+    # The runtime carries C++ (and, with translation on, spirv-cross), so the
+    # C++ driver must do the final link or the standard library goes missing.
+    set_target_properties(ps3recomp_host PROPERTIES LINKER_LANGUAGE CXX)
+
+    # Guest shader translation, decompilers -> HLSL -> MSL, with no GPU: the
+    # regression net for the Metal backend's shader path on every platform.
+    if(PS3RECOMP_MSL_TRANSLATION)
+        add_executable(test_shader_msl
+            libs/video/tests/test_shader_msl.c
+            libs/video/rsx_shader_msl.cpp
+            libs/video/rsx_vp_decompiler.c
+            libs/video/rsx_fp_decompiler.c
+        )
+        target_include_directories(test_shader_msl PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        )
+        target_link_libraries(test_shader_msl PRIVATE ps3recomp_msl_translation)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
