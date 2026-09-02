@@ -47,10 +47,14 @@ Complete guide to building the ps3recomp runtime library and game projects.
 - GCC 12+ or Clang 14+
 - Development headers: `libpthread`, `libm`
 - Optional: SDL2 development package (`libsdl2-dev`) for input/audio
+- Optional: `glslang-dev glslang-tools spirv-tools libspirv-cross-c-shared-dev`
+  build the HLSL → MSL shader translation and its test, which need no GPU
 
 **macOS:**
 - Xcode 14+ (Apple Clang 14+)
 - Optional: SDL2 via Homebrew (`brew install sdl2`)
+- Optional: `brew install glslang spirv-cross` for guest shaders in the Metal
+  backend; without them it stays on its fixed-function path
 
 ---
 
@@ -261,16 +265,26 @@ Builds and is covered by CI (`.github/workflows/macos.yml`, arm64, Debug and
 Release on every push). That workflow builds the runtime library, runs all
 eight lifter test suites — including the 1300+ instruction conformance checks,
 which compile and *execute* lifted code — and then runs `ps3recomp_host`
-headlessly, asserting the presented pixel matches the guest clear colour and
-that an NV4097 triangle covers the centre pixel. A green tick means the
-graphics bridge works, not merely that it compiled.
+headlessly: the presented pixel must match the guest clear colour, an NV4097
+triangle must cover the centre pixel, a triangle drawn through a guest vertex
+program and a guest fragment program must come out the colour the fragment
+program computes, and a guest texture sampled by a guest program must come out
+the texture's colour. A green tick means the graphics bridge works, not merely
+that it compiled.
 
 ```bash
-brew install ninja sdl2
+brew install ninja sdl2 glslang spirv-cross
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
+PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader
+PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --tex
+./build/test_shader_msl
 ```
+
+glslang and spirv-cross are what turn the decompilers' HLSL into MSL
+(`libs/video/rsx_shader_msl.cpp`). They are optional: without them CMake says
+so and the Metal backend draws with its built-in shader only.
 
 The same workflow also runs `test_win32_compat` and `sync_stress` on the
 arm64 runner, and `tools/check_ppu_scaffold.py` compiles the PPU boot scaffold
@@ -282,9 +296,10 @@ arm64 runner, and `tools/check_ppu_scaffold.py` compiles the PPU boot scaffold
 **It cannot run a recompiled game yet.** What is missing is not the scaffold
 but what sits on either side of it: the production renderer
 (`libs/video/rsx_live_draw.c`, the live NV4097 draw engine) is D3D12-only and
-compiles to a stub off Windows, while the Metal backend covers the clear, flip
-and fixed-function draw path `ps3recomp_host` exercises; and a title's own host
-code has to be built and debugged on the platform. `docs/MACOS_PORT.md` has the
+compiles to a stub off Windows, while the Metal backend covers clear, flip,
+guest vertex and fragment programs and guest textures -- not yet depth and
+stencil, render targets, mip levels or cube maps; and a title's own host code
+has to be built and debugged on the platform. `docs/MACOS_PORT.md` has the
 status and the plan.
 
 Apple Silicon specifics the tree already accounts for: 16 KB host pages (the

@@ -11,7 +11,8 @@ documents the host shim itself._
 | Runtime library | builds, Debug and Release, verified arm64 |
 | Lifter suites | all eight, including the 1300+ conformance cases compiled and executed with Apple Clang |
 | SPU helper tests | pass |
-| `ps3recomp_host` | clear, flip, a real NV4097 draw and a 60-frame run through the **Metal** backend, headless |
+| `ps3recomp_host` | clear, flip, a fixed-function NV4097 draw, a draw through **guest vertex and fragment programs**, and a draw sampling a **guest texture** from a guest program -- headless through the **Metal** backend, with 60-frame runs |
+| Guest shader translation | `test_shader_msl`: hand-assembled NV40 programs through the decompilers, glslang and spirv-cross, checked for the MSL binding contract the backend relies on (runs on Linux too) |
 | PPU boot scaffold | `ppu_loader.cpp`, `ppu_hle.cpp`, `ppu_fs.cpp`, `ppu_sysprx.cpp`, `boot_main.cpp` compile at a recorded baseline of **0** errors (`darwin-clang` in `tools/ppu_scaffold_baseline.json`) |
 | Win32 host shim | `runtime/platform/tests/test_win32_compat.c`, 197 checks |
 | lv2 sync primitives | `tests/sync_stress`: mutex, cond, semaphore and event-queue stress on host threads |
@@ -25,9 +26,19 @@ because that needs a lifted game.
 1. **A renderer.** The production draw path is `libs/video/rsx_live_draw.c`,
    the live NV4097 draw engine, and it is D3D12-only: off Windows the whole file
    compiles to a stub (`#if !defined(_WIN32)`). The Metal backend
-   (`rsx_metal_backend.m`) is the vtable-style backend: clear, flip, a
-   fixed-function draw with a built-in shader and a PSO cache -- enough for
-   `ps3recomp_host`, not for a game. Nothing runs guest shaders on a Mac yet.
+   (`rsx_metal_backend.m`) is the vtable-style backend. It runs the guest's
+   own vertex and fragment programs -- decompiler HLSL, lowered to MSL by
+   glslang and spirv-cross (`rsx_shader_msl.cpp`) and compiled at runtime --
+   with per-draw constant blocks, the alpha test, culling and the colour
+   mask, and it binds guest textures through the shared layout/decode path
+   with the `TEXTURE_CONTROL1` crossbar as the texture's swizzle and the
+   sampler registers decoded; every one of those semantics is copied field
+   for field from the D3D12 backend. It has no depth/stencil attachment,
+   no render-to-texture or MRT, no surface formats beyond the drawable's,
+   no mip levels, cube maps or vertex textures. And it is the simpler
+   engine: a title on Windows runs through `rsx_live_draw.c`, so the last
+   step is either a seam under that file or the vtable backend growing the
+   rest of that behaviour.
 
 2. **A game's host code.** The scaffold in `runtime/ppu/` is game-agnostic; a
    port adds its own runner (imports, overrides, the window, diagnostics). A
@@ -44,21 +55,33 @@ because that needs a lifted game.
 
 ### 1. Renderer
 
-Two routes, and the recommendation is the first:
+The Metal-native route was taken. `rsx_metal_backend.m` runs guest programs
+through `libs/video/rsx_shader_msl.cpp` -- HLSL to SPIR-V with glslang,
+SPIR-V to MSL with spirv-cross, both optional at configure time and the
+backend fixed-function without them -- and binds guest textures through the
+shared `rsx_texture_layout` path. There is no second emitter: the decompilers'
+HLSL is the one source, and `test_shader_msl` checks on every push, on Linux
+as well, that glslang's front end still accepts what they emit and that the
+MSL carries the buffer, texture, sampler and attribute slots the backend binds
+to. The alternative -- Vulkan through MoltenVK under a seam in
+`rsx_live_draw.c`, with a Windows A/B through `rsx_live_replay` -- remains the
+obvious shape for a Linux backend.
 
-- **Vulkan through MoltenVK.** Put a small seam under the ~50 functions of
-  `rsx_live_draw.c` that touch D3D12 (device, swap chain, PSO, resources,
-  command lists, present) and implement it on Vulkan, with SDL2 owning the
-  window and surface. The HLSL the fp/vp decompilers emit stays as it is and is
-  compiled to SPIR-V at cache-miss time (glslang's HLSL front end; DXC for
-  what it rejects). The same backend serves Linux, and on Windows it gives an
-  A/B against D3D12 through the existing `rsx_live_replay` capture harness --
-  which is how the port gets validated without a Mac-side oracle.
-- **Metal-native.** Extend `rsx_metal_backend.m` with the guest shader path
-  (HLSL -> SPIR-V -> MSL via spirv-cross). Fewer layers on a Mac; no Linux, no
-  Windows A/B, and a second emitter to keep in step with the first.
+What is left, in order:
 
-Interim visibility before either lands: an SDL2 window that blits
+- **Depth and stencil.** A depth attachment on the drawable and the NV4097
+  depth/stencil state as pipeline state (`set_depth_stencil` is still
+  unhandled).
+- **Render targets.** `SET_SURFACE_*` beyond the clip size: colour and zeta
+  surfaces as textures, render-to-texture, MRT, surface formats.
+- **The rest of texturing.** Mip levels, cube maps, vertex textures, and the
+  formats `rsx_texture_layout` does not classify yet.
+- **The production engine.** A seam under `rsx_live_draw.c`, or the vtable
+  backend growing its behaviour. The game-proven pieces to carry across are in
+  the Yakuza port's `rsx_live_draw.c`, `rsx_dispatch.c`, `rsx_gpu_mirror.c`
+  and `rsx_guest_pages.c`.
+
+Interim visibility before that lands: an SDL2 window that blits
 `rsx_live_draw_present_rgba()` frames, so a Mac boot is visible.
 
 ### 2. Bring up a title
@@ -83,10 +106,13 @@ and consumer.
 ## Building and testing on a Mac
 
 ```bash
-brew install cmake ninja sdl2 python@3.12
+brew install cmake ninja sdl2 python@3.12 glslang spirv-cross
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw --frames=60
+PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw --frames=60   # fixed-function draw
+PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader             # guest VP + FP
+PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --tex                # guest texture via a guest FP
+./build/test_shader_msl -v                        # decompilers -> MSL, sources printed
 
 for t in tools/test_*.py; do python3 "$t"; done          # lifter suites
 python3 tools/check_ppu_scaffold.py                     # scaffold ratchet
@@ -94,6 +120,12 @@ clang -std=gnu17 -I runtime/platform -o /tmp/twc \
       runtime/platform/tests/test_win32_compat.c runtime/platform/win32_compat.c && /tmp/twc
 cmake -S tests/sync_stress -B build-ss -G Ninja && cmake --build build-ss && ./build-ss/sync_stress
 ```
+
+Two switches on the backend: `PS3RECOMP_METAL_SHADER_DUMP=<dir>` writes every
+translated program's HLSL and MSL there, named by cache key, and
+`PS3RECOMP_METAL_FIXED_FUNCTION=1` pins every draw to the built-in shader --
+the first thing to flip when a title's draws vanish, to tell a translation
+problem from a fetch or state one.
 
 Profiling moves from WPR/uProf to Instruments (`xctrace`) and `sample`. An
 M1 Pro has 8 (or 6) performance cores and 2 efficiency cores; count busy host

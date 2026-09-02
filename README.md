@@ -48,7 +48,8 @@ Verified by CI on every push unless noted.
 | Render backend | D3D12 | Metal | null (headless software) |
 | Runs a recompiled game | **yes** | **no** | no |
 
-macOS builds the runtime, renders through Metal, passes the full test suite,
+macOS builds the runtime, renders through Metal — the guest's own vertex and
+fragment programs and its textures included — passes the full test suite,
 compiles the PPU boot scaffold — `ppu_loader.cpp`, `boot_main.cpp` and the HLE
 dispatch — at zero errors against the Win32 host layer in `runtime/platform/`,
 and runs the lv2 sync stress suite on Apple Silicon. What it cannot do yet is
@@ -84,13 +85,15 @@ can run a title no matter how good its renderer is.
 a neutral draw record all live outside the D3D12 file now, so a backend no
 longer has to reimplement them to draw anything.
 
-- **macOS** has the furthest to go that is *interesting* rather than
-  mechanical: [@slushiimusic](https://github.com/slushiimusic)'s Metal backend
+- **macOS**: [@slushiimusic](https://github.com/slushiimusic)'s Metal backend
   (#96) does clear, flip, guest vertex fetch, a pipeline-state cache and blend
-  translation. Reaching D3D12 parity means the guest's own fragment programs
-  through the decompiler, then textures. `ps3recomp_host` already drives
-  cellGcm → RSX → Metal with no lifted game, so each step is testable before a
-  title exists to run.
+  translation, and now runs the guest's own vertex and fragment programs —
+  the decompilers' HLSL lowered to MSL by glslang and spirv-cross — and
+  samples guest textures through the `TEXTURE_CONTROL1` crossbar, with every
+  semantic copied from the D3D12 backend. `ps3recomp_host` drives all of it
+  headlessly with no lifted game (`--draw`, `--shader`, `--tex`), so each step
+  was testable before a title exists to run. Next come depth/stencil, render
+  targets, mip levels and cube maps, and then the production draw engine.
 - **Linux** has no renderer at all — the headless backend is a CPU triangle
   filler for CI, deliberately. Vulkan is the obvious target, and it starts from
   the same neutral draw record Metal reads.
