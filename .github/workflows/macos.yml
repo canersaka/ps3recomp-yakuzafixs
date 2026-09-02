@@ -88,6 +88,10 @@ jobs:
           # built-in run proves the check has teeth: it must fail.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader --frames=60
+          # A guest texture sampled by a guest fragment program: layout,
+          # decode, upload, the CONTROL1 crossbar as a swizzle, and the
+          # sampler registers. The quad is green and the texture is not.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --tex
           if PS3RECOMP_METAL_FIXED_FUNCTION=1 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader; then
             echo "--shader passed with the built-in shader forced; the check is not checking"
             exit 1

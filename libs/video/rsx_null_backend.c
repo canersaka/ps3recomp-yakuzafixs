@@ -402,14 +402,18 @@ static void nullsw_bind_texture(void* ud, u32 unit, const rsx_texture_state* t)
     u32 h =  t->image_rect        & 0xFFFFu;
     if (!w || !h || w > 4096u || h > 4096u) { s_soft.tex_ready = 0; return; }
 
-    /* Bit 31 of the offset selects MAIN vs LOCAL, same as a vertex array. */
-    u32 ea = (t->offset & 0x80000000u)
-                 ? cellGcmResolveLocated(0, t->offset & 0x7FFFFFFFu)
-                 : cellGcmResolveLocated(1, t->offset & 0x7FFFFFFFu);
-    if (!vm_base) { s_soft.tex_ready = 0; return; }
+    /* SET_TEXTURE_FORMAT as a title writes it: bits [1:0] are the location
+     * (1 = local, 2 = main), [15:8] the format byte with its LN/UN flags.
+     * The offset is a plain RSX offset. This used to read the format byte
+     * from the low bits and a location flag from bit 31 of the offset --
+     * a convention only this backend and the host harness shared; the
+     * D3D12 backend, which has met real titles, decodes the register. */
+    u32 ea = cellGcmResolveLocated((t->format & 3u) == 1u, t->offset);
+    if (!vm_base || ea == 0xFFFFFFFFu) { s_soft.tex_ready = 0; return; }
+    const u32 fmt = (t->format >> 8) & 0xFFu;
 
     rsx_tex_layout tl;
-    rsx_texture_layout(t->format, w, h, &tl);
+    rsx_texture_layout(fmt, w, h, &tl);
     if (tl.compressed) { s_soft.tex_ready = 0; return; }   /* no BC decode here */
 
     u32 pitch = w * 4u;
