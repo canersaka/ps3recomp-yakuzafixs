@@ -17,6 +17,8 @@ How ps3recomp handles cross-platform compatibility between Windows and POSIX (Li
 9. [Cryptographic RNG](#cryptographic-rng)
 10. [Filesystem Differences](#filesystem-differences)
 11. [Fiber / Coroutine Support](#fiber--coroutine-support)
+12. [The Host Shim (`runtime/platform/`)](#the-host-shim-runtimeplatform)
+13. [Apple Silicon Notes](#apple-silicon-notes)
 
 ---
 
@@ -402,3 +404,74 @@ swapcontext(&current, &ctx);
 ```
 
 **Note:** `ucontext` is deprecated on macOS but still works. For production macOS builds, consider using `setjmp`/`longjmp` with manual stack management, or platform-specific alternatives.
+
+---
+
+## The Host Shim (`runtime/platform/`)
+
+The inline `#ifdef _WIN32` pattern above is right for HLE modules, where each
+branch is a few lines. It is the wrong tool for code written *entirely* against
+Win32 -- the PPU boot scaffold, the sync stress suite, and a game's own host
+code, where the call sites number in the hundreds. For those, the Win32 names
+are supplied on POSIX instead, and the call sites stand:
+
+| Header | Provides | On Windows |
+|---|---|---|
+| `win32_compat.h` + `win32_compat.c` | Types (`DWORD`, `LONG`, `HANDLE`, `LARGE_INTEGER`...), the Interlocked family (32/64-bit, pointer, both spellings), `ReadAcquire`/`WriteRelease`, barriers, `SRWLOCK` (both modes), `CONDITION_VARIABLE`, `CRITICAL_SECTION`, events, semaphores, joinable threads, waitable timers, `WaitForSingleObject`/`WaitForMultipleObjects`, `WaitOnAddress`, `Sleep`/QPC/`GetTickCount64`, thread priority/affinity/description, `VirtualAlloc`/`VirtualProtect`/`VirtualFree`, `GetSystemInfo`, `GetLastError` | passthrough to `<windows.h>` |
+| `msvc_compat.h` | The MSVC CRT and intrinsic dialect: `_snprintf`, `fopen_s`, `strcpy_s`, `_stricmp`, `_fseeki64`, `_mkdir`, `_stat`, `_byteswap_*`, `_BitScanForward`, `__popcnt`, `_umul128`, `_ReturnAddress`, `__debugbreak`, `__declspec(thread/noinline/align)`, `__forceinline` | passthrough to `<intrin.h>` and the CRT |
+| `win32_backtrace.h` | `RtlCaptureStackBackTrace`, `GetModuleHandleA/ExA` over `backtrace(3)` and `dladdr(3)` | passthrough |
+| `win32_dirent.h` | `<dirent.h>` for MSVC | a `FindFirstFile` implementation |
+| `darwin_compat.h` | `pthread_mutex_timedlock`, `sem_timedwait` on Darwin | n/a |
+| `posix_sem.h` | `ps3_sem_t`: a counting semaphore with a real timed wait, for hosts where `sem_init` is a stub (Darwin) | n/a |
+
+Rules the shim keeps, and code using it must keep too:
+
+- **`LONG` is 32 bits** on every host, as it is on Windows. The LP64 `long` is
+  not an acceptable stand-in: `InterlockedExchange((volatile LONG*)&u32, ...)`
+  through a 64-bit `LONG` is an 8-byte read-modify-write on a 4-byte object.
+  Declare interlocked targets `LONG`/`LONG64`, never `long`.
+- **`SRWLOCK` and `CONDITION_VARIABLE` stay pointer-sized** so they fit the
+  `void*` slots the SPU context stores them in. The real pthread object is
+  heap-allocated on first use; zero initialisation remains valid.
+- **Condition variables work with any lock** (SRW in either mode, or a
+  critical section) through a generation counter, so they are not tied to a
+  pthread mutex.
+- **Waitable handles share one lock**, which is what makes
+  `WaitForMultipleObjects(bWaitAll)` atomic. The runtime's hot paths use
+  pthreads directly in their `#else` branches; the shim carries the coarse,
+  Win32-shaped traffic it was written for.
+- **`WakeByAddressSingle` broadcasts.** Addresses hash to buckets, so a single
+  signal could wake the wrong waiter; callers already re-check the value, as
+  the Win32 contract requires.
+- **`SuspendThread` of a running thread fails** (`(DWORD)-1`), the value Win32
+  code already checks for. A thread created `CREATE_SUSPENDED` is parked on a
+  gate that `ResumeThread` opens, and that case is exact.
+- **`VirtualProtect` cannot report the old protection**; it reports
+  `PAGE_READWRITE`, so a restore errs towards accessible.
+
+`runtime/platform/tests/test_win32_compat.c` is the contract: return
+conventions, widths, one waiter per `SetEvent`, both wait modes, timers,
+`VirtualAlloc` reserve/commit/protect/release. It runs in the Linux and macOS
+workflows, and `tests/sync_stress` runs on the same shim on every platform.
+
+---
+
+## Apple Silicon Notes
+
+What differs on an arm64 Mac from the x86-64 Windows machines the runtime was
+validated on, and where each is handled:
+
+| Difference | Where |
+|---|---|
+| **Weak memory model.** x86 is TSO; arm64 reorders freely. Lifted guest code carries its own fences (`sync`/`lwsync`/`eieio`/`isync` and the SPU `sync`/`dsync` lift to C11 fences), so the audit target is host runtime code that used `volatile` or a plain store to publish state. Every "data stores, then flag store" needs a release/acquire pair; the shim's Interlocked ops are sequentially consistent and `ReadAcquire`/`WriteRelease` are there for the flag case. | `runtime/platform/win32_compat.h`, per-module |
+| **16 KB pages.** `mprotect` on a 4 KB-aligned address fails with `EINVAL`, and a "4 KB" guard covers 16 KB. `VM_PAGE_SIZE` stays the guest's 4 KB; commit, protect and the stack guard use `vm_host_page_size()`. | `runtime/memory/vm.h` |
+| **No unnamed semaphores.** `sem_init` returns `ENOSYS`. | `runtime/platform/posix_sem.h` |
+| **No thread affinity.** `SetThreadAffinityMask` is a no-op; thread priority maps to QoS classes (`USER_INTERACTIVE` for above-normal and up), which is what keeps a thread on the P-cores. | `runtime/platform/win32_compat.c` |
+| **FMA in the base ISA.** Clang contracts `a*b+c` into a fused multiply-add by default on arm64; MSVC never does and x86-64 without `-mfma` cannot. The library builds with `-ffp-contract=off` so results match the validated x86 builds and a PPC `fmadd` is fused only where the lifter spells one -- and a port's own build of the lifted code must set the same flag. | `CMakeLists.txt` |
+| **`ucontext` is deprecated** and hidden unless `_XOPEN_SOURCE` is defined first. | `libs/spurs/cellFiber.c` |
+| **Darwin names only the calling thread** (`pthread_setname_np(name)`), and `pthread_threadid_np` is the kernel tid. | `runtime/platform/win32_compat.c` |
+| **x86 intrinsics.** Spin hints are `pause` on x86 and `yield` on arm64; SSE paths in `stb_image` are guarded by its own `STBI_SSE2` detection. | `runtime/spu/spu_lockstep.c`, `win32_compat.h` |
+
+An x86-64 build of the same tree under Rosetta 2 runs with TSO and 4 KB pages,
+so it separates an OS-port bug from an architecture bug when an arm64 hang
+needs classifying. Set it up for that, not as the mainline.

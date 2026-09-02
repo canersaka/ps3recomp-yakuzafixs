@@ -139,9 +139,19 @@ cmake --build build-tests
 ctest --test-dir build-tests --output-on-failure
 ```
 
-The test build currently registers the deterministic synchronization stress
-suite. It can still be configured directly from `tests/sync_stress` when
-testing an alternate runtime tree with `PS3RECOMP_TREE_ROOT`.
+The test build registers the deterministic synchronization stress suite
+(`tests/sync_stress`), on every platform: off Windows it runs on the Win32
+threads and events that `runtime/platform/win32_compat.h` provides. It can
+still be configured directly from `tests/sync_stress` when testing an
+alternate runtime tree with `PS3RECOMP_TREE_ROOT`.
+
+The host shim has a self-contained test of its own, which needs no CMake:
+
+```bash
+cc -std=gnu17 -Wall -Wextra -I runtime/platform \
+   runtime/platform/tests/test_win32_compat.c runtime/platform/win32_compat.c -lpthread \
+   -o test_win32_compat && ./test_win32_compat
+```
 
 ### Checking the PPU boot scaffold
 
@@ -173,14 +183,12 @@ GCC, Clang and clang-cl — so in practice this is a hard gate: any new error
 fails the build.
 
 Compiling is not the same as running. The scaffold is not linked or executed by
-anything in this repository (that needs a lifted game), and `boot_main.cpp`
-still starts its vblank ticker, hang watchdog and profiler inside
-`#ifdef _WIN32` with no `#else`, so a POSIX host has no frame clock. Those are
-the remaining gaps between "builds" and "runs a title".
+anything in this repository (that needs a lifted game). `boot_main.cpp` starts
+its vblank ticker and the guest profiler on every host; only the tlhelp32-based
+hang watchdog stays inside `#ifdef _WIN32`.
 
-It compiles the four scaffold translation units. `boot_main.cpp` is excluded:
-it also pulls in the per-game SPU recomp header and the generated function
-table, which a stub cannot stand in for.
+It compiles all five scaffold translation units, `boot_main.cpp` included --
+`ppu_recomp.h` is the only generated header it needs, and the stub covers that.
 
 ### Compile Definitions
 
@@ -264,11 +272,26 @@ cmake --build build
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
 ```
 
-**It cannot run a recompiled game yet.** The PPU boot scaffold —
-`runtime/ppu/ppu_loader.cpp`, `runtime/ppu/tests/boot_main.cpp` and the HLE
-dispatch — is still Win32-only (thread creation, `VirtualAlloc`, SEH, stack
-walking) and is compiled per-game rather than into the library, so it is not
-covered by the macOS build. Porting that scaffold is the remaining work.
+The same workflow also runs `test_win32_compat` and `sync_stress` on the
+arm64 runner, and `tools/check_ppu_scaffold.py` compiles the PPU boot scaffold
+-- `ppu_loader.cpp`, `ppu_hle.cpp`, `ppu_fs.cpp`, `ppu_sysprx.cpp` and
+`boot_main.cpp` -- at a recorded baseline of **zero** errors for
+`darwin-clang`. The Win32 API those files were written against comes from
+`runtime/platform/` (see `docs/PLATFORM_ABSTRACTION.md`).
+
+**It cannot run a recompiled game yet.** What is missing is not the scaffold
+but what sits on either side of it: the production renderer
+(`libs/video/rsx_live_draw.c`, the live NV4097 draw engine) is D3D12-only and
+compiles to a stub off Windows, while the Metal backend covers the clear, flip
+and fixed-function draw path `ps3recomp_host` exercises; and a title's own host
+code has to be built and debugged on the platform. `docs/MACOS_PORT.md` has the
+status and the plan.
+
+Apple Silicon specifics the tree already accounts for: 16 KB host pages (the
+VM sizes guard pages and protection changes in host pages), no unnamed POSIX
+semaphores (`runtime/platform/posix_sem.h`), no thread affinity (thread
+priority maps to QoS classes instead), and `-ffp-contract=off` so a PPC
+`fmadd` is fused only where the lifter says so.
 
 Thanks to [@slushiimusic](https://github.com/slushiimusic), who reported the
 original docs-vs-reality gap in
@@ -287,7 +310,7 @@ and the Metal backend ([#96](https://github.com/sp00nznet/ps3recomp/pull/96)).
 | MSVC | 19.35+ (VS 2022) | Windows | Full support |
 | GCC | 12+ | Linux | Full support |
 | Clang | 14+ | Linux | Full support |
-| Clang / Apple Clang | 14+ (Xcode 14) | macOS | **Not building** — see #94, fix in review (#95) |
+| Clang / Apple Clang | 14+ (Xcode 14) | macOS (arm64) | Full support — CI |
 | MinGW-w64 | GCC 12+ | Windows | Supported |
 
 ### Required C17 Features
