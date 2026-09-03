@@ -158,14 +158,20 @@ s32 cellSysutilCheckCallback(void)
     return CELL_OK;
 }
 
-s32 cellSysutilGetSystemParamInt(s32 id, s32* value)
+/* value_ea is a GUEST address, and it is spelt as one. It used to be declared
+ * s32* and immediately cast back to a guest EA, with a comment explaining that
+ * dereferencing it as a host pointer faults -- true, and no help to a caller
+ * who reads the declaration instead of the body. A host that translated the
+ * argument first, which is what a pointer parameter asks for, handed this the
+ * address of a host stack local; the cast truncated it to 32 bits and
+ * vm_write32 stored four bytes at whatever guest address that spelt. It varies
+ * with stack layout, so it lands somewhere different every run and nowhere
+ * near the guest's variable, and nothing on the way says a word.
+ *
+ * A u32 cannot be passed a host pointer by accident. */
+s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
 {
-    /* `value` is a GUEST address (the recompiled title passes its own VM
-     * pointer); dereferencing it as a host pointer faults. Compute locally
-     * and store big-endian via vm_write32 (this crashed minecraft's boot at
-     * its very first GetSystemParamInt(LANG) call). */
-    uint32_t out_ea = (uint32_t)(uintptr_t)value;
-    if (!out_ea)
+    if (!value_ea)
         return CELL_SYSUTIL_ERROR_VALUE;
 
     s32 v = 0;
@@ -193,36 +199,36 @@ s32 cellSysutilGetSystemParamInt(s32 id, s32* value)
         break;
     }
 
-    vm_write32(out_ea, (uint32_t)v);
+    vm_write32(value_ea, (uint32_t)v);
     return CELL_OK;
 }
 
-s32 cellSysutilGetSystemParamString(s32 id, char* buf, u32 bufsize)
+/* buf_ea is a GUEST address, for the same reason and with the same history as
+ * the Int form above: the body always treated it as one, and only the
+ * declaration said otherwise. */
+s32 cellSysutilGetSystemParamString(s32 id, u32 buf_ea, u32 bufsize)
 {
-    if (!buf || bufsize == 0)
+    if (!buf_ea || bufsize == 0)
         return CELL_SYSUTIL_ERROR_VALUE;
 
     switch (id) {
     case CELL_SYSUTIL_SYSTEMPARAM_ID_NICKNAME: {
-        /* `buf` is a GUEST address — serialize byte-wise via vm_write8. */
         const char* s = "ps3recomp_user";
-        uint32_t ea = (uint32_t)(uintptr_t)buf;
         u32 i;
-        for (i = 0; s[i] && i < bufsize - 1; i++) vm_write8(ea + i, (uint8_t)s[i]);
-        vm_write8(ea + i, 0);
+        for (i = 0; s[i] && i < bufsize - 1; i++) vm_write8(buf_ea + i, (uint8_t)s[i]);
+        vm_write8(buf_ea + i, 0);
         break;
     }
     case CELL_SYSUTIL_SYSTEMPARAM_ID_CURRENT_USERNAME: {
         const char* s = "User";
-        uint32_t ea = (uint32_t)(uintptr_t)buf;
         u32 i;
-        for (i = 0; s[i] && i < bufsize - 1; i++) vm_write8(ea + i, (uint8_t)s[i]);
-        vm_write8(ea + i, 0);
+        for (i = 0; s[i] && i < bufsize - 1; i++) vm_write8(buf_ea + i, (uint8_t)s[i]);
+        vm_write8(buf_ea + i, 0);
         break;
     }
     default:
         printf("[cellSysutil] GetSystemParamString: unknown id 0x%04X\n", id);
-        vm_write8((uint32_t)(uintptr_t)buf, 0);
+        vm_write8(buf_ea, 0);
         break;
     }
 
