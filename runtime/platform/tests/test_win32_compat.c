@@ -851,6 +851,36 @@ static void test_module_names(void)
     CHECK(GetModuleFileNameA(NULL, narrow, 0) == 0);
 }
 
+/* ---- directories and process information --------------------------------- */
+static void test_directories_and_process(void)
+{
+    /* Named for this process: the suites run side by side on a build machine. */
+    char dir[256], deep[512];
+    snprintf(dir, sizeof dir, "/tmp/ps3recomp_compat_%u", (unsigned)GetCurrentProcessId());
+    rmdir(dir);                                       /* a previous run's, if any */
+
+    CHECK(CreateDirectoryA(dir, NULL));
+    struct _stat st;
+    CHECK(_stat(dir, &st) == 0 && (st.st_mode & _S_IFDIR));
+    CHECK(!CreateDirectoryA(dir, NULL) && GetLastError() == ERROR_ALREADY_EXISTS);
+
+    snprintf(deep, sizeof deep, "%s/absent/leaf", dir);
+    CHECK(!CreateDirectoryA(deep, NULL) && GetLastError() == ERROR_PATH_NOT_FOUND);
+    CHECK(!CreateDirectoryA("/dev/null/leaf", NULL) &&
+          GetLastError() == ERROR_PATH_NOT_FOUND);     /* a component is not a directory */
+    CHECK(!CreateDirectoryA(NULL, NULL) && GetLastError() == ERROR_INVALID_PARAMETER);
+    CHECK(rmdir(dir) == 0);
+
+    /* Accepted and ignored: no POSIX host has an EcoQoS to opt out of. */
+    PROCESS_POWER_THROTTLING_STATE pt;
+    memset(&pt, 0, sizeof pt);
+    pt.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    pt.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    pt.StateMask   = 0;
+    CHECK(SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+                                &pt, (DWORD)sizeof pt));
+}
+
 /* ---- MSVC CRT and intrinsic spellings ------------------------------------ */
 static __declspec(thread) int t_tls_probe;
 
@@ -922,6 +952,7 @@ int main(void)
     test_exceptions();
     test_symbols();
     test_module_names();
+    test_directories_and_process();
     test_msvc_compat();
     printf("win32_compat tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail;
