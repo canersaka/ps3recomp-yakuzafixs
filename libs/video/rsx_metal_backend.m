@@ -2075,7 +2075,11 @@ typedef enum {
 
 typedef struct {
     EngRecKind kind;
-    u32 surface, depth;
+    /* The colour targets a draw writes, A first, and how many of them; a
+     * colour clear names one, in rt[0]. */
+    u32 rt[RSX_BE_MAX_COLOR_TARGETS];
+    u32 nrt;
+    u32 depth;
     u32 pipeline;
     MTLPrimitiveType topology;
     u32 vb_off, stride, vertex_count;
@@ -2446,10 +2450,13 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
 static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
                                const rsx_be_render_state* rs,
                                const rsx_vertex_layout_plan* layout,
-                               u32 vertex_stride, rsx_be_format rt_fmt)
+                               u32 vertex_stride, rsx_be_format rt_fmt,
+                               u32 rt_count)
 {
     (void)user;
     if (!s_dev || !s_guest_shaders || !vertex_stride) return 0;
+    if (!rt_count) rt_count = 1;
+    if (rt_count > RSX_BE_MAX_COLOR_TARGETS) rt_count = RSX_BE_MAX_COLOR_TARGETS;
     if (s_eng_pipe_count >= ENG_MAX_PIPES) return 0;
     id<MTLFunction> vs = eng_function(vs_hlsl, RSX_SHADER_STAGE_VERTEX, "vp");
     if (!vs) return 0;
@@ -2476,8 +2483,6 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
     pd.vertexDescriptor = vd;
     pd.depthAttachmentPixelFormat   = MTL_DEPTH_FORMAT;
     pd.stencilAttachmentPixelFormat = MTL_DEPTH_FORMAT;
-    MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[0];
-    ca.pixelFormat = eng_pixel_format(rt_fmt);
     /* nv40 COLOR_MASK byte layout: B=[0:7] G=[8:15] R=[16:23] A=[24:31], any
      * nonzero byte turning that channel on. */
     MTLColorWriteMask wm = MTLColorWriteMaskNone;
@@ -2485,15 +2490,24 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
     if ((rs->color_mask >>  8) & 0xFF) wm |= MTLColorWriteMaskGreen;
     if ((rs->color_mask >> 16) & 0xFF) wm |= MTLColorWriteMaskRed;
     if ((rs->color_mask >> 24) & 0xFF) wm |= MTLColorWriteMaskAlpha;
-    ca.writeMask = wm;
-    if (rs->blend_enable) {
-        ca.blendingEnabled             = YES;
-        ca.sourceRGBBlendFactor        = blend_factor_to_metal(rs->sf_rgb);
-        ca.destinationRGBBlendFactor   = blend_factor_to_metal(rs->df_rgb);
-        ca.sourceAlphaBlendFactor      = blend_factor_to_metal(rs->sf_a);
-        ca.destinationAlphaBlendFactor = blend_factor_to_metal(rs->df_a);
-        ca.rgbBlendOperation           = blend_equation_to_metal(rs->eq_rgb);
-        ca.alphaBlendOperation         = blend_equation_to_metal(rs->eq_a);
+    /* Every attachment of an MRT set takes target A's blend and colour mask,
+     * as the vtable path's pso_for does with RTVFormats[1..]: a
+     * zero-initialised secondary attachment writes nothing at all. The
+     * fragment decompiler still emits one SV_TARGET, so B, C and D are
+     * attached and cleared, not fed. */
+    for (u32 r = 0; r < rt_count; r++) {
+        MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[r];
+        ca.pixelFormat = eng_pixel_format(rt_fmt);
+        ca.writeMask   = wm;
+        if (rs->blend_enable) {
+            ca.blendingEnabled             = YES;
+            ca.sourceRGBBlendFactor        = blend_factor_to_metal(rs->sf_rgb);
+            ca.destinationRGBBlendFactor   = blend_factor_to_metal(rs->df_rgb);
+            ca.sourceAlphaBlendFactor      = blend_factor_to_metal(rs->sf_a);
+            ca.destinationAlphaBlendFactor = blend_factor_to_metal(rs->df_a);
+            ca.rgbBlendOperation           = blend_equation_to_metal(rs->eq_rgb);
+            ca.alphaBlendOperation         = blend_equation_to_metal(rs->eq_a);
+        }
     }
 
     NSError* err = nil;
@@ -2598,11 +2612,15 @@ static int eng_sampler_slot(const rsx_be_sampler_desc* d)
     return slot;
 }
 
-static void eng_bind_targets(void* user, u32 surface, u32 depth)
+static void eng_bind_targets(void* user, const u32* surfaces, u32 count,
+                             u32 depth)
 {
     (void)user;
-    s_eng_pending.surface = surface;
-    s_eng_pending.depth   = depth;
+    if (count > RSX_BE_MAX_COLOR_TARGETS) count = RSX_BE_MAX_COLOR_TARGETS;
+    for (u32 i = 0; i < RSX_BE_MAX_COLOR_TARGETS; i++)
+        s_eng_pending.rt[i] = (i < count) ? surfaces[i] : 0;
+    s_eng_pending.nrt   = count;
+    s_eng_pending.depth = depth;
 }
 
 static void eng_bind_pipeline(void* user, u32 pipeline)
@@ -2695,8 +2713,9 @@ static void eng_clear_color(void* user, u32 surface, const float rgba[4])
     if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
     memset(r, 0, sizeof *r);
-    r->kind = ENG_REC_CLEAR_COLOR;
-    r->surface = surface;
+    r->kind  = ENG_REC_CLEAR_COLOR;
+    r->rt[0] = surface;
+    r->nrt   = 1;
     memcpy(r->clear_rgba, rgba, sizeof r->clear_rgba);
 }
 
@@ -2763,6 +2782,14 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
                 vertexStart:0 vertexCount:r->vertex_count];
 }
 
+/* Is this record aimed at exactly these colour attachments, in this order? */
+static int eng_record_targets_are(const EngRecord* r, const u32* rt, u32 nrt)
+{
+    if (r->nrt != nrt) return 0;
+    for (u32 k = 0; k < nrt; k++) if (r->rt[k] != rt[k]) return 0;
+    return 1;
+}
+
 /* One pass per contiguous run of draws against the same attachments, with any
  * clears immediately ahead of it folded into its load actions. A clear whose
  * targets the following draw does not share becomes a pass of its own, which
@@ -2790,19 +2817,28 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             continue;
         }
 
-        int have_clear_color = 0, have_clear_ds = 0;
-        u32 cs = 0, cd = 0, ds_flags = 0;
-        float crgba[4] = { 0, 0, 0, 0 };
+        /* The clears queued ahead of this pass. A colour clear names one
+         * surface and an MRT set arrives as one clear per target, so they are
+         * collected rather than compared: they become load actions on the
+         * pass below when the draw that follows writes the same targets. */
+        u32 n_cc = 0;
+        u32 cc_surf[RSX_BE_MAX_COLOR_TARGETS];
+        float cc_rgba[RSX_BE_MAX_COLOR_TARGETS][4];
+        int have_clear_ds = 0;
+        u32 cd = 0, ds_flags = 0;
         float cdepth = 1.0f;
         u8 cstencil = 0;
         while (i < s_eng_rec_count && s_eng_rec[i].kind != ENG_REC_DRAW &&
                s_eng_rec[i].kind != ENG_REC_DEPTH_RESOLVE) {
             const EngRecord* r = &s_eng_rec[i];
             if (r->kind == ENG_REC_CLEAR_COLOR) {
-                if (have_clear_color && r->surface != cs) break;
-                cs = r->surface;
-                memcpy(crgba, r->clear_rgba, sizeof crgba);
-                have_clear_color = 1;
+                u32 k = 0;
+                while (k < n_cc && cc_surf[k] != r->rt[0]) k++;
+                if (k == n_cc) {
+                    if (n_cc == RSX_BE_MAX_COLOR_TARGETS) break;
+                    cc_surf[n_cc++] = r->rt[0];
+                }
+                memcpy(cc_rgba[k], r->clear_rgba, sizeof cc_rgba[k]);
             } else {
                 if (have_clear_ds && r->depth != cd) break;
                 cd = r->depth;
@@ -2814,33 +2850,64 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             i++;
         }
 
-        u32 surface = have_clear_color ? cs : 0;
-        u32 depth   = have_clear_ds ? cd : 0;
+        /* What the pass attaches: the following draw's targets when it writes
+         * every surface the clears named, else the cleared surfaces on their
+         * own -- which is what keeps a mid-frame clear ordered against the
+         * draws around it. */
+        u32 rt[RSX_BE_MAX_COLOR_TARGETS];
+        u32 nrt = n_cc;
+        for (u32 k = 0; k < n_cc; k++) rt[k] = cc_surf[k];
+        u32 depth = have_clear_ds ? cd : 0;
         if (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
-            (!have_clear_color || s_eng_rec[i].surface == cs) &&
-            (!have_clear_ds    || s_eng_rec[i].depth   == cd)) {
-            surface = s_eng_rec[i].surface;
-            depth   = s_eng_rec[i].depth;
+            (!have_clear_ds || s_eng_rec[i].depth == cd)) {
+            const EngRecord* d = &s_eng_rec[i];
+            int covered = 1;
+            for (u32 k = 0; k < n_cc && covered; k++) {
+                int found = 0;
+                for (u32 j = 0; j < d->nrt; j++)
+                    if (d->rt[j] == cc_surf[k]) found = 1;
+                covered = found;
+            }
+            if (covered) {
+                nrt = d->nrt;
+                for (u32 k = 0; k < nrt; k++) rt[k] = d->rt[k];
+                depth = d->depth;
+            }
         }
 
-        id<MTLTexture> color = eng_obj(surface);
-        id<MTLTexture> zbuf  = eng_obj(depth);
-        if (!color && !zbuf) { if (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW) i++; continue; }
+        /* Metal wants every attachment the same size, and the engine registers
+         * an MRT set's members at target A's, so a set whose members disagree
+         * is one this frame cannot honour: it stops at the gap, as the vtable
+         * path's begin_pass does. */
+        id<MTLTexture> tex[RSX_BE_MAX_COLOR_TARGETS];
+        u32 attach = 0;
+        for (u32 k = 0; k < nrt; k++) {
+            id<MTLTexture> t = eng_obj(rt[k]);
+            if (!t) break;
+            if (attach && ([t width]  != [tex[0] width] ||
+                           [t height] != [tex[0] height])) break;
+            tex[attach++] = t;
+        }
+        id<MTLTexture> zbuf = eng_obj(depth);
+        if (!attach && !zbuf) { if (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW) i++; continue; }
         /* A pipeline always declares the depth attachment, so a draw pass
          * always has to have one; the display's shared buffer is the fallback
          * for a guest that never declared a zeta. */
-        if (color && !zbuf) zbuf = s_depth;
+        if (attach && !zbuf) zbuf = s_depth;
 
         MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-        if (color) {
-            rp.colorAttachments[0].texture     = color;
-            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-            if (have_clear_color && surface == cs) {
-                rp.colorAttachments[0].loadAction = MTLLoadActionClear;
-                rp.colorAttachments[0].clearColor =
-                    MTLClearColorMake(crgba[0], crgba[1], crgba[2], crgba[3]);
+        for (u32 k = 0; k < attach; k++) {
+            rp.colorAttachments[k].texture     = tex[k];
+            rp.colorAttachments[k].storeAction = MTLStoreActionStore;
+            int cleared = -1;
+            for (u32 c = 0; c < n_cc; c++) if (cc_surf[c] == rt[k]) cleared = (int)c;
+            if (cleared >= 0) {
+                rp.colorAttachments[k].loadAction = MTLLoadActionClear;
+                rp.colorAttachments[k].clearColor =
+                    MTLClearColorMake(cc_rgba[cleared][0], cc_rgba[cleared][1],
+                                      cc_rgba[cleared][2], cc_rgba[cleared][3]);
             } else {
-                rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+                rp.colorAttachments[k].loadAction = MTLLoadActionLoad;
             }
         }
         if (zbuf) {
@@ -2858,18 +2925,23 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
                     ? MTLLoadActionClear : MTLLoadActionLoad;
             rp.stencilAttachment.clearStencil = cstencil;
         }
-        if (!color) {
+        if (!attach) {
             rp.renderTargetWidth  = [zbuf width];
             rp.renderTargetHeight = [zbuf height];
         }
 
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
-        if (!enc) {
-            while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW) i++;
+        /* A draw's pipeline declares as many colour attachments as its record
+         * named, so a pass that could not bind them all takes its clears and
+         * skips those draws rather than encoding a mismatch. */
+        if (!enc || attach != nrt) {
+            if (enc) [enc endEncoding];
+            while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
+                   eng_record_targets_are(&s_eng_rec[i], rt, nrt)) i++;
             continue;
         }
         while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
-               s_eng_rec[i].surface == surface &&
+               eng_record_targets_are(&s_eng_rec[i], rt, nrt) &&
                (s_eng_rec[i].depth == depth ||
                 (!s_eng_rec[i].depth && zbuf == s_depth))) {
             eng_encode_draw(enc, &s_eng_rec[i], stage);

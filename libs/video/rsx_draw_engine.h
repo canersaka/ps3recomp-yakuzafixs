@@ -96,6 +96,8 @@ typedef struct rsx_be_render_state {
 
 #define RSX_BE_MAX_TEXTURES        RSX_DSP_NUM_TEXTURES
 #define RSX_BE_MAX_VERTEX_TEXTURES RSX_DSP_NUM_VERTEX_TEXTURES
+/* Colour targets a draw can name: A alone, or an MRT set of A, B, C and D. */
+#define RSX_BE_MAX_COLOR_TARGETS   4
 
 /* How many distinct guest textures the engine keeps before it evicts the
  * least recently used one. Public so the eviction test can be exact about
@@ -149,17 +151,30 @@ typedef struct rsx_draw_backend {
     /* Pipelines, from the decompilers' HLSL plus the state that selects a
      * variant. This is the one call that hides D3DCompile against glslang
      * plus spirv-cross plus -newLibraryWithSource:, and the input layout with
-     * it. 0 means the pair could not be built; the engine caches that. */
+     * it. 0 means the pair could not be built; the engine caches that.
+     *
+     * `rt_count` is how many colour attachments the pass will have, and every
+     * one of them takes target A's blend and colour mask: a zero-initialised
+     * secondary attachment writes nothing at all, which would leave a
+     * deferred pass with only its first G-buffer plane. It is part of the
+     * engine's pipeline key, because a host API matches a pipeline's
+     * attachments against the pass it is encoded in. */
     u32  (*pipeline_create)(void* user, const char* vs_hlsl, const char* ps_hlsl,
                             const rsx_be_render_state* rs,
                             const rsx_vertex_layout_plan* layout,
-                            u32 vertex_stride, rsx_be_format rt_fmt);
+                            u32 vertex_stride, rsx_be_format rt_fmt,
+                            u32 rt_count);
     void (*pipeline_release)(void* user, u32 pipeline);
 
     /* Per-draw binding. The backend owns every ring the D3D12 engine used to
      * own itself, so the engine hands over CPU-side arrays and never mentions
      * a descriptor. */
-    void (*bind_targets)(void* user, u32 surface, u32 depth);
+    /* The colour targets this draw writes, and the depth attachment under
+     * them. `count` is 1 for an ordinary draw and up to
+     * RSX_BE_MAX_COLOR_TARGETS for an MRT set, whose members are all target
+     * A's size and format -- the rule both render paths bind by, and the one
+     * a host API enforces on a pass's attachments. */
+    void (*bind_targets)(void* user, const u32* surfaces, u32 count, u32 depth);
     void (*bind_pipeline)(void* user, u32 pipeline);
     void (*bind_vs_constants)(void* user, const void* data, u32 bytes);
     void (*bind_ps_constants)(void* user, const void* data, u32 bytes);
