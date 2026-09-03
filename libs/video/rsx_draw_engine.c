@@ -1585,3 +1585,18 @@ u32 rsx_draw_engine_guest_draws(void)
 {
     return g.last_guest_draws;
 }
+
+u32 rsx_draw_engine_readback_center(void)
+{
+    if (!g.ready || !g.be->readback) return 0;
+    const u32 slot = g.last_present_surface;
+    if (slot >= g.n_surfaces) return 0;
+    const eng_surface* s = &g.surfaces[slot];
+    if (!s->handle || s->fmt != RSX_BE_FMT_R8G8B8A8 || !s->w || !s->h) return 0;
+    u8 px[4] = { 0, 0, 0, 0 };
+    g.be->readback(g.be->user, s->handle, s->w / 2u, s->h / 2u, 1, 1, px, 4);
+    /* Decoded rows are R,G,B,A; the guest's own clear colour is A8R8G8B8, and
+     * a host comparing the two wants them in the same order. */
+    return ((u32)px[3] << 24) | ((u32)px[0] << 16) |
+           ((u32)px[1] << 8)  |  (u32)px[2];
+}

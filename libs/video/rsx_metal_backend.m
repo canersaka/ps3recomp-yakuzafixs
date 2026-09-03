@@ -2979,21 +2979,17 @@ static void eng_present(void* user, u32 surface)
     id<MTLTexture> src = eng_obj(surface);
     if (!src) { eng_encode_and_commit(nil); return; }
     eng_encode_and_commit(src);
-    if (s_headless && s_offscreen) {
-        u32 px = 0;
-        MTLRegion r = MTLRegionMake2D(s_width / 2, s_height / 2, 1, 1);
-        [s_offscreen getBytes:&px bytesPerRow:4 fromRegion:r mipmapLevel:0];
-        s_last_present_bgra = px;
-    }
 }
 
-static void eng_readback(void* user, u32 surface, void* out, u32 out_pitch)
+static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+                         void* out, u32 out_pitch)
 {
     (void)user;
     id<MTLTexture> t = eng_obj(surface);
-    if (!t || !out || !out_pitch) return;
+    if (!t || !out || !out_pitch || !w || !h) return;
+    if (x + w > [t width] || y + h > [t height]) return;
     [t getBytes:out bytesPerRow:out_pitch
-     fromRegion:MTLRegionMake2D(0, 0, [t width], [t height]) mipmapLevel:0];
+     fromRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:0];
 }
 
 static const rsx_draw_backend s_engine_backend = {
@@ -3311,7 +3307,13 @@ void rsx_metal_backend_present(void)
 }
 
 u32 rsx_metal_backend_debug_color(void)     { return s_clear_argb; }
-u32 rsx_metal_backend_readback_center(void) { return s_last_present_bgra; }
+/* Under the draw engine the presented image is a surface of the engine's own,
+ * so the sample comes from there rather than from the drawable it was blitted
+ * onto: it is the same pixel one step earlier, and it needs no window. */
+u32 rsx_metal_backend_readback_center(void)
+{
+    return s_eng_active ? rsx_draw_engine_readback_center() : s_last_present_bgra;
+}
 /* The draw engine has no fixed-function fallback: every draw it executes runs
  * the guest's own programs, so its own count is the answer under that path. */
 u32 rsx_metal_backend_guest_draws(void)

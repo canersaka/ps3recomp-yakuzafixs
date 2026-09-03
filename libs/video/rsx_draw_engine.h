@@ -184,9 +184,12 @@ typedef struct rsx_draw_backend {
     void (*clear_depth_stencil)(void* user, u32 depth, u32 flags,
                                 float depth_value, u8 stencil);
 
-    /* Present the named surface, and read one back for a headless check. */
+    /* Present the named surface, and read a rectangle of one back. The rows
+     * come back in the format the target was created with, so R,G,B,A for an
+     * ordinary colour surface. */
     void (*present)(void* user, u32 surface);
-    void (*readback)(void* user, u32 surface, void* out, u32 out_pitch);
+    void (*readback)(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+                     void* out, u32 out_pitch);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
@@ -227,9 +230,15 @@ void rsx_draw_engine_present(void);
 
 /* --- test hooks ---------------------------------------------------------- */
 
-/* Draws executed through the guest's own programs in the last presented
- * frame. The engine has no fixed-function path, so this is every draw. */
+/* Draws that ran the guest's OWN programs in the last presented frame. A draw
+ * through the built-in pair is not one of them. */
 u32  rsx_draw_engine_guest_draws(void);
+
+/* The centre pixel of the surface the last flip presented, as A8R8G8B8 --
+ * the convention the RSX clear colour arrives in, so a host can compare the
+ * two. Zero when nothing has been presented or the surface is not an
+ * 8-bit-per-channel one. */
+u32  rsx_draw_engine_readback_center(void);
 
 /* ---- pieces the engine exposes for its own tests ------------------------ */
 /*
