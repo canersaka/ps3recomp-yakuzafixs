@@ -589,6 +589,94 @@ static inline BOOL SleepConditionVariableCS(CONDITION_VARIABLE* c, CRITICAL_SECT
 }
 
 /* ---------------------------------------------------------------------------
+ * One-time initialisation
+ *
+ * Not pthread_once, which cannot express either half of the Win32 contract.
+ * Its callback takes no argument, so the Parameter the caller hands the
+ * callback has nowhere to go and the Context a successful callback publishes
+ * has nowhere to come from; and its callback returns nothing, so a failed
+ * initialisation cannot be reported. Win32 treats FALSE from the callback as
+ * "not initialised after all" and leaves the INIT_ONCE where it was, so the
+ * next caller tries again -- a lazy open that failed on a missing file gets
+ * another go once the file is there. pthread_once has already burnt its flag
+ * by then and never calls anything again.
+ *
+ * So the slot holds a pointer to a small object of the shim's own, materialised
+ * on first use exactly as the SRW locks and condition variables above are, and
+ * the state machine lives in there: one thread claims the RUNNING state and
+ * runs the callback with the lock DROPPED, every other sleeps on the condition
+ * variable until the result is known. Dropping the lock is what lets the
+ * callback take locks of its own, which is the whole point of the primitive --
+ * the callback this exists for constructs a critical section. Re-entering the
+ * SAME INIT_ONCE from inside its own callback deadlocks, as it does on Windows.
+ *
+ * The object is never freed. A Win32 INIT_ONCE has no destroy call, so there is
+ * nowhere to hang one, and the callers are process-lifetime statics; this is
+ * the same deliberate leak the SRWLOCK and CONDITION_VARIABLE slots take.
+ * -----------------------------------------------------------------------*/
+typedef union { PVOID Ptr; } INIT_ONCE;
+typedef INIT_ONCE* PINIT_ONCE;
+typedef INIT_ONCE* LPINIT_ONCE;
+#define INIT_ONCE_STATIC_INIT { NULL }
+
+typedef BOOL (WINAPI *PINIT_ONCE_FN)(PINIT_ONCE once, PVOID parameter, PVOID* context);
+
+enum { PS3_ONCE_IDLE = 0, PS3_ONCE_RUNNING = 1, PS3_ONCE_DONE = 2 };
+
+typedef struct {
+    pthread_mutex_t m;
+    pthread_cond_t  c;
+    int             state;
+    PVOID           context;
+} ps3_init_once;
+
+static inline void ps3__once_init(void* p)
+{
+    ps3_init_once* o = (ps3_init_once*)p;
+    pthread_mutex_init(&o->m, NULL);
+    pthread_cond_init(&o->c, NULL);
+    o->state   = PS3_ONCE_IDLE;
+    o->context = NULL;
+}
+static inline ps3_init_once* ps3_once(INIT_ONCE* once)
+{ return (ps3_init_once*)ps3_lazy_obj((void**)&once->Ptr, sizeof(ps3_init_once), ps3__once_init); }
+
+static inline void InitOnceInitialize(PINIT_ONCE once) { once->Ptr = NULL; }
+
+static inline BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn,
+                                       PVOID parameter, PVOID* context)
+{
+    ps3_init_once* o = (once && fn) ? ps3_once(once) : NULL;
+    if (!o) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+
+    pthread_mutex_lock(&o->m);
+    while (o->state == PS3_ONCE_RUNNING) pthread_cond_wait(&o->c, &o->m);
+    if (o->state == PS3_ONCE_DONE) {
+        PVOID done = o->context;
+        pthread_mutex_unlock(&o->m);
+        if (context) *context = done;
+        return TRUE;
+    }
+    o->state = PS3_ONCE_RUNNING;
+    pthread_mutex_unlock(&o->m);
+
+    PVOID produced = NULL;
+    BOOL  ok = fn(once, parameter, &produced);
+
+    pthread_mutex_lock(&o->m);
+    o->state = ok ? PS3_ONCE_DONE : PS3_ONCE_IDLE;
+    if (ok) o->context = produced;
+    pthread_cond_broadcast(&o->c);
+    pthread_mutex_unlock(&o->m);
+
+    /* A failed callback is expected to have set the error itself, so nothing
+     * here overwrites it -- same as Win32. */
+    if (!ok) return FALSE;
+    if (context) *context = produced;
+    return TRUE;
+}
+
+/* ---------------------------------------------------------------------------
  * Timing
  * -----------------------------------------------------------------------*/
 static inline unsigned long long ps3__mono_ns(void)
