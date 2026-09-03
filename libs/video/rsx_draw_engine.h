@@ -127,6 +127,11 @@ typedef struct rsx_draw_backend {
     u32  (*color_target_create)(void* user, rsx_be_format fmt, u32 w, u32 h,
                                 const void* seed, u32 seed_row_bytes);
     void (*color_target_release)(void* user, u32 surface);
+    /* A texture handle for a colour target a texture unit names, wearing that
+     * unit's TEXTURE_CONTROL1 crossbar. An uploaded texture bakes the crossbar
+     * in when it is decoded, so only a surface bind needs this; 0 means the
+     * backend has no view and the engine binds the target itself. */
+    u32  (*surface_view)(void* user, u32 surface, u32 remap, u32 rsx_format);
 
     /* One depth target per guest zeta address. */
     u32  (*depth_target_create)(void* user, u32 w, u32 h);
