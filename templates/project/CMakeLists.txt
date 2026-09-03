@@ -175,6 +175,12 @@ elseif(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE
         /W3 /wd4100 /wd4244 /wd4267
         /Zc:__cplusplus         # report correct __cplusplus value
+        # ppu_recomp.h defines PPU_FENCE, the lowering of the guest's
+        # sync/lwsync/eieio/isync, and in C that is <stdatomic.h>. The lifter
+        # writes C++ by default, but --single-file writes ppu_recomp.c, and a
+        # port that took it would not compile without this. The runtime's own
+        # build already carries the same flag for the same reason.
+        /experimental:c11atomics
     )
     target_compile_definitions(${PROJECT_NAME} PRIVATE
         _CRT_SECURE_NO_WARNINGS

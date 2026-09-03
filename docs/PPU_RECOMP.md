@@ -86,6 +86,51 @@ holds `gpr[32]`, `fpr[32]`, `vr[32]` VMX, `cr/lr/ctr/xer/...`). Output is C++
 `/* TODO */` no-ops). Remaining gaps are a few VMX ops the *disassembler*
 doesn't decode (`op31_x983`, `vmx_x1098`), not the lifter.
 
+### Memory barriers
+
+The PPC barriers are lifted to real host fences, through one macro `PPU_FENCE`
+that the header preamble defines so the lifted code, the boot scaffold and the
+smoke title all spell a fence the same way. In C++ it is
+`std::atomic_thread_fence`, in C `atomic_thread_fence` from `<stdatomic.h>`.
+
+| Guest | Host fence | What the PowerISA promises |
+|---|---|---|
+| `sync` (hwsync), `ptesync` | `seq_cst` | every earlier access before every later one, StoreLoad included |
+| `lwsync` | `acq_rel` | load-load, load-store, store-store; **not** store-load |
+| `eieio` | `release` | storage accesses ahead of it before those after it |
+| `isync` | `acquire` | discards prefetched and speculatively executed instructions |
+
+`sync`, `lwsync` and `ptesync` share opcode 31 / XO 598 and differ only in the
+2-bit `L` field, so `ppu_disasm.py` reads `L` and names the three apart; a
+disassembler that calls them all `sync` turns every lightweight barrier into a
+full one.
+
+These were no-ops until now, which x86-64 forgave and arm64 does not: x86 store
+order is total, so the ordering the guest asked for was already there. On
+arm64 it is not, and a guest that writes its command words and then its FIFO
+put pointer, with `eieio` or `lwsync` between them as the SDK's gcm does, can
+have the pointer become visible before the words. Every lock-free handoff in a
+title is the same shape.
+
+The cost is small and measured. On an M-series Mac (Apple clang 21, `-O2`)
+`seq_cst`, `acq_rel` and `release` each become one `dmb ish` and `acquire`
+becomes `dmb ishld`, about half a nanosecond apiece in a tight loop. On x86-64
+the `acquire`, `release` and `acq_rel` forms emit **no instruction at all** and
+cost only the reordering the compiler no longer does; only `seq_cst` becomes a
+real barrier (`mfence`, or the `lock or` LLVM prefers). And there are very few
+of them: Yakuza: Dead Souls' EBOOT carries 46 barriers in 4.98 M instructions
+of PPU code, 0.001% of the image, because the SDK code that uses them most is
+firmware the port answers with HLE rather than lifted guest code. They arrive
+in clusters rather than scattered (15 `lwsync` in two regions, 27 `sync` in
+one, 4 `eieio` at the top of `.text`), which is what a handful of lock-free
+routines looks like. A 598 K-line lifted chunk holding 28 of them compiles to
+within noise of the same chunk with the fences removed.
+
+MSVC needs `/experimental:c11atomics` for the C spelling. The runtime's build
+and `templates/project` both pass it; a port that compiles a `--single-file`
+lift with its own CMake needs it too. The default split output is C++ and does
+not.
+
 ---
 
 ## NID → HLE bridge
