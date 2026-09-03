@@ -9,11 +9,13 @@
 
 extern uint8_t* vm_base;
 
-/* The lifted-code registry and the dispatcher, both in spu_channels.c. */
+/* The lifted-code registry, the dispatcher and the per-context MFC engine
+ * table, all in spu_channels.c. */
 int  spu_have_function(uint32_t addr);
 int  spu_image_of_function(uint32_t addr);
 void spu_indirect_branch(struct spu_context* ctx);
 int  spu_run_with_halt(void (*entry)(struct spu_context*), struct spu_context* ctx);
+void spu_mfc_release(struct spu_context* ctx);
 
 /* Guest memory is big-endian and this file reads descriptors out of it. lv2 has
  * its own copy of this helper; duplicating four lines is cheaper than exporting
@@ -146,6 +148,20 @@ void spu_lifted_thread_run(spu_context* ctx, spu_lifted_thread_result* out)
             ctx->spu_id, ctx->status, ctx->pc, ctx->stop_code, r.exit_status,
             r.group_exit ? " group-exit" : "", r.faulted ? " FAULT" : "");
     fflush(stderr);
+
+    /* The SPU has stopped, so its MFC engine is idle and the slot it holds in
+     * the per-context table can go back. There are eight of those and they used
+     * to be claimed for good, which a title only notices once it has started
+     * its ninth SPU thread: from there on every thread shares one engine with
+     * every other, tags and queue included. This is the natural place to give
+     * one back -- the context may be started again (the group is destroyed
+     * later, and lv2 keeps the context until then), and a fresh run claims a
+     * freshly initialized engine, which is what a fresh SPU thread should get.
+     *
+     * The fallback and interpreter paths are unchanged: neither runs a context
+     * through here, so both keep the engine they had for as long as they had
+     * it. */
+    spu_mfc_release(ctx);
 
     if (out) *out = r;
 }
