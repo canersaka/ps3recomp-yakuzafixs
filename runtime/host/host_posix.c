@@ -13,6 +13,13 @@
  * Exit status: 0 on success, non-zero if the guest command stream did not reach
  * the backend intact -- so it works as a CI check.
  */
+/* --threads reads the host stack's size back through pthread_getattr_np,
+ * which glibc declares only under _GNU_SOURCE, and that has to be set before
+ * the first system header of the translation unit. Darwin has its own
+ * pthread_get_stacksize_np and needs nothing. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#  define _GNU_SOURCE
+#endif
 #include "cellGcmSys.h"
 #include "../memory/vm.h"           /* VM_HLE_INJECT_BASE */
 #include "rsx_commands.h"

@@ -79,6 +79,13 @@
 #  define PS3_HAVE_BACKTRACE 0
 #endif
 #include <dlfcn.h>
+/* glibc declares Dl_info and dladdr only under _GNU_SOURCE, which must be
+ * defined before the translation unit's first system header. C++ compilers
+ * on Linux define it themselves; a C translation unit has to, and finding
+ * out through "unknown type name Dl_info" is worse than being told. */
+#if defined(__GLIBC__) && !defined(__USE_GNU)
+#  error "win32_backtrace.h needs _GNU_SOURCE defined before the first #include on glibc (dladdr's Dl_info)"
+#endif
 
 #ifndef PS3_WIN32_TYPES_USHORT
 #define PS3_WIN32_TYPES_USHORT
