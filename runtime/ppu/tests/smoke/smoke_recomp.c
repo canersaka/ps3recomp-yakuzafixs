@@ -43,8 +43,11 @@
 
 /* GetCurrentThreadId: the host thread identity the assertion about the guest
  * thread is made of. On POSIX this is runtime/platform's shim, which is what
- * the rest of the scaffold uses. */
-#include "../../../platform/win32_compat.h"
+ * the rest of the scaffold uses. Through the include path, like rsx_commands.h
+ * above: a lifted title's sources are built from wherever its port keeps them,
+ * so a relative path into the toolkit only works while the file sits in this
+ * directory. */
+#include "win32_compat.h"
 
 #include <stdatomic.h>
 #include <stdint.h>
