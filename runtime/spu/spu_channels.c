@@ -852,6 +852,29 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
     return NULL;
 }
 
+/* Which image registered a function at this LS address, or -1 if none did.
+ *
+ * Deliberately NOT spu_lookup(addr, 0): that call means "dispatch here in a
+ * context with no image", so it reports a cross-image substitution for every
+ * hit in a real image. This is a question about the registry, not a dispatch,
+ * and it runs once per SPU thread start. First match wins, in registration
+ * order, so it agrees with which function spu_lookup would actually serve. */
+int spu_image_of_function(uint32_t addr)
+{
+    for (uint32_t n = s_hash_head[spu_fn_hash(addr)]; n; n = s_hash_next[n - 1]) {
+        const spu_reg_entry* e = &s_registry[n - 1];
+        if (e->addr == addr) return e->image_id;
+    }
+    return -1;
+}
+
+/* Does a lifted function exist at this LS address (any image)? Lets the lv2
+ * layer decide between real SPU execution and the PPU-fallback paths. */
+int spu_have_function(uint32_t addr)
+{
+    return spu_image_of_function(addr) >= 0;
+}
+
 /* The pure interpreter's fast-path "is this LSA already lifted?" probe
  * (spu_interp.c, rejoin path). It IS the registry lookup, so overlay eviction and
  * self-modifying-code invalidation are honored automatically. Lived in
