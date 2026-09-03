@@ -2913,21 +2913,32 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
     [e endEncoding];
 }
 
-/* Encode everything recorded so far, commit, and wait. The engine recycles
- * its own staging the moment this returns, and the headless readback has to
- * observe a finished frame, so the wait is the contract rather than a
- * pessimisation. */
+/* Encode everything recorded so far and commit it.
+ *
+ * The staging arena is recycled the moment this returns, which is safe
+ * without a wait: newBufferWithBytes COPIES, so what the GPU reads is the
+ * MTLBuffer and not the arena, and a command buffer retains every resource it
+ * uses. So only headless waits, where the readback has to observe a finished
+ * frame -- there the stall is the point. A windowed present is paced by the
+ * in-flight semaphore instead, the same bound the vtable path uses, because
+ * waiting on every frame is the one pattern where a driver cannot hide its
+ * encoding work. */
 static void eng_encode_and_commit(id<MTLTexture> present_dst)
 {
     @autoreleasepool {
         id<CAMetalDrawable> drawable = nil;
         id<MTLTexture> dst = nil;
+        const int windowed_present = (present_dst && !s_headless);
+        if (windowed_present) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
         if (present_dst) {
             if (s_headless) {
                 dst = s_offscreen;
             } else {
                 drawable = [s_layer nextDrawable];
-                if (!drawable) return;     /* compositor is busy; skip */
+                if (!drawable) {           /* compositor is busy; skip */
+                    dispatch_semaphore_signal(s_inflight);
+                    return;
+                }
                 dst = [drawable texture];
             }
         }
@@ -2940,10 +2951,19 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         eng_encode_records(cb, stage);
         if (present_dst && dst) eng_blit_to_display(cb, present_dst, dst);
         if (drawable) [cb presentDrawable:drawable];
-        [cb commit];
-        [cb waitUntilCompleted];
+        if (windowed_present) {
+            dispatch_semaphore_t sem = s_inflight;
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) {
+                (void)_unused;
+                dispatch_semaphore_signal(sem);
+            }];
+            [cb commit];
+        } else {
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
 
-        if (s_dropped_records || s_eng_dropped) {
+        if (s_eng_dropped) {
             fprintf(stderr, "[rsx engine/metal] dropped %u record(s) (cap %d)\n",
                     s_eng_dropped, ENG_MAX_RECORDS);
             s_eng_dropped = 0;
@@ -3083,6 +3103,10 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
         s_ready  = 1;
         s_closed = 0;
         rsx_draw_engine_set_backend(&s_engine_backend);
+        /* The engine is this backend's default now that every host mode
+         * passes both ways. PS3RECOMP_RSX_ENGINE=vtable is the way back, and
+         * it stays that way until the vtable path has nothing left to say. */
+        rsx_draw_engine_set_default(1);
         if (rsx_draw_engine_enabled() &&
             rsx_draw_engine_init(s_width, s_height) == 0) {
             s_eng_active = 1;
