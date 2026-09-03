@@ -13,8 +13,9 @@ documents the host shim itself._
 | SPU helper tests | pass |
 | `ps3recomp_host` | clear, flip, a fixed-function NV4097 draw, a draw through **guest vertex and fragment programs**, a draw sampling a **guest texture** from a guest program, a pair of triangles the **depth test** has to order, a two-level texture whose **second mip level** must be the one sampled, a triangle drawn into an offscreen **colour surface** that a later draw then **samples**, a **polygon and a quad strip** that only exist once expanded into triangles, and a **depth surface** one pass writes and the next samples as a texture -- headless through the **Metal** backend, with 60-frame runs, and **twice over**: once through the register-file draw engine, which is the default, and once through the older vtable path. The depth-texture mode is the one exception, and runs on the draw engine alone: the vtable path tracks no zeta as a texture |
 | Guest shader translation | `test_shader_msl`: hand-assembled NV40 programs through the decompilers, glslang and spirv-cross, checked for the MSL binding contract the backend relies on (runs on Linux too) |
-| PPU boot scaffold | `ppu_loader.cpp`, `ppu_hle.cpp`, `ppu_fs.cpp`, `ppu_sysprx.cpp`, `boot_main.cpp` compile at a recorded baseline of **0** errors (`darwin-clang` in `tools/ppu_scaffold_baseline.json`) |
+| PPU boot scaffold | `ppu_loader.cpp`, `ppu_hle.cpp`, `ppu_fs.cpp`, `ppu_sysprx.cpp`, `boot_main.cpp` and `templates/project/main.cpp` compile at a recorded baseline of **0** errors (`darwin-clang` in `tools/ppu_scaffold_baseline.json`) |
 | PPU boot path | `ps3recomp_boot_smoke`: the scaffold **linked and run** against the synthetic title in `runtime/ppu/tests/smoke/` -- ELF load, entry OPD, TLS, the NID bridge, lv2 syscalls, a guest thread on a second host thread, three frames cleared and flipped through the FIFO to the Metal backend, and `sys_process_exit` |
+| Game project template | `templates/project` configured with `PS3RECOMP_DIR` at the checkout and `RECOMP_DIR` at a lift, built with its own CMakeLists, and **run** against the smoke title -- the same verdict, through the runner a port actually starts from |
 | Win32 host shim | `runtime/platform/tests/test_win32_compat.c`, 299 checks: threads, sync, `VirtualAlloc`/`VirtualQuery`, `SuspendThread` of a running thread with `GetThreadContext`, vectored exception handlers, `SymFromAddr` |
 | lv2 sync primitives | `tests/sync_stress`: mutex, cond, semaphore, event-queue and rwlock stress on host threads, including recursive-mutex re-entry and write-lock ownership |
 | lv2 threads | `ps3recomp_host --threads`: a guest PPU thread created and joined through the syscalls, and the host stack it got |
@@ -173,6 +174,55 @@ exercised: the `#else` branches in `runtime/syscalls/sys_*`, `cellSpurs.c`,
 `cellFiber.c` and the audio/pad SDL2 backends. Compare each POSIX branch
 against its Windows twin for the wait/repark, priority and timeout behaviour
 added since; do not assume equivalence.
+
+**The runner is not one of them.** `templates/project` is a working runner on
+this platform, built and run against the smoke title in CI, and a new port
+starts there rather than from a Windows-shaped file:
+
+```bash
+cp -r templates/project my_game
+cmake -S my_game -B my_game/build -G Ninja \
+      -DPS3RECOMP_DIR=/path/to/ps3recomp \
+      -DRECOMP_DIR=/path/to/lift
+cmake --build my_game/build
+./my_game/build/MyGameRecomp game/PS3_GAME/USRDIR/EBOOT.ELF
+```
+
+The toolkit supplies the window, the message pump, the FIFO walker and the
+Win32 shim, so what the runner owns is small: the backend `#if`, the frame
+clock, and its own diagnostics. `main.cpp` is that, and `boot_main.cpp` is the
+same boot with a real title's instrumentation on it.
+
+An **existing Windows runner** takes four mechanical steps to reach the same
+point, and they are worth doing in this order because the first two fail before
+a compiler is reached:
+
+1. **Point it at the toolkit.** One variable usually names both the toolkit and
+   the game tree, which works only while the toolkit is vendored in the port.
+   Split them, and the runner builds against a checkout with its generated code
+   left where it is.
+2. **Gate the Windows-only build pieces.** `app.rc` needs a resource compiler.
+   `dbghelp`, `user32`, `gdi32` and `winmm` name nothing a POSIX linker can
+   find. The lifted chunks want a Clang branch beside the `if(MSVC)` one, or
+   400k-line generated files compile unoptimised with warnings on. Set the link
+   language to CXX explicitly: inferred from the generated C, it leaves the C++
+   standard library and the Objective-C runtime out.
+3. **Take the Win32 names from `runtime/platform/win32_compat.h`** instead of
+   `<windows.h>`, and include it early -- before anything that uses
+   `EXCEPTION_POINTERS` or `CONTEXT`. `<timeapi.h>`, `<dbghelp.h>`,
+   `<tlhelp32.h>` and `<intrin.h>` stay under `_WIN32`; each names something
+   the shim or `win32_backtrace.h` already provides here, so the guard removes
+   a header and not a capability.
+4. **Compile out the Win32 diagnostics.** The crash filter reads `CONTEXT.Rip`,
+   which is not the register on arm64; the hang watchdog's `tlhelp32` walk with
+   `SuspendThread`/`GetThreadContext` has no POSIX equivalent short of writing
+   a debugger. Under `_WIN32` they go, and they get ported when a bug here
+   actually needs them. `boot_main.cpp` draws that line already -- its frame
+   clock, which the boot depends on, is deliberately outside the guard while
+   the watchdog is inside it.
+
+`docs/GAME_PORTING_GUIDE.md`'s platform notes carry the same recipe with the
+Linux column beside it.
 
 A first pass over those branches has been made and what it found is fixed:
 the rwlock had no write-lock owner off Windows, so a foreign unlock released

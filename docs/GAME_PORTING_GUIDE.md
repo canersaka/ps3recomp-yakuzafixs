@@ -19,8 +19,9 @@ A comprehensive, step-by-step guide to porting a PS3 game to native PC using ps3
 11. [Phase 10: Audio and Input](#phase-10-audio-and-input)
 12. [Phase 11: SPU Handling](#phase-11-spu-handling)
 13. [Phase 12: Testing and Polish](#phase-12-testing-and-polish)
-14. [Tips and Best Practices](#tips-and-best-practices)
-15. [Case Study: flOw](#case-study-flow)
+14. [Platform Notes](#platform-notes)
+15. [Tips and Best Practices](#tips-and-best-practices)
+16. [Case Study: flOw](#case-study-flow)
 
 ---
 
@@ -264,8 +265,18 @@ break_on_unimplemented = true   # Stop on unimplemented calls
 ### Copy Generated Files
 
 ```bash
+cp recomp/ppu_recomp.h my_game/recompiled/
 cp recomp/*.c recomp/*.cpp my_game/recompiled/
 cp data_segments.c my_game/recompiled/
+```
+
+`recompiled/` is what the template calls `RECOMP_DIR`, and `ppu_recomp.h` has
+to be in it: the boot scaffold and every lifted source `#include` it, and the
+build stops with a message rather than a wall of errors if it is missing. Keep
+the lift somewhere else if you prefer and point at it instead:
+
+```bash
+cmake -B build -DRECOMP_DIR=/path/to/lift
 ```
 
 ### Set Up Game Assets
@@ -307,19 +318,32 @@ error: incompatible pointer types
 
 ### First Run
 
+The runner takes the PPU ELF on the command line -- the same one the lifter
+read. It derives the virtual filesystem root from that path
+(`<root>/PS3_GAME/USRDIR/EBOOT.ELF` gives `<root>`), so point it at the ELF
+inside the game tree rather than at a copy somewhere else, or set
+`PS3_VFS_ROOT`.
+
 ```bash
-./build/my_game 2>&1 | tee run.log
+./build/MyGameRecomp game/PS3_GAME/USRDIR/EBOOT.ELF 2>&1 | tee run.log
 ```
 
 Expected output:
 ```
 === ps3recomp game runner ===
-Initializing runtime...
-Loaded 1234 recompiled functions
-Creating main PPU thread...
-[WARNING] Unimplemented NID 0xABCDEF01 in module cellFoo
-[WARNING] Unimplemented NID 0x12345678 in module cellBar
+[boot] VFS root: game
+[rsx] Metal backend init OK -- window open
+
+[boot] dispatching entry OPD 0x00010000 (stack top 0x0FF00000)
+
+[hle] unresolved NID 0xABCDEF01
+[LV2] unimplemented syscall 352 (0x160)
 ```
+
+Every one of those lines is the next thing to implement. Execution runs real
+guest code until it reaches a function outside the lifted subset, a firmware
+import with no handler, or an lv2 syscall that has none -- each of which is
+logged with what it was.
 
 ### Debugging Strategy
 
@@ -524,6 +548,105 @@ void hle_spu_audio_mixer(spu_context* ctx)
 3. **Batch DMA** — if SPU DMA is a bottleneck, consider batching transfers
 4. **Reduce logging** — disable `log_hle_calls` for release builds
 5. **Memory access patterns** — the endian conversion can be a bottleneck; consider caching
+
+---
+
+## Platform Notes
+
+A port started from `templates/project` builds and boots on Windows, macOS and
+Linux as it stands. CI proves the last two on every push: it configures the
+template with `PS3RECOMP_DIR` at the toolkit and `RECOMP_DIR` at a lift, builds
+it, and runs it against the boot smoke title -- on headless Metal for macOS and
+on the null backend for Linux.
+
+### What the toolkit provides
+
+You do not write a backend, a window or a shim. The runtime has them:
+
+| Piece | Windows | macOS | Linux |
+|---|---|---|---|
+| Present backend | D3D12 | Metal | null (headless software) |
+| Window and message pump | `rsx_*_backend_pump_messages` | same | same |
+| FIFO walker | `cellGcm_rsx_process_fifo` | same | same |
+| Win32 API (threads, sync, timing, `VirtualAlloc`) | the real thing | `runtime/platform/win32_compat.h` | same |
+| Audio and pad | WASAPI, XInput | SDL2 | SDL2 |
+
+`templates/project/main.cpp` selects the backend with an `#if` on the host and
+calls the same three entry points either way, so the frame clock above them is
+written once. `runtime/ppu/tests/boot_main.cpp` makes the same selection; if
+you are reading one to understand the other, they agree.
+
+### What a runner has to do itself
+
+Most ports do not start from the template -- they start from a runner that grew
+up on Windows. Four things stand between that and a build on another host, and
+they are the same four every time:
+
+**1. Separate the toolkit from the game.** One variable usually means both: the
+tree that owns `include/`, `runtime/` and `libs/`, and the tree that owns the
+lifter's output. They are only the same directory while the toolkit is
+vendored. Split them -- `PS3RECOMP_DIR` and `RECOMP_DIR` in the template -- and
+the runner can be built against a toolkit checkout with the generated code left
+where it is.
+
+**2. Gate the Windows-only build pieces.** These fail at configure time, before
+a compiler is reached, so they come first:
+
+- **Resource scripts.** `app.rc` needs a resource compiler. On a host without
+  one it is not a link error, it is "no rule to make" for a file nothing can
+  consume.
+- **System import libraries.** `dbghelp`, `user32`, `gdi32`, `winmm` name
+  nothing a POSIX linker can find. The D3D12 backend's own imports arrive
+  through `#pragma comment(lib)` and need no CMake entry at all.
+- **MSVC flags.** `/W3`, `/bigobj`, `/Zc:__cplusplus` under `if(MSVC)`, with a
+  Clang/GCC branch beside it -- not an `if(MSVC)` with no `else`, which leaves
+  hundreds of thousands of lines of generated code compiled at the default
+  optimisation level with warnings on.
+- **The link language.** Set it to CXX explicitly. Inferring it from the
+  generated C leaves the C++ standard library out of the link.
+
+**3. Take the Win32 names from the shim.** `#include <windows.h>` is the first
+thing a build elsewhere trips over. `runtime/platform/win32_compat.h` supplies
+the same names over pthreads and mmap -- the sync and timing API, the
+interlocked operations, the scalar typedefs, `VirtualAlloc`, the vectored
+exception handlers -- and on Windows it is a passthrough to `<windows.h>` with
+`WIN32_LEAN_AND_MEAN` already set. Call sites do not move; the names arrive
+from somewhere else. Include it early: anything using `EXCEPTION_POINTERS` or
+`CONTEXT` needs it before the first use, not wherever `<windows.h>` happened to
+sit.
+
+The headers that have no shim and no meaning elsewhere stay under `_WIN32`:
+`<timeapi.h>` for `timeBeginPeriod`, `<dbghelp.h>`, `<tlhelp32.h>`,
+`<intrin.h>`. Each names something the shim already provides off Windows, so
+the guard removes a header rather than a capability.
+
+**4. Compile out or port the Win32 diagnostics.** A runner that has debugged a
+real boot accumulates them: an unhandled-exception filter reading `CONTEXT.Rip`
+(which is not the register name on arm64), a `tlhelp32` thread walk with
+`SuspendThread`/`GetThreadContext`, symbolization through `SymFromAddr`. The
+thread walk in particular has no POSIX equivalent that is not a debugger. Put
+them under `_WIN32` and move on; port them only when a bug on the other host
+needs them. `boot_main.cpp` does exactly this and is worth reading for where
+the line falls.
+
+### Things that only show up off Windows
+
+- **arm64 has a weak memory model.** `volatile` was never a fence and on Apple
+  Silicon it stops looking like one. Interlocked operations, not `volatile ++`.
+  `docs/PLATFORM_ABSTRACTION.md` has the checklist.
+- **Clang does not have MSVC's dialect.** `__declspec(thread)` is parsed and
+  then discarded unless something maps it; `runtime/platform/msvc_compat.h`
+  maps it to `__thread`, which is a real thread-local. A generated file
+  compiled without that mapping references a thread-local as an ordinary
+  global, and Mach-O does not diagnose it.
+- **Which signal a bad access raises is per-OS.** Linux delivers an access to a
+  mapped-but-forbidden page as `SIGSEGV`; Darwin turns the same one into
+  `SIGBUS`. A handler for guest pointer faults has to take both, which is what
+  `ppu_loader.cpp` does.
+- **The default host thread stack is 512 KB on Darwin.** A recompiled call
+  chain nests one host frame per guest call; Windows reserves 256 MB.
+- **`-ffp-contract=off` on the lifted sources.** arm64 fuses a multiply and an
+  add by default. A PPC `fmadd` is spelt as one where the lifter means one.
 
 ---
 
