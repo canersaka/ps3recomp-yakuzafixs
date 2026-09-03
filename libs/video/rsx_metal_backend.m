@@ -71,18 +71,36 @@ static u32                 s_height = 720;
  * --------------------------------------------------------------------------*/
 
 #define MTL_ATTRIBS        16
-#define MTL_MAX_DRAWS      4096
+#define MTL_MAX_RECORDS    4096
 #define MTL_MAX_VERTS      (256u * 1024u)
 #define MTL_VB_INDEX       30      /* buffer(0) and buffer(1) are the constant blocks */
 
 typedef struct { float a[MTL_ATTRIBS][4]; } MtlVertex;
 
-/* ---- draw recording ---------------------------------------------------------
- * RSX draws arrive while the guest builds its frame; the flip comes later. So
+/* ---- the frame's record stream ----------------------------------------------
+ * RSX work arrives while the guest builds its frame; the flip comes later. So
  * draws are recorded with their vertices already fetched out of guest memory,
- * then replayed inside a single render pass at present time. This mirrors the
- * D3D12 backend's D3D12DrawRecord / render_frame split.
+ * then replayed at present time. This mirrors the D3D12 backend's
+ * D3D12DrawRecord / render_frame split.
+ *
+ * Clears are records in the same ordered stream, because a clear in the middle
+ * of a frame is something a title really does -- it draws the world, clears
+ * depth, and draws the first-person weapon over it. Replaying every draw into
+ * one pass that clears once at the top loses that clear entirely. So a clear
+ * record ends the open render pass and starts a new one whose flagged
+ * attachments load-action Clear and whose others load-action Load.
+ *
+ * Render targets will hang off the same stream: a target change is one more
+ * record that ends the pass and opens the next one somewhere else.
  * --------------------------------------------------------------------------*/
+
+/* NV4097_CLEAR_SURFACE flags: 0x01 depth, 0x02 stencil, and one bit per colour
+ * channel in 0xF0 (nouveau's NV30_3D_CLEAR_BUFFERS layout). A title clears the
+ * four colour channels together, so 0xF0 is treated as one colour bit here,
+ * exactly as the old clear callback did. */
+#define MTL_CLEAR_DEPTH    0x01u
+#define MTL_CLEAR_STENCIL  0x02u
+#define MTL_CLEAR_COLOR    0xF0u
 
 typedef struct {
     u32 base;        /* first vertex in s_verts               */
@@ -105,11 +123,27 @@ typedef struct {
     float mvp[16];   /* built-in path: 4 rows of the RSX vertex-constant matrix */
 } MtlDraw;
 
+/* One NV4097_CLEAR_SURFACE, with the values rsx_commands.c decoded out of
+ * SET_COLOR_CLEAR_VALUE and SET_ZSTENCIL_CLEAR_VALUE. */
+typedef struct {
+    u32   flags;     /* CLEAR_SURFACE mask                     */
+    u32   color;     /* ARGB8888                               */
+    float depth;     /* [0,1]                                  */
+    u8    stencil;
+} MtlClear;
+
+typedef enum { MTL_REC_DRAW, MTL_REC_CLEAR } MtlRecordKind;
+
+typedef struct {
+    MtlRecordKind kind;
+    union { MtlDraw draw; MtlClear clear; } u;
+} MtlRecord;
+
 static MtlVertex* s_verts;
 static u32        s_vert_count;
-static MtlDraw    s_draws[MTL_MAX_DRAWS];
-static u32        s_draw_count;
-static u32        s_dropped_draws;
+static MtlRecord  s_records[MTL_MAX_RECORDS];
+static u32        s_rec_count;
+static u32        s_dropped_records;
 static u32        s_guest_draws;       /* draws through guest programs this frame */
 static u32        s_last_guest_draws;  /* ... in the last presented frame        */
 
@@ -224,9 +258,20 @@ static u32 s_last_present_bgra;
 
 static void mtl_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
 {
-    (void)ud; (void)depth; (void)stencil;
-    /* 0xF0 is the colour-buffer mask; depth/stencil clears carry 0x03. */
-    if (flags & 0xF0u) s_clear_argb = color;
+    (void)ud;
+    /* The debug hook reports the last colour the guest asked for, whether or
+     * not the record stream had room for the clear itself. */
+    if (flags & MTL_CLEAR_COLOR) s_clear_argb = color;
+    if (!s_ready) return;
+    if (!(flags & (MTL_CLEAR_COLOR | MTL_CLEAR_DEPTH | MTL_CLEAR_STENCIL))) return;
+    if (s_rec_count >= MTL_MAX_RECORDS) { s_dropped_records++; return; }
+
+    MtlRecord* r = &s_records[s_rec_count++];
+    r->kind = MTL_REC_CLEAR;
+    r->u.clear.flags   = flags;
+    r->u.clear.color   = color;
+    r->u.clear.depth   = depth;
+    r->u.clear.stencil = stencil;
 }
 
 /* The draw callbacks are not handed the state, so it is latched here. Every
@@ -270,15 +315,15 @@ static rsx_backend s_backend_vtable = {
 
 /* ---- helpers ------------------------------------------------------------- */
 
-static MTLClearColor clear_color_from_rsx(void)
+static MTLClearColor clear_color_from_argb(u32 argb)
 {
     /* ARGB8888 -> normalised RGBA. sRGB conversion is deliberately skipped:
      * the D3D12 backend treats the guest value as raw UNORM too, so both
      * backends agree pixel-for-pixel. */
-    const double a = (double)((s_clear_argb >> 24) & 0xFF) / 255.0;
-    const double r = (double)((s_clear_argb >> 16) & 0xFF) / 255.0;
-    const double g = (double)((s_clear_argb >>  8) & 0xFF) / 255.0;
-    const double b = (double)( s_clear_argb        & 0xFF) / 255.0;
+    const double a = (double)((argb >> 24) & 0xFF) / 255.0;
+    const double r = (double)((argb >> 16) & 0xFF) / 255.0;
+    const double g = (double)((argb >>  8) & 0xFF) / 255.0;
+    const double b = (double)( argb        & 0xFF) / 255.0;
     return MTLClearColorMake(r, g, b, a);
 }
 
@@ -883,9 +928,11 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
                         IndexResolver resolve)
 {
     if (!s_ready || !s_verts || !st || count == 0) return;
-    if (s_draw_count >= MTL_MAX_DRAWS) { s_dropped_draws++; return; }
+    if (s_rec_count >= MTL_MAX_RECORDS) { s_dropped_records++; return; }
 
-    MtlDraw* d = &s_draws[s_draw_count];
+    MtlRecord* r = &s_records[s_rec_count];
+    r->kind = MTL_REC_DRAW;
+    MtlDraw* d = &r->u.draw;
     memset(d, 0, sizeof *d);
     d->vs_idx = d->fs_idx = -1;
     for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) d->tex[u] = d->samp[u] = -1;
@@ -899,8 +946,8 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
 
     u32 first_vert = s_vert_count;
     u32 wrote = emit_vertices(st, prim, count, resolve, &base);
-    if (wrote == 0) { s_dropped_draws++; return; }
-    s_draw_count++;
+    if (wrote == 0) { s_dropped_records++; return; }
+    s_rec_count++;
     if (guest) s_guest_draws++;
 
     d->base  = first_vert;
@@ -1075,6 +1122,86 @@ static id<MTLRenderPipelineState> pso_for(const MtlDraw* d)
     return pso;
 }
 
+/* ---- replay --------------------------------------------------------------
+ * Everything a render pass has to bind before its first draw. Encoder state
+ * does not outlive endEncoding, so a clear in the middle of a frame pays for
+ * this again on the pass it opens.
+ * --------------------------------------------------------------------------*/
+
+typedef struct {
+    id<MTLBuffer> vb;
+    id<MTLBuffer> cbuf;
+    int tex[RSX_MAX_TEXTURES];    /* what each unit currently holds, or -1 */
+    int samp[RSX_MAX_TEXTURES];
+} MtlPassState;
+
+/* Open a render pass on `color`. The attachments `clear` flags name load-action
+ * Clear with its values; the rest load-action Load, so what an earlier pass in
+ * the same frame left behind survives. */
+static id<MTLRenderCommandEncoder> begin_pass(id<MTLCommandBuffer> cb,
+                                              id<MTLTexture> color,
+                                              const MtlClear* clear,
+                                              MtlPassState* ps)
+{
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture     = color;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    if (clear->flags & MTL_CLEAR_COLOR) {
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].clearColor = clear_color_from_argb(clear->color);
+    } else {
+        rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    }
+
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    if (!enc) return nil;
+
+    if (ps->vb) [enc setVertexBuffer:ps->vb offset:0 atIndex:MTL_VB_INDEX];
+    /* Every fragment texture unit starts on the zero texture -- a guest
+     * program may sample a unit nothing was bound to, and Metal validation
+     * rejects a nil texture on use. Units are then rebound per draw only where
+     * the draw's slot differs. */
+    for (int u = 0; u < RSX_MAX_TEXTURES; u++) {
+        [enc setFragmentTexture:s_null_tex atIndex:(NSUInteger)u];
+        [enc setFragmentSamplerState:s_default_sampler atIndex:(NSUInteger)u];
+        ps->tex[u] = ps->samp[u] = -1;
+    }
+    MTLViewport vp = { 0.0, 0.0, (double)s_width, (double)s_height, 0.0, 1.0 };
+    [enc setViewport:vp];
+    return enc;
+}
+
+static void encode_draw(id<MTLRenderCommandEncoder> enc, const MtlDraw* d,
+                        MtlPassState* ps)
+{
+    id<MTLRenderPipelineState> pso = pso_for(d);
+    if (!pso) return;
+    [enc setRenderPipelineState:pso];
+    [enc setCullMode:d->cull];
+    [enc setFrontFacingWinding:d->winding];
+    if (d->vs_idx >= 0 && ps->cbuf) {
+        [enc setVertexBuffer:ps->cbuf offset:d->vp_cb_off atIndex:0];
+        [enc setFragmentBuffer:ps->cbuf offset:d->fp_cb_off atIndex:1];
+        for (int u = 0; u < RSX_MAX_TEXTURES; u++) {
+            if (d->tex[u] != ps->tex[u]) {
+                [enc setFragmentTexture:(d->tex[u] >= 0 ? s_tex_cache[d->tex[u]].tex
+                                                        : s_null_tex)
+                                atIndex:(NSUInteger)u];
+                ps->tex[u] = d->tex[u];
+            }
+            if (d->samp[u] != ps->samp[u]) {
+                [enc setFragmentSamplerState:(d->samp[u] >= 0 ? s_samp_cache[d->samp[u]].samp
+                                                              : s_default_sampler)
+                                     atIndex:(NSUInteger)u];
+                ps->samp[u] = d->samp[u];
+            }
+        }
+    } else {
+        [enc setVertexBytes:d->mvp length:sizeof(d->mvp) atIndex:0];
+    }
+    [enc drawPrimitives:d->topology vertexStart:d->base vertexCount:d->count];
+}
+
 static void clear_caches(void)
 {
     for (u32 i = 0; i < s_vp_count;   i++) s_vp_cache[i].fn     = nil;
@@ -1183,7 +1310,7 @@ void rsx_metal_backend_shutdown(void)
         free(s_verts); s_verts = NULL;
         free(s_cb); s_cb = NULL; s_cb_used = s_cb_cap = 0;
         free(s_tex_staging); s_tex_staging = NULL; s_tex_staging_cap = 0;
-        s_vert_count = s_draw_count = 0;
+        s_vert_count = s_rec_count = 0;
         s_guest_draws = s_last_guest_draws = 0;
         clear_caches();
         s_shader_lib = nil;
@@ -1240,68 +1367,46 @@ void rsx_metal_backend_present(void)
             return;
         }
 
-        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-        rp.colorAttachments[0].texture     = target;
-        rp.colorAttachments[0].loadAction  = MTLLoadActionClear;
-        rp.colorAttachments[0].clearColor  = clear_color_from_rsx();
-        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        /* The frame's first pass clears colour to the last value the guest
+         * asked for, which is what this backend has always done and what keeps
+         * a frame with no clear in it from presenting an undefined drawable.
+         * Depth and stencil start at the nv40 reset values, unless a clear
+         * ahead of the first draw says otherwise -- those clears are folded
+         * into this pass rather than each opening one of their own. */
+        MtlClear first;
+        first.flags   = MTL_CLEAR_COLOR | MTL_CLEAR_DEPTH | MTL_CLEAR_STENCIL;
+        first.color   = s_clear_argb;
+        first.depth   = 1.0f;
+        first.stencil = 0;
+        u32 r = 0;
+        for (; r < s_rec_count && s_records[r].kind == MTL_REC_CLEAR; r++) {
+            const MtlClear* c = &s_records[r].u.clear;
+            if (c->flags & MTL_CLEAR_DEPTH)   first.depth   = c->depth;
+            if (c->flags & MTL_CLEAR_STENCIL) first.stencil = c->stencil;
+        }
+
+        MtlPassState ps;
+        memset(&ps, 0, sizeof ps);
+        if (s_vert_count > 0) {
+            ps.vb = [s_dev newBufferWithBytes:s_verts
+                                       length:sizeof(MtlVertex) * s_vert_count
+                                      options:MTLResourceStorageModeShared];
+            if (s_cb_used)
+                ps.cbuf = [s_dev newBufferWithBytes:s_cb length:s_cb_used
+                                            options:MTLResourceStorageModeShared];
+        }
 
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
-        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
-
-        if (s_draw_count > 0 && s_vert_count > 0) {
-            id<MTLBuffer> vb = [s_dev newBufferWithBytes:s_verts
-                                                  length:sizeof(MtlVertex) * s_vert_count
-                                                 options:MTLResourceStorageModeShared];
-            [enc setVertexBuffer:vb offset:0 atIndex:MTL_VB_INDEX];
-            id<MTLBuffer> cbuf = nil;
-            if (s_cb_used)
-                cbuf = [s_dev newBufferWithBytes:s_cb length:s_cb_used
-                                         options:MTLResourceStorageModeShared];
-            /* Every fragment texture unit starts on the zero texture -- a
-             * guest program may sample a unit nothing was bound to, and
-             * Metal validation rejects a nil texture on use. Units are then
-             * rebound per draw only where the draw's slot differs. */
-            int bound_tex[RSX_MAX_TEXTURES], bound_samp[RSX_MAX_TEXTURES];
-            for (int u = 0; u < RSX_MAX_TEXTURES; u++) {
-                [enc setFragmentTexture:s_null_tex atIndex:(NSUInteger)u];
-                [enc setFragmentSamplerState:s_default_sampler atIndex:(NSUInteger)u];
-                bound_tex[u] = bound_samp[u] = -1;
+        id<MTLRenderCommandEncoder> enc = begin_pass(cb, target, &first, &ps);
+        for (; enc && r < s_rec_count; r++) {
+            if (s_records[r].kind == MTL_REC_CLEAR) {
+                [enc endEncoding];
+                enc = begin_pass(cb, target, &s_records[r].u.clear, &ps);
+                continue;
             }
-            MTLViewport vp = { 0.0, 0.0, (double)s_width, (double)s_height, 0.0, 1.0 };
-            [enc setViewport:vp];
-
-            for (u32 i = 0; i < s_draw_count; i++) {
-                MtlDraw* d = &s_draws[i];
-                id<MTLRenderPipelineState> pso = pso_for(d);
-                if (!pso) continue;
-                [enc setRenderPipelineState:pso];
-                [enc setCullMode:d->cull];
-                [enc setFrontFacingWinding:d->winding];
-                if (d->vs_idx >= 0 && cbuf) {
-                    [enc setVertexBuffer:cbuf offset:d->vp_cb_off atIndex:0];
-                    [enc setFragmentBuffer:cbuf offset:d->fp_cb_off atIndex:1];
-                    for (int u = 0; u < RSX_MAX_TEXTURES; u++) {
-                        if (d->tex[u] != bound_tex[u]) {
-                            [enc setFragmentTexture:(d->tex[u] >= 0 ? s_tex_cache[d->tex[u]].tex
-                                                                    : s_null_tex)
-                                            atIndex:(NSUInteger)u];
-                            bound_tex[u] = d->tex[u];
-                        }
-                        if (d->samp[u] != bound_samp[u]) {
-                            [enc setFragmentSamplerState:(d->samp[u] >= 0 ? s_samp_cache[d->samp[u]].samp
-                                                                          : s_default_sampler)
-                                                 atIndex:(NSUInteger)u];
-                            bound_samp[u] = d->samp[u];
-                        }
-                    }
-                } else {
-                    [enc setVertexBytes:d->mvp length:sizeof(d->mvp) atIndex:0];
-                }
-                [enc drawPrimitives:d->topology vertexStart:d->base vertexCount:d->count];
-            }
+            encode_draw(enc, &s_records[r].u.draw, &ps);
         }
-        [enc endEncoding];
+        if (enc) [enc endEncoding];
 
         if (drawable) [cb presentDrawable:drawable];
 
@@ -1318,12 +1423,12 @@ void rsx_metal_backend_present(void)
             [cb commit];        /* no wait: the CPU goes on to the next frame */
         }
 
-        if (s_dropped_draws) {
-            fprintf(stderr, "[RSX metal] dropped %u draw(s) this frame (cap %d draws / %u verts)\n",
-                    s_dropped_draws, MTL_MAX_DRAWS, MTL_MAX_VERTS);
-            s_dropped_draws = 0;
+        if (s_dropped_records) {
+            fprintf(stderr, "[RSX metal] dropped %u record(s) this frame (cap %d records / %u verts)\n",
+                    s_dropped_records, MTL_MAX_RECORDS, MTL_MAX_VERTS);
+            s_dropped_records = 0;
         }
-        s_draw_count = 0;
+        s_rec_count  = 0;
         s_vert_count = 0;
         s_cb_used    = 0;
         s_last_guest_draws = s_guest_draws;
