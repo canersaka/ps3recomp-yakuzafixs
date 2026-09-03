@@ -1,0 +1,452 @@
+/*
+ * A thread group starts its threads on their image's lifted SPU code.
+ *
+ * The failure this guards is the one a real title hit: sys_spu_thread_group_start
+ * looked up a PPU fallback and, failing that, the interpreter, and never asked
+ * the lifted-code registry anything. Every thread of the group completed
+ * instantly with status 0, the group reported a clean exit, and nothing
+ * anywhere said that the program the guest asked to run had not run. Only the
+ * absence of its effects, several layers downstream, ever showed.
+ *
+ * So the assertions here are about the things that are silent when they are
+ * wrong. That each thread ran AT ALL, and ran on a host thread of its own
+ * rather than one after another on the caller's -- checked with a barrier
+ * inside the SPU code, so two threads that were serialized deadlock it and
+ * time out instead of quietly passing. That each got its own 256 KB local
+ * store, with the image's COPY segment really in it and the FILL segment
+ * really filled. That the entry point and the image the registry dispatches in
+ * are the ones the image declared. That each thread got ITS OWN arguments,
+ * which is the failure mode when they are read at start time out of a guest
+ * block the title rewrites between initialize calls. And that the status the
+ * SPU wrote on the way out survives to the group's join.
+ *
+ * The real syscall handlers run: the file that defines them is compiled in, so
+ * this drives sys_spu_thread_group_create, _initialize, _group_start and
+ * _group_join themselves rather than a re-creation of what they do. What it
+ * cannot bring is a guest, so the runtime the handlers reach for outside the
+ * SPU and lv2 layers -- the PPU backtrace helpers, the other syscall families,
+ * the event queues -- is stubbed at the bottom of this file.
+ *
+ * Build:
+ *   clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+ *         -o /tmp/test_spu_lifted_start \
+ *         runtime/spu/tests/test_spu_lifted_start.c \
+ *         runtime/spu/spu_channels.c runtime/spu/spu_drain.c \
+ *         runtime/spu/spu_lockstep.c runtime/spu/spu_coherency.c \
+ *         runtime/spu/spu_workload.c runtime/spu/spurs_policy.c \
+ *         runtime/spu/spurs_job.c runtime/spu/spu_tsp_weak.c \
+ *         runtime/spu/spu_vm_pagemap.c runtime/spu/spurs_policy_blob_weak.c \
+ *         runtime/spu/spu_interp.c runtime/spu/spu_lifted_thread.c \
+ *         runtime/syscalls/spu_fallback.c runtime/platform/win32_compat.c \
+ *         -lpthread
+ *
+ * Exit code: 0 if all passed, 1 if any failed. Final line prints a summary.
+ */
+
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+/* ---------------------------------------------------------------------------
+ * Guest memory. Defined before the unit under test is compiled in, because
+ * that is what its vm_read_be32 reads through.
+ *
+ * Reserved rather than declared, and large enough to cover the sys_memory
+ * window at 0x40000000: the group-start path carries diagnostics that read
+ * fixed high guest addresses, which a real runtime has mapped because vm_init
+ * reserves the whole 4 GB. Reserving less here would fail on where those
+ * diagnostics look rather than on anything this test is about. Nothing is
+ * committed until touched, so the cost is address space.
+ * -----------------------------------------------------------------------*/
+#include <sys/mman.h>
+#define GUEST_SIZE  0x41000000u
+static uint8_t*  g_guest_mem;
+uint8_t*         vm_base;
+uint32_t         ppu_vm_size = GUEST_SIZE;
+
+/* The lv2 SPU thread-group layer, handlers and all. Compiled in rather than
+ * linked so the test can call the static syscall handlers directly and read
+ * the group and thread tables to check what they did. */
+#include "../../syscalls/lv2_register.c"
+
+/* The lifted-code registry (spu_channels.c), which the test registers into. */
+typedef void (*test_spu_fn)(spu_context*);
+void spu_begin_image(int image_id);
+void spu_register_function(uint32_t addr, test_spu_fn fn);
+void spu_stop(spu_context* ctx);
+
+/* ---------------------------------------------------------------------------
+ * Harness
+ * -----------------------------------------------------------------------*/
+static int g_pass, g_fail;
+
+static void check(int ok, const char* what)
+{
+    if (ok) { g_pass++; return; }
+    g_fail++;
+    printf("  FAIL: %s\n", what);
+}
+
+#define CHECK(cond)  check((cond), #cond)
+
+/* ---------------------------------------------------------------------------
+ * The synthetic SPU image
+ *
+ * Guest layout, mirroring what _sys_spu_image_import builds from an ELF: a
+ * sys_spu_image { type, entry, segs, nsegs } pointing at a table of
+ * sys_spu_segment { type, ls_start, size, src } records of 0x18 bytes each.
+ * -----------------------------------------------------------------------*/
+#define IMG_CODE_EA    0x00011000u   /* the COPY segment's source bytes      */
+#define IMG_SEGS_EA    0x00012000u   /* the segment table                    */
+#define IMG_EA         0x00013000u   /* the sys_spu_image struct             */
+#define ARGS0_EA       0x00014000u   /* thread 0's sys_spu_thread_argument   */
+#define ARGS1_EA       0x00014100u   /* thread 1's                           */
+#define OUT_EA         0x00015000u   /* syscall out-parameter scratch        */
+
+#define IMG_CODE_LS    0x800u        /* where the COPY segment lands in LS   */
+#define IMG_CODE_LEN   0x40u
+#define IMG_FILL_LS    0x840u        /* the FILL segment, as an ELF bss tail */
+#define IMG_FILL_LEN   0x40u
+#define IMG_FILL_BYTE  0xABu
+#define IMG_ENTRY      0x848u        /* inside the filled region, on purpose */
+#define IMG_IMAGE_ID   7             /* the id the lifted code registers under */
+
+#define RESULT_LS      0x900u        /* where the SPU writes its result byte */
+#define RESULT_BYTE    0x5Au
+
+static void wr_be32(uint32_t ea, uint32_t v)
+{
+    uint8_t* p = g_guest_mem + ea;
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
+}
+
+static void wr_be64(uint32_t ea, uint64_t v)
+{
+    wr_be32(ea, (uint32_t)(v >> 32));
+    wr_be32(ea + 4, (uint32_t)v);
+}
+
+static void build_guest_image(void)
+{
+    /* Code bytes the COPY segment must land in local store verbatim. */
+    for (uint32_t i = 0; i < IMG_CODE_LEN; i++)
+        g_guest_mem[IMG_CODE_EA + i] = (uint8_t)(0x40u + i);
+
+    /* seg 0: COPY. _sys_spu_image_import writes the source EA at both +0x10
+     * and +0x14; write both here for the same reason. */
+    wr_be32(IMG_SEGS_EA + 0x00, 1);
+    wr_be32(IMG_SEGS_EA + 0x04, IMG_CODE_LS);
+    wr_be32(IMG_SEGS_EA + 0x08, IMG_CODE_LEN);
+    wr_be32(IMG_SEGS_EA + 0x10, IMG_CODE_EA);
+    wr_be32(IMG_SEGS_EA + 0x14, IMG_CODE_EA);
+
+    /* seg 1: FILL, the shape an ELF's memsz>filesz tail takes. */
+    wr_be32(IMG_SEGS_EA + 0x18 + 0x00, 2);
+    wr_be32(IMG_SEGS_EA + 0x18 + 0x04, IMG_FILL_LS);
+    wr_be32(IMG_SEGS_EA + 0x18 + 0x08, IMG_FILL_LEN);
+    wr_be32(IMG_SEGS_EA + 0x18 + 0x10, IMG_FILL_BYTE);
+
+    wr_be32(IMG_EA + 0x00, 0);            /* type = user image */
+    wr_be32(IMG_EA + 0x04, IMG_ENTRY);
+    wr_be32(IMG_EA + 0x08, IMG_SEGS_EA);
+    wr_be32(IMG_EA + 0x0C, 2);            /* nsegs */
+}
+
+/* ---------------------------------------------------------------------------
+ * What the lifted code saw, one slot per SPU thread
+ * -----------------------------------------------------------------------*/
+typedef struct {
+    int            ran;
+    pthread_t      host_thread;
+    const uint8_t* ls;
+    uint32_t       entry_pc;
+    int            image_id;
+    uint64_t       arg[4];
+    int            copy_ok;
+    int            fill_ok;
+    int            concurrent;   /* both threads were inside at the same time */
+} observation;
+
+static observation g_obs[2];
+
+/* Barrier across the two SPU threads. A run that serialized them cannot get
+ * both here, so this is what turns "they ran on their own host threads" into
+ * something that fails rather than something taken on trust. It times out so
+ * that a failure is a failing test and not a hung one. */
+static pthread_mutex_t g_bar_mu  = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_bar_cv  = PTHREAD_COND_INITIALIZER;
+static int             g_bar_n   = 0;
+
+static int barrier_wait_two(void)
+{
+    struct timespec deadline;
+    int ok = 1;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 10;
+
+    pthread_mutex_lock(&g_bar_mu);
+    if (++g_bar_n >= 2) {
+        pthread_cond_broadcast(&g_bar_cv);
+    } else {
+        while (g_bar_n < 2) {
+            if (pthread_cond_timedwait(&g_bar_cv, &g_bar_mu, &deadline) != 0) {
+                ok = 0;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_bar_mu);
+    return ok;
+}
+
+/* ---------------------------------------------------------------------------
+ * The lifted SPU function
+ *
+ * Hand-written in the shape the lifter emits: it takes the context, works on
+ * ctx->ls and ctx->gpr, and finishes by writing its exit status to the
+ * outbound mailbox and executing stop 0x102, which is the SPU side of
+ * sys_spu_thread_exit. The status is written straight into the channel rather
+ * than through spu_wrch, to keep this about the start and exit path and not
+ * about mailbox delivery to a PPU that is not here.
+ * -----------------------------------------------------------------------*/
+static void tiny_spu_entry(spu_context* ctx)
+{
+    int slot = (ctx->spu_id & 1u) ? 1 : 0;
+    observation* o = &g_obs[slot];
+
+    o->ran         = 1;
+    o->host_thread = pthread_self();
+    o->ls          = ctx->ls;
+    o->entry_pc    = ctx->pc;
+    o->image_id    = ctx->image_id;
+    for (int a = 0; a < 4; a++)
+        o->arg[a] = ((uint64_t)ctx->gpr[3 + a]._u32[0] << 32) |
+                    (uint64_t)ctx->gpr[3 + a]._u32[1];
+
+    o->copy_ok = 1;
+    for (uint32_t i = 0; i < IMG_CODE_LEN; i++)
+        if (ctx->ls[IMG_CODE_LS + i] != (uint8_t)(0x40u + i)) o->copy_ok = 0;
+    o->fill_ok = (ctx->ls[IMG_ENTRY] == IMG_FILL_BYTE) &&
+                 (ctx->ls[IMG_FILL_LS] == IMG_FILL_BYTE);
+
+    o->concurrent = barrier_wait_two();
+
+    /* Something for the PPU to read back out of local store afterwards. */
+    ctx->ls[RESULT_LS] = (uint8_t)(RESULT_BYTE + slot);
+
+    /* sys_spu_thread_exit: status to SPU_WrOutMbox, then stop 0x102. Thread 1
+     * exits with a failure so the group's join has a worst status to find. */
+    spu_channel_write(&ctx->ch_out_mbox, slot ? (uint32_t)(int32_t)-7 : 0u);
+    ctx->stop_code = 0x102u;
+    ctx->status    = SPU_STATUS_STOPPED_BY_STOP;
+    spu_stop(ctx);
+}
+
+/* ---------------------------------------------------------------------------
+ * Driving the syscalls
+ * -----------------------------------------------------------------------*/
+static ppu_context g_ppu;
+
+static int64_t call(int64_t (*handler)(ppu_context*),
+                    uint64_t a3, uint64_t a4, uint64_t a5,
+                    uint64_t a6, uint64_t a7, uint64_t a8)
+{
+    memset(&g_ppu, 0, sizeof(g_ppu));
+    g_ppu.gpr[3] = a3; g_ppu.gpr[4] = a4; g_ppu.gpr[5] = a5;
+    g_ppu.gpr[6] = a6; g_ppu.gpr[7] = a7; g_ppu.gpr[8] = a8;
+    return handler(&g_ppu);
+}
+
+static uint32_t rd_be32(uint32_t ea)
+{
+    const uint8_t* p = g_guest_mem + ea;
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+}
+
+int main(void)
+{
+    printf("SPU lifted thread-group start\n");
+
+    g_guest_mem = (uint8_t*)mmap(NULL, GUEST_SIZE, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                                 -1, 0);
+    if (g_guest_mem == MAP_FAILED) {
+        printf("  FAIL: could not reserve %u bytes of guest memory\n", GUEST_SIZE);
+        return 1;
+    }
+    vm_base = g_guest_mem;
+
+    build_guest_image();
+
+    /* The title's registration: lifted code for this image, under its own id. */
+    spu_begin_image(IMG_IMAGE_ID);
+    spu_register_function(IMG_ENTRY, tiny_spu_entry);
+    spu_begin_image(0);
+
+    /* Two threads, each with its own argument block. Distinct values, so a
+     * thread reading the other's is visible rather than plausible. */
+    for (int a = 0; a < 4; a++) {
+        wr_be64(ARGS0_EA + (uint32_t)a * 8, 0x1000000000ull + (uint64_t)a);
+        wr_be64(ARGS1_EA + (uint32_t)a * 8, 0x2000000000ull + (uint64_t)a);
+    }
+
+    /* --- create ------------------------------------------------------- */
+    CHECK(call(sys_spu_thread_group_create_handler, OUT_EA, 2, 250, 0, 0, 0) == 0);
+    uint32_t gid = rd_be32(OUT_EA);
+    CHECK(gid != 0);
+
+    /* --- initialize --------------------------------------------------- */
+    CHECK(call(sys_spu_thread_initialize_handler,
+               OUT_EA, gid, 0, IMG_EA, 0, ARGS0_EA) == 0);
+    uint32_t tid0 = rd_be32(OUT_EA);
+    CHECK(call(sys_spu_thread_initialize_handler,
+               OUT_EA, gid, 1, IMG_EA, 0, ARGS1_EA) == 0);
+    uint32_t tid1 = rd_be32(OUT_EA);
+    CHECK(tid0 != tid1);
+    /* The entry point comes off the image, so the registry can be asked. */
+    CHECK(spu_find_thread(tid0)->entry_point == IMG_ENTRY);
+    /* Slot selection below keys on the low bit of the tid; if lv2 ever hands
+     * out two ids of the same parity the two threads would share a slot. */
+    CHECK(((tid0 ^ tid1) & 1u) == 1u);
+
+    /* --- start and join ----------------------------------------------- */
+    CHECK(call(sys_spu_thread_group_start_handler, gid, 0, 0, 0, 0, 0) == 0);
+    CHECK(call(sys_spu_thread_group_join_handler, gid, OUT_EA, OUT_EA + 4,
+               0, 0, 0) == 0);
+    uint32_t cause  = rd_be32(OUT_EA);
+    int32_t  status = (int32_t)rd_be32(OUT_EA + 4);
+
+    /* --- what the lifted code saw -------------------------------------- */
+    observation* a = &g_obs[tid0 & 1u];
+    observation* b = &g_obs[tid1 & 1u];
+
+    CHECK(a->ran);                              /* it ran at all */
+    CHECK(b->ran);
+    if (!a->ran || !b->ran) {
+        printf("SPU lifted thread-group start: %d passed, %d failed\n",
+               g_pass, g_fail);
+        return 1;
+    }
+
+    /* Its own host thread, concurrently with the other, and neither of them
+     * the thread that called group_start. */
+    CHECK(!pthread_equal(a->host_thread, b->host_thread));
+    CHECK(!pthread_equal(a->host_thread, pthread_self()));
+    CHECK(!pthread_equal(b->host_thread, pthread_self()));
+    CHECK(a->concurrent);
+    CHECK(b->concurrent);
+
+    /* Its own local store, and the one lv2 hands out for this thread. */
+    CHECK(a->ls != b->ls);
+    CHECK(a->ls == spu_thread_get_local_store(tid0));
+    CHECK(b->ls == spu_thread_get_local_store(tid1));
+
+    /* The image really landed in it: COPY copied, FILL filled. */
+    CHECK(a->copy_ok);
+    CHECK(b->copy_ok);
+    CHECK(a->fill_ok);
+    CHECK(b->fill_ok);
+
+    /* Entry and image: pc at the image's entry point, dispatching in the
+     * image that registered it rather than in the id-0 wildcard. */
+    CHECK(a->entry_pc == IMG_ENTRY);
+    CHECK(b->entry_pc == IMG_ENTRY);
+    CHECK(a->image_id == IMG_IMAGE_ID);
+    CHECK(b->image_id == IMG_IMAGE_ID);
+
+    /* Each thread's OWN arguments, in the preferred doubleword of r3..r6. */
+    for (int i = 0; i < 4; i++) {
+        CHECK(a->arg[i] == 0x1000000000ull + (uint64_t)i);
+        CHECK(b->arg[i] == 0x2000000000ull + (uint64_t)i);
+    }
+
+    /* The status each SPU wrote on its way out, and the group's. */
+    CHECK(spu_find_thread(tid0)->exit_status == 0);
+    CHECK(spu_find_thread(tid1)->exit_status == -7);
+    CHECK(cause == SPU_GROUP_CAUSE_ALL_THREADS_EXIT);
+    CHECK(status == -7);
+
+    /* And the PPU can read back what the SPU left in local store, which it
+     * can only do if the two views of it are the same 256 KB. The syscall
+     * writes its result as a big-endian u64 at a guest address. */
+    CHECK(call(sys_spu_thread_read_ls_handler, tid0, RESULT_LS,
+               OUT_EA + 8, 1, 0, 0) == 0);
+    CHECK(g_guest_mem[OUT_EA + 15] == (uint8_t)(RESULT_BYTE + (int)(tid0 & 1u)));
+
+    /* An image with no lifted code must still take the old path. */
+    CHECK(!spu_lifted_thread_available(IMG_ENTRY + 4));
+
+    printf("SPU lifted thread-group start: %d passed, %d failed\n",
+           g_pass, g_fail);
+    return g_fail ? 1 : 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * The runtime beyond the SPU and lv2 layers, stubbed.
+ *
+ * These are the symbols lv2_register.c and spu_channels.c reach for outside
+ * their own subsystems: the other syscall families, the PPU's backtrace and
+ * watch helpers, and the title-specific SPURS hooks. None of them is on the
+ * path this test drives.
+ * -----------------------------------------------------------------------*/
+void sys_ppu_thread_init(lv2_syscall_table* t) { (void)t; }
+void sys_mutex_init(lv2_syscall_table* t)      { (void)t; }
+void sys_cond_init(lv2_syscall_table* t)       { (void)t; }
+void sys_semaphore_init(lv2_syscall_table* t)  { (void)t; }
+void sys_rwlock_init(lv2_syscall_table* t)     { (void)t; }
+void sys_event_init(lv2_syscall_table* t)      { (void)t; }
+void sys_timer_init(lv2_syscall_table* t)      { (void)t; }
+void sys_memory_init(lv2_syscall_table* t)     { (void)t; }
+void sys_vm_init(lv2_syscall_table* t)         { (void)t; }
+void sys_fs_init(lv2_syscall_table* t)         { (void)t; }
+
+int sys_event_queue_push_by_id(uint32_t q, uint64_t d0, uint64_t d1,
+                               uint64_t d2, uint64_t d3)
+{
+    (void)q; (void)d0; (void)d1; (void)d2; (void)d3;
+    return 0;
+}
+void sys_fs_translate_path(const char* ps3_path, char* host, int size)
+{
+    (void)ps3_path;
+    if (host && size > 0) host[0] = 0;
+}
+void sys_process_exit(int32_t status)            { exit((int)status); }
+int32_t sys_process_getpid(void)                 { return 1; }
+
+void ppu_dump_guest_stack(ppu_context* c, const char* tag) { (void)c; (void)tag; }
+void ppu_guard_page(uint32_t ea)                 { (void)ea; }
+void ppu_guest_caller(char* out, size_t n)       { if (out && n) out[0] = 0; }
+void ppu_guest_callstack(const char* tag)        { (void)tag; }
+void ppu_log_host_chain(const char* tag)         { (void)tag; }
+void ps3_hle_register_ctx(uint32_t nid, const char* name,
+                          void (*fn)(ppu_context*))
+{
+    (void)nid; (void)name; (void)fn;
+}
+void ppu_resv_break_store(uint64_t ea)           { (void)ea; }
+void ps3_ww_report_inline(uint32_t a, uint64_t v, int w)
+{
+    (void)a; (void)v; (void)w;
+}
+uint64_t ps3_ms_now(void)                        { return 0; }
+uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi = 0;
+int      g_resv_store_active = 0;
+int      g_barrier_sync_watch = 0;
+
+/* Title-specific SPURS hooks the SPU half offers but nothing here installs. */
+void (*g_spurs_kernel_hook)(uint32_t) = 0;
+uint32_t g_ydkj_spurs_ctx_ea = 0;
+uint32_t g_ydkj_real_spurs_ea = 0;
+uint32_t g_ydkj_real_taskset_ea = 0;
+uint32_t g_ydkj_real_taskid = 0;
+void spurs_ef_set_from_spu(uint32_t ea, uint32_t bits) { (void)ea; (void)bits; }
+void ydkj_wake_all_event_flags(void)                   { }
+void spurs_pm_build_context(spu_context* c, uint32_t a, uint32_t b, uint32_t d)
+{
+    (void)c; (void)a; (void)b; (void)d;
+}
