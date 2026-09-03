@@ -3,12 +3,13 @@
  *
  * Exercises the POSIX side of the Win32 shim: interlocked return conventions
  * and widths, critical sections, SRW locks in both modes, condition variables
- * against each lock kind, events (auto and manual reset), semaphores,
- * joinable threads with exit codes and the CREATE_SUSPENDED gate,
- * WaitForMultipleObjects in both modes, WaitOnAddress, waitable timers,
- * timing, virtual memory, stopping a running thread and reading its
- * registers, the address-space queries, vectored exception handlers, the
- * dbghelp symbol names, and the MSVC CRT spellings.
+ * against each lock kind, one-time initialisation, events (auto and manual
+ * reset), semaphores, joinable threads with exit codes and the
+ * CREATE_SUSPENDED gate, WaitForMultipleObjects in both modes, WaitOnAddress,
+ * waitable timers, timing, virtual memory, stopping a running thread and
+ * reading its registers, the address-space queries, vectored exception
+ * handlers, the module-name and dbghelp symbol calls, directory creation, and
+ * the MSVC CRT spellings.
  *
  * Build (any POSIX host):
  *   cc -std=gnu17 -Wall -Wextra -I runtime/platform \
@@ -376,6 +377,79 @@ static void test_srw_and_cv(void)
     CloseHandle(g_readers_go);
     CHECK(TryAcquireSRWLockExclusive(&g_srw)); ReleaseSRWLockExclusive(&g_srw);
     for (int i = 0; i < 2; i++) CloseHandle(rs[i]);
+}
+
+/* ---- one-time initialisation --------------------------------------------- */
+static INIT_ONCE     g_once = INIT_ONCE_STATIC_INIT;
+static volatile LONG g_once_runs;
+static volatile LONG g_once_seen;
+static HANDLE        g_once_go;
+
+static BOOL CALLBACK once_cb(PINIT_ONCE once, PVOID parameter, PVOID* context)
+{
+    (void)once;
+    InterlockedIncrement(&g_once_runs);
+    Sleep(40);                        /* long enough for the others to pile up */
+    *context = parameter;
+    return TRUE;
+}
+
+static DWORD WINAPI once_worker(LPVOID a)
+{
+    (void)a;
+    WaitForSingleObject(g_once_go, 5000);
+    PVOID ctx = NULL;
+    if (InitOnceExecuteOnce(&g_once, once_cb, (PVOID)(intptr_t)0x1234, &ctx) &&
+        ctx == (PVOID)(intptr_t)0x1234)
+        InterlockedIncrement(&g_once_seen);
+    return 0;
+}
+
+/* Fails twice, then succeeds. A failed callback leaves the INIT_ONCE where it
+ * was, which is the half of the contract pthread_once cannot express. */
+static BOOL CALLBACK once_fail_cb(PINIT_ONCE once, PVOID parameter, PVOID* context)
+{
+    (void)once;
+    *context = (PVOID)(intptr_t)9;                     /* ignored on failure */
+    return InterlockedIncrement((volatile LONG*)parameter) >= 3;
+}
+
+static void test_init_once(void)
+{
+    INIT_ONCE    local = INIT_ONCE_STATIC_INIT;
+    volatile LONG tries = 0;
+    PVOID        ctx = (PVOID)(intptr_t)-1;
+
+    CHECK(!InitOnceExecuteOnce(&local, once_fail_cb, (PVOID)&tries, &ctx));
+    CHECK(!InitOnceExecuteOnce(&local, once_fail_cb, (PVOID)&tries, &ctx));
+    CHECK(ctx == (PVOID)(intptr_t)-1);                 /* untouched by a failure */
+    CHECK(InitOnceExecuteOnce(&local, once_fail_cb, (PVOID)&tries, &ctx));
+    CHECK(tries == 3 && ctx == (PVOID)(intptr_t)9);
+    CHECK(InitOnceExecuteOnce(&local, once_fail_cb, (PVOID)&tries, &ctx));
+    CHECK(tries == 3);                                 /* done: never runs again */
+
+    /* the runner's shape: four threads race one lazy initialisation */
+    g_once_go = CreateEventA(NULL, TRUE, FALSE, NULL);           /* manual-reset */
+    CHECK(g_once_go != NULL);
+    HANDLE th[4];
+    for (int i = 0; i < 4; i++) th[i] = CreateThread(NULL, 0, once_worker, NULL, 0, NULL);
+    Sleep(30);
+    SetEvent(g_once_go);
+    CHECK(WaitForMultipleObjects(4, th, TRUE, 5000) == WAIT_OBJECT_0);
+    CHECK(g_once_runs == 1);                           /* exactly one callback */
+    CHECK(g_once_seen == 4);                           /* everyone got the context */
+    for (int i = 0; i < 4; i++) CloseHandle(th[i]);
+    CloseHandle(g_once_go);
+
+    ctx = NULL;
+    CHECK(InitOnceExecuteOnce(&g_once, once_cb, NULL, &ctx));
+    CHECK(g_once_runs == 1 && ctx == (PVOID)(intptr_t)0x1234);   /* the stored one */
+
+    INIT_ONCE reinit;
+    InitOnceInitialize(&reinit);
+    CHECK(reinit.Ptr == NULL);
+    CHECK(!InitOnceExecuteOnce(&reinit, NULL, NULL, NULL) &&
+          GetLastError() == ERROR_INVALID_PARAMETER);
 }
 
 /* ---- waitable timers ----------------------------------------------------- */
@@ -804,6 +878,7 @@ int main(void)
     test_semaphores();
     test_wait_on_address();
     test_srw_and_cv();
+    test_init_once();
     test_timers();
     test_timing();
     test_virtual_memory();
