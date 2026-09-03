@@ -55,6 +55,7 @@ static id<MTLDevice>       s_dev;
 static id<MTLCommandQueue> s_queue;
 static CAMetalLayer*       s_layer;      /* windowed only   */
 static id<MTLTexture>      s_offscreen;  /* headless only   */
+static id<MTLTexture>      s_depth;      /* depth + stencil, both surfaces  */
 static NSWindow*           s_window;
 static int                 s_headless;
 static int                 s_closed;
@@ -111,6 +112,8 @@ typedef struct {
     u32 color_mask;  /* NV4097_SET_COLOR_MASK word              */
     MTLCullMode cull;
     MTLWinding  winding;
+    int ds_idx;      /* slot in s_ds_cache, or -1 for no test / no writes */
+    u32 stencil_ref; /* SET_STENCIL_FUNC_REF; encoder state, not pipeline */
     /* Guest programs: cache slots, or -1 when the draw uses the built-in
      * shader. Slots are stable for the whole frame (see s_caches_full). */
     int vs_idx, fs_idx;
@@ -209,6 +212,8 @@ static char s_log[8192];
  * texture on use, so zero is a real 1x1 texture here. */
 static id<MTLTexture>      s_null_tex;
 static id<MTLSamplerState> s_default_sampler;
+/* What a draw gets when the depth/stencil cache is full: no test, no writes. */
+static id<MTLDepthStencilState> s_ds_default;
 
 /* ---- guest textures ---------------------------------------------------------
  * Keyed on where the bytes are and what the register says they are, plus a
@@ -279,6 +284,8 @@ static void mtl_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
  * a draw. The D3D12 backend does the same via s_d3d.current_rsx_state. */
 static const rsx_state* s_state;
 
+static int create_depth(void);
+
 static void mtl_set_render_target(void* ud, const rsx_state* state)
 {
     (void)ud;
@@ -288,6 +295,9 @@ static void mtl_set_render_target(void* ud, const rsx_state* state)
     if (!w || !h || (w == s_width && h == s_height)) return;
     s_width = w; s_height = h;
     if (s_layer) s_layer.drawableSize = CGSizeMake((CGFloat)w, (CGFloat)h);
+    if (s_depth && create_depth() != 0)
+        fprintf(stderr, "[RSX metal] depth/stencil resize to %ux%u failed; "
+                        "the old buffer stays bound\n", w, h);
 }
 
 static void mtl_latch_state(void* ud, const rsx_state* state)
@@ -302,6 +312,7 @@ static rsx_backend s_backend_vtable = {
     .set_render_target  = mtl_set_render_target,
     .set_vertex_attribs = mtl_latch_state,
     .set_blend          = mtl_latch_state,
+    .set_depth_stencil  = mtl_latch_state,
     .set_viewport       = mtl_latch_state,
     .set_color_mask     = mtl_latch_state,
     .set_alpha_test     = mtl_latch_state,
@@ -339,6 +350,34 @@ static u64 fnv1a64(const void* data, u32 n, u64 h)
     const u8* p = (const u8*)data;
     for (u32 i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
     return h;
+}
+
+/* One depth/stencil texture for the display target, sized like the colour
+ * attachment, shared by every pass the frame opens -- the D3D12 backend shares
+ * one depth buffer the same way, because a PS3 title typically uses a single
+ * zeta surface. Zeta offsets and per-target depth belong with render targets.
+ *
+ * D24S8 is not a format Apple GPUs have, so the depth is 32-bit float. Both
+ * hold the guest's [0,1] window z, with more precision than the RSX's 24 bits
+ * rather than less. The texture is never read back, so it is private.
+ *
+ * Assigned only on success: a failed resize keeps the old texture bound rather
+ * than leaving passes and pipelines disagreeing about whether depth exists. */
+#define MTL_DEPTH_FORMAT   MTLPixelFormatDepth32Float_Stencil8
+
+static int create_depth(void)
+{
+    MTLTextureDescriptor* td =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTL_DEPTH_FORMAT
+                                                           width:s_width
+                                                          height:s_height
+                                                       mipmapped:NO];
+    td.usage       = MTLTextureUsageRenderTarget;
+    td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
+    if (!t) return -1;
+    s_depth = t;
+    return 0;
 }
 
 static int create_offscreen(void)
@@ -405,7 +444,13 @@ static int create_placeholders(void)
     sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
     sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
     s_default_sampler = [s_dev newSamplerStateWithDescriptor:sd];
-    return s_default_sampler ? 0 : -1;
+    if (!s_default_sampler) return -1;
+
+    MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
+    dd.depthCompareFunction = MTLCompareFunctionAlways;
+    dd.depthWriteEnabled    = NO;
+    s_ds_default = [s_dev newDepthStencilStateWithDescriptor:dd];
+    return s_ds_default ? 0 : -1;
 }
 
 /* ---- guest vertex fetch --------------------------------------------------
@@ -922,6 +967,123 @@ static void cull_from_state(const rsx_state* st, MtlDraw* d)
                                              : MTLWindingClockwise;
 }
 
+/* ---- depth/stencil state -------------------------------------------------
+ * The NV4097 comparison functions are the GL enums, 0x200 NEVER .. 0x207
+ * ALWAYS, and the stencil ops are GL's too. Both tables are copied from the
+ * live draw engine's gcm_cmp / gcm_stencil_op, which is what a title has
+ * actually run through.
+ *
+ * Note that rsx_state_init seeds depth_func with 1 and calls it LESS, which is
+ * not the GL enum for anything; like the reference, an unrecognised function
+ * decodes as ALWAYS. Nothing reaches the depth test with that value unless the
+ * guest enabled the test without programming SET_DEPTH_FUNC.
+ * --------------------------------------------------------------------------*/
+
+static MTLCompareFunction gcm_compare_to_metal(u32 f)
+{
+    switch (f) {
+    case 0x0200: return MTLCompareFunctionNever;
+    case 0x0201: return MTLCompareFunctionLess;
+    case 0x0202: return MTLCompareFunctionEqual;
+    case 0x0203: return MTLCompareFunctionLessEqual;
+    case 0x0204: return MTLCompareFunctionGreater;
+    case 0x0205: return MTLCompareFunctionNotEqual;
+    case 0x0206: return MTLCompareFunctionGreaterEqual;
+    default:     return MTLCompareFunctionAlways;
+    }
+}
+
+/* GL_ZERO is 0, which is also what the register reads before a title ever
+ * writes it -- and GL_KEEP is the value that leaves such a stream alone, so
+ * zero maps to ZERO only because the guest asked for it explicitly; an
+ * unrecognised op keeps, as in the reference. */
+static MTLStencilOperation gcm_stencil_op_to_metal(u32 op)
+{
+    switch (op) {
+    case 0x0000: return MTLStencilOperationZero;              /* GL_ZERO       */
+    case 0x1E01: return MTLStencilOperationReplace;
+    case 0x1E02: return MTLStencilOperationIncrementClamp;    /* GL_INCR       */
+    case 0x1E03: return MTLStencilOperationDecrementClamp;    /* GL_DECR       */
+    case 0x150A: return MTLStencilOperationInvert;
+    case 0x8507: return MTLStencilOperationIncrementWrap;
+    case 0x8508: return MTLStencilOperationDecrementWrap;
+    default:     return MTLStencilOperationKeep;              /* GL_KEEP 0x1E00 */
+    }
+}
+
+/* MTLDepthStencilState objects are immutable, so one is built per distinct
+ * combination of the registers and kept for the frame, exactly like the
+ * pipeline states. The stencil reference value is not part of the object --
+ * Metal sets it on the encoder -- so it is not part of the key either. */
+#define MTL_DS_CACHE 256
+
+typedef struct {
+    u8  depth_test, depth_mask, stencil_test;
+    u32 depth_func;
+    u32 stencil_func, stencil_mask;
+    u32 op_fail, op_zfail, op_zpass;
+} MtlDsKey;
+typedef struct { MtlDsKey key; id<MTLDepthStencilState> state; } MtlDsEntry;
+
+static MtlDsEntry s_ds_cache[MTL_DS_CACHE];
+static u32        s_ds_count;
+
+static int ds_slot_for(const rsx_state* st)
+{
+    MtlDsKey key;
+    memset(&key, 0, sizeof key);
+    key.depth_test   = (u8)(st->depth_test_enable ? 1 : 0);
+    key.depth_mask   = (u8)(st->depth_mask ? 1 : 0);
+    key.stencil_test = (u8)(st->stencil_test_enable ? 1 : 0);
+    key.depth_func   = st->depth_func;
+    key.stencil_func = st->stencil_func;
+    key.stencil_mask = st->stencil_mask;
+    key.op_fail      = st->stencil_op_fail;
+    key.op_zfail     = st->stencil_op_zfail;
+    key.op_zpass     = st->stencil_op_zpass;
+
+    for (u32 i = 0; i < s_ds_count; i++)
+        if (memcmp(&s_ds_cache[i].key, &key, sizeof key) == 0) return (int)i;
+    if (s_ds_count >= MTL_DS_CACHE) { s_caches_full = 1; return -1; }
+
+    MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
+    /* The attachment is always bound, so "depth test off" is compare Always
+     * with writes off -- which is also what the hardware does: with the test
+     * disabled the RSX writes no depth, whatever SET_DEPTH_MASK says. */
+    dd.depthCompareFunction = key.depth_test ? gcm_compare_to_metal(key.depth_func)
+                                             : MTLCompareFunctionAlways;
+    dd.depthWriteEnabled    = (key.depth_test && key.depth_mask) ? YES : NO;
+    if (key.stencil_test) {
+        MTLStencilDescriptor* sd = [MTLStencilDescriptor new];
+        sd.stencilCompareFunction    = gcm_compare_to_metal(key.stencil_func);
+        sd.stencilFailureOperation   = gcm_stencil_op_to_metal(key.op_fail);
+        sd.depthFailureOperation     = gcm_stencil_op_to_metal(key.op_zfail);
+        sd.depthStencilPassOperation = gcm_stencil_op_to_metal(key.op_zpass);
+        sd.readMask                  = key.stencil_mask & 0xFFu;
+        /* SET_STENCIL_FUNC_MASK is the read mask. The write mask lives in
+         * NV4097_SET_STENCIL_MASK (0x032C), which rsx_commands.c does not
+         * decode and rsx_state has no field for, so every plane is writable
+         * here. It reads back wrong for a title that masks stencil planes;
+         * fixing it means adding the register upstream, not guessing here. */
+        sd.writeMask                 = 0xFFu;
+        /* Two-sided stencil (SET_BACK_STENCIL_*) is not decoded upstream
+         * either; nv40 applies the front state to both faces when it is off,
+         * which is what this does. */
+        dd.frontFaceStencil = sd;
+        dd.backFaceStencil  = sd;
+    } else {
+        dd.frontFaceStencil = nil;
+        dd.backFaceStencil  = nil;
+    }
+
+    id<MTLDepthStencilState> state = [s_dev newDepthStencilStateWithDescriptor:dd];
+    if (!state) return -1;
+    const int slot = (int)s_ds_count++;
+    s_ds_cache[slot].key   = key;
+    s_ds_cache[slot].state = state;
+    return slot;
+}
+
 /* ---- draw recording ------------------------------------------------------ */
 
 static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
@@ -934,7 +1096,7 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     r->kind = MTL_REC_DRAW;
     MtlDraw* d = &r->u.draw;
     memset(d, 0, sizeof *d);
-    d->vs_idx = d->fs_idx = -1;
+    d->vs_idx = d->fs_idx = d->ds_idx = -1;
     for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) d->tex[u] = d->samp[u] = -1;
 
     /* Programs first: their translation is what can fail, and a draw that
@@ -960,6 +1122,8 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     d->blend_dfactor  = st->blend_dfactor;
     d->blend_equation = st->blend_equation;
     d->color_mask     = st->color_mask;
+    d->ds_idx         = ds_slot_for(st);
+    d->stencil_ref    = st->stencil_ref;
     cull_from_state(st, d);
 
     /* Built-in path: RSX vertex constant slots 0..3 hold the MVP rows when no
@@ -1095,6 +1259,11 @@ static id<MTLRenderPipelineState> pso_for(const MtlDraw* d)
         pd.fragmentFunction = [s_shader_lib newFunctionWithName:@"fs_main"];
     }
     pd.vertexDescriptor = vertex_descriptor();
+    /* The depth/stencil attachment is bound on every pass, so every pipeline
+     * declares it; whether a draw tests or writes is the MTLDepthStencilState's
+     * business, not the pipeline's. */
+    pd.depthAttachmentPixelFormat   = MTL_DEPTH_FORMAT;
+    pd.stencilAttachmentPixelFormat = MTL_DEPTH_FORMAT;
     MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[0];
     ca.pixelFormat = MTLPixelFormatBGRA8Unorm;
     ca.writeMask   = color_mask_to_metal(d->color_mask);
@@ -1152,6 +1321,18 @@ static id<MTLRenderCommandEncoder> begin_pass(id<MTLCommandBuffer> cb,
     } else {
         rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
     }
+    /* Both halves of the one Depth32Float_Stencil8 texture. Stored rather than
+     * discarded: a later pass in the same frame loads what this one wrote. */
+    rp.depthAttachment.texture       = s_depth;
+    rp.depthAttachment.storeAction   = MTLStoreActionStore;
+    rp.depthAttachment.loadAction    = (clear->flags & MTL_CLEAR_DEPTH)
+                                           ? MTLLoadActionClear : MTLLoadActionLoad;
+    rp.depthAttachment.clearDepth    = (double)clear->depth;
+    rp.stencilAttachment.texture     = s_depth;
+    rp.stencilAttachment.storeAction = MTLStoreActionStore;
+    rp.stencilAttachment.loadAction  = (clear->flags & MTL_CLEAR_STENCIL)
+                                           ? MTLLoadActionClear : MTLLoadActionLoad;
+    rp.stencilAttachment.clearStencil = clear->stencil;
 
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
     if (!enc) return nil;
@@ -1179,6 +1360,9 @@ static void encode_draw(id<MTLRenderCommandEncoder> enc, const MtlDraw* d,
     [enc setRenderPipelineState:pso];
     [enc setCullMode:d->cull];
     [enc setFrontFacingWinding:d->winding];
+    [enc setDepthStencilState:(d->ds_idx >= 0 ? s_ds_cache[d->ds_idx].state
+                                              : s_ds_default)];
+    [enc setStencilReferenceValue:d->stencil_ref];
     if (d->vs_idx >= 0 && ps->cbuf) {
         [enc setVertexBuffer:ps->cbuf offset:d->vp_cb_off atIndex:0];
         [enc setFragmentBuffer:ps->cbuf offset:d->fp_cb_off atIndex:1];
@@ -1209,7 +1393,9 @@ static void clear_caches(void)
     for (u32 i = 0; i < s_pso_count;  i++) s_pso_cache[i].pso   = nil;
     for (u32 i = 0; i < s_tex_count;  i++) s_tex_cache[i].tex   = nil;
     for (u32 i = 0; i < s_samp_count; i++) s_samp_cache[i].samp = nil;
+    for (u32 i = 0; i < s_ds_count;   i++) s_ds_cache[i].state  = nil;
     s_vp_count = s_fp_count = s_pso_count = s_tex_count = s_samp_count = 0;
+    s_ds_count = 0;
     s_caches_full = 0;
 }
 
@@ -1244,6 +1430,10 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
 #endif
         if (rc != 0) {
             fprintf(stderr, "[RSX metal] surface creation failed\n");
+            return -1;
+        }
+        if (create_depth() != 0) {
+            fprintf(stderr, "[RSX metal] depth/stencil buffer creation failed\n");
             return -1;
         }
         if (create_placeholders() != 0) {
@@ -1316,8 +1506,10 @@ void rsx_metal_backend_shutdown(void)
         s_shader_lib = nil;
         s_null_tex   = nil;
         s_default_sampler = nil;
+        s_ds_default = nil;
         s_layer     = nil;
         s_offscreen = nil;
+        s_depth     = nil;
         s_queue     = nil;
         s_dev       = nil;
         s_ready     = 0;
@@ -1385,8 +1577,8 @@ void rsx_metal_backend_present(void)
             if (c->flags & MTL_CLEAR_STENCIL) first.stencil = c->stencil;
         }
 
-        MtlPassState ps;
-        memset(&ps, 0, sizeof ps);
+        /* Designated rather than memset: the buffers are ARC-managed. */
+        MtlPassState ps = { .vb = nil, .cbuf = nil };
         if (s_vert_count > 0) {
             ps.vb = [s_dev newBufferWithBytes:s_verts
                                        length:sizeof(MtlVertex) * s_vert_count
