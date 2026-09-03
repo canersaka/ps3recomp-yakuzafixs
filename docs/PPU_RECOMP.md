@@ -133,6 +133,42 @@ so the boot is a live to-do list. First boot stops at **`sys_initialize_tls`**
 14,104-function lift is ~88 MB of C in one file, impractical for a single g++
 invocation. That output-splitting is the main scaling task.
 
+### The smoke title
+
+Everything above needs a game, which is why nothing in this repository built
+the scaffold until now: `tools/check_ppu_scaffold.py` compiles it against a
+stub header and stops there, and compiling is not running. On POSIX the
+loader, the NID bridge, the lv2 syscalls, guest threads, the frame clock and
+the RSX backend had never once run together.
+
+`runtime/ppu/tests/smoke/` is a **synthetic title**: a hand-written program in
+the lifter's ABI, plus the image it is loaded from. `tools/make_smoke_elf.py`
+writes both: a big-endian ELF64 PPC executable with the OPD table, the marker
+strings, an image canary, a BSS tail and a PT_TLS template, and the
+`ppu_recomp.h` it compiles against, whose preamble is imported from
+`ppu_lifter.py` so the synthetic title cannot drift from the real ABI. The
+program then does what a title does at boot: a line through `sys_tty_write`,
+a firmware import through the NID bridge (as a stub whose whole body is
+`ps3_hle_call`), a guest thread created and joined, `_cellGcmInitBody` and
+three frames cleared and flipped through the FIFO, then `sys_process_exit`
+with a chosen status.
+
+`ps3recomp_boot_smoke` (UNIX) is `boot_main.cpp` plus the scaffold plus that
+program, and it exits 0 only if every marker appeared in order, the guest
+thread really ran on a second host thread, three frames reached the backend
+and the chosen status came back through `sys_process_exit`. CI runs it on
+macOS through headless Metal and on Linux through the null backend.
+
+Four defects surfaced the moment it ran, all of them POSIX-only and all of
+them invisible to a compile check: lv2 syscall 3 (`sys_process_exit`) was
+never registered, so a guest that exited that way was told it had succeeded
+and carried on; `sys_ppu_thread_join` held the thread-table lock across
+`pthread_join` while the thread it was waiting for needed that lock, so a join
+deadlocked at random; a hook in `ppu_hle.cpp` was declared weak at block
+scope, which does not make a symbol weak, so any build without that one port's
+file failed to link; and the exit status a guest chose was visible nowhere but
+the process's own exit code.
+
 ---
 
 ## File map
@@ -151,6 +187,8 @@ invocation. That output-splitting is the main scaling task.
 | `runtime/ppu/tests/test_loader.cpp` | loader smoke test (real EBOOT) |
 | `runtime/ppu/tests/test_hle*.cpp` | HLE adapter + real-library integration tests |
 | `runtime/ppu/tests/boot_main.cpp` | integrated first-boot harness |
+| `runtime/ppu/tests/smoke/smoke_recomp.c` | the smoke title: a synthetic lifted program |
+| `tools/make_smoke_elf.py` | its image + the matching `ppu_recomp.h` |
 
 ## Status
 
@@ -161,6 +199,7 @@ invocation. That output-splitting is the main scaling task.
 | Lifter ISA coverage | ~99.8% on real code |
 | NID→HLE bridge + correct NID algorithm | done, 69% import coverage |
 | Integrated build + first boot | done; stops at `sys_initialize_tls` |
+| Scaffold linked and run with no game | done: `ps3recomp_boot_smoke` + the smoke title, in CI on macOS and Linux |
 | Full-image lift (output splitting) | TODO (scaling) |
 | HLE completeness (net/input/spurs/CRT) | incremental, mapped by NID |
 | Pointer host↔guest wrappers | TODO |

@@ -14,12 +14,15 @@ documents the host shim itself._
 | `ps3recomp_host` | clear, flip, a fixed-function NV4097 draw, a draw through **guest vertex and fragment programs**, a draw sampling a **guest texture** from a guest program, a pair of triangles the **depth test** has to order, and a two-level texture whose **second mip level** must be the one sampled -- headless through the **Metal** backend, with 60-frame runs |
 | Guest shader translation | `test_shader_msl`: hand-assembled NV40 programs through the decompilers, glslang and spirv-cross, checked for the MSL binding contract the backend relies on (runs on Linux too) |
 | PPU boot scaffold | `ppu_loader.cpp`, `ppu_hle.cpp`, `ppu_fs.cpp`, `ppu_sysprx.cpp`, `boot_main.cpp` compile at a recorded baseline of **0** errors (`darwin-clang` in `tools/ppu_scaffold_baseline.json`) |
+| PPU boot path | `ps3recomp_boot_smoke`: the scaffold **linked and run** against the synthetic title in `runtime/ppu/tests/smoke/` -- ELF load, entry OPD, TLS, the NID bridge, lv2 syscalls, a guest thread on a second host thread, three frames cleared and flipped through the FIFO to the Metal backend, and `sys_process_exit` |
 | Win32 host shim | `runtime/platform/tests/test_win32_compat.c`, 197 checks |
 | lv2 sync primitives | `tests/sync_stress`: mutex, cond, semaphore and event-queue stress on host threads |
 | RSX self-contained tests | texture layout and primitive tables |
 
-The scaffold check is compile-only: nothing in this repository links it,
-because that needs a lifted game.
+The scaffold check is compile-only. What links and runs it is the smoke title:
+a hand-written program in the lifter's ABI, with an image
+(`tools/make_smoke_elf.py`) the loader reads for real, so the boot path is
+exercised on the Mac without a game. See docs/PPU_RECOMP.md.
 
 ## What a title still needs
 
@@ -124,6 +127,7 @@ PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader             # guest V
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --tex                # guest texture via a guest FP
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depth              # near-first pair, depth test
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip                # two mip levels, level 1 sampled
+PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_boot_smoke build/smoke/smoke.elf   # the PPU boot path
 ./build/test_shader_msl -v                        # decompilers -> MSL, sources printed
 
 for t in tools/test_*.py; do python3 "$t"; done          # lifter suites
