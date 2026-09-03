@@ -27,7 +27,10 @@
  * rsx_texture_decode turns them into host rows, and the TEXTURE_CONTROL1
  * crossbar becomes the texture's swizzle. Every mip level the register says
  * is there is uploaded, and the sampler's mip filter and LOD range come from
- * SET_TEXTURE_FILTER and SET_TEXTURE_CONTROL0.
+ * SET_TEXTURE_FILTER and SET_TEXTURE_CONTROL0. A unit SET_TEXTURE_FORMAT
+ * bit 2 marks as a cube map becomes an MTLTextureTypeCube of six faces, and
+ * the fragment program is compiled against that so it samples with a
+ * direction.
  *
  * Why Metal rather than SDL_Renderer: SDL2's renderer is a 2D sprite API with
  * no route to a custom vertex program, depth/stencil, MRT or render-to-texture,
@@ -646,14 +649,23 @@ static int vp_slot_for(const rsx_state* st)
     return fn ? slot : -1;
 }
 
+/* Which texture units are cube maps, from the texture registers. Defined with
+ * the rest of the texture code below; declared here because the fragment
+ * program is compiled against it. */
+static u32 cube_mask_for(const rsx_state* st);
+
 /* The fragment program the draw would run, resolved as the D3D12 backend's
  * vp_get_fp_pso does: SET_SHADER_PROGRAM's low bits are the location (1 =
  * local, 2 = main), the rest the offset. Keyed on the program's structure
  * (its inline constants are hoisted into PSConstants, so the compiled shader
  * is invariant under constant changes), the export width from
  * SHADER_CONTROL, and the alpha test patched into the source. Returns the
- * slot or -1; `*uc` receives the program bytes for the constant collection. */
-static int fp_slot_for(const rsx_state* st, const u8** uc)
+ * slot or -1; `*uc` receives the program bytes for the constant collection.
+ * `cube_mask` says which units are cube maps: those are declared TextureCube
+ * and sampled with a direction rather than a 2D coordinate, so it changes the
+ * compiled program and belongs in the key -- the D3D12 backend's PSO key
+ * carries cube_mask for the same reason. */
+static int fp_slot_for(const rsx_state* st, const u8** uc, u32 cube_mask)
 {
     if (!vm_base || st->shader_program == 0) return -1;
     const u32 off = cellGcmResolveLocated((st->shader_program & 3u) == 1u,
@@ -670,6 +682,7 @@ static int fp_slot_for(const rsx_state* st, const u8** uc)
     key = fnv1a64(&ctrl_key, sizeof ctrl_key, key);
     key = fnv1a64(&alpha_en, sizeof alpha_en, key);
     key = fnv1a64(&alpha_fn, sizeof alpha_fn, key);
+    key = fnv1a64(&cube_mask, sizeof cube_mask, key);
 
     for (u32 i = 0; i < s_fp_count; i++)
         if (s_fp_cache[i].key == key) return s_fp_cache[i].fn ? (int)i : -1;
@@ -678,7 +691,7 @@ static int fp_slot_for(const rsx_state* st, const u8** uc)
     char name[64];
     id<MTLFunction> fn = nil;
     u32 nconst = 0;
-    int ni = rsx_fp_decompile_buffered_ex(*uc, MTL_FP_MAX_BYTES, ctrl, 0 /* all 2D */,
+    int ni = rsx_fp_decompile_buffered_ex(*uc, MTL_FP_MAX_BYTES, ctrl, cube_mask,
                                           s_hlsl, sizeof s_hlsl, &nconst);
     if (ni > 0 && alpha_en &&
         rsx_fp_apply_alpha_test_buffered(s_hlsl, sizeof s_hlsl, st->alpha_func) < 0)
@@ -741,7 +754,7 @@ static int guest_programs_for(const rsx_state* st, MtlDraw* d)
     const int vs = vp_slot_for(st);
     if (vs < 0) return 0;
     const u8* fp_uc = NULL;
-    const int fs = fp_slot_for(st, &fp_uc);
+    const int fs = fp_slot_for(st, &fp_uc, cube_mask_for(st));
     if (fs < 0) return 0;
 
     /* PSConstants: the program's inline constants as host-order bit patterns,
@@ -830,11 +843,40 @@ static u32 tex_csum(const u8* base, u32 nbytes)
     return h;
 }
 
-/* How many guest bytes a texture occupies: the whole mip chain, which is what
- * the checksum has to cover -- a title that animates only a lower level would
- * otherwise keep the stale upload. */
-static u32 texture_source_span(u32 fmt, u32 w, u32 h, u32 levels, u32 pitch)
+/* A unit is a cube map when SET_TEXTURE_FORMAT bit 2 says so. A cube face is
+ * square by construction, so a non-square image cannot be one. The check
+ * lives in one place because two things read it and they must not disagree:
+ * the fragment program is compiled against a cube unit's sampler, and a
+ * `texturecube` slot filled with a 2D texture is a validation failure, not a
+ * wrong pixel. */
+static int texture_is_cube(const rsx_texture_state* t)
 {
+    const u32 w = (t->image_rect >> 16) & 0xFFFFu, h = t->image_rect & 0xFFFFu;
+    return (t->format & 4u) && w && w == h;
+}
+
+/* The enabled cube units as a bit mask, which is what the fragment program is
+ * decompiled against. Built from the registers rather than from the resolved
+ * textures, as the D3D12 backend's dr_cube_mask is, so a unit whose bytes
+ * could not be uploaded still compiles to the sampler type the register
+ * asked for. */
+static u32 cube_mask_for(const rsx_state* st)
+{
+    u32 m = 0;
+    for (u32 u = 0; u < RSX_MAX_TEXTURES; u++)
+        if ((st->textures[u].control0 & 0x80000000u) && texture_is_cube(&st->textures[u]))
+            m |= 1u << u;
+    return m;
+}
+
+/* How many guest bytes a texture occupies: the whole mip chain, times six for
+ * a cube map. That is what the checksum has to cover -- a title that animates
+ * only a lower level, or only one face, would otherwise keep the stale
+ * upload. */
+static u32 texture_source_span(u32 fmt, u32 w, u32 h, u32 levels, u32 pitch,
+                               int cube)
+{
+    if (cube) return rsx_texture_cube_face_stride(fmt, w, h, levels, pitch) * 6u;
     rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
     const u32 n = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
     if (!n) return 0;
@@ -854,20 +896,28 @@ static int tex_staging_reserve(u32 bytes)
 
 /* Decode a guest texture out of guest memory into a new texture whose swizzle
  * applies the TEXTURE_CONTROL1 crossbar. `fmt` is the format byte with its
- * LN/UN flags, `levels` SET_TEXTURE_FORMAT's level count and `pitch`
- * SET_TEXTURE_CONTROL3's row pitch. */
+ * LN/UN flags, `levels` SET_TEXTURE_FORMAT's level count, `pitch`
+ * SET_TEXTURE_CONTROL3's row pitch, and `cube` its bit 2. */
 static id<MTLTexture> upload_texture(const u8* src, u32 w, u32 h, u32 fmt,
-                                     u32 control1, u32 levels, u32 pitch)
+                                     u32 control1, u32 levels, u32 pitch,
+                                     int cube)
 {
     rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
     const u32 nlv = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
     if (!nlv || lv[0].tl.face_bytes == 0) return nil;
+    /* Faces are stored face-major, each one a whole mip pyramid rather than a
+     * single image, so the stride between them is the pyramid rounded up to
+     * 128 bytes. */
+    const u32 nfaces = cube ? 6u : 1u;
+    const u32 face_stride = cube ? rsx_texture_cube_face_stride(fmt, w, h, levels, pitch) : 0u;
 
-    MTLTextureDescriptor* td =
-        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:texfmt_to_metal(lv[0].tl.fmt)
-                                                           width:w height:h mipmapped:NO];
-    td.mipmapLevelCount = nlv;
-    td.usage = MTLTextureUsageShaderRead;
+    MTLTextureDescriptor* td = [MTLTextureDescriptor new];
+    td.textureType       = cube ? MTLTextureTypeCube : MTLTextureType2D;
+    td.pixelFormat       = texfmt_to_metal(lv[0].tl.fmt);
+    td.width             = w;
+    td.height            = h;
+    td.mipmapLevelCount  = nlv;
+    td.usage             = MTLTextureUsageShaderRead;
     /* The crossbar's selectors arrive in its own field order A,R,G,B; the
      * D3D12 backend maps them to destR = out[1], destG = out[2],
      * destB = out[3], destA = out[0], and so does this. */
@@ -878,19 +928,25 @@ static id<MTLTexture> upload_texture(const u8* src, u32 w, u32 h, u32 fmt,
     id<MTLTexture> tex = [s_dev newTextureWithDescriptor:td];
     if (!tex) return nil;
 
-    for (u32 m = 0; m < nlv; m++) {
-        const rsx_tex_layout* tl = &lv[m].tl;
-        if (!tex_staging_reserve(tl->dst_row_bytes * tl->rows)) return nil;
-        /* TEX_RGBA is consulted unconditionally, as the D3D12 backend does:
-         * the decode only reads it for the two formats whose bytes are
-         * A,R,G,B. */
-        rsx_texture_decode(s_tex_staging, tl->dst_row_bytes,
-                           src + lv[m].offset, lv[m].w, lv[m].h, tl,
-                           rsx_texture_argb_is_rgba());
-        [tex replaceRegion:MTLRegionMake2D(0, 0, lv[m].w, lv[m].h)
-               mipmapLevel:m
-                 withBytes:s_tex_staging
-               bytesPerRow:tl->dst_row_bytes];
+    for (u32 f = 0; f < nfaces; f++) {
+        const u8* face = src + (size_t)f * face_stride;
+        for (u32 m = 0; m < nlv; m++) {
+            const rsx_tex_layout* tl = &lv[m].tl;
+            if (!tex_staging_reserve(tl->dst_row_bytes * tl->rows)) return nil;
+            /* TEX_RGBA is consulted unconditionally, as the D3D12 backend
+             * does: the decode only reads it for the two formats whose bytes
+             * are A,R,G,B. */
+            rsx_texture_decode(s_tex_staging, tl->dst_row_bytes,
+                               face + lv[m].offset, lv[m].w, lv[m].h, tl,
+                               rsx_texture_argb_is_rgba());
+            /* bytesPerImage is for 3D textures only; a cube face is a slice. */
+            [tex replaceRegion:MTLRegionMake2D(0, 0, lv[m].w, lv[m].h)
+                   mipmapLevel:m
+                         slice:f
+                     withBytes:s_tex_staging
+                   bytesPerRow:tl->dst_row_bytes
+                 bytesPerImage:0];
+        }
     }
     return tex;
 }
@@ -913,7 +969,8 @@ static int tex_slot_for(const rsx_texture_state* t)
      * levels the dimensions allow, so the two readings agree. */
     const u32 levels = (t->format >> 16) & 0xFFFFu;
     const u32 pitch  = t->control3 & 0xFFFFFu;
-    const u32 span   = texture_source_span(fmt, w, h, levels, pitch);
+    const int cube   = texture_is_cube(t);
+    const u32 span   = texture_source_span(fmt, w, h, levels, pitch, cube);
     if (!span) return -1;
     const u32 csum = tex_csum(vm_base + ea, span);
 
@@ -927,7 +984,7 @@ static int tex_slot_for(const rsx_texture_state* t)
             continue;
         if (e->csum != csum) {
             id<MTLTexture> fresh = upload_texture(vm_base + ea, w, h, fmt,
-                                                  t->control1, levels, pitch);
+                                                  t->control1, levels, pitch, cube);
             if (!fresh) return -1;
             e->tex = fresh; e->csum = csum;
         }
@@ -936,10 +993,10 @@ static int tex_slot_for(const rsx_texture_state* t)
     if (s_tex_count >= MTL_TEX_CACHE) { s_caches_full = 1; return -1; }
 
     id<MTLTexture> tex = upload_texture(vm_base + ea, w, h, fmt, t->control1,
-                                        levels, pitch);
+                                        levels, pitch, cube);
     { static int n = 0; if (n++ < 16)
-        fprintf(stderr, "[RSX metal] texture %ux%u fmt 0x%02X %u level(s) at 0x%08X (%s) -> %s\n",
-                w, h, fmt, levels ? levels : 1u, ea,
+        fprintf(stderr, "[RSX metal] texture %ux%u fmt 0x%02X %u level(s)%s at 0x%08X (%s) -> %s\n",
+                w, h, fmt, levels ? levels : 1u, cube ? " cube" : "", ea,
                 (t->format & 3u) == 1u ? "local" : "main",
                 tex ? "ok" : "FAILED"); }
     const int slot = (int)s_tex_count++;
