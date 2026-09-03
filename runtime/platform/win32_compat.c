@@ -1410,7 +1410,7 @@ void WakeByAddressSingle(PVOID address) { WakeByAddressAll(address); }   /* see 
  * Virtual memory
  * -----------------------------------------------------------------------*/
 #define VA_REGIONS 512
-static struct { void* base; size_t size; } s_regions[VA_REGIONS];
+static struct { void* base; size_t size; DWORD protect; } s_regions[VA_REGIONS];
 
 static int prot_of(DWORD protect)
 {
@@ -1458,7 +1458,7 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD type, DWORD protect)
         pthread_mutex_lock(&s_lock);
         for (int i = 0; i < VA_REGIONS; i++)
             if (!s_regions[i].base) {
-                s_regions[i].base = p; s_regions[i].size = sz;
+                s_regions[i].base = p; s_regions[i].size = sz; s_regions[i].protect = protect;
                 break;
             }
         pthread_mutex_unlock(&s_lock);
@@ -1482,7 +1482,7 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD type)
         for (int i = 0; i < VA_REGIONS; i++) {
             if (s_regions[i].base == address && s_regions[i].base) {
                 munmap(s_regions[i].base, s_regions[i].size);
-                s_regions[i].base = NULL; s_regions[i].size = 0;
+                s_regions[i].base = NULL; s_regions[i].size = 0; s_regions[i].protect = 0;
                 ok = TRUE;
                 break;
             }
@@ -1524,6 +1524,173 @@ void GetSystemInfo(SYSTEM_INFO* si)
     si->dwActiveProcessorMask   = n >= 64 ? ~(DWORD_PTR)0 : (((DWORD_PTR)1 << n) - 1);
     si->lpMinimumApplicationAddress = (LPVOID)(uintptr_t)si->dwPageSize;
     si->lpMaximumApplicationAddress = (LPVOID)(uintptr_t)0x00007FFFFFFFFFFFull;
+}
+
+/* ---------------------------------------------------------------------------
+ * Querying the address space
+ * -----------------------------------------------------------------------*/
+
+/* The mapping the OS has at `addr`. Returns 1 with base/size/prot filled, or 0
+ * for an unmapped address with `next` set to where the following mapping
+ * starts (0 if there is none above it). Never fails: an address with no answer
+ * is an address with nothing mapped at it. */
+static int os_region(uintptr_t addr, uintptr_t* base, size_t* size, int* prot,
+                     uintptr_t* next)
+{
+    *base = 0; *size = 0; *prot = 0; *next = 0;
+#if defined(__APPLE__)
+    /* mach_vm_region searches UPWARDS from the address it is given and reports
+     * where it landed, so one call answers both questions: a base above the
+     * address means nothing is mapped at it, and that base is the gap's end. */
+    mach_vm_address_t a = (mach_vm_address_t)addr;
+    mach_vm_size_t    sz = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t name = MACH_PORT_NULL;
+    kern_return_t kr = mach_vm_region(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO_64,
+                                      (vm_region_info_t)&info, &cnt, &name);
+    if (name != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), name);
+    if (kr != KERN_SUCCESS) return 0;             /* nothing at or above it */
+    if ((uintptr_t)a > addr) { *next = (uintptr_t)a; return 0; }
+    *base = (uintptr_t)a;
+    *size = (size_t)sz;
+    *prot = ((info.protection & VM_PROT_READ)    ? PROT_READ  : 0)
+          | ((info.protection & VM_PROT_WRITE)   ? PROT_WRITE : 0)
+          | ((info.protection & VM_PROT_EXECUTE) ? PROT_EXEC  : 0);
+    return 1;
+#elif defined(__linux__)
+    /* /proc/self/maps is sorted by address, so the first line that starts above
+     * the address ends the gap it sits in. */
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return 0;
+    char line[512];
+    int found = 0;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long lo = 0, hi = 0;
+        char perms[8] = {0};
+        if (sscanf(line, "%llx-%llx %7s", &lo, &hi, perms) != 3) continue;
+        if (addr >= (uintptr_t)lo && addr < (uintptr_t)hi) {
+            *base = (uintptr_t)lo;
+            *size = (size_t)(hi - lo);
+            *prot = (perms[0] == 'r' ? PROT_READ  : 0)
+                  | (perms[1] == 'w' ? PROT_WRITE : 0)
+                  | (perms[2] == 'x' ? PROT_EXEC  : 0);
+            found = 1;
+            break;
+        }
+        if ((uintptr_t)lo > addr) { *next = (uintptr_t)lo; break; }
+    }
+    fclose(f);
+    return found;
+#else
+    (void)addr;
+    return 0;
+#endif
+}
+
+static DWORD win_prot_of(int prot)
+{
+    if (!(prot & (PROT_READ | PROT_WRITE | PROT_EXEC))) return PAGE_NOACCESS;
+    if (prot & PROT_EXEC) {
+        if (prot & PROT_WRITE) return PAGE_EXECUTE_READWRITE;
+        if (prot & PROT_READ)  return PAGE_EXECUTE_READ;
+        return PAGE_EXECUTE;
+    }
+    if (prot & PROT_WRITE) return PAGE_READWRITE;
+    return PAGE_READONLY;
+}
+
+SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION mbi, SIZE_T length)
+{
+    if (!mbi || length < sizeof *mbi) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    size_t pg = page_size();
+    uintptr_t a = (uintptr_t)address & ~(uintptr_t)(pg - 1);
+
+    uintptr_t base = 0, next = 0;
+    size_t    size = 0;
+    int       prot = 0;
+    int mapped = os_region(a, &base, &size, &prot, &next);
+
+    memset(mbi, 0, sizeof *mbi);
+    if (!mapped) {
+        mbi->BaseAddress = (PVOID)a;
+        mbi->RegionSize  = (SIZE_T)(next > a ? next - a : (uintptr_t)pg);
+        mbi->State       = MEM_FREE;
+        mbi->Protect     = PAGE_NOACCESS;
+        return sizeof *mbi;
+    }
+    mbi->BaseAddress = (PVOID)base;
+    mbi->RegionSize  = (SIZE_T)size;
+    mbi->Protect     = win_prot_of(prot);
+    mbi->Type        = MEM_PRIVATE;
+    /* The shim's model: a reservation is PROT_NONE and a commit made it
+     * accessible, so that is what the protection reads back as. */
+    mbi->State       = (prot == 0) ? MEM_RESERVE : MEM_COMMIT;
+
+    /* AllocationBase and AllocationProtect are the reservation this belongs
+     * to, which is a Win32 notion neither host keeps -- but the shim does, for
+     * everything it reserved itself. */
+    pthread_mutex_lock(&s_lock);
+    for (int i = 0; i < VA_REGIONS; i++) {
+        uintptr_t rb = (uintptr_t)s_regions[i].base;
+        if (s_regions[i].base && a >= rb && a < rb + s_regions[i].size) {
+            mbi->AllocationBase    = s_regions[i].base;
+            mbi->AllocationProtect = s_regions[i].protect;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_lock);
+    if (!mbi->AllocationBase) {
+        mbi->AllocationBase    = (PVOID)base;
+        mbi->AllocationProtect = mbi->Protect;
+    }
+    return sizeof *mbi;
+}
+
+/* Every Win32 protection that grants the access in `need`, as a mask: the
+ * PAGE_* values are distinct bits, so one test covers all of them. */
+#define PS3_PAGE_READABLE (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | \
+                           PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
+#define PS3_PAGE_WRITABLE (PAGE_READWRITE | PAGE_WRITECOPY | \
+                           PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
+
+/* One query per region rather than per page, so a walk across a mapping costs
+ * one lookup. On Darwin that lookup is a Mach trap; on Linux it re-reads
+ * /proc/self/maps, which is not something to put in a hot loop. */
+static BOOL range_has_access(uintptr_t p, size_t len, DWORD need)
+{
+    if (len == 0) return TRUE;                    /* Win32: zero length is good */
+    uintptr_t end = p + len;
+    if (end < p) return FALSE;                    /* wrapped past the top */
+    while (p < end) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery((LPCVOID)p, &mbi, sizeof mbi) == 0) return FALSE;
+        if (mbi.State != MEM_COMMIT || !(mbi.Protect & need)) return FALSE;
+        uintptr_t region_end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (region_end <= p) return FALSE;        /* no progress: refuse to spin */
+        p = region_end;
+    }
+    return TRUE;
+}
+
+BOOL IsBadReadPtr(LPCVOID p, UINT_PTR length)
+{
+    if (length == 0) return FALSE;
+    if (!p) return TRUE;
+    return range_has_access((uintptr_t)p, (size_t)length, PS3_PAGE_READABLE) ? FALSE : TRUE;
+}
+
+BOOL IsBadWritePtr(LPVOID p, UINT_PTR length)
+{
+    if (length == 0) return FALSE;
+    if (!p) return TRUE;
+    return range_has_access((uintptr_t)p, (size_t)length, PS3_PAGE_WRITABLE) ? FALSE : TRUE;
+}
+
+BOOL IsBadCodePtr(LPCVOID p)
+{
+    if (!p) return TRUE;
+    return range_has_access((uintptr_t)p, 1, PS3_PAGE_READABLE) ? FALSE : TRUE;
 }
 
 #else  /* _WIN32 */

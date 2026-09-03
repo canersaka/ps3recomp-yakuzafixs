@@ -116,6 +116,7 @@ typedef unsigned long long DWORD64;
 typedef unsigned long long DWORDLONG;
 typedef size_t             SIZE_T;
 typedef size_t             ULONG_PTR;
+typedef size_t             UINT_PTR;
 typedef size_t             DWORD_PTR;
 typedef intptr_t           LONG_PTR;
 typedef intptr_t           SSIZE_T;
@@ -902,6 +903,54 @@ BOOL   VirtualFree(LPVOID address, SIZE_T size, DWORD type);
 BOOL   VirtualProtect(LPVOID address, SIZE_T size, DWORD protect, DWORD* old);
 void   GetSystemInfo(SYSTEM_INFO* si);
 #define GetNativeSystemInfo GetSystemInfo
+
+/* ---------------------------------------------------------------------------
+ * Querying the address space
+ *
+ * VirtualQuery answers from two sources. The shim's own VirtualAlloc region
+ * table gives AllocationBase and AllocationProtect -- the reservation an
+ * address belongs to and the protection it was reserved with -- because that
+ * is a Win32 notion neither host keeps for us. The OS gives everything else:
+ * mach_vm_region on Darwin, /proc/self/maps on Linux, both of which report the
+ * run of pages around an address that share one protection, which is exactly
+ * what BaseAddress and RegionSize mean.
+ *
+ * State follows the shim's own model of reserve and commit, since that is what
+ * it built the mapping out of: PROT_NONE is MEM_RESERVE, anything accessible
+ * is MEM_COMMIT, nothing mapped at all is MEM_FREE. A page the process made
+ * PROT_NONE for its own reasons therefore reads as reserved, which is the same
+ * conflation Win32 makes with PAGE_NOACCESS on a committed page and the reason
+ * MEM_COMMIT is the flag worth testing.
+ *
+ * Type is MEM_PRIVATE throughout. Distinguishing a file mapping from an
+ * anonymous one costs a second query on both hosts and no caller has asked.
+ *
+ * IsBadReadPtr and IsBadWritePtr walk the range through the same resolution,
+ * a whole region at a time, and are safe on an unmapped or protected address
+ * because nothing dereferences it. They carry the Win32 caveat too: the answer
+ * describes the address space at the moment it was taken, and another thread
+ * may unmap the page before the caller reads it.
+ * -----------------------------------------------------------------------*/
+#define MEM_FREE                      0x00010000u
+#define MEM_PRIVATE                   0x00020000u
+#define MEM_MAPPED                    0x00040000u
+#define MEM_IMAGE                     0x01000000u
+
+typedef struct {
+    PVOID  BaseAddress;
+    PVOID  AllocationBase;
+    DWORD  AllocationProtect;
+    SIZE_T RegionSize;
+    DWORD  State;
+    DWORD  Protect;
+    DWORD  Type;
+} MEMORY_BASIC_INFORMATION;
+typedef MEMORY_BASIC_INFORMATION* PMEMORY_BASIC_INFORMATION;
+
+SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION mbi, SIZE_T length);
+BOOL   IsBadReadPtr(LPCVOID p, UINT_PTR length);
+BOOL   IsBadWritePtr(LPVOID p, UINT_PTR length);
+BOOL   IsBadCodePtr(LPCVOID p);
 
 /* ---------------------------------------------------------------------------
  * Odds and ends
