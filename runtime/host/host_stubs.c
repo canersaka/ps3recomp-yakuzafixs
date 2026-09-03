@@ -18,6 +18,17 @@ extern uint8_t* vm_base;
 int  g_resv_store_active = 0;
 void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 
+/* ppu_loader.cpp - each guest thread registers its context so a concurrent
+ * stwcx can break its reservation. With g_resv_store_active off there is
+ * nothing to register into. */
+void ppu_resv_register(void* ctx) { (void)ctx; }
+
+/* ppu_loader.cpp - the size of the guest address space the loader mapped.
+ * This host calloc's its own VM and passes bounds explicitly, so the bounds
+ * checks keyed off this stay out of the way (see VM_READY in vm.h, which
+ * takes vm_base != 0 as the other way to be ready). */
+uint32_t ppu_vm_size = 0;
+
 /* ppu_loader.cpp - out-of-line big-endian guest stores. */
 void vm_write8(uint64_t addr, uint8_t v)
 {

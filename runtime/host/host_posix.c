@@ -46,7 +46,10 @@
 #endif
 #include "rsx_test_programs.h"
 
+#include "../syscalls/sys_ppu_thread.h"   /* --threads: the lv2 thread path */
+
 #include <ps3emu/guest_call.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -546,6 +549,103 @@ static void submit_frame(int with_draw)
     cellGcm_rsx_process_fifo();
 }
 
+/* ---------------------------------------------------------------------------
+ * --threads: the host stack a guest PPU thread actually gets
+ *
+ * sys_ppu_thread_create reserves a big host stack because every recompiled
+ * guest call is a real host call and a guest call chain nests just as deeply
+ * on the host. The Win32 branch has always done that; the POSIX branch used
+ * to take the default, which is 512 KB on Darwin. Nothing about that shows up
+ * until a title recurses a few hundred frames deep and the process dies with
+ * no diagnosis, so check the number here instead.
+ * -----------------------------------------------------------------------*/
+static size_t g_reported_stack = 0;
+static int    g_thread_ran     = 0;
+
+static size_t host_self_stack_bytes(void)
+{
+#if defined(__APPLE__)
+    return pthread_get_stacksize_np(pthread_self());
+#elif defined(__GLIBC__) || defined(__linux__)
+    pthread_attr_t a;
+    size_t sz = 0;
+    if (pthread_getattr_np(pthread_self(), &a) == 0) {
+        pthread_attr_getstacksize(&a, &sz);
+        pthread_attr_destroy(&a);
+    }
+    return sz;
+#else
+    return 0;
+#endif
+}
+
+static void thread_probe_entry(ppu_context* ctx)
+{
+    (void)ctx;
+    g_reported_stack = host_self_stack_bytes();
+    g_thread_ran = 1;
+}
+
+/* A guest thread is worth starting only if its host stack can hold a deep
+ * recompiled call chain. 64 MB is well under the 256 MB reserved and well
+ * over any default, so it separates "the reservation was applied" from "the
+ * host handed out whatever it felt like" without pinning the exact number. */
+#define HOST_STACK_FLOOR  (64u * 1024u * 1024u)
+
+static int run_thread_check(void)
+{
+    printf("[host] --threads: guest PPU thread host stack\n");
+    vm_stack_alloc_init(&g_vm_stack_alloc);
+    g_ppu_thread_entry_trampoline = thread_probe_entry;
+    ppu_thread_register_main();
+
+    ppu_context ctx;
+    ppu_context_init(&ctx);
+    ctx.thread_id = 1;
+
+    u32 tid_out = host_alloc(8, 8);
+    ctx.gpr[3] = tid_out;      /* u64* thread id out */
+    ctx.gpr[4] = 0x10000;      /* entry (unused: the trampoline is ours) */
+    ctx.gpr[5] = 0;            /* arg */
+    ctx.gpr[6] = 1000;         /* priority */
+    ctx.gpr[7] = 0x10000;      /* guest stack size */
+    ctx.gpr[8] = 0;            /* flags */
+    ctx.gpr[9] = 0;            /* name */
+    int64_t crc = sys_ppu_thread_create(&ctx);
+    if (crc != 0) {
+        fprintf(stderr, "[host] sys_ppu_thread_create failed: 0x%llX\n",
+                (unsigned long long)crc);
+        return 1;
+    }
+
+    /* The id is written big-endian into guest memory. */
+    const uint8_t* p = vm_base + tid_out;
+    uint64_t tid = 0;
+    for (int i = 0; i < 8; i++) tid = (tid << 8) | p[i];
+
+    ctx.gpr[3] = tid;
+    ctx.gpr[4] = 0;
+    int64_t jrc = sys_ppu_thread_join(&ctx);
+    if (jrc != 0) {
+        fprintf(stderr, "[host] sys_ppu_thread_join(tid=%llu) failed: 0x%llX\n",
+                (unsigned long long)tid, (unsigned long long)jrc);
+        return 1;
+    }
+    if (!g_thread_ran) {
+        fprintf(stderr, "[host] the guest thread never ran\n");
+        return 1;
+    }
+    if (g_reported_stack == 0) {
+        printf("[host] host stack size not queryable here -- thread ran, size unchecked\n");
+        return 0;
+    }
+    printf("[host] guest thread host stack: %zu bytes (%.1f MB), floor %.0f MB %s\n",
+           g_reported_stack, g_reported_stack / 1048576.0,
+           HOST_STACK_FLOOR / 1048576.0,
+           g_reported_stack >= HOST_STACK_FLOOR ? "OK" : "TOO SMALL");
+    return g_reported_stack >= HOST_STACK_FLOOR ? 0 : 5;
+}
+
 int main(int argc, char** argv)
 {
     /* frames = 0 runs until the window is closed, which is what the .app
@@ -554,6 +654,14 @@ int main(int argc, char** argv)
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--frames=", 9) == 0) frames = atoi(argv[i] + 9);
         else if (strcmp(argv[i], "--draw") == 0)   do_draw = 1;
+        /* --threads: no graphics at all, just the lv2 thread path. */
+        else if (strcmp(argv[i], "--threads") == 0) {
+            vm_base = (uint8_t*)calloc(1, VM_SIZE);
+            if (!vm_base) { fprintf(stderr, "[host] guest VM alloc failed\n"); return 1; }
+            int trc = run_thread_check();
+            free(vm_base);
+            return trc;
+        }
         /* --tex: bind a texture and sample it, which exercises the shared
          * rsx_texture_layout/decode path end to end rather than in a unit
          * test. The vertex colour differs from the texture colour, so a
