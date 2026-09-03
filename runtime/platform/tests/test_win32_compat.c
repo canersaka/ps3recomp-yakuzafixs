@@ -7,7 +7,7 @@
  * joinable threads with exit codes and the CREATE_SUSPENDED gate,
  * WaitForMultipleObjects in both modes, WaitOnAddress, waitable timers,
  * timing, virtual memory, stopping a running thread and reading its
- * registers, and the MSVC CRT spellings.
+ * registers, the address-space queries, and the MSVC CRT spellings.
  *
  * Build (any POSIX host):
  *   cc -std=gnu17 -Wall -Wextra -I runtime/platform \
@@ -551,6 +551,58 @@ static void test_thread_control(void)
     CHECK(CloseHandle(h));
 }
 
+/* ---- querying the address space ------------------------------------------ */
+static void test_virtual_query(void)
+{
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    size_t pg = si.dwPageSize;
+    MEMORY_BASIC_INFORMATION mbi;
+    DWORD old = 0;
+
+    CHECK(VirtualQuery(&si, &mbi, sizeof mbi - 1) == 0);       /* buffer too small */
+
+    unsigned char* r = (unsigned char*)VirtualAlloc(NULL, 4u << 20, MEM_RESERVE, PAGE_NOACCESS);
+    CHECK(r != NULL);
+    CHECK(VirtualQuery(r, &mbi, sizeof mbi) == sizeof mbi);
+    CHECK(mbi.State == MEM_RESERVE && mbi.Protect == PAGE_NOACCESS);
+    CHECK(mbi.AllocationBase == r && mbi.AllocationProtect == PAGE_NOACCESS);
+    CHECK((uintptr_t)mbi.BaseAddress <= (uintptr_t)r);
+    CHECK((uintptr_t)mbi.BaseAddress + mbi.RegionSize >= (uintptr_t)r + pg);
+
+    unsigned char* c = (unsigned char*)VirtualAlloc(r + pg, pg * 2, MEM_COMMIT, PAGE_READWRITE);
+    CHECK(c == r + pg);
+    memset(c, 0xCD, pg * 2);
+    CHECK(VirtualQuery(c, &mbi, sizeof mbi) == sizeof mbi);
+    CHECK(mbi.State == MEM_COMMIT && mbi.Protect == PAGE_READWRITE);
+    CHECK(mbi.BaseAddress == c && mbi.RegionSize >= pg * 2);
+    CHECK(mbi.AllocationBase == r);              /* the reservation it came from */
+    CHECK(mbi.Type == MEM_PRIVATE);
+
+    int on_stack = 0;
+    CHECK(VirtualQuery(&on_stack, &mbi, sizeof mbi) == sizeof mbi);
+    CHECK(mbi.State == MEM_COMMIT);
+    CHECK((uintptr_t)mbi.BaseAddress <= (uintptr_t)&on_stack);
+
+    CHECK(IsBadReadPtr(NULL, 4) && IsBadWritePtr(NULL, 4));
+    CHECK(!IsBadReadPtr(NULL, 0));                             /* zero length is good */
+    CHECK(!IsBadReadPtr(&on_stack, sizeof on_stack));
+    CHECK(!IsBadWritePtr(&on_stack, sizeof on_stack));
+    CHECK(IsBadReadPtr(r, pg) && IsBadWritePtr(r, pg));        /* reserved: no access */
+    CHECK(!IsBadReadPtr(c, pg * 2) && !IsBadWritePtr(c, pg * 2));
+    CHECK(!IsBadReadPtr(c + pg - 4, 4));
+    CHECK(IsBadReadPtr(c + pg * 2 - 4, 8));                    /* runs off the commit */
+    CHECK(VirtualProtect(c, pg, PAGE_READONLY, &old));
+    CHECK(!IsBadReadPtr(c, pg) && IsBadWritePtr(c, pg));
+    CHECK(VirtualProtect(c, pg, PAGE_READWRITE, &old));
+    CHECK(!IsBadCodePtr((LPCVOID)(uintptr_t)&test_virtual_query));
+
+    CHECK(VirtualFree(r, 0, MEM_RELEASE));
+    CHECK(VirtualQuery(r, &mbi, sizeof mbi) == sizeof mbi);    /* the gap it left */
+    CHECK(mbi.State == MEM_FREE && mbi.BaseAddress == r);
+    CHECK(mbi.RegionSize >= pg && mbi.AllocationBase == NULL);
+    CHECK(IsBadReadPtr(r, pg));
+}
+
 /* ---- MSVC CRT and intrinsic spellings ------------------------------------ */
 static __declspec(thread) int t_tls_probe;
 
@@ -617,6 +669,7 @@ int main(void)
     test_timing();
     test_virtual_memory();
     test_thread_control();
+    test_virtual_query();
     test_msvc_compat();
     printf("win32_compat tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail;
