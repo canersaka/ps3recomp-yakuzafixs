@@ -523,6 +523,20 @@ void func_00010000(ppu_context* ctx)
                     "the RSX never drained the guest's command stream (get != put)");
     }
 
+    /* A flip reads as done the moment the clock ticks it; the backend presents
+     * it a step later on the clock's own thread. A guest that exits in that
+     * gap takes the process down with the last frame still unpresented, and
+     * the verdict below then counts one present too few -- which is what a
+     * loaded runner showed. Give the clock the beat it needs, bounded like the
+     * waits above, so the verdict measures the backend and not the race. */
+    {
+        int waited;
+        for (waited = 0; waited < 2000; waited++) {
+            if (ppu_boot_frames_presented() >= (unsigned)SMOKE_FRAMES) break;
+            smoke_usleep(ctx, 1000);
+        }
+    }
+
     smoke_mark(ctx, SMOKE_STEP_EXIT);
 
     /* Installed last so it runs first: exit() calls handlers in reverse order
