@@ -15,7 +15,7 @@ documents the host shim itself._
 | Guest shader translation | `test_shader_msl`: hand-assembled NV40 programs through the decompilers, glslang and spirv-cross, checked for the MSL binding contract the backend relies on (runs on Linux too) |
 | PPU boot scaffold | `ppu_loader.cpp`, `ppu_hle.cpp`, `ppu_fs.cpp`, `ppu_sysprx.cpp`, `boot_main.cpp` compile at a recorded baseline of **0** errors (`darwin-clang` in `tools/ppu_scaffold_baseline.json`) |
 | PPU boot path | `ps3recomp_boot_smoke`: the scaffold **linked and run** against the synthetic title in `runtime/ppu/tests/smoke/` -- ELF load, entry OPD, TLS, the NID bridge, lv2 syscalls, a guest thread on a second host thread, three frames cleared and flipped through the FIFO to the Metal backend, and `sys_process_exit` |
-| Win32 host shim | `runtime/platform/tests/test_win32_compat.c`, 197 checks |
+| Win32 host shim | `runtime/platform/tests/test_win32_compat.c`, 298 checks |
 | lv2 sync primitives | `tests/sync_stress`: mutex, cond, semaphore and event-queue stress on host threads |
 | RSX self-contained tests | texture layout and primitive tables |
 
@@ -61,10 +61,13 @@ exercised on the Mac without a game. See docs/PPU_RECOMP.md.
 
 2. **A game's host code.** The scaffold in `runtime/ppu/` is game-agnostic; a
    port adds its own runner (imports, overrides, the window, diagnostics). A
-   runner written against Win32 compiles against `runtime/platform/` first and
-   is then ported where the shim stops: `SuspendThread` of a running thread,
-   vectored exception handlers, `SymFromAddr`, `VirtualQuery`, the Win32 window
-   and message pump.
+   runner written against Win32 compiles against `runtime/platform/`, which now
+   covers the diagnostic surface a runner is built on as well as the
+   synchronisation one: `SuspendThread` of a running thread with
+   `GetThreadContext`, `VirtualQuery` and `IsBadReadPtr`, vectored exception
+   handlers, `SymFromAddr`. What is still Windows-only there is the window and
+   the message pump, `__try`/`__except`, and the x86 debug registers a hardware
+   watchpoint needs. `docs/PLATFORM_ABSTRACTION.md` has the call-by-call table.
 
 3. **Time on the hardware.** Everything above is proven on GitHub's arm64
    runners. The 30-minute soaks, the frame-rate numbers and the memory-model

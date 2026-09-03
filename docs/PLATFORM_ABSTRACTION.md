@@ -417,9 +417,9 @@ are supplied on POSIX instead, and the call sites stand:
 
 | Header | Provides | On Windows |
 |---|---|---|
-| `win32_compat.h` + `win32_compat.c` | Types (`DWORD`, `LONG`, `HANDLE`, `LARGE_INTEGER`...), the Interlocked family (32/64-bit, pointer, both spellings), `ReadAcquire`/`WriteRelease`, barriers, `SRWLOCK` (both modes), `CONDITION_VARIABLE`, `CRITICAL_SECTION`, events, semaphores, joinable threads, waitable timers, `WaitForSingleObject`/`WaitForMultipleObjects`, `WaitOnAddress`, `Sleep`/QPC/`GetTickCount64`, thread priority/affinity/description, `VirtualAlloc`/`VirtualProtect`/`VirtualFree`, `GetSystemInfo`, `GetLastError` | passthrough to `<windows.h>` |
+| `win32_compat.h` + `win32_compat.c` | Types (`DWORD`, `LONG`, `HANDLE`, `LARGE_INTEGER`, `CONTEXT`, `EXCEPTION_POINTERS`...), the Interlocked family (32/64-bit, pointer, both spellings), `ReadAcquire`/`WriteRelease`, barriers, `SRWLOCK` (both modes), `CONDITION_VARIABLE`, `CRITICAL_SECTION`, events, semaphores, joinable threads, waitable timers, `WaitForSingleObject`/`WaitForMultipleObjects`, `WaitOnAddress`, `Sleep`/QPC/`GetTickCount64`, thread priority/affinity/description, thread control (`SuspendThread`/`ResumeThread`/`GetThreadContext`/`SetThreadContext`/`OpenThread`/`DuplicateHandle`/`GetThreadTimes`/`CreateToolhelp32Snapshot`), `VirtualAlloc`/`VirtualProtect`/`VirtualFree`/`VirtualQuery`, `IsBadReadPtr`/`IsBadWritePtr`, `AddVectoredExceptionHandler`/`RemoveVectoredExceptionHandler`/`SetUnhandledExceptionFilter`, `GetSystemInfo`, `GetLastError` | passthrough to `<windows.h>` |
 | `msvc_compat.h` | The MSVC CRT and intrinsic dialect: `_snprintf`, `fopen_s`, `strcpy_s`, `_stricmp`, `_fseeki64`, `_mkdir`, `_stat`, `_byteswap_*`, `_BitScanForward`, `__popcnt`, `_umul128`, `_ReturnAddress`, `__debugbreak`, `__declspec(thread/noinline/align)`, `__forceinline` | passthrough to `<intrin.h>` and the CRT |
-| `win32_backtrace.h` | `RtlCaptureStackBackTrace`, `GetModuleHandleA/ExA` over `backtrace(3)` and `dladdr(3)` | passthrough |
+| `win32_backtrace.h` | `RtlCaptureStackBackTrace`, `GetModuleHandleA/ExA`, `GetModuleFileNameA`, and the dbghelp names a crash report uses (`SymInitialize`, `SymFromAddr`, `SymCleanup`), over `backtrace(3)` and `dladdr(3)` | passthrough |
 | `win32_dirent.h` | `<dirent.h>` for MSVC | a `FindFirstFile` implementation |
 | `darwin_compat.h` | `pthread_mutex_timedlock`, `sem_timedwait` on Darwin | n/a |
 | `posix_sem.h` | `ps3_sem_t`: a counting semaphore with a real timed wait, for hosts where `sem_init` is a stub (Darwin) | n/a |
@@ -443,15 +443,56 @@ Rules the shim keeps, and code using it must keep too:
 - **`WakeByAddressSingle` broadcasts.** Addresses hash to buckets, so a single
   signal could wake the wrong waiter; callers already re-check the value, as
   the Win32 contract requires.
-- **`SuspendThread` of a running thread fails** (`(DWORD)-1`), the value Win32
-  code already checks for. A thread created `CREATE_SUSPENDED` is parked on a
-  gate that `ResumeThread` opens, and that case is exact.
+- **A suspended thread still holds what it held.** `SuspendThread` stops a
+  running thread for real, and inherits the Win32 hazard with it: a thread
+  frozen inside `malloc` still owns `malloc`'s lock, so the thread that
+  suspended it must not allocate before it resumes it. Suspending the CALLING
+  thread is refused (`(DWORD)-1`) rather than deadlocking the shim, which is
+  the one place this deliberately differs from Windows.
+- **A thread the shim did not create is adopted** into the thread table the
+  first time `DuplicateHandle`, `OpenThread` or a snapshot names it, and the
+  record is released by a TLS destructor at that thread's exit. Nothing tells
+  the shim when a foreign thread ends before that, so an adopted record has no
+  exit code and never becomes signaled: waiting on one waits forever.
 - **`VirtualProtect` cannot report the old protection**; it reports
-  `PAGE_READWRITE`, so a restore errs towards accessible.
+  `PAGE_READWRITE`, so a restore errs towards accessible. `VirtualQuery` does
+  report the current one, so a caller that wants the real value asks for it.
+- **`VirtualQuery`'s `State` is the shim's own model** of reserve and commit,
+  because that is what it built the mapping out of: `PROT_NONE` is
+  `MEM_RESERVE`, anything accessible is `MEM_COMMIT`, nothing mapped is
+  `MEM_FREE`. A page the process made `PROT_NONE` for its own reasons reads as
+  reserved, which is the same conflation Win32 makes with `PAGE_NOACCESS` on a
+  committed page.
+- **The exception dispatcher takes no lock and chains.** The handler list is
+  read through atomic loads, so a fault on a thread holding the shim's lock is
+  not a deadlock; and after the handlers and the unhandled filter, the signal
+  goes to whatever `sigaction` was installed before the shim. That is what
+  makes it compose with `runtime/ppu/ppu_loader.cpp`, which installs its own
+  `SIGSEGV` handler and chains the same way, in either installation order.
+
+### Where each of the game-runner calls lands
+
+`docs/MACOS_PORT.md` names the point a Win32 runner used to stop compiling
+against the shim. These are the calls that were on that list.
+
+| Call | macOS | Linux | Not covered |
+|---|---|---|---|
+| `SuspendThread`, `ResumeThread` | `thread_suspend` / `thread_resume` on the thread's Mach port | `SIGRTMIN+4` parks the thread inside its own handler until the resume | suspending the calling thread |
+| `GetThreadContext`, `SetThreadContext` | `thread_get_state` / `thread_set_state`, `ARM_THREAD_STATE64` or `x86_THREAD_STATE64` | the registers the park handler saved, written back into the signal frame as it returns | floating point, vector and segment state; the x86 debug registers, so no hardware watchpoints |
+| `OpenThread`, `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)`, `Thread32First`/`Next` | the shim's thread table | same | threads the C library or a framework created; any other process |
+| `DuplicateHandle` | another reference to the same object; the current-thread pseudo handle adopts the caller | same | cross-process duplication |
+| `GetThreadTimes` | the shim's creation and exit stamps; `thread_info THREAD_BASIC_INFO` splits kernel from user | `pthread_getcpuclockid`, which does not split: the total is reported as user time | a thread's true creation time -- the stamp is when the shim learned of it |
+| `VirtualQuery` | `mach_vm_region`, with the shim's reservation table for `AllocationBase` | `/proc/self/maps`, the same | `Type` is always `MEM_PRIVATE` |
+| `IsBadReadPtr`, `IsBadWritePtr` | one Mach trap per region walked | one `/proc/self/maps` read per region walked: not for a hot loop | the Win32 race is unchanged -- the answer describes the address space at the moment it was taken |
+| `AddVectoredExceptionHandler`, `SetUnhandledExceptionFilter` | `sigaction` on `SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`; the write bit from the ESR's `WnR` | the same, with the ESR read out of the signal frame's extension records on arm64 and the page-fault error code on x86-64 | `__try`/`__except`, `RaiseException`, and a stack overflow unless the process installed its own `sigaltstack` |
+| `SymInitialize`, `SymFromAddr`, `SymCleanup`, `GetModuleFileNameA` | `dladdr`; an unstripped image carries local symbols, so a file-static function usually resolves | `dladdr` sees the dynamic symbol table only: an executable's own functions need `-rdynamic`, a `static` one never resolves | line numbers, inlined frames, a symbol's extent, a separate symbol file |
 
 `runtime/platform/tests/test_win32_compat.c` is the contract: return
 conventions, widths, one waiter per `SetEvent`, both wait modes, timers,
-`VirtualAlloc` reserve/commit/protect/release. It runs in the Linux and macOS
+`VirtualAlloc` reserve/commit/protect/release, a spinning thread frozen and
+released, `VirtualQuery` over a reservation, a commit, a stack and a gap, a
+vectored handler that repairs a fault and continues, and one that declines and
+falls through to the unhandled filter. It runs in the Linux and macOS
 workflows, and `tests/sync_stress` runs on the same shim on every platform.
 
 ---
@@ -466,6 +507,7 @@ validated on, and where each is handled:
 | **Weak memory model.** x86 is TSO; arm64 reorders freely. Lifted guest code carries its own fences (`sync`/`lwsync`/`eieio`/`isync` and the SPU `sync`/`dsync` lift to C11 fences), so the audit target is host runtime code that used `volatile` or a plain store to publish state. Every "data stores, then flag store" needs a release/acquire pair; the shim's Interlocked ops are sequentially consistent and `ReadAcquire`/`WriteRelease` are there for the flag case. | `runtime/platform/win32_compat.h`, per-module |
 | **16 KB pages.** `mprotect` on a 4 KB-aligned address fails with `EINVAL`, and a "4 KB" guard covers 16 KB. `VM_PAGE_SIZE` stays the guest's 4 KB; commit, protect and the stack guard use `vm_host_page_size()`. | `runtime/memory/vm.h` |
 | **No unnamed semaphores.** `sem_init` returns `ENOSYS`. | `runtime/platform/posix_sem.h` |
+| **A protection fault is `SIGBUS`, not `SIGSEGV`.** Darwin routes an access to a page that is mapped but inaccessible -- a `PROT_NONE` reservation, most of all -- to `SIGBUS`, and only an address with nothing mapped at it to `SIGSEGV`. So a handler installed for one signal and not the other misses half the faults. Worse, `si_code` there is 1, the value that spells `BUS_ADRALN`, whether the access was misaligned or merely forbidden; the direction and the real cause come from the trap frame's ESR instead. | `runtime/platform/win32_compat.c` |
 | **No thread affinity.** `SetThreadAffinityMask` is a no-op; thread priority maps to QoS classes (`USER_INTERACTIVE` for above-normal and up), which is what keeps a thread on the P-cores. | `runtime/platform/win32_compat.c` |
 | **FMA in the base ISA.** Clang contracts `a*b+c` into a fused multiply-add by default on arm64; MSVC never does and x86-64 without `-mfma` cannot. The library builds with `-ffp-contract=off` so results match the validated x86 builds and a PPC `fmadd` is fused only where the lifter spells one -- and a port's own build of the lifted code must set the same flag. | `CMakeLists.txt` |
 | **`ucontext` is deprecated** and hidden unless `_XOPEN_SOURCE` is defined first. | `libs/spurs/cellFiber.c` |
