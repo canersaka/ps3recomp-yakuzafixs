@@ -216,6 +216,7 @@ typedef HANDLE spu_thread_handle_t;
 typedef HANDLE spu_thread_event_t;
 #else
 #  include <pthread.h>
+#  include <errno.h>
 typedef pthread_t spu_thread_handle_t;
 typedef struct {
     pthread_mutex_t mu;
@@ -832,7 +833,22 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         pthread_mutex_init(&t->finish_event.mu, NULL);
         pthread_cond_init(&t->finish_event.cv, NULL);
         t->finish_event.done = 0;
-        pthread_create(&t->host_thread, NULL, spu_fallback_thread_proc, t);
+        /* Same reservation and the same YDKJ_BIGSTACK lever as the Win32
+         * branch. Without it a lifted SPU loop that became deep C recursion
+         * got the host default, 512 KB on Darwin against 16 MB there. */
+        {
+            size_t stk = getenv("YDKJ_BIGSTACK") ? (size_t)512 * 1024 * 1024
+                                                 : (size_t)16 * 1024 * 1024;
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            int prc = EINVAL;
+            if (pthread_attr_setstacksize(&attr, stk) == 0)
+                prc = pthread_create(&t->host_thread, &attr,
+                                     spu_fallback_thread_proc, t);
+            pthread_attr_destroy(&attr);
+            if (prc != 0)
+                pthread_create(&t->host_thread, NULL, spu_fallback_thread_proc, t);
+        }
 #endif
         fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X entry=0x%08X args=0x%08X -> spawned host thread\n",
                 id, t->tid, t->entry_point, t->args_ea);
