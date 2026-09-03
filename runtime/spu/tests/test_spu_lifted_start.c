@@ -54,18 +54,43 @@
  * Guest memory. Defined before the unit under test is compiled in, because
  * that is what its vm_read_be32 reads through.
  *
- * Reserved rather than declared, and large enough to cover the sys_memory
- * window at 0x40000000: the group-start path carries diagnostics that read
- * fixed high guest addresses, which a real runtime has mapped because vm_init
- * reserves the whole 4 GB. Reserving less here would fail on where those
- * diagnostics look rather than on anything this test is about. Nothing is
- * committed until touched, so the cost is address space.
+ * A megabyte, which is more than every address this test hands the syscalls,
+ * and an unreadable megabyte above it. It used to be 0x41000000 -- a gigabyte
+ * of address space -- for one reason that had nothing to do with what is being
+ * tested: the group-start path dumped a fixed guest address at 0x40009D00, one
+ * title's SPURS instance, on every start of every group, and an arena that
+ * stopped short of it failed on the diagnostic. That read is asked for by
+ * environment now and bounds-checked against ppu_vm_size, so the arena can be
+ * the size of the test again.
+ *
+ * The guard region above it is what keeps that honest. A real runtime maps
+ * guest memory lazily, so a diagnostic reaching for an address the title never
+ * allocated faults; here it faults too, by name, instead of reading whatever
+ * the allocator happened to put next to us.
  * -----------------------------------------------------------------------*/
+#include <signal.h>
 #include <sys/mman.h>
-#define GUEST_SIZE  0x41000000u
+#include <unistd.h>
+#define GUEST_SIZE   0x00100000u   /* every address this test uses is below this */
+#define GUEST_GUARD  0x00100000u   /* ...and nothing above it is readable        */
 static uint8_t*  g_guest_mem;
 uint8_t*         vm_base;
 uint32_t         ppu_vm_size = GUEST_SIZE;
+
+/* Darwin raises SIGBUS for an inaccessible mapping where Linux raises SIGSEGV
+ * (runtime/platform/tests/test_guest_ptr_trap.c is where that was measured), so
+ * both mean the same thing here. Naming the failure is the whole job; there is
+ * nothing to carry on with afterwards, and write/_exit are what a handler may
+ * call. */
+static void guard_fault(int sig)
+{
+    static const char msg[] =
+        "  FAIL: a guest read left the arena (the group-start diagnostics again?)\n"
+        "SPU lifted thread-group start: FAILED\n";
+    ssize_t ignored = write(2, msg, sizeof(msg) - 1);
+    (void)ignored; (void)sig;
+    _exit(1);
+}
 
 /* The lv2 SPU thread-group layer, handlers and all. Compiled in rather than
  * linked so the test can call the static syscall handlers directly and read
@@ -272,14 +297,29 @@ int main(void)
 {
     printf("SPU lifted thread-group start\n");
 
-    g_guest_mem = (uint8_t*)mmap(NULL, GUEST_SIZE, PROT_READ | PROT_WRITE,
+    signal(SIGSEGV, guard_fault);
+    signal(SIGBUS,  guard_fault);
+
+    /* Arena and guard in one mapping, so nothing can be placed between them,
+     * then the arena alone made readable. */
+    g_guest_mem = (uint8_t*)mmap(NULL, GUEST_SIZE + GUEST_GUARD, PROT_NONE,
                                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
                                  -1, 0);
     if (g_guest_mem == MAP_FAILED) {
         printf("  FAIL: could not reserve %u bytes of guest memory\n", GUEST_SIZE);
         return 1;
     }
+    if (mprotect(g_guest_mem, GUEST_SIZE, PROT_READ | PROT_WRITE) != 0) {
+        printf("  FAIL: could not map the %u byte guest arena\n", GUEST_SIZE);
+        return 1;
+    }
     vm_base = g_guest_mem;
+
+    /* Ask for the group-start diagnostic that reads one title's SPURS instance
+     * at a fixed 0x40009D00, a thousand times past the end of this arena, so
+     * the start path below runs with it armed. Its bounds check against
+     * ppu_vm_size is then the only thing between it and the guard region. */
+    setenv("YDKJ_INSTDUMP", "1", 1);
 
     build_guest_image();
 
