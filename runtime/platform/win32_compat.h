@@ -719,8 +719,9 @@ BOOL   CloseHandle(HANDLE h);
 /* ---------------------------------------------------------------------------
  * Thread context: the register file
  *
- * What GetThreadContext reads off a suspended thread, and what
- * SetThreadContext writes back to it.
+ * Two things here want a thread's registers: the exception layer further down,
+ * which hands its handlers the state at the fault, and GetThreadContext on a
+ * suspended thread. One struct serves both.
  * -----------------------------------------------------------------------*/
 #define CONTEXT_CONTROL         0x00000001u   /* Pc, Sp, Fp, Lr and the flags */
 #define CONTEXT_INTEGER         0x00000002u   /* the general registers */
@@ -951,6 +952,102 @@ SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION mbi, SIZE_T lengt
 BOOL   IsBadReadPtr(LPCVOID p, UINT_PTR length);
 BOOL   IsBadWritePtr(LPVOID p, UINT_PTR length);
 BOOL   IsBadCodePtr(LPCVOID p);
+
+/* ---------------------------------------------------------------------------
+ * Vectored exception handlers
+ *
+ * A game runner uses these to survive and explain a fault: re-protect a
+ * watched page and let the store through, or print the guest function behind a
+ * host access violation before the process dies. Both are sigaction work on
+ * POSIX, and the translation is mechanical enough to be worth doing once here
+ * rather than in every runner.
+ *
+ * SIGSEGV, SIGBUS, SIGILL and SIGFPE are taken over on the first registration.
+ * Each delivery builds an EXCEPTION_RECORD (the code from the signal and its
+ * si_code, ExceptionAddress from the interrupted program counter, and for an
+ * access violation NumberParameters 2 with ExceptionInformation[0] set to 1
+ * for a write and [1] to the faulting address) and a CONTEXT from the signal
+ * frame, then runs the handlers in registration order -- first-registered
+ * first when AddVectoredExceptionHandler was passed a nonzero `first`, as
+ * Win32 defines it.
+ *
+ *   EXCEPTION_CONTINUE_EXECUTION writes the CONTEXT's Pc and Sp back into the
+ *   signal frame and returns, so the thread resumes on them. That is what
+ *   makes "re-protect the page and retry the instruction" work.
+ *
+ *   EXCEPTION_CONTINUE_SEARCH goes to the next handler, then to the unhandled
+ *   filter, and then to whatever sigaction was installed before the shim.
+ *
+ * That last step is the load-bearing one. runtime/ppu/ppu_loader.cpp installs
+ * its own SIGSEGV handler for the untranslated-guest-pointer report and chains
+ * to its predecessor by hand; the two compose in either installation order
+ * because both keep the previous action and call it in its own form, SIGINFO
+ * or not, and both restore SIG_DFL and return when there is nothing to chain
+ * to -- which re-runs the faulting instruction and lets the process die
+ * exactly as it would have.
+ *
+ * The dispatcher takes no lock: the handler list is read through atomic loads
+ * so a fault on a thread that happens to hold the shim's lock is not a
+ * deadlock. Registrations are bounded (64 for the life of the process) and a
+ * removed slot is reused only when the next registration wants its position,
+ * which covers the arm/disarm cycle a watchpoint does.
+ *
+ * A stack overflow is not recoverable here unless the process installed a
+ * sigaltstack of its own: the handlers are registered SA_ONSTACK, but the shim
+ * does not create the alternate stack, so the fault that has no stack left to
+ * run a handler on still ends the process.
+ * -----------------------------------------------------------------------*/
+#define EXCEPTION_MAXIMUM_PARAMETERS    15
+
+#define EXCEPTION_ACCESS_VIOLATION      0xC0000005u
+#define EXCEPTION_IN_PAGE_ERROR         0xC0000006u
+#define EXCEPTION_ILLEGAL_INSTRUCTION   0xC000001Du
+#define EXCEPTION_PRIV_INSTRUCTION      0xC0000096u
+#define EXCEPTION_DATATYPE_MISALIGNMENT 0x80000002u
+#define EXCEPTION_BREAKPOINT            0x80000003u
+#define EXCEPTION_SINGLE_STEP           0x80000004u
+#define EXCEPTION_ARRAY_BOUNDS_EXCEEDED 0xC000008Cu
+#define EXCEPTION_FLT_DENORMAL_OPERAND  0xC000008Du
+#define EXCEPTION_FLT_DIVIDE_BY_ZERO    0xC000008Eu
+#define EXCEPTION_FLT_INEXACT_RESULT    0xC000008Fu
+#define EXCEPTION_FLT_INVALID_OPERATION 0xC0000090u
+#define EXCEPTION_FLT_OVERFLOW          0xC0000091u
+#define EXCEPTION_FLT_STACK_CHECK       0xC0000092u
+#define EXCEPTION_FLT_UNDERFLOW         0xC0000093u
+#define EXCEPTION_INT_DIVIDE_BY_ZERO    0xC0000094u
+#define EXCEPTION_INT_OVERFLOW          0xC0000095u
+#define EXCEPTION_STACK_OVERFLOW        0xC00000FDu
+
+#define EXCEPTION_CONTINUE_EXECUTION    (-1)
+#define EXCEPTION_CONTINUE_SEARCH       0
+#define EXCEPTION_EXECUTE_HANDLER       1
+
+#define EXCEPTION_NONCONTINUABLE        0x01u
+
+typedef struct _EXCEPTION_RECORD {
+    DWORD                    ExceptionCode;
+    DWORD                    ExceptionFlags;
+    struct _EXCEPTION_RECORD* ExceptionRecord;
+    PVOID                    ExceptionAddress;
+    DWORD                    NumberParameters;
+    ULONG_PTR                ExceptionInformation[EXCEPTION_MAXIMUM_PARAMETERS];
+} EXCEPTION_RECORD;
+typedef EXCEPTION_RECORD* PEXCEPTION_RECORD;
+
+typedef struct {
+    PEXCEPTION_RECORD ExceptionRecord;
+    PCONTEXT          ContextRecord;
+} EXCEPTION_POINTERS;
+typedef EXCEPTION_POINTERS* PEXCEPTION_POINTERS;
+typedef EXCEPTION_POINTERS* LPEXCEPTION_POINTERS;
+
+typedef LONG (WINAPI *PVECTORED_EXCEPTION_HANDLER)(EXCEPTION_POINTERS*);
+typedef LONG (WINAPI *LPTOP_LEVEL_EXCEPTION_FILTER)(EXCEPTION_POINTERS*);
+typedef LPTOP_LEVEL_EXCEPTION_FILTER PTOP_LEVEL_EXCEPTION_FILTER;
+
+PVOID AddVectoredExceptionHandler(ULONG first, PVECTORED_EXCEPTION_HANDLER handler);
+ULONG RemoveVectoredExceptionHandler(PVOID handle);
+LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER filter);
 
 /* ---------------------------------------------------------------------------
  * Odds and ends

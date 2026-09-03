@@ -721,9 +721,6 @@ static void ctx_to_native(x86_thread_state64_t* s, const CONTEXT* c, int all)
 }
 #endif
 
-/* The only thing that reads a signal frame so far is the Linux park
- * handler below; Darwin asks Mach and never sees one. */
-#if !defined(__APPLE__)
 static void ctx_from_uc(CONTEXT* c, const ucontext_t* uc)
 {
     memset(c, 0, sizeof *c);
@@ -755,8 +752,9 @@ static void ctx_from_uc(CONTEXT* c, const ucontext_t* uc)
 #endif
 }
 
-/* `all` false writes back only Pc and Sp: a redirection of the thread and
- * nothing else. */
+/* `all` false writes back only Pc and Sp, which is what continuing from an
+ * exception handler means: the handler fixed the mapping and wants the same
+ * instruction, or the next one, on the same stack. */
 static void ctx_to_uc(ucontext_t* uc, const CONTEXT* c, int all)
 {
 #if defined(__APPLE__)
@@ -786,7 +784,6 @@ static void ctx_to_uc(ucontext_t* uc, const CONTEXT* c, int all)
     (void)uc; (void)c; (void)all;
 #endif
 }
-#endif
 
 /* --- stopping a running thread ----------------------------------------------
  *
@@ -1691,6 +1688,316 @@ BOOL IsBadCodePtr(LPCVOID p)
 {
     if (!p) return TRUE;
     return range_has_access((uintptr_t)p, 1, PS3_PAGE_READABLE) ? FALSE : TRUE;
+}
+
+/* ---------------------------------------------------------------------------
+ * Vectored exception handlers over sigaction
+ *
+ * The dispatcher runs in a signal handler, so it takes no lock. The handler
+ * list is a chain of nodes out of a fixed pool, published with release stores
+ * and read with acquire loads; a node is never unlinked, only emptied, and an
+ * empty node is reused when the next registration wants the position it is
+ * already in -- which is the arm, disarm, re-arm cycle a watchpoint does.
+ * Registrations are serialised by their own lock, never s_lock, so a fault on
+ * a thread inside a wait cannot deadlock against a registration.
+ * -----------------------------------------------------------------------*/
+#define VEH_MAX      64
+#define PS3_SIG_MAX  32     /* the four signals taken over all sit well below this */
+
+typedef struct ps3_veh_node {
+    struct ps3_veh_node*        next;
+    PVECTORED_EXCEPTION_HANDLER fn;      /* NULL once removed */
+} ps3_veh_node;
+
+static ps3_veh_node    s_veh_pool[VEH_MAX];
+static int             s_veh_used;                    /* under s_veh_lock */
+static ps3_veh_node*   s_veh_head;                    /* atomic */
+static LPTOP_LEVEL_EXCEPTION_FILTER s_top_filter;     /* atomic */
+static pthread_mutex_t s_veh_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static struct sigaction s_prev_action[PS3_SIG_MAX];
+static int              s_prev_valid[PS3_SIG_MAX];
+static int              s_sig_installed;
+
+static const int s_veh_signals[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE };
+
+/* The arm64 exception syndrome for the fault, where there is one to read. Zero
+ * on x86-64, which reports through the page-fault error code instead. */
+#if defined(__aarch64__)
+static unsigned long long fault_esr(const ucontext_t* uc)
+{
+    if (!uc) return 0;
+#if defined(__APPLE__)
+    return (unsigned long long)uc->uc_mcontext->__es.__esr;
+#elif defined(__linux__)
+    /* The ESR arrives as one record in the chain of extension blocks the
+     * kernel appends to the signal frame, terminated by a zero magic. */
+    struct ps3_a64_hdr { uint32_t magic; uint32_t size; };
+    const unsigned char* p   = (const unsigned char*)uc->uc_mcontext.__reserved;
+    const unsigned char* lim = p + sizeof uc->uc_mcontext.__reserved;
+    while ((size_t)(lim - p) >= sizeof(struct ps3_a64_hdr)) {
+        struct ps3_a64_hdr h;
+        memcpy(&h, p, sizeof h);
+        if (h.magic == 0 || h.size < sizeof h || (size_t)(lim - p) < h.size) break;
+        if (h.magic == 0x45535201u) {                 /* ESR_MAGIC */
+            unsigned long long esr = 0;
+            if (h.size >= sizeof h + sizeof esr) memcpy(&esr, p + sizeof h, sizeof esr);
+            return esr;
+        }
+        p += h.size;
+    }
+    return 0;
+#else
+    return 0;
+#endif
+}
+/* Data abort from a lower or the same exception level: the two syndromes that
+ * carry a faulting data address and a direction. */
+static int esr_is_data_abort(unsigned long long esr)
+{
+    unsigned ec = (unsigned)((esr >> 26) & 0x3Fu);
+    return ec == 0x24u || ec == 0x25u;
+}
+#endif
+
+/* An alignment fault specifically, as opposed to every other reason a load or
+ * store can trap. arm64 says so in the syndrome's fault status code. */
+static int fault_is_alignment(const ucontext_t* uc)
+{
+#if defined(__aarch64__)
+    unsigned long long esr = fault_esr(uc);
+    return esr_is_data_abort(esr) && (esr & 0x3Fu) == 0x21u;
+#else
+    (void)uc;
+    return 0;
+#endif
+}
+
+/* Which Win32 exception a signal means.
+ *
+ * si_code is the natural discriminator and is used where it discriminates. It
+ * does not on Darwin, which routes every EXC_BAD_ACCESS that reached a mapped
+ * but inaccessible page to SIGBUS and leaves si_code at 1 -- the value that
+ * spells BUS_ADRALN -- whether the access was misaligned or merely forbidden.
+ * A PROT_NONE page is exactly that case, so taking si_code at its word there
+ * would report an alignment fault for the commonest access violation there is.
+ * The trap frame is asked instead. */
+static DWORD exception_code_of(int sig, const siginfo_t* si, const ucontext_t* uc)
+{
+    int code = si ? si->si_code : 0;
+    switch (sig) {
+    case SIGSEGV:
+        return EXCEPTION_ACCESS_VIOLATION;
+    case SIGBUS:
+        if (fault_is_alignment(uc)) return EXCEPTION_DATATYPE_MISALIGNMENT;
+#if !defined(__APPLE__)
+        if (code == BUS_ADRALN) return EXCEPTION_DATATYPE_MISALIGNMENT;
+        if (code == BUS_OBJERR) return EXCEPTION_IN_PAGE_ERROR;
+#endif
+        return EXCEPTION_ACCESS_VIOLATION;
+    case SIGILL:
+        if (code == ILL_PRVOPC || code == ILL_PRVREG) return EXCEPTION_PRIV_INSTRUCTION;
+        return EXCEPTION_ILLEGAL_INSTRUCTION;
+    case SIGFPE:
+        switch (code) {
+        case FPE_INTDIV: return EXCEPTION_INT_DIVIDE_BY_ZERO;
+        case FPE_INTOVF: return EXCEPTION_INT_OVERFLOW;
+        case FPE_FLTDIV: return EXCEPTION_FLT_DIVIDE_BY_ZERO;
+        case FPE_FLTOVF: return EXCEPTION_FLT_OVERFLOW;
+        case FPE_FLTUND: return EXCEPTION_FLT_UNDERFLOW;
+        case FPE_FLTRES: return EXCEPTION_FLT_INEXACT_RESULT;
+        case FPE_FLTSUB: return EXCEPTION_ARRAY_BOUNDS_EXCEEDED;
+        default:         return EXCEPTION_FLT_INVALID_OPERATION;
+        }
+    default:
+        return EXCEPTION_ILLEGAL_INSTRUCTION;
+    }
+}
+
+/* Read or write? si_code does not say -- it separates unmapped from protected
+ * -- so the answer comes from the trap frame: the ESR's WnR bit on arm64, the
+ * page-fault error code's bit 1 on x86-64. Anything else reports a read, which
+ * is the direction that claims less. */
+static int fault_is_write(const ucontext_t* uc)
+{
+    if (!uc) return 0;
+#if defined(__aarch64__)
+    unsigned long long esr = fault_esr(uc);
+    return esr_is_data_abort(esr) && (esr & (1ull << 6)) != 0;   /* WnR */
+#elif defined(__APPLE__) && defined(__x86_64__)
+    return (uc->uc_mcontext->__es.__err & 2u) != 0;
+#elif defined(__linux__) && defined(__x86_64__)
+    return ((unsigned long long)uc->uc_mcontext.gregs[REG_ERR] & 2ull) != 0;
+#else
+    (void)uc;
+    return 0;
+#endif
+}
+
+/* Hand the signal to whoever had it before the shim, in the form they
+ * registered it, and otherwise restore the default and return so the faulting
+ * instruction re-runs and the process dies as it would have. This is the same
+ * sequence runtime/ppu/ppu_loader.cpp uses for its own SIGSEGV handler, which
+ * is what lets the two compose in either installation order. */
+static void veh_chain_previous(int sig, siginfo_t* si, void* uctx)
+{
+    if (sig > 0 && sig < PS3_SIG_MAX && s_prev_valid[sig]) {
+        struct sigaction prev = s_prev_action[sig];
+        if ((prev.sa_flags & SA_SIGINFO) && prev.sa_sigaction) {
+            prev.sa_sigaction(sig, si, uctx);
+            return;
+        }
+        if (prev.sa_handler && prev.sa_handler != SIG_DFL && prev.sa_handler != SIG_IGN) {
+            prev.sa_handler(sig);
+            return;
+        }
+    }
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof dfl);
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    sigaction(sig, &dfl, NULL);
+}
+
+static void veh_signal_handler(int sig, siginfo_t* si, void* uctx)
+{
+    /* A handler that continues execution puts the thread back where it faulted,
+     * so nothing this dispatcher does may be visible there -- errno included. */
+    int saved_errno = errno;
+    ucontext_t* uc = (ucontext_t*)uctx;
+    CONTEXT ctx;
+    ctx_from_uc(&ctx, uc);
+
+    EXCEPTION_RECORD er;
+    memset(&er, 0, sizeof er);
+    er.ExceptionCode    = exception_code_of(sig, si, uc);
+    er.ExceptionAddress = (PVOID)(uintptr_t)ctx.Pc;
+    if (er.ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
+        er.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) {
+        er.NumberParameters = 2;
+        er.ExceptionInformation[0] = uc && fault_is_write(uc) ? 1u : 0u;
+        er.ExceptionInformation[1] = (ULONG_PTR)(uintptr_t)(si ? si->si_addr : NULL);
+    }
+
+    EXCEPTION_POINTERS ep;
+    ep.ExceptionRecord = &er;
+    ep.ContextRecord   = &ctx;
+
+    for (ps3_veh_node* n = (ps3_veh_node*)__atomic_load_n(&s_veh_head, __ATOMIC_ACQUIRE);
+         n; n = (ps3_veh_node*)__atomic_load_n(&n->next, __ATOMIC_ACQUIRE)) {
+        PVECTORED_EXCEPTION_HANDLER fn =
+            (PVECTORED_EXCEPTION_HANDLER)__atomic_load_n(&n->fn, __ATOMIC_ACQUIRE);
+        if (!fn) continue;
+        if (fn(&ep) == EXCEPTION_CONTINUE_EXECUTION) {
+            ctx_to_uc(uc, &ctx, 0);
+            errno = saved_errno;
+            return;
+        }
+    }
+
+    LPTOP_LEVEL_EXCEPTION_FILTER top =
+        (LPTOP_LEVEL_EXCEPTION_FILTER)__atomic_load_n(&s_top_filter, __ATOMIC_ACQUIRE);
+    if (top && top(&ep) == EXCEPTION_CONTINUE_EXECUTION) {
+        ctx_to_uc(uc, &ctx, 0);
+        errno = saved_errno;
+        return;
+    }
+
+    veh_chain_previous(sig, si, uctx);
+}
+
+/* Call with s_veh_lock held. */
+static void veh_install_locked(void)
+{
+    if (s_sig_installed) return;
+    s_sig_installed = 1;
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = veh_signal_handler;
+    /* SA_ONSTACK so a process that installed a sigaltstack of its own can
+     * still handle a stack overflow; the shim installs none itself. */
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+
+    for (size_t i = 0; i < sizeof s_veh_signals / sizeof *s_veh_signals; i++) {
+        int sig = s_veh_signals[i];
+        struct sigaction prev;
+        if (sigaction(sig, &sa, &prev) == 0) {
+            s_prev_action[sig] = prev;
+            s_prev_valid[sig]  = 1;
+        }
+    }
+}
+
+PVOID AddVectoredExceptionHandler(ULONG first, PVECTORED_EXCEPTION_HANDLER handler)
+{
+    if (!handler) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
+    pthread_mutex_lock(&s_veh_lock);
+    veh_install_locked();
+
+    /* An emptied node already sitting where this registration wants to go can
+     * take it; that is what keeps arm/disarm/re-arm from consuming the pool. */
+    ps3_veh_node* reuse = NULL;
+    if (first) {
+        if (s_veh_head && !s_veh_head->fn) reuse = s_veh_head;
+    } else {
+        ps3_veh_node* tail = s_veh_head;
+        while (tail && tail->next) tail = tail->next;
+        if (tail && !tail->fn) reuse = tail;
+    }
+    if (reuse) {
+        __atomic_store_n(&reuse->fn, handler, __ATOMIC_RELEASE);
+        pthread_mutex_unlock(&s_veh_lock);
+        return (PVOID)reuse;
+    }
+
+    if (s_veh_used >= VEH_MAX) {
+        pthread_mutex_unlock(&s_veh_lock);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    ps3_veh_node* n = &s_veh_pool[s_veh_used++];
+    n->fn = handler;
+    if (first) {
+        n->next = s_veh_head;
+        __atomic_store_n(&s_veh_head, n, __ATOMIC_RELEASE);
+    } else {
+        n->next = NULL;
+        if (!s_veh_head) {
+            __atomic_store_n(&s_veh_head, n, __ATOMIC_RELEASE);
+        } else {
+            ps3_veh_node* tail = s_veh_head;
+            while (tail->next) tail = tail->next;
+            __atomic_store_n(&tail->next, n, __ATOMIC_RELEASE);
+        }
+    }
+    pthread_mutex_unlock(&s_veh_lock);
+    return (PVOID)n;
+}
+
+ULONG RemoveVectoredExceptionHandler(PVOID handle)
+{
+    ps3_veh_node* n = (ps3_veh_node*)handle;
+    if (!n || n < s_veh_pool || n >= s_veh_pool + VEH_MAX) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    pthread_mutex_lock(&s_veh_lock);
+    ULONG had = n->fn ? 1u : 0u;
+    __atomic_store_n(&n->fn, (PVECTORED_EXCEPTION_HANDLER)NULL, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&s_veh_lock);
+    if (!had) SetLastError(ERROR_INVALID_HANDLE);
+    return had;
+}
+
+LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER filter)
+{
+    pthread_mutex_lock(&s_veh_lock);
+    veh_install_locked();
+    pthread_mutex_unlock(&s_veh_lock);
+    return (LPTOP_LEVEL_EXCEPTION_FILTER)
+        __atomic_exchange_n(&s_top_filter, filter, __ATOMIC_ACQ_REL);
 }
 
 #else  /* _WIN32 */
