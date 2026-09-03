@@ -58,6 +58,8 @@ u32 cellGcmResolveIO(u32 offset)
 /* ---- the stub backend ---------------------------------------------------- */
 
 #define STUB_MAX_OBJECTS 8192
+/* Colour clears kept by surface, so a test can say which targets were hit. */
+#define STUB_MAX_CLEARED 8
 
 typedef struct {
     u32 next_handle;
@@ -68,10 +70,14 @@ typedef struct {
     int n_depth_create, n_depth_snapshot;
     int n_pipeline_create;
     int n_draw, n_clear_color, n_clear_ds, n_present;
+    u32 cleared[STUB_MAX_CLEARED];
 
     /* the last draw's bindings */
     u32 bound_tex[RSX_BE_MAX_TEXTURES];
     u32 bound_mask;
+    u32 bound_rt[RSX_BE_MAX_COLOR_TARGETS];
+    u32 bound_rt_count;
+    u32 pipeline_rt_count;
     u32 bound_surface, bound_depth, bound_pipeline;
     u32 draw_vertices, draw_indices, draw_stride;
     rsx_topology draw_topology;
@@ -148,18 +154,26 @@ static u32 stub_depth_snapshot(void* u, u32 d, u32 w, u32 h)
 static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
                                 const rsx_be_render_state* rs,
                                 const rsx_vertex_layout_plan* layout,
-                                u32 stride, rsx_be_format rt)
+                                u32 stride, rsx_be_format rt, u32 rt_count)
 {
     (void)u; (void)rs; (void)layout; (void)stride; (void)rt;
     if (!vs || !ps || !*vs || !*ps) return 0;
     stub.n_pipeline_create++;
+    stub.pipeline_rt_count = rt_count;
     return stub_handle();
 }
 
 static void stub_pipeline_release(void* u, u32 p) { (void)u; (void)p; }
 
-static void stub_bind_targets(void* u, u32 s, u32 d)
-{ (void)u; stub.bound_surface = s; stub.bound_depth = d; }
+static void stub_bind_targets(void* u, const u32* s, u32 count, u32 d)
+{
+    (void)u;
+    stub.bound_surface = count ? s[0] : 0;
+    stub.bound_rt_count = count;
+    for (u32 i = 0; i < RSX_BE_MAX_COLOR_TARGETS; i++)
+        stub.bound_rt[i] = (i < count) ? s[i] : 0;
+    stub.bound_depth = d;
+}
 static void stub_bind_pipeline(void* u, u32 p) { (void)u; stub.bound_pipeline = p; }
 static void stub_bind_vs(void* u, const void* d, u32 n) { (void)u; (void)d; (void)n; }
 static void stub_bind_ps(void* u, const void* d, u32 n) { (void)u; (void)d; (void)n; }
@@ -201,7 +215,12 @@ static void stub_draw(void* u, rsx_topology topology, const void* verts,
 }
 
 static void stub_clear_color(void* u, u32 s, const float rgba[4])
-{ (void)u; (void)s; (void)rgba; stub.n_clear_color++; }
+{
+    (void)u; (void)rgba;
+    if (stub.n_clear_color < (int)STUB_MAX_CLEARED)
+        stub.cleared[stub.n_clear_color] = s;
+    stub.n_clear_color++;
+}
 
 static void stub_clear_ds(void* u, u32 d, u32 f, float z, u8 s)
 { (void)u; (void)d; (void)f; (void)z; (void)s; stub.n_clear_ds++; }
@@ -253,12 +272,19 @@ static const rsx_draw_backend g_stub_backend = {
 
 /* ---- driving the engine -------------------------------------------------- */
 
+#define M_CONTEXT_DMA_COLOR_B 0x018C
 #define M_CONTEXT_DMA_COLOR_A 0x0194
+#define M_CONTEXT_DMA_COLOR_C 0x01B4
+#define M_CONTEXT_DMA_COLOR_D 0x01B8
 #define M_SURFACE_CLIP_H      0x0200
 #define M_SURFACE_CLIP_V      0x0204
 #define M_SURFACE_FORMAT      0x0208
 #define M_COLOR_A_OFFSET      0x0210
 #define M_ZETA_OFFSET         0x0214
+#define M_COLOR_B_OFFSET      0x0218
+#define M_COLOR_TARGET        0x0220
+#define M_COLOR_C_OFFSET      0x0288
+#define M_COLOR_D_OFFSET      0x028C
 #define M_SCISSOR_H           0x08C0
 #define M_SCISSOR_V           0x08C4
 #define M_VTXBUF_OFFSET       0x1680
@@ -421,6 +447,65 @@ static void test_surface_aliasing(void)
     draw_triangle();
     CHECK(stub.n_texture_create == before + 1 && stub.bound_tex[0] != surface,
           "a unit in the other context uploads instead of aliasing");
+
+    engine_down();
+}
+
+/* ---- 2b. the MRT set ----------------------------------------------------- */
+
+static void test_mrt_set(void)
+{
+    printf("-- MRT set\n");
+    engine_up();
+
+    /* Targets B, C and D alongside the A engine_up declared, then MRT3 --
+     * the way a deferred pass declares its G-buffer. */
+    m(M_CONTEXT_DMA_COLOR_B, DMA_LOCAL);
+    m(M_CONTEXT_DMA_COLOR_C, DMA_LOCAL);
+    m(M_CONTEXT_DMA_COLOR_D, DMA_LOCAL);
+    m(M_COLOR_B_OFFSET, 0x50000u);
+    m(M_COLOR_C_OFFSET, 0x60000u);
+    m(M_COLOR_D_OFFSET, 0x70000u);
+    m(M_COLOR_TARGET, CELL_GCM_SURFACE_TARGET_MRT3);
+
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(stub.n_color_create == 4,
+          "an MRT set registers all four targets (%d)", stub.n_color_create);
+    CHECK(stub.n_clear_color == 4,
+          "and one CLEAR_SURFACE clears every one of them (%d)",
+          stub.n_clear_color);
+    CHECK(stub.cleared[0] != stub.cleared[1] &&
+          stub.cleared[1] != stub.cleared[2] &&
+          stub.cleared[2] != stub.cleared[3] &&
+          stub.cleared[0] != stub.cleared[3],
+          "four distinct surfaces, not target A four times (%u,%u,%u,%u)",
+          stub.cleared[0], stub.cleared[1], stub.cleared[2], stub.cleared[3]);
+
+    draw_triangle();
+    CHECK(stub.bound_rt_count == 4 && stub.bound_rt[0] == stub.cleared[0],
+          "the draw binds all four, A first (%u bound)", stub.bound_rt_count);
+    CHECK(stub.pipeline_rt_count == 4,
+          "and its pipeline is built for four attachments (%u)",
+          stub.pipeline_rt_count);
+
+    /* A texture unit naming target C must not alias it: reading a target the
+     * pass writes is undefined, and an MRT set writes more than one. */
+    bind_texture_unit(RSX_LOCATION_LOCAL, 0x60000u);
+    const int before = stub.n_texture_create;
+    draw_triangle();
+    CHECK(stub.n_texture_create == before + 1 &&
+          stub.bound_tex[0] != stub.bound_rt[2],
+          "a unit naming target C uploads instead of aliasing it");
+
+    /* Back to target A alone: one attachment, and a pipeline of its own,
+     * because the attachment count is part of the pipeline key. */
+    const int pipelines = stub.n_pipeline_create;
+    m(M_COLOR_TARGET, CELL_GCM_SURFACE_TARGET_0);
+    draw_triangle();
+    CHECK(stub.bound_rt_count == 1 && stub.pipeline_rt_count == 1 &&
+          stub.n_pipeline_create == pipelines + 1,
+          "target A alone binds one and builds its own pipeline (%u bound, %d)",
+          stub.bound_rt_count, stub.n_pipeline_create);
 
     engine_down();
 }
@@ -801,6 +886,7 @@ int main(void)
 
     test_surface_set();
     test_surface_aliasing();
+    test_mrt_set();
     test_texture_cache();
     test_pipeline_key();
     test_restart_expansion();

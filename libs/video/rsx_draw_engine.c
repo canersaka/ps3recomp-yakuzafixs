@@ -7,8 +7,8 @@
  * is vendored and stays exactly as it is.
  *
  * What is deliberately left out, because it is not renderer behaviour a title
- * needs: MRT beyond one colour target, the shader disk cache, movie mode and
- * its compositor, the a010 probe, and every YZ_PERF_PROFILE block.
+ * needs: the shader disk cache, movie mode and its compositor, the a010
+ * probe, and every YZ_PERF_PROFILE block.
  */
 #include "rsx_draw_engine.h"
 
@@ -547,16 +547,50 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     return slot;
 }
 
-static u32 eng_current_surface(void)
+/* The colour targets SET_SURFACE_COLOR_TARGET names, as slots into
+ * g.surfaces, with A first. One for an ordinary draw; an MRT set adds B, C
+ * and D, each created at target A's size and format, which is the rule the
+ * vtable path's target_for binds by. Resolution stops at the first member
+ * that cannot be created, as that path stops at the first gap. Returns how
+ * many were resolved, or 0. */
+static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
 {
     rsx_dsp_surface sf;
     rsx_dsp_get_surface(&g.rsx, &sf);
-    /* SET_SURFACE_COLOR_TARGET 2 selects B; every other value starts at A.
-     * MRT sets bind B, C and D as well, which this engine does not. */
-    const u32 sel = (sf.color_target == 2u) ? 1u : 0u;
-    return eng_surface_get(sf.color_location[sel], sf.color_offset[sel],
-                           sf.clip_w, sf.clip_h,
-                           eng_surface_format(sf.color_format));
+    /* SET_SURFACE_COLOR_TARGET 2 selects B alone; every other value starts at
+     * A, and the MRT selectors add B, C and D on top of it. */
+    const u32 sel = (sf.color_target == CELL_GCM_SURFACE_TARGET_1) ? 1u : 0u;
+    const rsx_be_format fmt = eng_surface_format(sf.color_format);
+    const u32 first = eng_surface_get(sf.color_location[sel], sf.color_offset[sel],
+                                      sf.clip_w, sf.clip_h, fmt);
+    if (first == ENG_INVALID) return 0;
+    slots[0] = first;
+    u32 n = 1;
+
+    static const u32 mrt_from[3] = {
+        CELL_GCM_SURFACE_TARGET_MRT1, CELL_GCM_SURFACE_TARGET_MRT2,
+        CELL_GCM_SURFACE_TARGET_MRT3
+    };
+    for (u32 i = 0; i < 3; i++) {
+        if (sf.color_target < mrt_from[i]) break;
+        const u32 slot = eng_surface_get(sf.color_location[i + 1],
+                                         sf.color_offset[i + 1],
+                                         sf.clip_w, sf.clip_h, fmt);
+        if (slot == ENG_INVALID) break;
+        /* A set naming one buffer twice would attach the same target twice,
+         * which no host API allows. */
+        int seen = 0;
+        for (u32 k = 0; k < n; k++) if (slots[k] == slot) seen = 1;
+        if (seen) break;
+        slots[n++] = slot;
+    }
+    return n;
+}
+
+static u32 eng_current_surface(void)
+{
+    u32 slots[RSX_BE_MAX_COLOR_TARGETS];
+    return eng_current_target_set(slots) ? slots[0] : ENG_INVALID;
 }
 
 /* ---- per-zeta depth ------------------------------------------------------ */
@@ -960,7 +994,7 @@ static const char* const kEngFixedPS =
  * retried on every draw of every frame. */
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
-                            rsx_be_format rt_fmt, int* out_fixed)
+                            rsx_be_format rt_fmt, u32 rt_count, int* out_fixed)
 {
     *out_fixed = 1;
     const u8* vp_uc = NULL;
@@ -998,6 +1032,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
     key = eng_fnv1a(&layout->stride, sizeof layout->stride, key);
     key = eng_fnv1a(&rt_fmt, sizeof rt_fmt, key);
+    /* How many colour attachments the pass will have is pipeline identity:
+     * a host API matches the two against each other. */
+    key = eng_fnv1a(&rt_count, sizeof rt_count, key);
     key = rsx_draw_engine_hash_render_state(rs, key);
 
     for (u32 i = 0; i < g.n_pipelines; i++)
@@ -1027,7 +1064,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     }
     if (vi > 0 && fi > 0)
         handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
-                                       layout, layout->stride, rt_fmt);
+                                       layout, layout->stride, rt_fmt, rt_count);
     { static u32 logs = 0; if (logs++ < 32)
         fprintf(stderr, "[rsx engine] pipeline %016llx: %s vp %d, fp %d,"
                         " %u constants -> %s\n",
@@ -1203,7 +1240,8 @@ static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 co
  * render-to-texture read back through a texture unit), a unit naming a
  * tracked zeta in DEPTH24_D8 samples its snapshot, and everything else is a
  * guest upload (rsx_live_draw.c:5986-6062). */
-static u32 sink_bind_textures(u32 target_slot, u32 current_zslot,
+static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+                              u32 current_zslot,
                               u32 textures[RSX_BE_MAX_TEXTURES],
                               rsx_be_sampler_desc samplers[RSX_BE_MAX_TEXTURES])
 {
@@ -1216,12 +1254,19 @@ static u32 sink_bind_textures(u32 target_slot, u32 current_zslot,
         eng_decode_sampler(t.filter, t.wrap, t.control0, &samplers[u]);
 
         int sampled = -1;
-        for (u32 i = 0; i < g.n_surfaces; i++)
-            if (g.surfaces[i].handle && g.surfaces[i].location == t.location &&
-                g.surfaces[i].offset == t.offset && i != target_slot) {
-                sampled = (int)i;
-                break;
-            }
+        for (u32 i = 0; i < g.n_surfaces; i++) {
+            if (!g.surfaces[i].handle || g.surfaces[i].location != t.location ||
+                g.surfaces[i].offset != t.offset)
+                continue;
+            /* Not one this draw writes: reading a target a pass is writing
+             * is undefined on every API, and an MRT set writes more than
+             * one of them. */
+            int own = 0;
+            for (u32 k = 0; k < n_targets; k++) if (target_slots[k] == i) own = 1;
+            if (own) break;
+            sampled = (int)i;
+            break;
+        }
         if (sampled >= 0) {
             const u32 view = g.be->surface_view
                 ? g.be->surface_view(g.be->user, g.surfaces[sampled].handle,
@@ -1309,8 +1354,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
     rsx_be_render_state rs;
     rsx_draw_engine_decode_render_state(&g.rsx, &rs);
 
-    const u32 target = eng_current_surface();
-    if (target == ENG_INVALID) return;
+    u32 targets[RSX_BE_MAX_COLOR_TARGETS];
+    const u32 n_targets = eng_current_target_set(targets);
+    if (!n_targets) return;
+    const u32 target = targets[0];
 
     rsx_dsp_surface sf;
     rsx_dsp_viewport vp;
@@ -1329,7 +1376,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
     memset(samplers, 0, sizeof samplers);
     memset(vtextures, 0, sizeof vtextures);
     memset(vsamplers, 0, sizeof vsamplers);
-    const u32 tex_mask = sink_bind_textures(target, zslot, textures, samplers);
+    const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot,
+                                            textures, samplers);
     const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
                                                     vsamplers);
 
@@ -1340,7 +1388,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     int pipeline_is_fixed = 1;
     const u32 pipeline = eng_pipeline_get(&layout, &rs,
                                           eng_surface_format(sf.color_format),
-                                          &pipeline_is_fixed);
+                                          n_targets, &pipeline_is_fixed);
     if (!pipeline) return;
 
     if (indexed) {
@@ -1396,7 +1444,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
         g.zdepths[zslot].had_write = 0;
     }
 
-    g.be->bind_targets(g.be->user, g.surfaces[target].handle, depth_handle);
+    u32 handles[RSX_BE_MAX_COLOR_TARGETS];
+    for (u32 i = 0; i < n_targets; i++) handles[i] = g.surfaces[targets[i]].handle;
+    g.be->bind_targets(g.be->user, handles, n_targets, depth_handle);
     g.be->bind_pipeline(g.be->user, pipeline);
     g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
     g.be->bind_ps_constants(g.be->user, g.fp_cb, fp_bytes);
@@ -1446,8 +1496,9 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
 {
     (void)user; (void)r;
     if (!g.ready) return;
-    const u32 target = eng_current_surface();
-    if (target == ENG_INVALID) return;
+    u32 targets[RSX_BE_MAX_COLOR_TARGETS];
+    const u32 n_targets = eng_current_target_set(targets);
+    if (!n_targets) return;
 
     if (mask & (RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G |
                 RSX_CLEAR_COLOR_B | RSX_CLEAR_COLOR_A)) {
@@ -1458,7 +1509,11 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
             (float)( c        & 0xFF) / 255.0f,
             (float)((c >> 24) & 0xFF) / 255.0f,
         };
-        g.be->clear_color(g.be->user, g.surfaces[target].handle, rgba);
+        /* Every target the set names, not only A: a deferred pass clears its
+         * whole G-buffer in one CLEAR_SURFACE, and B, C and D would otherwise
+         * keep whatever the last frame left in them. */
+        for (u32 i = 0; i < n_targets; i++)
+            g.be->clear_color(g.be->user, g.surfaces[targets[i]].handle, rgba);
     }
     if (mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) {
         rsx_dsp_surface sf;
