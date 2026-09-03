@@ -2169,17 +2169,28 @@ void* cellGcmGetNotifyDataAddress(u32 index)
 }
 
 /* Timestamp location — returns CELL_GCM_LOCATION_LOCAL or MAIN */
-u32 cellGcmGetTimeStampLocation(u32 index, u32* location)
+/* The Location suffix names an ARGUMENT, not an out-parameter: it is the
+ * caller saying which memory the report lives in, CELL_GCM_LOCATION_LOCAL or
+ * _MAIN, exactly as cellGcmGetReportDataLocation and
+ * cellGcmGetReportDataAddressLocation take it three hundred lines below. This
+ * one alone was declared u32* and treated the value as a guest address to
+ * write the location INTO, which inverts the parameter and loses the return.
+ *
+ * A title passing CELL_GCM_LOCATION_MAIN therefore had a 1 taken for an
+ * effective address, and vm_write32 stored four bytes at guest address 1.
+ * Yakuza: Dead Souls does that during display setup and dies there.
+ *
+ * It returns the timestamp, like cellGcmGetTimeStamp, whose body this is with
+ * a location the report table does not distinguish. */
+u64 cellGcmGetTimeStampLocation(u32 index, u32 location)
 {
-    /* `location` is a GUEST address (see cellGcmGetConfiguration): the HLE
-     * ABI adapter passes pointer parameters through as guest values, so
-     * dereferencing one writes to whatever host address shares that number
-     * -- an access violation. Tokyo Jungle calls this during display setup,
-     * which is how it turned up. */
-    uint32_t loc_ea = (uint32_t)(uintptr_t)location;
-    (void)index;
-    if (loc_ea) vm_write32(loc_ea, CELL_GCM_LOCATION_LOCAL);
-    return 0;
+    (void)location;
+
+    if (index >= CELL_GCM_MAX_REPORT_COUNT)
+        return 0;
+
+    s_report_data[index].timestamp = get_timestamp_ns();
+    return s_report_data[index].timestamp;
 }
 
 /* SetTileInfo — alternative to SetTile with same parameters */
