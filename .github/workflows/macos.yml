@@ -121,6 +121,39 @@ jobs:
           # no controller are the runner's situation and must both be fine.
           SDL_AUDIODRIVER=dummy ./build/ps3recomp_host --audio-pad
 
+      # ...and the same modes again through the register-file draw engine,
+      # which is what a real title's frame goes through: rsx_dispatch's whole
+      # NV4097 register file into rsx_draw_engine.c, and a record-oriented
+      # backend under it, instead of rsx_state and the vtable. Both paths have
+      # to pass every mode for as long as both exist, so this is the same list
+      # with one environment variable set -- the pixel assertions are what say
+      # the two agree.
+      - name: Run the POSIX host (register-file draw engine)
+        env:
+          PS3RECOMP_METAL_HEADLESS: "1"
+          PS3RECOMP_RSX_ENGINE: dispatch
+        run: |
+          ./build/ps3recomp_host
+          ./build/ps3recomp_host --draw
+          ./build/ps3recomp_host --draw --frames=60
+          ./build/ps3recomp_host --depth
+          ./build/ps3recomp_host --shader
+          ./build/ps3recomp_host --shader --frames=60
+          ./build/ps3recomp_host --tex
+          ./build/ps3recomp_host --mip
+          ./build/ps3recomp_host --rtt
+          ./build/ps3recomp_host --rtt --frames=60
+          # A guest program pair that will not translate has no fallback in
+          # this engine, so forcing the built-in shader leaves --shader with
+          # nothing to draw: it must still fail, or the check is not checking.
+          if PS3RECOMP_METAL_FIXED_FUNCTION=1 ./build/ps3recomp_host --shader; then
+            echo "--shader passed with the built-in shader forced; the check is not checking"
+            exit 1
+          fi
+          # And the PPU boot path, whose three frames reach the backend from
+          # guest code rather than from the harness.
+          ./build/ps3recomp_boot_smoke build/smoke/smoke.elf
+
       # Guest vertex and fragment programs through the decompilers, glslang
       # and spirv-cross: asserts the MSL carries the buffer, texture, sampler
       # and attribute slots the Metal backend binds to. The binary missing
@@ -159,6 +192,13 @@ jobs:
           /tmp/test_texture_layout
           clang -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_primitives libs/video/tests/test_rsx_primitives.c
           /tmp/test_rsx_primitives
+          # The register-file draw engine's platform-neutral halves against a
+          # stub backend -- surface keying and reallocation, render-target
+          # aliasing on a texture bind, the texture cache's revalidation and
+          # eviction, the pipeline key's stability under constant changes, and
+          # restart cuts bounding topology expansion. Runs on Linux too.
+          clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_draw_engine libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
+          /tmp/test_rsx_draw_engine
 
       # The Win32 shim the runtime runs through on macOS: interlocked widths
       # and return conventions, SRW/CS/condition variables, events, semaphores,

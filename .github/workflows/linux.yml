@@ -178,6 +178,16 @@ jobs:
           /tmp/test_texture_layout
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_primitives libs/video/tests/test_rsx_primitives.c
           /tmp/test_rsx_primitives
+          # The register-file draw engine's platform-neutral halves, driven
+          # through its dispatch sink against a stub backend: the surface set's
+          # keying and reallocation, a texture unit that names a render target
+          # sampling it rather than guest memory, the texture cache's
+          # once-per-frame revalidation and its LRU eviction, the pipeline key
+          # holding still while constants change, and restart cuts bounding
+          # every topology expansion. No GPU and no host graphics API, so this
+          # is where those get checked at all.
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_draw_engine libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
+          /tmp/test_rsx_draw_engine
 
       # The Win32 shim every POSIX host runs the runtime through: interlocked
       # widths and return conventions, SRW/CS/condition variables, events,
