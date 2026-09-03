@@ -15,6 +15,7 @@
  *   FP  MOV r0, COL0.zyxw (END)            colour out, red and blue swapped:
  *                                          what the host's --shader mode runs
  *   FP  TEX r0, TC0 unit 0 (END)           texture unit 0 sampled at texcoord0
+ *   FP  TEX r0, TC0 unit 0, CUBE (END)     ... with unit 0 a cube map
  *
  * Each program's HLSL is checked for what was meant before the MSL is looked
  * at, so a wrong bit in an encoder shows up as a decompiler-level failure
@@ -163,6 +164,31 @@ int main(int argc, char** argv)
             check("TEX FP MSL", g_msl, "[[texture(0)]]");
             check("TEX FP MSL", g_msl, "[[sampler(0)]]");
             check("TEX FP MSL", g_msl, "[[user(locn3)]]");    /* TEXCOORD0 */
+        }
+    }
+
+    /* ---- fragment program: TEX r0, TC0 on a CUBE unit --------------------
+     * The same program, decompiled with unit 0 marked as a cube map. The
+     * declaration and the sample both have to change: a cube is looked up
+     * with a 3-component direction, not a 2D coordinate, and the backend
+     * binds an MTLTextureTypeCube to that slot -- Metal rejects a 2D texture
+     * bound where the shader declared a texturecube, so a mask that did not
+     * survive translation would be a validation failure rather than a wrong
+     * pixel. */
+    {
+        u8 fp[16];
+        rsx_test_fp_tex_r0_tc0(fp, 0);
+        check_count("cube TEX FP",
+                    rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u,
+                                                 1u /* unit 0 is a cube */,
+                                                 g_hlsl, sizeof g_hlsl, NULL), 1);
+        check("cube TEX FP HLSL", g_hlsl, "TextureCube rsx_tex0 : register(t0);");
+        check("cube TEX FP HLSL", g_hlsl, "rsx_tex0.Sample(rsx_samp[0]");
+
+        if (translate("cube TEX FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
+            check("cube TEX FP MSL", g_msl, "texturecube");
+            check("cube TEX FP MSL", g_msl, "[[texture(0)]]");
+            check("cube TEX FP MSL", g_msl, "[[sampler(0)]]");
         }
     }
 
