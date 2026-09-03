@@ -620,6 +620,11 @@ static void spu_async_run(spu_async_job* j)
                 for (int attempt = 0; attempt < 400 && !g_cri_video_dma; attempt++) {
 #ifdef _WIN32
                     Sleep(3);
+#else
+                    /* The pause is the point: it is the window in which the
+                     * PPU marks work ready. Without it the 400 attempts are
+                     * spent before the producer runs at all. */
+                    { struct timespec _d = { 0, 3 * 1000 * 1000 }; nanosleep(&_d, NULL); }
 #endif
                     memset(ls, 0, SPU_LS_SIZE);
                     uint32_t e2 = 0;
