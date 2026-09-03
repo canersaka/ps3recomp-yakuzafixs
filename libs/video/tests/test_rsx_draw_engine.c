@@ -74,6 +74,7 @@ typedef struct {
     u32 bound_mask;
     u32 bound_surface, bound_depth, bound_pipeline;
     u32 draw_vertices, draw_indices, draw_stride;
+    rsx_topology draw_topology;
     u32 scissor[4];
     u32 stencil_ref;
     u32 last_created_texture, last_created_color;
@@ -187,11 +188,13 @@ static void stub_scissor(void* u, u32 x, u32 y, u32 w, u32 h)
 
 static void stub_stencil_ref(void* u, u32 r) { (void)u; stub.stencil_ref = r; }
 
-static void stub_draw(void* u, const void* verts, u32 count, u32 stride,
-                      const u32* indices, u32 index_count)
+static void stub_draw(void* u, rsx_topology topology, const void* verts,
+                      u32 count, u32 stride, const u32* indices,
+                      u32 index_count)
 {
     (void)u; (void)verts; (void)indices;
     stub.n_draw++;
+    stub.draw_topology = topology;
     stub.draw_vertices = count;
     stub.draw_stride = stride;
     stub.draw_indices = index_count;
@@ -634,6 +637,31 @@ static void test_indexed_draws(void)
     CHECK(stub.draw_stride == 16u * 16u,
           "the built-in program's layout is all sixteen attributes (%u bytes)",
           stub.draw_stride);
+
+    /* Quads have no host equivalent and become an indexed triangle list. */
+    m(M_BEGIN_END, RSX_PRIMITIVE_QUADS);
+    m(M_DRAW_ARRAYS, 0u | ((8u - 1u) << 24));
+    m(M_BEGIN_END, 0u);
+    CHECK(stub.draw_topology == RSX_TOPOLOGY_TRIANGLES &&
+          stub.draw_indices == 12,
+          "two quads become twelve triangle indices (%u)", stub.draw_indices);
+
+    /* Points and lines are drawn as they are, in the order they arrived: an
+     * index buffer would be pointless and collapsing repeats would reorder
+     * them. */
+    m(M_BEGIN_END, RSX_PRIMITIVE_LINES);
+    m(M_DRAW_ARRAYS, 0u | ((4u - 1u) << 24));
+    m(M_BEGIN_END, 0u);
+    CHECK(stub.draw_topology == RSX_TOPOLOGY_LINES && stub.draw_indices == 0 &&
+          stub.draw_vertices == 4,
+          "lines pass through unindexed (%u verts, %u indices)",
+          stub.draw_vertices, stub.draw_indices);
+
+    m(M_BEGIN_END, RSX_PRIMITIVE_POINTS);
+    m(M_DRAW_ARRAYS, 0u | ((2u - 1u) << 24));
+    m(M_BEGIN_END, 0u);
+    CHECK(stub.draw_topology == RSX_TOPOLOGY_POINTS && stub.draw_vertices == 2,
+          "so do points (%u verts)", stub.draw_vertices);
 
     engine_down();
 }

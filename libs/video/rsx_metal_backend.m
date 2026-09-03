@@ -2077,6 +2077,7 @@ typedef struct {
     EngRecKind kind;
     u32 surface, depth;
     u32 pipeline;
+    MTLPrimitiveType topology;
     u32 vb_off, stride, vertex_count;
     u32 ib_off, index_count;
     u32 vs_cb_off, vs_cb_bytes;
@@ -2658,8 +2659,9 @@ static void eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
 static void eng_set_stencil_ref(void* user, u32 ref)
 { (void)user; s_eng_pending.stencil_ref = ref; }
 
-static void eng_draw(void* user, const void* vertices, u32 vertex_count,
-                     u32 stride, const u32* indices, u32 index_count)
+static void eng_draw(void* user, rsx_topology topology, const void* vertices,
+                     u32 vertex_count, u32 stride, const u32* indices,
+                     u32 index_count)
 {
     (void)user;
     if (!vertex_count || !stride) return;
@@ -2673,6 +2675,7 @@ static void eng_draw(void* user, const void* vertices, u32 vertex_count,
     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
     *r = s_eng_pending;
     r->kind         = ENG_REC_DRAW;
+    r->topology     = topo_to_metal(topology);
     r->vb_off       = vb_off;
     r->stride       = stride;
     r->vertex_count = vertex_count;
@@ -2745,17 +2748,18 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
                                                      : s_default_sampler)
                            atIndex:MTL_VSAMP_INDEX(u)];
     }
-    /* Every expansion the engine performs comes out as a triangle list, and
-     * an indexed draw is really indexed here: the index buffer is what keeps
-     * a strip's shared vertices from being fetched and uploaded per triangle. */
+    /* An indexed draw is really indexed here: the index buffer is what keeps a
+     * strip's shared vertices from being fetched and uploaded per triangle.
+     * Only a rebuilt triangle list is ever indexed; points and lines arrive as
+     * the guest issued them. */
     if (r->index_count)
-        [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+        [enc drawIndexedPrimitives:r->topology
                         indexCount:r->index_count
                          indexType:MTLIndexTypeUInt32
                        indexBuffer:stage
                  indexBufferOffset:r->ib_off];
     else
-        [enc drawPrimitives:MTLPrimitiveTypeTriangle
+        [enc drawPrimitives:r->topology
                 vertexStart:0 vertexCount:r->vertex_count];
 }
 
