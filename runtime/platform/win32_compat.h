@@ -663,9 +663,9 @@ static inline HANDLE GetCurrentThread(void)    { return (HANDLE)(intptr_t)-2; } 
  * Threads: the handle is joinable (WaitForSingleObject blocks until the
  * routine returns, GetExitCodeThread reads its DWORD), and it is reference
  * counted -- CloseHandle before or after the thread ends is fine either way.
- * CREATE_SUSPENDED parks the thread on a gate that ResumeThread opens.
- * SuspendThread of a RUNNING thread is not expressible on POSIX and reports
- * failure ((DWORD)-1), which is the value Win32 code already checks for.
+ * CREATE_SUSPENDED parks the thread on a gate that ResumeThread opens; a
+ * RUNNING thread is stopped for real, through the mechanism described under
+ * "Thread control" below.
  * -----------------------------------------------------------------------*/
 typedef DWORD (*PS3_THREAD_FN)(LPVOID);
 typedef PS3_THREAD_FN LPTHREAD_START_ROUTINE;
@@ -714,6 +714,161 @@ DWORD  WaitForSingleObject(HANDLE h, DWORD ms);
 DWORD  WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable);
 DWORD  WaitForMultipleObjects(DWORD count, const HANDLE* handles, BOOL wait_all, DWORD ms);
 BOOL   CloseHandle(HANDLE h);
+
+/* ---------------------------------------------------------------------------
+ * Thread context: the register file
+ *
+ * What GetThreadContext reads off a suspended thread, and what
+ * SetThreadContext writes back to it.
+ * -----------------------------------------------------------------------*/
+#define CONTEXT_CONTROL         0x00000001u   /* Pc, Sp, Fp, Lr and the flags */
+#define CONTEXT_INTEGER         0x00000002u   /* the general registers */
+#define CONTEXT_SEGMENTS        0x00000004u
+#define CONTEXT_FLOATING_POINT  0x00000008u
+#define CONTEXT_DEBUG_REGISTERS 0x00000010u
+#define CONTEXT_FULL            (CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS)
+#define CONTEXT_ALL             (CONTEXT_FULL | CONTEXT_FLOATING_POINT | CONTEXT_DEBUG_REGISTERS)
+
+/* The register file, in the shape both hosts can actually fill.
+ *
+ * Pc / Sp / Fp / Lr are the portable spelling and are what code meant to build
+ * on both architectures should use. On x86-64 they are unions with Rip / Rsp /
+ * Rbp so a body written against the Win32 CONTEXT compiles unchanged; Lr has
+ * no x86 counterpart and reads zero there. Floating point, vector and segment
+ * state are not carried -- nothing that asks for a thread's registers on this
+ * path has wanted them -- and neither are the x86 debug registers, which are a
+ * separate Mach state flavour and have no arm64 equivalent at all.
+ *
+ * ContextFlags on input says which groups the caller wants. Everything listed
+ * here comes back regardless, because one thread_get_state or one signal frame
+ * carries all of it; on return ContextFlags says what was actually filled. */
+typedef struct {
+    DWORD     ContextFlags;
+#if defined(__x86_64__)
+    DWORD     EFlags;
+    ULONGLONG Rax, Rbx, Rcx, Rdx, Rsi, Rdi;
+    ULONGLONG R8, R9, R10, R11, R12, R13, R14, R15;
+    union { ULONGLONG Pc; ULONGLONG Rip; };
+    union { ULONGLONG Sp; ULONGLONG Rsp; };
+    union { ULONGLONG Fp; ULONGLONG Rbp; };
+    ULONGLONG Lr;                       /* no link register on x86-64: zero */
+#elif defined(__aarch64__)
+    DWORD     Cpsr;
+    ULONGLONG X[29];                    /* x0 .. x28 */
+    ULONGLONG Pc;
+    ULONGLONG Sp;
+    union { ULONGLONG Fp; ULONGLONG X29; };
+    union { ULONGLONG Lr; ULONGLONG X30; };
+#else
+    DWORD     ps3_status;
+    ULONGLONG Pc, Sp, Fp, Lr;
+#endif
+} CONTEXT;
+typedef CONTEXT* PCONTEXT;
+typedef CONTEXT* LPCONTEXT;
+
+/* ---------------------------------------------------------------------------
+ * Thread control: stopping a running thread and reading its registers
+ *
+ * What a game runner does with these is diagnosis: freeze a thread that looks
+ * stuck, read its program counter and stack pointer, walk the host stack, let
+ * it go. That is a debugger's job, and both hosts have a debugger's mechanism
+ * for it, so this is a real implementation rather than the failure stub the
+ * shim used to return.
+ *
+ *   Darwin: Mach. The thread record keeps the port pthread_mach_thread_np
+ *   gives for its pthread, and thread_suspend / thread_resume /
+ *   thread_get_state / thread_set_state do the work -- exactly what a debugger
+ *   attached to the process would issue. thread_suspend is synchronous: when
+ *   it returns the thread executes no further user instructions.
+ *
+ *   Linux: a real-time signal (SIGRTMIN+4, out of the range glibc and musl
+ *   reserve for their own use). The handler saves the interrupted registers
+ *   into the thread record and parks on a semaphore until the resume; the
+ *   registers a later SetThreadContext writes are put back into the signal
+ *   frame on the way out, so returning from the handler resumes the thread on
+ *   them. sem_post and sem_wait are async-signal-safe, which is what makes the
+ *   park legal inside a handler; nothing in it takes the shim's lock. A thread
+ *   that blocks SIGRTMIN+4 cannot be stopped this way, and SuspendThread waits
+ *   for it: do not mask it in a thread anything might want to freeze.
+ *
+ * The Win32 hazards apply unchanged and are inherent, not artefacts of the
+ * mapping: a thread stopped inside malloc still holds malloc's lock, so the
+ * suspending thread must not allocate before it resumes it. Suspending the
+ * CALLING thread is refused ((DWORD)-1) rather than deadlocking the shim.
+ *
+ * Suspend counts nest, as on Windows: SuspendThread returns the PREVIOUS
+ * count and ResumeThread the previous count too, and the thread runs again
+ * only when the count reaches zero. A thread created CREATE_SUSPENDED starts
+ * at one and is parked on the gate in the trampoline instead, which is where
+ * these two counts meet: the same counter drives both.
+ *
+ * A thread the shim did not create -- the process's main thread, or one a
+ * library spawned -- is ADOPTED into the thread table the first time one of
+ * these calls names it, so DuplicateHandle(GetCurrentThread()) from main()
+ * yields a handle the rest of them accept. An adopted record has no exit code
+ * and never becomes signaled: nothing tells the shim when a foreign thread
+ * ends, so waiting on one waits forever, and the record lives for the process.
+ * -----------------------------------------------------------------------*/
+#define THREAD_TERMINATE            0x00000001u
+#define THREAD_SUSPEND_RESUME       0x00000002u
+#define THREAD_GET_CONTEXT          0x00000008u
+#define THREAD_SET_CONTEXT          0x00000010u
+#define THREAD_SET_INFORMATION      0x00000020u
+#define THREAD_QUERY_INFORMATION    0x00000040u
+#define SYNCHRONIZE                 0x00100000u
+#define THREAD_ALL_ACCESS           0x001FFFFFu
+
+#define DUPLICATE_CLOSE_SOURCE      0x00000001u
+#define DUPLICATE_SAME_ACCESS       0x00000002u
+
+/* Meaningful on a SUSPENDED thread. On Linux only a suspended thread has a
+ * saved frame at all, so these fail on any other; on Darwin the Mach call
+ * answers for a running thread too, and the answer is a snapshot that was
+ * already stale when it was taken. */
+BOOL   GetThreadContext(HANDLE h, CONTEXT* ctx);
+BOOL   SetThreadContext(HANDLE h, const CONTEXT* ctx);
+
+/* Access rights are not enforced: this is one process with one address space,
+ * and a handle either names a thread the shim knows or it does not. NULL if
+ * no thread in the table has that id. */
+HANDLE OpenThread(DWORD access, BOOL inherit, DWORD tid);
+
+/* Same-process duplication only, which is every use there is here. The source
+ * may be the current-thread pseudo handle, and that is the point of it: it is
+ * how a thread the shim did not create gets a real, reference-counted handle
+ * to itself. Both process arguments must be the current-process pseudo handle. */
+BOOL   DuplicateHandle(HANDLE src_process, HANDLE src, HANDLE dst_process,
+                       HANDLE* out, DWORD access, BOOL inherit, DWORD options);
+
+/* Times in FILETIME units (100 ns). Creation and exit are recorded by the
+ * shim, so an adopted thread reports its adoption rather than its birth and
+ * zero for an exit that has not happened. Kernel and user are the thread's own
+ * CPU time: Darwin splits them (thread_info THREAD_BASIC_INFO), Linux cannot
+ * without parsing /proc, so it reports the total as user time and zero kernel. */
+BOOL   GetThreadTimes(HANDLE h, FILETIME* creation, FILETIME* exit,
+                      FILETIME* kernel, FILETIME* user);
+
+/* A snapshot of the shim's thread table, which is what TH32CS_SNAPTHREAD gets
+ * you here: threads the shim created plus every thread since adopted. Threads
+ * belonging to the C library or to a framework are invisible, and no other
+ * process is ever enumerable. th32OwnerProcessID is always this process. */
+#define TH32CS_SNAPTHREAD  0x00000004u
+
+typedef struct {
+    DWORD dwSize;
+    DWORD cntUsage;
+    DWORD th32ThreadID;
+    DWORD th32OwnerProcessID;
+    LONG  tpBasePri;
+    LONG  tpDeltaPri;
+    DWORD dwFlags;
+} THREADENTRY32;
+typedef THREADENTRY32* LPTHREADENTRY32;
+
+HANDLE CreateToolhelp32Snapshot(DWORD flags, DWORD pid);
+BOOL   Thread32First(HANDLE snapshot, THREADENTRY32* entry);
+BOOL   Thread32Next(HANDLE snapshot, THREADENTRY32* entry);
 
 /* ---------------------------------------------------------------------------
  * WaitOnAddress / WakeByAddress
