@@ -1107,6 +1107,158 @@ static int test4_event_queue(void)
 }
 
 /* =========================================================================
+ * TEST 6 -- recursive mutex re-entry through trylock
+ *
+ * A guest lock and its host acquisition are one to one: unlock releases the
+ * host mutex once per guest unlock, so every guest lock has to take it once.
+ * A recursive re-entry through trylock is a guest lock like any other. The
+ * POSIX branch used to bump lock_count and skip the host lock, so a mutex
+ * held twice by the guest was held once by pthreads and the FIRST guest
+ * unlock handed it to whoever was waiting.
+ *
+ * The probe is the window between the two unlocks: the owner is still one
+ * level deep, so a foreign trylock must still be EBUSY.
+ * ========================================================================= */
+#define T6_THREADS  4
+#define T6_ITERS    5000
+
+typedef struct {
+    uint32_t mutex_id;
+    HANDLE   owner_re_entered;   /* owner holds it twice */
+    HANDLE   probe_one_done;     /* helper probed at depth 2 */
+    HANDLE   owner_dropped_one;  /* owner unlocked once, still holds it */
+    HANDLE   probe_two_done;
+    LONG volatile counter;
+} t6_shared;
+
+static unsigned __stdcall t6_owner(void* p)
+{
+    t6_shared* sh = (t6_shared*)p;
+    uint32_t tid = alloc_tid(); t_tid = tid;
+    ppu_context ctx; ctx_init_for_thread(&ctx, tid);
+
+    int32_t rc = call2((int64_t(*)(ppu_context*))sys_mutex_lock, &ctx, sh->mutex_id, 0);
+    if (rc != CELL_OK) { fail("test6", "owner lock rc=0x%08X", (unsigned)rc); return 1; }
+
+    rc = call1((int64_t(*)(ppu_context*))sys_mutex_trylock, &ctx, sh->mutex_id);
+    if (rc != CELL_OK) { fail("test6", "owner recursive trylock rc=0x%08X", (unsigned)rc); return 1; }
+
+    SetEvent(sh->owner_re_entered);
+    WaitForSingleObject(sh->probe_one_done, 10000);
+
+    rc = call1((int64_t(*)(ppu_context*))sys_mutex_unlock, &ctx, sh->mutex_id);
+    if (rc != CELL_OK) fail("test6", "owner first unlock rc=0x%08X", (unsigned)rc);
+
+    SetEvent(sh->owner_dropped_one);
+    WaitForSingleObject(sh->probe_two_done, 10000);
+
+    rc = call1((int64_t(*)(ppu_context*))sys_mutex_unlock, &ctx, sh->mutex_id);
+    if (rc != CELL_OK) fail("test6", "owner second unlock rc=0x%08X", (unsigned)rc);
+    return 0;
+}
+
+static unsigned __stdcall t6_prober(void* p)
+{
+    t6_shared* sh = (t6_shared*)p;
+    uint32_t tid = alloc_tid(); t_tid = tid;
+    ppu_context ctx; ctx_init_for_thread(&ctx, tid);
+
+    WaitForSingleObject(sh->owner_re_entered, 10000);
+    int32_t rc = call1((int64_t(*)(ppu_context*))sys_mutex_trylock, &ctx, sh->mutex_id);
+    if (rc != (int32_t)CELL_EBUSY)
+        fail("test6", "trylock at owner depth 2 rc=0x%08X, want CELL_EBUSY", (unsigned)rc);
+    SetEvent(sh->probe_one_done);
+
+    WaitForSingleObject(sh->owner_dropped_one, 10000);
+    rc = call1((int64_t(*)(ppu_context*))sys_mutex_trylock, &ctx, sh->mutex_id);
+    if (rc != (int32_t)CELL_EBUSY)
+        fail("test6", "trylock at owner depth 1 rc=0x%08X, want CELL_EBUSY "
+                      "(one guest unlock released the host mutex outright)", (unsigned)rc);
+    SetEvent(sh->probe_two_done);
+
+    /* Once the owner is out, it is ours. */
+    for (int i = 0; i < 1000; i++) {
+        rc = call1((int64_t(*)(ppu_context*))sys_mutex_trylock, &ctx, sh->mutex_id);
+        if (rc == CELL_OK) {
+            call1((int64_t(*)(ppu_context*))sys_mutex_unlock, &ctx, sh->mutex_id);
+            return 0;
+        }
+        Sleep(1);
+    }
+    fail("test6", "mutex never became free after the owner released both levels");
+    return 1;
+}
+
+static unsigned __stdcall t6_worker(void* p)
+{
+    t6_shared* sh = (t6_shared*)p;
+    uint32_t tid = alloc_tid(); t_tid = tid;
+    ppu_context ctx; ctx_init_for_thread(&ctx, tid);
+
+    for (int i = 0; i < T6_ITERS; i++) {
+        int32_t rc = call2((int64_t(*)(ppu_context*))sys_mutex_lock, &ctx, sh->mutex_id, 0);
+        if (rc != CELL_OK) { fail("test6", "worker lock rc=0x%08X", (unsigned)rc); return 1; }
+        rc = call1((int64_t(*)(ppu_context*))sys_mutex_trylock, &ctx, sh->mutex_id);
+        if (rc != CELL_OK) { fail("test6", "worker re-entry rc=0x%08X", (unsigned)rc); return 1; }
+
+        /* Non-atomic on purpose: the mutex is what makes it safe. */
+        LONG v = sh->counter;
+        sh->counter = v + 1;
+
+        call1((int64_t(*)(ppu_context*))sys_mutex_unlock, &ctx, sh->mutex_id);
+        call1((int64_t(*)(ppu_context*))sys_mutex_unlock, &ctx, sh->mutex_id);
+    }
+    return 0;
+}
+
+static int test6_recursive_mutex(void)
+{
+    const char* name = "test6_recursive_mutex";
+    LONG before = g_fail_count;
+    ppu_context ctx; ctx_init_for_thread(&ctx, alloc_tid());
+
+    uint32_t attr = make_mutex_attr(SYS_SYNC_FIFO, 1 /* recursive */);
+    uint32_t id_addr = guest_alloc(4);
+    int32_t rc = call2((int64_t(*)(ppu_context*))sys_mutex_create, &ctx, id_addr, attr);
+    if (rc != CELL_OK) { fail(name, "mutex_create rc=0x%08X", (unsigned)rc); return 1; }
+
+    t6_shared sh; memset(&sh, 0, sizeof(sh));
+    sh.mutex_id          = read_be32(id_addr);
+    sh.owner_re_entered  = CreateEventA(NULL, TRUE, FALSE, NULL);
+    sh.probe_one_done    = CreateEventA(NULL, TRUE, FALSE, NULL);
+    sh.owner_dropped_one = CreateEventA(NULL, TRUE, FALSE, NULL);
+    sh.probe_two_done    = CreateEventA(NULL, TRUE, FALSE, NULL);
+
+    HANDLE owner  = (HANDLE)_beginthreadex(NULL, 0, t6_owner, &sh, 0, NULL);
+    HANDLE prober = (HANDLE)_beginthreadex(NULL, 0, t6_prober, &sh, 0, NULL);
+    if (WaitForSingleObject(owner, 20000) == WAIT_TIMEOUT)
+        fail(name, "owner thread never returned");
+    if (WaitForSingleObject(prober, 20000) == WAIT_TIMEOUT)
+        fail(name, "prober thread never returned");
+    CloseHandle(owner); CloseHandle(prober);
+    CloseHandle(sh.owner_re_entered); CloseHandle(sh.probe_one_done);
+    CloseHandle(sh.owner_dropped_one); CloseHandle(sh.probe_two_done);
+
+    /* And the lock/re-enter/unlock/unlock cycle still excludes under load. */
+    HANDLE th[T6_THREADS];
+    for (int i = 0; i < T6_THREADS; i++)
+        th[i] = (HANDLE)_beginthreadex(NULL, 0, t6_worker, &sh, 0, NULL);
+    if (WaitForMultipleObjects(T6_THREADS, th, TRUE, 60000) == WAIT_TIMEOUT)
+        fail(name, "worker threads never returned");
+    for (int i = 0; i < T6_THREADS; i++) CloseHandle(th[i]);
+
+    if (sh.counter != (LONG)(T6_THREADS * T6_ITERS))
+        fail(name, "counter=%ld, want %d (the recursive mutex did not exclude)",
+             (long)sh.counter, T6_THREADS * T6_ITERS);
+
+    call1((int64_t(*)(ppu_context*))sys_mutex_destroy, &ctx, sh.mutex_id);
+
+    int ok = (g_fail_count == before);
+    printf("[%s] counter=%ld -> %s\n", name, (long)sh.counter, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+/* =========================================================================
  * TEST 5 -- rwlock write ownership
  *
  * The write lock has an owner, and three answers depend on it: a second
@@ -1295,11 +1447,12 @@ int main(int argc, char** argv)
     int rc3 = test3_semaphore_counting();
     int rc4 = test4_event_queue();
     int rc5 = test5_rwlock_ownership();
+    int rc6 = test6_recursive_mutex();
 
     ULONGLONG total_ms = now_ms() - t_start;
     printf("=== total wall time: %llums ===\n", (unsigned long long)total_ms);
 
-    int failed = rc1a || rc1 || rc2 || rc3 || rc4 || rc5 || (g_fail_count != 0);
+    int failed = rc1a || rc1 || rc2 || rc3 || rc4 || rc5 || rc6 || (g_fail_count != 0);
     printf("=== RESULT: %s (fail_count=%ld) ===\n", failed ? "FAIL" : "PASS", (long)g_fail_count);
     return failed ? 1 : 0;
 }
