@@ -16,6 +16,7 @@
  *                                          what the host's --shader mode runs
  *   FP  TEX r0, TC0 unit 0 (END)           texture unit 0 sampled at texcoord0
  *   FP  TEX r0, TC0 unit 0, CUBE (END)     ... with unit 0 a cube map
+ *   VP  MOV o0, v0 ; TXL o1, v8 (END)      a vertex texture sampled at t16
  *
  * Each program's HLSL is checked for what was meant before the MSL is looked
  * at, so a wrong bit in an encoder shows up as a decompiler-level failure
@@ -164,6 +165,48 @@ int main(int argc, char** argv)
             check("TEX FP MSL", g_msl, "[[texture(0)]]");
             check("TEX FP MSL", g_msl, "[[sampler(0)]]");
             check("TEX FP MSL", g_msl, "[[user(locn3)]]");    /* TEXCOORD0 */
+        }
+    }
+
+    /* ---- vertex program sampling a VERTEX TEXTURE ------------------------
+     * MOV o0, v0 ; TXL o1, v8 on vertex-texture unit 0 (END). A transform
+     * program that samples is how a title places instances or displaces a
+     * mesh, and the point of the case is the binding slot: the decompiler
+     * declares the unit at HLSL register t16, and the backend binds it with
+     * setVertexTexture at index 16, so what has to hold is that spirv-cross
+     * carries that register number into the vertex function rather than
+     * renumbering it from zero. */
+    {
+        u8 vp[32];
+        rsx_test_vp_mov_out(vp +  0, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);
+        rsx_test_vp_txl_out(vp + 16, 8, RSX_TEST_VP_SWZ_IDENT, 0, 1, 1);
+
+        check_count("vtex VP",
+                    rsx_vp_decompile_ex(vp, sizeof vp, 1u /* unit 0 bound */,
+                                        g_hlsl, sizeof g_hlsl), 2);
+        check("vtex VP HLSL", g_hlsl, "Texture2D rsx_vtex0 : register(t16);");
+        check("vtex VP HLSL", g_hlsl, "rsx_vtex0.SampleLevel(rsx_vsamp0,");
+
+        if (translate("vtex VP", RSX_SHADER_STAGE_VERTEX) == 0) {
+            check("vtex VP MSL", g_msl, "[[texture(16)]]");
+            /* The sampler does NOT follow the texture's number: the
+             * decompiler declares rsx_vsampN at register(sN), so unit 0's
+             * sampler is [[sampler(0)]] while its texture is [[texture(16)]].
+             * The backend binds them at those two different indices. */
+            check("vtex VP MSL", g_msl, "[[sampler(0)]]");
+        }
+
+        /* Unmasked, the same program keeps its defined-zero fallback and
+         * declares no texture at all -- which is why the mask has to be part
+         * of the vertex program's cache key. */
+        check_count("vtex VP unmasked",
+                    rsx_vp_decompile(vp, sizeof vp, g_hlsl, sizeof g_hlsl), 2);
+        if (strstr(g_hlsl, "rsx_vtex0")) {
+            printf("[FAIL] vtex VP unmasked -- declared rsx_vtex0 with no unit bound\n");
+            g_fail++;
+        } else {
+            printf("[PASS] vtex VP unmasked -- no texture declared\n");
+            g_pass++;
         }
     }
 
