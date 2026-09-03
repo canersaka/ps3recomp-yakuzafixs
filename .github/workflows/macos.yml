@@ -80,6 +80,9 @@ jobs:
           # and the draw path, not just the clear.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw --frames=60
+          # Two triangles drawn near-first: the centre pixel is red only if the
+          # depth test rejected the later far one.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depth
           # Guest programs: a vertex program and a fragment program loaded
           # through the FIFO, decompiled, translated to MSL, compiled and
           # bound. The fragment program swaps the triangle's red and blue,

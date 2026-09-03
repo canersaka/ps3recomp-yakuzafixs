@@ -137,6 +137,9 @@ jobs:
           # the draw path, not just the clear.
           ./build/ps3recomp_host --draw
           ./build/ps3recomp_host --draw --frames=60
+          # Two triangles drawn near-first: the centre pixel is red only if the
+          # depth test rejected the later far one.
+          ./build/ps3recomp_host --depth
           # Bind a texture and sample it: the quad is green, the texture is
           # not, so a path that dropped the texture still draws something
           # plausible and still fails here. Exercises rsx_texture_layout and
