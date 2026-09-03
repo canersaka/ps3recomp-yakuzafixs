@@ -146,6 +146,24 @@ pthread_setschedparam(thread, SCHED_OTHER, &param);
 | **Read Unlock** | `ReleaseSRWLockShared()` | `pthread_rwlock_unlock()` |
 | **Write Unlock** | `ReleaseSRWLockExclusive()` | `pthread_rwlock_unlock()` |
 
+### One-Time Initialization
+
+| Feature | Windows | POSIX |
+|---------|---------|-------|
+| **Type** | `INIT_ONCE` | a mutex, a condition variable and a state, behind the same pointer-sized slot |
+| **Init** | `INIT_ONCE_STATIC_INIT` / `InitOnceInitialize()` | the same names |
+| **Run** | `InitOnceExecuteOnce()` | the same name |
+
+**Not `pthread_once`.** Its callback takes no argument and returns nothing, so
+neither half of the Win32 contract survives the mapping: the `Parameter` the
+caller hands the callback and the `Context` a successful callback publishes have
+nowhere to travel, and a callback that FAILS cannot say so. Win32 treats `FALSE`
+from the callback as "not initialised after all" and leaves the `INIT_ONCE`
+untouched, so the next caller tries again; `pthread_once` has already burnt its
+flag and never calls anything again. The shim runs the callback with its own
+lock dropped, so the callback may take locks of its own -- which is the point of
+the primitive, since the callback this exists for constructs a critical section.
+
 ---
 
 ## Networking
@@ -430,7 +448,7 @@ are supplied on POSIX instead, and the call sites stand:
 
 | Header | Provides | On Windows |
 |---|---|---|
-| `win32_compat.h` + `win32_compat.c` | Types (`DWORD`, `LONG`, `HANDLE`, `LARGE_INTEGER`, `CONTEXT`, `EXCEPTION_POINTERS`...), the Interlocked family (32/64-bit, pointer, both spellings), `ReadAcquire`/`WriteRelease`, barriers, `SRWLOCK` (both modes), `CONDITION_VARIABLE`, `CRITICAL_SECTION`, events, semaphores, joinable threads, waitable timers, `WaitForSingleObject`/`WaitForMultipleObjects`, `WaitOnAddress`, `Sleep`/QPC/`GetTickCount64`, thread priority/affinity/description, thread control (`SuspendThread`/`ResumeThread`/`GetThreadContext`/`SetThreadContext`/`OpenThread`/`DuplicateHandle`/`GetThreadTimes`/`CreateToolhelp32Snapshot`), `VirtualAlloc`/`VirtualProtect`/`VirtualFree`/`VirtualQuery`, `IsBadReadPtr`/`IsBadWritePtr`, `AddVectoredExceptionHandler`/`RemoveVectoredExceptionHandler`/`SetUnhandledExceptionFilter`, `GetSystemInfo`, `GetLastError` | passthrough to `<windows.h>` |
+| `win32_compat.h` + `win32_compat.c` | Types (`DWORD`, `LONG`, `HANDLE`, `LARGE_INTEGER`, `CONTEXT`, `EXCEPTION_POINTERS`...), the Interlocked family (32/64-bit, pointer, both spellings), `ReadAcquire`/`WriteRelease`, barriers, `SRWLOCK` (both modes), `CONDITION_VARIABLE`, `CRITICAL_SECTION`, `INIT_ONCE`/`InitOnceExecuteOnce`, events, semaphores, joinable threads, waitable timers, `WaitForSingleObject`/`WaitForMultipleObjects`, `WaitOnAddress`, `Sleep`/QPC/`GetTickCount64`, thread priority/affinity/description, thread control (`SuspendThread`/`ResumeThread`/`GetThreadContext`/`SetThreadContext`/`OpenThread`/`DuplicateHandle`/`GetThreadTimes`/`CreateToolhelp32Snapshot`), `VirtualAlloc`/`VirtualProtect`/`VirtualFree`/`VirtualQuery`, `IsBadReadPtr`/`IsBadWritePtr`, `AddVectoredExceptionHandler`/`RemoveVectoredExceptionHandler`/`SetUnhandledExceptionFilter`, `GetSystemInfo`, `GetLastError` | passthrough to `<windows.h>` |
 | `msvc_compat.h` | The MSVC CRT and intrinsic dialect: `_snprintf`, `fopen_s`, `strcpy_s`, `_stricmp`, `_fseeki64`, `_mkdir`, `_stat`, `_byteswap_*`, `_BitScanForward`, `__popcnt`, `_umul128`, `_ReturnAddress`, `__debugbreak`, `__declspec(thread/noinline/align)`, `__forceinline` | passthrough to `<intrin.h>` and the CRT |
 | `win32_backtrace.h` | `RtlCaptureStackBackTrace`, `GetModuleHandleA/ExA`, `GetModuleFileNameA`, and the dbghelp names a crash report uses (`SymInitialize`, `SymFromAddr`, `SymCleanup`), over `backtrace(3)` and `dladdr(3)` | passthrough |
 | `win32_dirent.h` | `<dirent.h>` for MSVC | a `FindFirstFile` implementation |
@@ -449,6 +467,11 @@ Rules the shim keeps, and code using it must keep too:
 - **Condition variables work with any lock** (SRW in either mode, or a
   critical section) through a generation counter, so they are not tied to a
   pthread mutex.
+- **A failed `InitOnceExecuteOnce` callback runs again.** Returning `FALSE`
+  leaves the `INIT_ONCE` where it was and the error the callback set stands, as
+  on Windows. The callback runs with the shim's own lock dropped, so it may
+  take locks; re-entering the SAME `INIT_ONCE` from inside it deadlocks, also
+  as on Windows.
 - **Waitable handles share one lock**, which is what makes
   `WaitForMultipleObjects(bWaitAll)` atomic. The runtime's hot paths use
   pthreads directly in their `#else` branches; the shim carries the coarse,
@@ -504,9 +527,11 @@ against the shim. These are the calls that were on that list.
 conventions, widths, one waiter per `SetEvent`, both wait modes, timers,
 `VirtualAlloc` reserve/commit/protect/release, a spinning thread frozen and
 released, `VirtualQuery` over a reservation, a commit, a stack and a gap, a
-vectored handler that repairs a fault and continues, and one that declines and
-falls through to the unhandled filter. It runs in the Linux and macOS
-workflows, and `tests/sync_stress` runs on the same shim on every platform.
+vectored handler that repairs a fault and continues, one that declines and
+falls through to the unhandled filter, and four threads racing one
+`InitOnceExecuteOnce` for a single callback and a shared context. It runs in
+the Linux and macOS workflows, and `tests/sync_stress` runs on the same shim on
+every platform.
 
 ---
 
