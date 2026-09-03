@@ -58,6 +58,21 @@ host_ptr = vm_base + guest_addr
 
 On Windows, `VirtualAlloc` with `MEM_RESERVE` reserves the 4 GB range without consuming physical memory. On POSIX, `mmap` with `MAP_NORESERVE | MAP_ANONYMOUS` does the same. Pages are committed on demand as regions are needed.
 
+### `vm_base` is 4 GB aligned, and that is a guarantee
+
+The low 32 bits of `vm_base` are zero. `vm_init()` makes that true rather than hoping for it: it reserves twice the space it needs, keeps the aligned 4 GB window inside, and gives the rest back (on Windows, which cannot release part of a reservation, by releasing the over-reservation and re-reserving at the aligned address, with retries). The result is asserted before `vm_init()` returns, and an unaligned base fails with `CELL_ENOMEM` rather than running.
+
+The alignment matters because translation goes both ways. Forward it is `vm_base + guest_addr`. Backward, a great many HLE bridges recover a guest address from a host pointer by truncating it to 32 bits:
+
+```c
+#define GUEST_EA(p)      ((uint32_t)(uintptr_t)(p))            // libs/guest_struct.h
+#define GUEST_PTR(p, T)  ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
+```
+
+`GUEST_EA(vm_base + ea) == ea` holds only while `(uintptr_t)vm_base & 0xFFFFFFFF` is zero, and 422 functions under `libs/` translate a guest address through a pointer parameter this way. When it stops holding there is no crash: the truncated value is a plausible-looking guest address, so the write lands inside the guest arena, at a different place every run, and the caller's variable keeps whatever was already in it.
+
+It used to hold by luck. Both kernels place the first few large reservations of a process on convenient boundaries, so a small test program sees an aligned base every time. A real process does not: with SDL2, Metal and the shader tools mapped, a 4 GB `mmap` on Darwin arm64 is aligned for the first three reservations of a run and unaligned from the fourth on.
+
 ### Memory Map
 
 | Guest Address Range | Size | Region | Committed At |
@@ -87,11 +102,13 @@ On Windows, `VirtualAlloc` with `MEM_RESERVE` reserves the 4 GB range without co
 
 #### `vm_init()`
 
-Reserves the 4 GB address space and commits the main memory (256 MB) and stack (256 MB) regions. Zeros main memory. Returns `CELL_OK` on success, `CELL_ENOMEM` on failure.
+Reserves the 4 GB address space, 4 GB aligned (see above), and commits the main memory (256 MB) and stack (256 MB) regions. Zeros main memory. Returns `CELL_OK` on success, `CELL_ENOMEM` on failure -- including when no aligned base could be obtained.
 
 **Platform behavior:**
-- **Windows**: `VirtualAlloc(NULL, 4GB, MEM_RESERVE, PAGE_NOACCESS)` then `VirtualAlloc(region, size, MEM_COMMIT, PAGE_READWRITE)` for each active region
-- **POSIX**: `mmap(NULL, 4GB, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0)` then `mprotect(region, size, PROT_READ|PROT_WRITE)`
+- **Windows**: `VirtualAlloc(NULL, 8GB, MEM_RESERVE, PAGE_NOACCESS)` to find an aligned address, released and re-reserved as `VirtualAlloc(aligned, 4GB, MEM_RESERVE, PAGE_NOACCESS)`, then `VirtualAlloc(region, size, MEM_COMMIT, PAGE_READWRITE)` for each active region
+- **POSIX**: `mmap(NULL, 8GB, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0)` with the unaligned head and tail returned by `munmap`, then `mprotect(region, size, PROT_READ|PROT_WRITE)`
+
+The over-reservation is address space only; nothing in the trimmed-away halves is ever committed.
 
 #### `vm_shutdown()`
 
