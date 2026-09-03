@@ -307,6 +307,79 @@ if(UNIX)
 endif()
 
 # ---------------------------------------------------------------------------
+# PPU boot smoke title
+# ---------------------------------------------------------------------------
+# The one target that LINKS AND RUNS the PPU boot scaffold. runtime/ppu/ is the
+# game-agnostic boot path every port is built on, and nothing here has ever
+# built it: it #includes the lifter's per-game ppu_recomp.h, so
+# tools/check_ppu_scaffold.py compiles it against a stub header and stops
+# there. Compiling is not running, and on POSIX the loader, the NID bridge, the
+# lv2 syscalls, guest threads, the frame clock and the RSX backend had never
+# once run together.
+#
+# runtime/ppu/tests/smoke/ supplies what was missing: a hand-written program in
+# the lifter's ABI, and tools/make_smoke_elf.py writes both the PPU ELF it is
+# loaded from and the ppu_recomp.h it compiles against -- the header from
+# ppu_lifter.py's own HEADER_PREAMBLE, so the synthetic title cannot drift away
+# from the ABI a real one gets.
+#
+# The HLE NID table is generated exactly as a port generates it, so the smoke
+# title's firmware imports resolve through the same bridge a game's do.
+if(UNIX)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(NOT Python3_Interpreter_FOUND)
+        message(STATUS "  Boot smoke:   no python3; ps3recomp_boot_smoke not built")
+    else()
+        set(SMOKE_GEN "${CMAKE_CURRENT_BINARY_DIR}/smoke")
+
+        add_custom_command(
+            OUTPUT "${SMOKE_GEN}/smoke.elf" "${SMOKE_GEN}/ppu_recomp.h"
+            COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/make_smoke_elf.py"
+                    --out    "${SMOKE_GEN}/smoke.elf"
+                    --header "${SMOKE_GEN}/ppu_recomp.h"
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/make_smoke_elf.py"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/ppu_lifter.py"
+            COMMENT "Generating the smoke title's image and ppu_recomp.h")
+
+        add_custom_command(
+            OUTPUT "${SMOKE_GEN}/ppu_hle_nids.cpp"
+            COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_hle_nids.py"
+                    --out "${SMOKE_GEN}/ppu_hle_nids.cpp" --all
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_hle_nids.py"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/nid_database.py"
+            COMMENT "Generating the HLE NID -> handler table")
+
+        add_executable(ps3recomp_boot_smoke
+            runtime/ppu/tests/boot_main.cpp
+            runtime/ppu/tests/smoke/smoke_recomp.c
+            runtime/ppu/ppu_loader.cpp
+            runtime/ppu/ppu_hle.cpp
+            runtime/ppu/ppu_fs.cpp
+            runtime/ppu/ppu_sysprx.cpp
+            "${SMOKE_GEN}/ppu_hle_nids.cpp"
+            "${SMOKE_GEN}/ppu_recomp.h"
+        )
+        target_include_directories(ps3recomp_boot_smoke PRIVATE
+            "${SMOKE_GEN}"                                  # the generated ppu_recomp.h
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/ppu"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/memory"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/syscalls"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        )
+        target_link_libraries(ps3recomp_boot_smoke PRIVATE ps3recomp_runtime)
+        set_target_properties(ps3recomp_boot_smoke PROPERTIES LINKER_LANGUAGE CXX)
+
+        # Where the runnable image lands, so CI and a developer both say
+        #   ./build/ps3recomp_boot_smoke build/smoke/smoke.elf
+        message(STATUS "  Boot smoke:   ps3recomp_boot_smoke + smoke/smoke.elf")
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
 install(TARGETS ps3recomp_runtime
