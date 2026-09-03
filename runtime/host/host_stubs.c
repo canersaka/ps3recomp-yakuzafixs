@@ -41,8 +41,58 @@ void vm_write32(uint64_t addr, uint32_t v)
     memcpy(vm_base + (uint32_t)addr, &v, 4);
 }
 
+void vm_write16(uint64_t addr, uint16_t v)
+{
+    v = __builtin_bswap16(v);
+    memcpy(vm_base + (uint32_t)addr, &v, 2);
+}
+
+void vm_write64(uint64_t addr, uint64_t v)
+{
+    v = __builtin_bswap64(v);
+    memcpy(vm_base + (uint32_t)addr, &v, 8);
+}
+
+/* ppu_loader.cpp - out-of-line big-endian guest loads. The loader's version
+ * bounds-checks against the mapped image; this host owns the whole arena. */
+uint32_t vm_read32(uint64_t addr)
+{
+    uint32_t v;
+    memcpy(&v, vm_base + (uint32_t)addr, 4);
+    return __builtin_bswap32(v);
+}
+
 /* ppu_fs.cpp - VFS root consulted by cellGame/cellFs path mapping. */
 const char* ppu_vfs_root = ".";
+
+/* ---------------------------------------------------------------------------
+ * Title-diagnostic hooks the HLE modules call into the PPU loader.
+ *
+ * Every one of these reports something about a lifted game: its guest call
+ * chain, its host call chain, a breadcrumb table, a guard page in its address
+ * space. A host with no game has nothing to report, and none of them feeds a
+ * decision -- they print and return. cellAudio pulls sys_event.c in, which is
+ * where most of these are reached from.
+ * -----------------------------------------------------------------------*/
+uint32_t g_barrier_sync_watch = 0;
+
+void lbp_breadcrumb_dump(const char* tag)   { (void)tag; }
+void ppu_log_host_chain(const char* tag)    { (void)tag; }
+void ppu_guest_callstack(const char* tag)   { (void)tag; }
+void ppu_guard_page(uint32_t guest_ea)      { (void)guest_ea; }
+void ppu_dump_guest_stack(void* ctx, const char* tag) { (void)ctx; (void)tag; }
+
+void ppu_guest_caller(char* out, size_t n)
+{
+    if (out && n) out[0] = '\0';
+}
+
+/* ppu_sysprx.cpp - the HLE registration table a lifted game's imports are
+ * bound through. Nothing here imports anything. */
+void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(void*))
+{
+    (void)nid; (void)name; (void)fn;
+}
 
 /* Inline write-watch hooks. ppu_memory.h expands every vm_write* into a range
  * test against g_ww_lo/g_ww_hi plus a call to ps3_ww_report_inline, and those
