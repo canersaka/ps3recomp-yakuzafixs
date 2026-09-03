@@ -26,6 +26,12 @@
  * that reads guest data declares them (rsx_vertex_fetch.h). */
 extern u8* vm_base;
 u32 cellGcmResolveLocated(int local, u32 offset);
+/* Non-zero only when the offset's page is in the IO table, so a caller can
+ * tell IO-mapped main memory from "assume VRAM". */
+u32 cellGcmResolveIO(u32 offset);
+/* The guest VM's OOB guard: the size a host backed, or 0 for "the whole 32-bit
+ * space is backed and no check is needed" (runtime/memory/vm.h). */
+extern u32 ppu_vm_size;
 
 /* ------------------------------------------------------------------------- */
 
@@ -189,6 +195,7 @@ static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
     if (!vm_base || !min_bytes || min_bytes > (256u << 20)) return NULL;
     const u32 ea = cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset);
     if (!ea) return NULL;
+    if (ppu_vm_size && (u64)ea + min_bytes > ppu_vm_size) return NULL;
     return vm_base + ea;
 }
 
@@ -403,6 +410,14 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
 {
     *out_row_bytes = 0;
     if (fmt != RSX_BE_FMT_R8G8B8A8) return NULL;
+    /* Only a surface in IO-mapped MAIN memory is seeded. RSX local memory is
+     * reserved and not backed by this tree's guest VM -- runtime/memory/vm.h
+     * maps the whole space PROT_NONE and commits main memory and the stacks,
+     * leaving a runner to commit what its own title needs -- so reading a VRAM
+     * surface's backing would fault long before it could help. Both halves are
+     * checked: the DMA context says which space the offset is in, and the IO
+     * table says the page is really mapped. */
+    if (location != RSX_LOCATION_MAIN || !cellGcmResolveIO(offset)) return NULL;
     rsx_tex_layout tl;
     /* A8R8G8B8 with the LN bit: a surface is linear, never swizzled. */
     rsx_texture_layout(0x85u | 0x20u, w, h, &tl);
@@ -776,24 +791,114 @@ static u32 eng_cube_mask(void)
     return mask;
 }
 
+/* Are both of the guest's own programs resident? One answer, used by the
+ * layout and by the pipeline, because they must not disagree: the built-in
+ * program declares all sixteen inputs, so narrowing the layout for it would
+ * leave the pipeline's vertex descriptor short of what the shader reads. */
+static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
+                              const u8** out_fp, u32* out_fp_size)
+{
+    const u8* vp_uc = NULL;
+    u32 vp_instrs = 0;
+    const u32 start = rsx_dsp_vp_start(&g.rsx);
+    if (start < RSX_DSP_VP_INSTR) {
+        vp_uc = (const u8*)(g.rsx.vp + start * 4);
+        vp_instrs = rsx_vp_program_size_instrs(
+            vp_uc, (RSX_DSP_VP_INSTR - start) * 16u);
+    }
+
+    /* A zero SET_SHADER_PROGRAM is "none", not "the program at offset 0": the
+     * register carries the location in its low two bits, so a real program can
+     * never read back as zero. */
+    const u8* fp_uc = NULL;
+    u32 fp_size = 0;
+    if (rsx_dsp_reg(&g.rsx, 0x08E4)) {
+        u32 fp_loc = 0;
+        const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
+        fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, 16);
+        fp_size = fp_uc ? rsx_fp_program_size(fp_uc, ENG_FP_MAX_BYTES) : 0;
+        if (fp_size) fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, fp_size);
+        if (!fp_uc) fp_size = 0;
+    }
+
+    if (out_vp) *out_vp = vp_uc;
+    if (out_vp_instrs) *out_vp_instrs = vp_instrs;
+    if (out_fp) *out_fp = fp_uc;
+    if (out_fp_size) *out_fp_size = fp_size;
+    return vp_instrs && fp_size;
+}
+
 /* The layout the active vertex program actually reads. An uncertain analysis
  * falls back to all sixteen registers (rsx_live_draw.c:3625-3643). */
 static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
 {
     u32 mask = 0xFFFFu;
-    const u32 start = rsx_dsp_vp_start(&g.rsx);
-    if (start < RSX_DSP_VP_INSTR) {
-        const u8* uc = (const u8*)(g.rsx.vp + start * 4);
-        const u32 instrs = rsx_vp_program_size_instrs(
-            uc, (RSX_DSP_VP_INSTR - start) * 16u);
+    const u8* uc = NULL;
+    u32 instrs = 0;
+    if (eng_guest_programs(&uc, &instrs, NULL, NULL)) {
         rsx_vp_input_analysis analysis = { 0xFFFFu, 0 };
-        if (instrs &&
-            rsx_vp_analyze_inputs(uc, instrs * 16u, &analysis) == (int)instrs &&
+        if (rsx_vp_analyze_inputs(uc, instrs * 16u, &analysis) == (int)instrs &&
             analysis.exact && analysis.input_mask)
             mask = analysis.input_mask;
     }
     rsx_vertex_layout_plan_init(layout, mask);
 }
+
+/* What a draw runs before a title has loaded programs of its own.
+ *
+ * The reference engine has no fallback and drops such a draw, because a title
+ * always has both programs resident by the time it draws anything. A general
+ * toolkit does not get to assume that: the host harness's fixed-function modes
+ * are exactly this case, and so is the first frame of a title that clears and
+ * flips before its first SET_TRANSFORM_PROGRAM. It is written in the same HLSL
+ * shape the decompilers emit -- ATTRn inputs, the COLOR0/TEXCOORD varyings, the
+ * VPConst block and the viewport epilogue -- so it goes through the one
+ * pipeline_create the backend already implements rather than needing a second
+ * entry point for a built-in shader.
+ *
+ * Vertex constant rows 0..3 are the transform when the guest programmed them
+ * and identity when it did not: an all-zero matrix would collapse every vertex
+ * onto the origin. */
+static const char* const kEngFixedVS =
+"struct VSInput {\n"
+"    float4 a0:ATTR0;  float4 a1:ATTR1;  float4 a2:ATTR2;  float4 a3:ATTR3;\n"
+"    float4 a4:ATTR4;  float4 a5:ATTR5;  float4 a6:ATTR6;  float4 a7:ATTR7;\n"
+"    float4 a8:ATTR8;  float4 a9:ATTR9;  float4 a10:ATTR10; float4 a11:ATTR11;\n"
+"    float4 a12:ATTR12; float4 a13:ATTR13; float4 a14:ATTR14; float4 a15:ATTR15;\n"
+"};\n"
+"struct VSOutput {\n"
+"    float4 pos:SV_Position; float4 col0:COLOR0; float4 col1:COLOR1;\n"
+"    float4 fog:FOG;\n"
+"    float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
+"    float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7;\n"
+"};\n"
+"cbuffer VPConst : register(b0) {\n"
+"    float4 vp_c[512];\n"
+"    float4 vp_posscale;\n"
+"    float4 vp_posoffset;\n"
+"};\n"
+"VSOutput main(VSInput input) {\n"
+"    float4 _p = float4(dot(vp_c[0], input.a0), dot(vp_c[1], input.a0),\n"
+"                       dot(vp_c[2], input.a0), dot(vp_c[3], input.a0));\n"
+"    float _m = dot(abs(vp_c[0]), 1.0) + dot(abs(vp_c[1]), 1.0)\n"
+"             + dot(abs(vp_c[2]), 1.0) + dot(abs(vp_c[3]), 1.0);\n"
+"    if (_m == 0.0) _p = input.a0;\n"
+"    VSOutput Out;\n"
+"    Out.pos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);\n"
+"    Out.col0 = input.a3; Out.col1 = float4(0,0,0,1); Out.fog = (float4)0;\n"
+"    Out.t0 = input.a8; Out.t1 = (float4)0; Out.t2 = (float4)0; Out.t3 = (float4)0;\n"
+"    Out.t4 = (float4)0; Out.t5 = (float4)0; Out.t6 = (float4)0; Out.t7 = (float4)0;\n"
+"    return Out;\n"
+"}\n";
+
+static const char* const kEngFixedPS =
+"struct PSInput {\n"
+"    float4 position : SV_POSITION; float4 col0 : COLOR0; float4 col1 : COLOR1;\n"
+"    float4 fog : FOG;\n"
+"    float4 tc0:TEXCOORD0; float4 tc1:TEXCOORD1; float4 tc2:TEXCOORD2; float4 tc3:TEXCOORD3;\n"
+"    float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n"
+"};\n"
+"float4 main(PSInput input) : SV_TARGET { return input.col0; }\n";
 
 /* The pipeline for this draw, built once per distinct key. A negative result
  * is cached too (handle 0), so a program pair that will not translate is not
@@ -802,40 +907,38 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
                             rsx_be_format rt_fmt)
 {
-    const u32 start = rsx_dsp_vp_start(&g.rsx);
-    if (start >= RSX_DSP_VP_INSTR) return 0;
-    const u8* vp_uc = (const u8*)(g.rsx.vp + start * 4);
-    const u32 vp_instrs = rsx_vp_program_size_instrs(
-        vp_uc, (RSX_DSP_VP_INSTR - start) * 16u);
-    if (!vp_instrs) return 0;
-
-    u32 fp_loc = 0;
-    const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
-    const u8* fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, 16);
-    if (!fp_uc) return 0;
-    const u32 fp_size = rsx_fp_program_size(fp_uc, ENG_FP_MAX_BYTES);
-    if (!fp_size) return 0;
-    fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, fp_size);
-    if (!fp_uc) return 0;
+    const u8* vp_uc = NULL;
+    const u8* fp_uc = NULL;
+    u32 vp_instrs = 0, fp_size = 0;
+    /* No resident program pair means the built-in one; see kEngFixedVS. */
+    const int fixed = !eng_guest_programs(&vp_uc, &vp_instrs, &fp_uc, &fp_size);
 
     const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
     const u32 cube_mask = eng_cube_mask();
     const u32 vtex_mask = eng_vtex_mask();
 
-    if (rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0) return 0;
+    memset(&g.fp_constants, 0, sizeof g.fp_constants);
+    if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
+        return 0;
 
     /* Identity: the vertex program's own bytes, the fragment program's
      * STRUCTURE (its inline constants are hoisted into the buffered block, so
      * a constant change must not be a new pipeline), the export-width bit of
      * SHADER_CONTROL, the cube and vertex-texture masks, the input layout,
      * and the structural render state. */
-    u64 key = eng_fnv1a(vp_uc, vp_instrs * 16u, 1469598103934665603ull);
-    key = rsx_fp_structural_hash(fp_uc, fp_size, key);
-    if (!key) return 0;
-    const u32 fp_ctrl_key = fp_ctrl & 0x40u;
-    key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
-    key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
-    key = eng_fnv1a(&vtex_mask, sizeof vtex_mask, key);
+    u64 key = 1469598103934665603ull;
+    if (fixed) {
+        static const u32 fixed_tag = 0x4E464958u;   /* "XIFN" */
+        key = eng_fnv1a(&fixed_tag, sizeof fixed_tag, key);
+    } else {
+        key = eng_fnv1a(vp_uc, vp_instrs * 16u, key);
+        key = rsx_fp_structural_hash(fp_uc, fp_size, key);
+        if (!key) return 0;
+        const u32 fp_ctrl_key = fp_ctrl & 0x40u;
+        key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
+        key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
+        key = eng_fnv1a(&vtex_mask, sizeof vtex_mask, key);
+    }
     key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
     key = eng_fnv1a(&layout->stride, sizeof layout->stride, key);
     key = eng_fnv1a(&rt_fmt, sizeof rt_fmt, key);
@@ -846,25 +949,31 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
 
     u32 handle = 0;
-    const int vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
-                                               layout->mask, s_vs_hlsl,
-                                               sizeof s_vs_hlsl);
+    int vi = 1, fi = 1;
     u32 nconst = 0;
-    int fi = rsx_fp_decompile_buffered_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
+    if (fixed) {
+        snprintf(s_vs_hlsl, sizeof s_vs_hlsl, "%s", kEngFixedVS);
+        snprintf(s_ps_hlsl, sizeof s_ps_hlsl, "%s", kEngFixedPS);
+    } else {
+        vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
+                                         layout->mask, s_vs_hlsl,
+                                         sizeof s_vs_hlsl);
+        fi = rsx_fp_decompile_buffered_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
                                           s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
-    if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
-    if (fi > 0 && rs->alpha_test_enable &&
-        rsx_fp_apply_alpha_test_buffered(s_ps_hlsl, sizeof s_ps_hlsl,
-                                         rs->alpha_func) < 0)
-        fi = -1;
+        if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
+        if (fi > 0 && rs->alpha_test_enable &&
+            rsx_fp_apply_alpha_test_buffered(s_ps_hlsl, sizeof s_ps_hlsl,
+                                             rs->alpha_func) < 0)
+            fi = -1;
+    }
     if (vi > 0 && fi > 0)
         handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
                                        layout, layout->stride, rt_fmt);
     { static u32 logs = 0; if (logs++ < 32)
-        fprintf(stderr, "[rsx engine] pipeline %016llx: vp %d instrs, fp %d instrs,"
+        fprintf(stderr, "[rsx engine] pipeline %016llx: %s vp %d, fp %d,"
                         " %u constants -> %s\n",
-                (unsigned long long)key, vi, fi, nconst,
-                handle ? "ok" : "FAILED (draw dropped)"); }
+                (unsigned long long)key, fixed ? "built-in" : "guest",
+                vi, fi, nconst, handle ? "ok" : "FAILED (draw dropped)"); }
 
     g.pipelines[g.n_pipelines].key = key;
     g.pipelines[g.n_pipelines].handle = handle;
@@ -1050,7 +1159,11 @@ static u32 sink_bind_textures(u32 target_slot, u32 current_zslot,
                 break;
             }
         if (sampled >= 0) {
-            textures[u] = g.surfaces[sampled].handle;
+            const u32 view = g.be->surface_view
+                ? g.be->surface_view(g.be->user, g.surfaces[sampled].handle,
+                                     t.remap & 0xFFFFu, t.format)
+                : 0;
+            textures[u] = view ? view : g.surfaces[sampled].handle;
             continue;
         }
         const u32 base_fmt = t.format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
