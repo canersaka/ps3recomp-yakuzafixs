@@ -15,7 +15,7 @@ documents the host shim itself._
 | Guest shader translation | `test_shader_msl`: hand-assembled NV40 programs through the decompilers, glslang and spirv-cross, checked for the MSL binding contract the backend relies on (runs on Linux too) |
 | PPU boot scaffold | `ppu_loader.cpp`, `ppu_hle.cpp`, `ppu_fs.cpp`, `ppu_sysprx.cpp`, `boot_main.cpp` compile at a recorded baseline of **0** errors (`darwin-clang` in `tools/ppu_scaffold_baseline.json`) |
 | PPU boot path | `ps3recomp_boot_smoke`: the scaffold **linked and run** against the synthetic title in `runtime/ppu/tests/smoke/` -- ELF load, entry OPD, TLS, the NID bridge, lv2 syscalls, a guest thread on a second host thread, three frames cleared and flipped through the FIFO to the Metal backend, and `sys_process_exit` |
-| Win32 host shim | `runtime/platform/tests/test_win32_compat.c`, 298 checks |
+| Win32 host shim | `runtime/platform/tests/test_win32_compat.c`, 299 checks: threads, sync, `VirtualAlloc`/`VirtualQuery`, `SuspendThread` of a running thread with `GetThreadContext`, vectored exception handlers, `SymFromAddr` |
 | lv2 sync primitives | `tests/sync_stress`: mutex, cond, semaphore, event-queue and rwlock stress on host threads, including recursive-mutex re-entry and write-lock ownership |
 | lv2 threads | `ps3recomp_host --threads`: a guest PPU thread created and joined through the syscalls, and the host stack it got |
 | cellFiber | `tests/fiber_switch`: 4000 scheduler round trips and 4000 direct fiber-to-fiber switches on ucontext (runs on Linux too) |
@@ -59,8 +59,8 @@ exercised on the Mac without a game. See docs/PPU_RECOMP.md.
    uploads from guest memory; there is no stencil write mask or two-sided
    stencil (neither register is decoded upstream), and no anisotropy or
    sampler LOD bias. And it is the simpler engine: a title on Windows runs
-   through `rsx_live_draw.c`, so the last step is either a seam under that
-   file or the vtable backend growing the rest of that behaviour.
+   through `rsx_live_draw.c`; the order of work below says how that gap is
+   being closed.
 
 2. **A game's host code.** The scaffold in `runtime/ppu/` is game-agnostic; a
    port adds its own runner (imports, overrides, the window, diagnostics). A
@@ -71,6 +71,17 @@ exercised on the Mac without a game. See docs/PPU_RECOMP.md.
    handlers, `SymFromAddr`. What is still Windows-only there is the window and
    the message pump, `__try`/`__except`, and the x86 debug registers a hardware
    watchpoint needs. `docs/PLATFORM_ABSTRACTION.md` has the call-by-call table.
+
+   What a runner needs from the toolkit is largely there. The window, the
+   present surface and the message pump exist in the Metal backend; a FIFO
+   walker exists in `cellGcmSys.c` and already feeds both render models; the
+   threading a runner is written against is the shim. What the Yakuza runner
+   keeps behind Win32 is, on inspection, four exception handlers that are all
+   diagnostics (page-guard watchpoints and a crash reporter) plus the null
+   backend's Win32 window, none of which a first Mac boot needs. Its build
+   graph is the real precondition: it builds against its own vendored copy of
+   the toolkit, which has no `runtime/platform/` and no Metal backend, so it
+   has to be pointed at this tree first.
 
 3. **Time on the hardware.** Everything above is proven on GitHub's arm64
    runners. The 30-minute soaks, the frame-rate numbers and the memory-model
@@ -103,13 +114,24 @@ What is left, in order:
   the LOD bias in `SET_TEXTURE_FILTER` (Metal has no sampler-side bias, so it
   means patching the sampling call in the fragment program), 3D textures, and
   `HILO_S8`'s signed channels.
-- **The production engine.** A seam under `rsx_live_draw.c`, or the vtable
-  backend growing its behaviour. The game-proven pieces to carry across are in
-  the Yakuza port's `rsx_live_draw.c`, `rsx_dispatch.c`, `rsx_gpu_mirror.c`
-  and `rsx_guest_pages.c`.
-
-Interim visibility before that lands: an SDL2 window that blits
-`rsx_live_draw_present_rgba()` frames, so a Mac boot is visible.
+- **The production engine.** Decided: no seam under `rsx_live_draw.c`.
+  Measured, that file is 6.8% D3D12 by line; the rest is engine logic,
+  diagnostics and one title's features. It grew by about 145 lines a day
+  upstream over the summer, and nothing in this repository initialises or
+  tests it, so a refactor of it could neither be validated here nor kept
+  merging. The macOS path gets a platform-neutral engine instead:
+  `rsx_draw_engine.c` implements `rsx_dispatch_sink` over the register-file
+  dispatcher `rsx_dispatch.c` already provides (portable, and already fed by
+  `cellGcmSys.c`'s FIFO walker) and drives the Metal backend through a
+  record-oriented interface. The game-proven logic is carried across from
+  `rsx_live_draw.c` one behaviour at a time, with its line numbers cited:
+  the address-keyed surface set seeded from guest memory, per-zeta depth,
+  surface aliasing on texture bind, depth-as-texture, the texture cache with
+  content-hash revalidation and eviction, restart cuts, the pipeline key,
+  buffered fragment constants, scissor, and the flip resolving a registered
+  display buffer. `rsx_live_draw.c` stays exactly as vendored and keeps
+  merging with upstream. Until the new path has parity with every host
+  check it is opt-in (`PS3RECOMP_RSX_ENGINE=dispatch`).
 
 ### 2. Bring up a title
 

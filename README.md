@@ -48,15 +48,19 @@ Verified by CI on every push unless noted.
 | Render backend | D3D12 | Metal | null (headless software) |
 | Runs a recompiled game | **yes** | **no** | no |
 
-macOS builds the runtime, renders through Metal — the guest's own vertex and
-fragment programs and its textures included — passes the full test suite,
-compiles the PPU boot scaffold — `ppu_loader.cpp`, `boot_main.cpp` and the HLE
-dispatch — at zero errors against the Win32 host layer in `runtime/platform/`,
-and runs the lv2 sync stress suite on Apple Silicon. What it cannot do yet is
-run a title: the production renderer (`rsx_live_draw.c`, the live NV4097 draw
-engine) is D3D12-only, and a game's own host code has to be brought up there.
-`ps3recomp_host` drives cellGcm → RSX → Metal end to end without a game, which
-is what makes that work possible. See `docs/MACOS_PORT.md`.
+macOS builds the runtime, renders through Metal (the guest's own vertex and
+fragment programs, its textures with mip chains and cube maps, depth and
+stencil, and its own colour surfaces with render-to-texture), passes the full
+test suite, and boots a synthetic title through the PPU scaffold:
+`ps3recomp_boot_smoke` loads an ELF, dispatches its entry through the HLE
+bridge and the lv2 syscalls, runs a guest thread, and flips three frames
+through the FIFO to Metal. The lv2 sync, fiber and Win32-layer suites run on
+Apple Silicon too. What it cannot do yet is run a real title: the production
+renderer (`rsx_live_draw.c`, the live NV4097 draw engine) is D3D12-only and its
+behaviour is being carried into a portable engine over the dispatcher, and a
+game's own host code has to be brought up there. `ps3recomp_host` drives
+cellGcm → RSX → Metal end to end without a game, which is what makes that work
+possible. See `docs/MACOS_PORT.md`.
 
 Linux builds and passes the same suites under both GCC and Clang, and runs
 `ps3recomp_host` end to end, on every push. Its backend is the null backend's

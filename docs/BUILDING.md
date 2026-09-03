@@ -268,9 +268,11 @@ which compile and *execute* lifted code — and then runs `ps3recomp_host`
 headlessly: the presented pixel must match the guest clear colour, an NV4097
 triangle must cover the centre pixel, a triangle drawn through a guest vertex
 program and a guest fragment program must come out the colour the fragment
-program computes, and a guest texture sampled by a guest program must come out
-the texture's colour. A green tick means the graphics bridge works, not merely
-that it compiled.
+program computes, a guest texture sampled by a guest program must come out
+the texture's colour, the depth test must order two triangles, a two-level
+texture must be sampled from its second level, and a triangle drawn into an
+offscreen surface must be what a later draw samples. A green tick means the
+graphics bridge works, not merely that it compiled.
 
 ```bash
 brew install ninja sdl2 glslang spirv-cross
@@ -279,7 +281,11 @@ cmake --build build
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --tex
+PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depth
+PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip
+PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --rtt
 ./build/test_shader_msl
+PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_boot_smoke build/smoke/smoke.elf
 ```
 
 glslang and spirv-cross are what turn the decompilers' HLSL into MSL
@@ -293,14 +299,16 @@ arm64 runner, and `tools/check_ppu_scaffold.py` compiles the PPU boot scaffold
 `darwin-clang`. The Win32 API those files were written against comes from
 `runtime/platform/` (see `docs/PLATFORM_ABSTRACTION.md`).
 
-**It cannot run a recompiled game yet.** What is missing is not the scaffold
-but what sits on either side of it: the production renderer
+**It cannot run a recompiled game yet.** The scaffold itself now links and
+runs: `ps3recomp_boot_smoke` boots a synthetic title through it on the Mac.
+What is missing sits on either side of it: the production renderer
 (`libs/video/rsx_live_draw.c`, the live NV4097 draw engine) is D3D12-only and
 compiles to a stub off Windows, while the Metal backend covers clear, flip,
-guest vertex and fragment programs and guest textures -- not yet depth and
-stencil, render targets, mip levels or cube maps; and a title's own host code
-has to be built and debugged on the platform. `docs/MACOS_PORT.md` has the
-status and the plan.
+guest programs, guest textures with mip chains and cube maps, depth and
+stencil and the guest's own colour surfaces -- its behaviour is being carried
+into a portable engine over the dispatcher; and a title's own host code has to
+be built and debugged on the platform. `docs/MACOS_PORT.md` has the status and
+the plan.
 
 Apple Silicon specifics the tree already accounts for: 16 KB host pages (the
 VM sizes guard pages and protection changes in host pages), no unnamed POSIX
