@@ -308,12 +308,17 @@ static DWORD WINAPI cv_producer(LPVOID a)
     WakeConditionVariable(&g_cv);
     return 0;
 }
+/* Readers hold the shared lock until told to let go, rather than for a fixed
+ * time: on a loaded runner the main thread's own sleep can outlast any hold
+ * time a reader picks, and the writer's failed try then passes for the wrong
+ * reason. The main thread waits for both readers to be inside first. */
+static HANDLE g_readers_go;
 static DWORD WINAPI reader(LPVOID a)
 {
     (void)a;
     AcquireSRWLockShared(&g_srw);
     InterlockedIncrement(&g_readers_in);
-    Sleep(120);
+    WaitForSingleObject(g_readers_go, 5000);
     ReleaseSRWLockShared(&g_srw);
     return 0;
 }
@@ -352,12 +357,16 @@ static void test_srw_and_cv(void)
 
     /* two readers overlap; a writer cannot get in while they hold it */
     HANDLE rs[2];
+    g_readers_go = CreateEventA(NULL, TRUE, FALSE, NULL);          /* manual-reset */
+    CHECK(g_readers_go != NULL);
     for (int i = 0; i < 2; i++) rs[i] = CreateThread(NULL, 0, reader, NULL, 0, NULL);
-    Sleep(60);
+    for (int spins = 0; g_readers_in != 2 && spins < 5000; spins++) Sleep(1);
     CHECK(g_readers_in == 2);
     CHECK(!TryAcquireSRWLockExclusive(&g_srw));
     CHECK(TryAcquireSRWLockShared(&g_srw)); ReleaseSRWLockShared(&g_srw);
+    SetEvent(g_readers_go);
     CHECK(WaitForMultipleObjects(2, rs, TRUE, 5000) == WAIT_OBJECT_0);
+    CloseHandle(g_readers_go);
     CHECK(TryAcquireSRWLockExclusive(&g_srw)); ReleaseSRWLockExclusive(&g_srw);
     for (int i = 0; i < 2; i++) CloseHandle(rs[i]);
 }
