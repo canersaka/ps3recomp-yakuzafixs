@@ -54,6 +54,7 @@
 #else
 
 #include <pthread.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -64,6 +65,7 @@
 #include <unistd.h>
 #include <sched.h>
 #include <wchar.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 
 #ifdef __cplusplus
@@ -181,9 +183,13 @@ typedef struct {
 #define STILL_ACTIVE           259u
 
 #define ERROR_SUCCESS          0u
+#define ERROR_PATH_NOT_FOUND   3u
+#define ERROR_ACCESS_DENIED    5u
 #define ERROR_INVALID_HANDLE   6u
 #define ERROR_NOT_ENOUGH_MEMORY 8u
+#define ERROR_GEN_FAILURE      31u
 #define ERROR_INVALID_PARAMETER 87u
+#define ERROR_ALREADY_EXISTS   183u
 #define ERROR_TIMEOUT          1460u
 #define TIMERR_NOERROR         0u
 
@@ -1152,6 +1158,77 @@ static inline DWORD GetEnvironmentVariableA(LPCSTR name, LPSTR buf, DWORD size)
     memcpy(buf, v, n + 1);
     return (DWORD)n;
 }
+
+/* mkdir, wearing Win32's answer to a directory that is already there: the call
+ * FAILS and GetLastError says ERROR_ALREADY_EXISTS. That distinction is the
+ * whole reason this is not just mkdir at the call site -- code that creates its
+ * own dump or cache directory calls unconditionally and tests for exactly that
+ * error, and a shim that returned TRUE would also swallow a permission failure.
+ * The security-descriptor argument has no POSIX counterpart and is ignored;
+ * 0777 leaves the final mode to the caller's umask.
+ *
+ * Separators are NOT translated. A backslash is an ordinary filename character
+ * here, so a Win32-spelt "scratch\\dump" makes one oddly named directory rather
+ * than two nested ones. Translating would guess at which backslashes were meant
+ * as separators in a name that is allowed to contain them; the call site is
+ * what has to spell the path portably. */
+static inline BOOL CreateDirectoryA(LPCSTR path, void* security_attributes)
+{
+    (void)security_attributes;
+    if (!path) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    if (mkdir(path, 0777) == 0) return TRUE;
+    switch (errno) {
+    case EEXIST:  SetLastError(ERROR_ALREADY_EXISTS); break;
+    case ENOENT:
+    case ENOTDIR: SetLastError(ERROR_PATH_NOT_FOUND); break;
+    case EACCES:
+    case EPERM:
+    case EROFS:   SetLastError(ERROR_ACCESS_DENIED);  break;
+    default:      SetLastError(ERROR_GEN_FAILURE);    break;
+    }
+    return FALSE;
+}
+
+/* Process information classes, of which exactly one is ever set here: a Win32
+ * runner opts out of EcoQoS with ProcessPowerThrottling so that backgrounding
+ * its window cannot throttle the scheduling its boot races depend on.
+ *
+ * Neither POSIX host has anything that corresponds. Darwin's equivalent knob is
+ * per-thread QoS, which the threads set for themselves through
+ * SetThreadPriority, and Linux has no such throttle to opt out of in the first
+ * place. So this succeeds and does nothing, deliberately: failing would push a
+ * caller down an error path over a facility that does not exist on this host
+ * and cannot be made to, and the things that DO move host scheduling -- the
+ * timer period, the priority class, thread priority -- are separate calls and
+ * are really implemented. Nothing is silently lost by the no-op that those
+ * three do not already cover. */
+typedef enum {
+    ProcessMemoryPriority,
+    ProcessMemoryExhaustionInfo,
+    ProcessAppMemoryInfo,
+    ProcessInPrivateInfo,
+    ProcessPowerThrottling,
+    ProcessReservedValue1,
+    ProcessTelemetryCoverageInfo,
+    ProcessProtectionLevelInfo,
+    ProcessLeapSecondInfo,
+    ProcessMachineTypeInfo,
+    ProcessInformationClassMax
+} PROCESS_INFORMATION_CLASS;
+
+#define PROCESS_POWER_THROTTLING_CURRENT_VERSION         1u
+#define PROCESS_POWER_THROTTLING_EXECUTION_SPEED         0x1u
+#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4u
+
+typedef struct {
+    ULONG Version;
+    ULONG ControlMask;
+    ULONG StateMask;
+} PROCESS_POWER_THROTTLING_STATE;
+
+static inline BOOL SetProcessInformation(HANDLE process, PROCESS_INFORMATION_CLASS cls,
+                                         LPVOID info, DWORD size)
+{ (void)process; (void)cls; (void)info; (void)size; return TRUE; }
 
 #ifdef __cplusplus
 } /* extern "C" */
