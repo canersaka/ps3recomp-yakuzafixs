@@ -17,6 +17,7 @@
  *   FP  TEX r0, TC0 unit 0 (END)           texture unit 0 sampled at texcoord0
  *   FP  TEX r0, TC0 unit 0, CUBE (END)     ... with unit 0 a cube map
  *   VP  MOV o0, v0 ; TXL o1, v8 (END)      a vertex texture sampled at t16
+ *   FP  MOV r0, COL0 ; MOV r2, COL0.zyxw   two colour targets: what --mrt runs
  *
  * Each program's HLSL is checked for what was meant before the MSL is looked
  * at, so a wrong bit in an encoder shows up as a decompiler-level failure
@@ -232,6 +233,34 @@ int main(int argc, char** argv)
             check("cube TEX FP MSL", g_msl, "texturecube");
             check("cube TEX FP MSL", g_msl, "[[texture(0)]]");
             check("cube TEX FP MSL", g_msl, "[[sampler(0)]]");
+        }
+    }
+
+    /* ---- fragment program writing TWO colour targets ---------------------
+     * MOV r0, COL0 ; MOV r2, COL0.zyxw (END). With 32-bit exports r0 is
+     * target A and r2 is target B, so the decompiler returns a struct of two
+     * SV_TARGETs rather than one value. What has to hold on the way out is
+     * that spirv-cross keeps them as [[color(0)]] and [[color(1)]] in that
+     * order: the backend attaches the guest's MRT set in the set's own order,
+     * and a pair that came back renumbered or collapsed would write the two
+     * planes to the wrong surfaces with nothing to say so. This is the
+     * program the host's --mrt mode draws with. */
+    {
+        u8 fp[32];
+        rsx_test_fp_mrt_col0(fp, RSX_TEST_FP_SWZ_IDENT, RSX_TEST_FP_SWZ(2, 1, 0, 3));
+        check_count("MRT FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
+                                                           g_hlsl, sizeof g_hlsl, NULL), 2);
+        check("MRT FP HLSL", g_hlsl, "float4 t0 : SV_TARGET0;");
+        check("MRT FP HLSL", g_hlsl, "float4 t1 : SV_TARGET1;");
+        check("MRT FP HLSL", g_hlsl, "PSOutput main(PSInput input) {");
+        check("MRT FP HLSL", g_hlsl, "r[0].xyzw = _v.xyzw;");
+        check("MRT FP HLSL", g_hlsl, "r[2].xyzw = _v.xyzw;");
+        check("MRT FP HLSL", g_hlsl, "(input.col0).zyxw");
+
+        if (translate("MRT FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
+            check("MRT FP MSL", g_msl, "fragment ");
+            check("MRT FP MSL", g_msl, "[[color(0)]]");
+            check("MRT FP MSL", g_msl, "[[color(1)]]");
         }
     }
 
