@@ -94,6 +94,7 @@ extern uint32_t ppu_vm_size;
 #define TEX_OFFSET  0x00020000u          /* RSX offset of our test texture    */
 #define FP_OFFSET   0x00030000u          /* RSX offset of our fragment programs */
 #define TFP_OFFSET  (FP_OFFSET + 0x1000u) /* ... the texturing one            */
+#define MFP_OFFSET  (FP_OFFSET + 0x2000u) /* ... and the two-target one       */
 #define TEX_W       4u
 #define TEX_H       4u
 #define TEX_ARGB    0xFF20C040u          /* what a textured pixel must read   */
@@ -125,6 +126,30 @@ extern uint32_t ppu_vm_size;
  * 1.0 and presents saturated red, and so does one that samples a zeta
  * nothing wrote -- one recognisable wrong answer rather than two. */
 #define DTEX_BACKING 0xFFFFFF00u
+/* --mrt: two offscreen colour surfaces for an MRT1 set (A and B), the size
+ * the guest clips them to, and the colour each one is drawn. One fragment
+ * program writes both -- r0 is target A and r2 is target B under 32-bit
+ * exports -- so the two surfaces come out different colours from a single
+ * draw, and the display pass samples one of them.
+ *
+ * Each of the three ways to get this wrong has its own colour. A renderer
+ * that uploads the guest bytes behind a surface instead of binding the one it
+ * rendered into presents the backing green, as in --rtt; one that attaches
+ * and clears the set but does not feed its second target presents the set's
+ * clear colour; and one that sampled the wrong member presents the other
+ * target's. */
+#define MRT_A_OFFSET 0x00140000u
+#define MRT_B_OFFSET 0x00180000u
+#define MRT_DIM      256u
+#define MRT_BACKING  0xFF00FF00u         /* green: neither target's colour  */
+#define MRT_A_ARGB   0xFFFF0000u         /* r0 <- COL0       (red)          */
+#define MRT_B_ARGB   0xFF0000FFu         /* r2 <- COL0.zyxw  (blue)         */
+/* The set's own clear colour, distinct from the frame's and from all three
+ * above. It is what an attached but unwritten target holds, and it has to be
+ * something rather than nothing: an unwritten surface on the vtable path
+ * reads as transparent black, and a zero pixel is what the harness cannot
+ * tell from a backend with no headless readback at all -- so it would pass. */
+#define MRT_CLEAR    0xFF804020u
 
 /* Functions the RSX side exports but does not declare in a public header. */
 extern void cellGcm_rsx_process_fifo(void);
@@ -242,6 +267,16 @@ static void upload_depthtex_backing(void)
 {
     for (uint32_t i = 0; i < DTEX_DIM * DTEX_DIM; i++)
         guest_w32(IO_ADDR + DTEX_OFFSET + i * 4u, DTEX_BACKING);
+}
+
+/* ...and for both members of --mrt's set, so neither surface can pass by
+ * holding what the CPU left there. */
+static void upload_mrt_backing(void)
+{
+    for (uint32_t i = 0; i < MRT_DIM * MRT_DIM; i++) {
+        guest_w32(IO_ADDR + MRT_A_OFFSET + i * 4u, MRT_BACKING);
+        guest_w32(IO_ADDR + MRT_B_OFFSET + i * 4u, MRT_BACKING);
+    }
 }
 
 /* The textured draw uses its own vertex block: two triangles covering the
@@ -412,15 +447,19 @@ static void upload_quad_geometry(void)
 
 /* The fragment programs live in guest memory, where SET_SHADER_PROGRAM points
  * the RSX at them, stored the way rsx_fp_read_word expects (big-endian,
- * half-words swapped). Each is one instruction, 16 bytes:
+ * half-words swapped):
  *   FP_OFFSET   MOV r0, COL0.zyxw ; END    (--shader: swaps red and blue)
  *   TFP_OFFSET  TEX r0, TC0 ; END          (--tex: samples unit 0 at texcoord0)
- * The unit test test_shader_msl decompiles exactly these words and checks
- * the HLSL reads (input.col0).zyxw and rsx_tex[0].Sample(rsx_samp[0], ...). */
+ *   MFP_OFFSET  MOV r0, COL0 ; MOV r2, COL0.zyxw ; END   (--mrt: two targets)
+ * The unit test test_shader_msl decompiles exactly these words and checks the
+ * HLSL reads (input.col0).zyxw, rsx_tex[0].Sample(rsx_samp[0], ...), and that
+ * the two-target one comes out as SV_TARGET0 and SV_TARGET1. */
 static void upload_fragment_programs(void)
 {
     rsx_test_fp_mov_r0_col0(vm_base + IO_ADDR + FP_OFFSET, RSX_TEST_FP_SWZ(2, 1, 0, 3));
     rsx_test_fp_tex_r0_tc0(vm_base + IO_ADDR + TFP_OFFSET, 0);
+    rsx_test_fp_mrt_col0(vm_base + IO_ADDR + MFP_OFFSET,
+                         RSX_TEST_FP_SWZ_IDENT, RSX_TEST_FP_SWZ(2, 1, 0, 3));
 }
 
 /* Load a vertex program and select a fragment program the way a title does.
@@ -564,6 +603,68 @@ static void emit_rtt_draws(void)
     emit(NV4097_SET_SURFACE_CLIP_HORIZONTAL, 1280u << 16);
     emit(NV4097_SET_SURFACE_CLIP_VERTICAL,   720u << 16);
     emit_textured_draw_at(RTT_OFFSET, RTT_DIM, RTT_DIM);
+}
+
+/* Declare an MRT1 set, write both of its members from ONE draw, then sample
+ * one of them -- which is what a deferred renderer's G-buffer pass is.
+ *
+ * Colour targets A and B move to two offsets no display buffer was registered
+ * at, both in main memory (each member of a set has its own context DMA, and
+ * the draw engine keys surfaces by location as well as offset, so B's has to
+ * be said as plainly as A's). SET_SURFACE_COLOR_TARGET then names MRT1, so
+ * the pass has two attachments.
+ *
+ * The draw runs the passthrough vertex program and MOV r0, COL0 ; MOV r2,
+ * COL0.zyxw. With 32-bit exports r0 is target A and r2 is target B, so one
+ * red triangle fills A with red and B with blue. Nothing else in the mode
+ * produces blue: the vertices are red, the quad's are green, and so are the
+ * guest bytes behind both surfaces.
+ *
+ * Then target A goes back to display buffer 0, the set goes back to one
+ * target, and the full-screen quad samples ONE of the two through TEX r0,
+ * TC0. Which one is the caller's choice, because the harness reads a single
+ * centre pixel: --mrt samples B, which is the export that had nowhere to go
+ * until the decompiler grew a second SV_TARGET, and --mrt-a samples A, which
+ * is what says growing the struct did not disturb the first target. Sampling
+ * both in one frame would only assert whichever was drawn last. */
+static void emit_mrt_draws(int sample_b)
+{
+    emit(NV4097_SET_CONTEXT_DMA_COLOR_A,     CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER);
+    emit(NV4097_SET_CONTEXT_DMA_COLOR_B,     CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER);
+    emit(NV4097_SET_SURFACE_COLOR_AOFFSET,   MRT_A_OFFSET);
+    emit(NV4097_SET_SURFACE_COLOR_BOFFSET,   MRT_B_OFFSET);
+    emit(NV4097_SET_SURFACE_COLOR_TARGET,    CELL_GCM_SURFACE_TARGET_MRT1);
+    emit(NV4097_SET_SURFACE_CLIP_HORIZONTAL, MRT_DIM << 16);
+    emit(NV4097_SET_SURFACE_CLIP_VERTICAL,   MRT_DIM << 16);
+
+    /* Clear the set, which is one clear per target on both paths, before
+     * anything draws into it. That is what a G-buffer pass does, and it is
+     * also what gives an unwritten target a colour of its own to be caught
+     * holding. */
+    emit(NV4097_SET_COLOR_CLEAR_VALUE, MRT_CLEAR);
+    emit(NV4097_CLEAR_SURFACE,         0xF0u);
+
+    u8 vp[32];
+    rsx_test_vp_mov_out(vp +  0, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);   /* MOV o0, v0      */
+    rsx_test_vp_mov_out(vp + 16, 3, RSX_TEST_VP_SWZ_IDENT, 1, 1);   /* MOV o1, v3, END */
+    emit_programs(vp, sizeof vp, MFP_OFFSET);
+    emit_triangle_draw();
+
+    emit(NV4097_SET_CONTEXT_DMA_COLOR_A,     CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER);
+    emit(NV4097_SET_SURFACE_COLOR_AOFFSET,   0u);
+    emit(NV4097_SET_SURFACE_COLOR_TARGET,    CELL_GCM_SURFACE_TARGET_0);
+    emit(NV4097_SET_SURFACE_CLIP_HORIZONTAL, 1280u << 16);
+    emit(NV4097_SET_SURFACE_CLIP_VERTICAL,   720u << 16);
+    /* The frame's own clear, which every other mode emits before its draws.
+     * It has to come after the offscreen pass here rather than before it: the
+     * draw engine folds a RUN of clears into one pass's load actions, and a
+     * run naming surfaces of different sizes is one it cannot open, so a
+     * display clear sitting immediately in front of the set's would take the
+     * set's down with it. A title clears each target set as it binds it,
+     * which is what this is. */
+    emit(NV4097_SET_COLOR_CLEAR_VALUE, CLEAR_ARGB);
+    emit(NV4097_CLEAR_SURFACE,         0xF0u);
+    emit_textured_draw_at(sample_b ? MRT_B_OFFSET : MRT_A_OFFSET, MRT_DIM, MRT_DIM);
 }
 
 /* Write a depth buffer of the guest's own, then sample it -- the two halves
@@ -728,18 +829,25 @@ static void emit_quad_draws(void)
  * overwrite the last one. */
 static void submit_frame(int with_draw)
 {
-    emit(NV4097_SET_COLOR_CLEAR_VALUE, CLEAR_ARGB);
-    if (with_draw == 4) {
-        /* CLEAR_SURFACE bits: 0x01 depth, 0x02 stencil, 0xF0 the four colour
-         * channels. ZSTENCIL_CLEAR_VALUE is Z24S8, so 0xFFFFFF00 is depth 1.0
-         * and stencil 0 -- the nv40 reset values, and what a title writes
-         * before drawing an opaque scene. */
-        emit(NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0xFFFFFF00u);
-        emit(NV4097_CLEAR_SURFACE,            0xF3u);
-    } else {
-        emit(NV4097_CLEAR_SURFACE,            0xF0u);
+    /* The MRT modes clear twice, once per target set, and emit both clears
+     * themselves so the display's lands after the offscreen pass rather than
+     * in front of it. */
+    if (with_draw != 9 && with_draw != 10) {
+        emit(NV4097_SET_COLOR_CLEAR_VALUE, CLEAR_ARGB);
+        if (with_draw == 4) {
+            /* CLEAR_SURFACE bits: 0x01 depth, 0x02 stencil, 0xF0 the four
+             * colour channels. ZSTENCIL_CLEAR_VALUE is Z24S8, so 0xFFFFFF00
+             * is depth 1.0 and stencil 0 -- the nv40 reset values, and what a
+             * title writes before drawing an opaque scene. */
+            emit(NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0xFFFFFF00u);
+            emit(NV4097_CLEAR_SURFACE,            0xF3u);
+        } else {
+            emit(NV4097_CLEAR_SURFACE,            0xF0u);
+        }
     }
-    if (with_draw == 8)      emit_depthtex_draws();
+    if (with_draw == 10)     emit_mrt_draws(0);
+    else if (with_draw == 9) emit_mrt_draws(1);
+    else if (with_draw == 8) emit_depthtex_draws();
     else if (with_draw == 7) emit_quad_draws();
     else if (with_draw == 6) emit_rtt_draws();
     else if (with_draw == 5) emit_mip_draw();
@@ -946,7 +1054,8 @@ static int run_audio_pad_check(void)
  * software path, which is why Linux runs that mode and not these. */
 static int mode_needs_translator(int mode)
 {
-    return mode == 3 || mode == 5 || mode == 6 || mode == 8;
+    return mode == 3 || mode == 5 || mode == 6 || mode == 8 ||
+           mode == 9 || mode == 10;
 }
 
 /* ...and which ones must, on a backend that has a translator, have run the
@@ -963,6 +1072,8 @@ static const char* mode_flag_name(int mode)
     case 5:  return "--mip";
     case 6:  return "--rtt";
     case 8:  return "--depthtex";
+    case 9:  return "--mrt";
+    case 10: return "--mrt-a";
     default: return "(mode)";
     }
 }
@@ -1025,6 +1136,14 @@ int main(int argc, char** argv)
          * tracks a zeta per address and can publish one as a texture; the
          * vtable path does not, so this mode is the draw engine's. */
         else if (strcmp(argv[i], "--depthtex") == 0) do_draw = 8;
+        /* --mrt: declare an MRT1 set and fill both of its members from one
+         * draw, with a fragment program that writes r0 and r2. That is a
+         * deferred renderer's G-buffer pass, and the second target is the one
+         * nothing wrote until the fragment decompiler grew a second
+         * SV_TARGET. --mrt samples target B on the display; --mrt-a samples
+         * target A, since a centre-pixel readback can only speak for one. */
+        else if (strcmp(argv[i], "--mrt") == 0)   do_draw = 9;
+        else if (strcmp(argv[i], "--mrt-a") == 0) do_draw = 10;
     }
     /* The guest-program modes, which a backend without a translator cannot
      * run. --depth and --quads are not among them: both are fixed-function. */
@@ -1066,6 +1185,13 @@ int main(int argc, char** argv)
         upload_depthtex_triangle();
         upload_textured_quad();
         upload_depthtex_backing();
+    }
+    /* --mrt draws both halves as well: the triangle into the set, the quad
+     * out of one of its members. */
+    if (do_draw == 9 || do_draw == 10) {
+        upload_triangle();
+        upload_textured_quad();
+        upload_mrt_backing();
     }
     if (mode_runs_guest_programs(do_draw)) upload_fragment_programs();
     submit_frame(do_draw);
@@ -1112,9 +1238,16 @@ int main(int argc, char** argv)
          * green. With --depthtex it is the DEPTH the first pass wrote, come
          * back through a sampler into the red channel: a zeta nothing wrote,
          * or the guest bytes behind its address, both read 1.0 and present
-         * saturated red instead.
+         * saturated red instead. With --mrt it is target B's blue and with
+         * --mrt-a target A's red, both written by one draw through an MRT1
+         * set: MRT_CLEAR means the target was attached and cleared but never
+         * fed, which is what a dropped second colour export looks like from
+         * here, and MRT_BACKING means the guest bytes behind the surface were
+         * sampled instead of the surface itself.
          */
-        u32 want = (do_draw == 8) ? DTEX_ARGB     /* the sampled depth as a byte */
+        u32 want = (do_draw == 10) ? MRT_A_ARGB
+                 : (do_draw == 9) ? MRT_B_ARGB
+                 : (do_draw == 8) ? DTEX_ARGB     /* the sampled depth as a byte */
                  : (do_draw == 7) ? 0xFFFF0000u   /* the quad strip over the polygon */
                  : (do_draw == 6) ? 0xFFFF0000u   /* only the surface holds red  */
                  : (do_draw == 5) ? MIP_L1_ARGB
