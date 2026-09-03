@@ -28,7 +28,7 @@
 #include "sys_event.h"
 
 #include <stdio.h>
-#include <string.h>
+#include <string.h>
 #include "../platform/win32_compat.h"   /* QueryPerformanceCounter shim for the SPU_SPEED timing */
 
 /* ---------------------------------------------------------------------------
@@ -1502,6 +1502,32 @@ static int64_t sys_spu_image_open_handler(ppu_context* ctx)
     return 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * Process control
+ *
+ * sys_process_exit is how a guest ends its process when it is not linked
+ * against the sysPrxForUser wrapper -- a bare-metal or PSL1GHT-style image
+ * issues `sc` with r11 = 3 and nothing else. That number was never registered,
+ * so it fell through to the catch-all stub in lv2_syscall(), which logs
+ * "lv2_syscall 3 (stub)" and returns CELL_OK: the guest was told its own exit
+ * succeeded and carried on executing past it. Route both process syscalls at
+ * the same implementation the import path uses.
+ * -----------------------------------------------------------------------*/
+extern void sys_process_exit(int32_t exitcode);   /* libs/system/sysPrxForUser.c */
+extern int32_t sys_process_getpid(void);
+
+static int64_t sys_process_exit_handler(ppu_context* ctx)
+{
+    sys_process_exit((int32_t)ctx->gpr[3]);   /* does not return */
+    return 0;
+}
+
+static int64_t sys_process_getpid_handler(ppu_context* ctx)
+{
+    ctx->gpr[3] = (uint64_t)(uint32_t)sys_process_getpid();
+    return (int64_t)(int32_t)ctx->gpr[3];
+}
+
 /* Catch-all stub for SPU syscalls we don't model individually yet. */
 static int64_t sys_spu_thread_stub(ppu_context* ctx)
 {
@@ -1514,6 +1540,10 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
 {
     /* Initialize the table with unimplemented stubs first */
     lv2_syscall_table_init(tbl);
+
+    /* Process control */
+    lv2_syscall_register(tbl, SYS_PROCESS_GETPID, sys_process_getpid_handler);
+    lv2_syscall_register(tbl, SYS_PROCESS_EXIT,   sys_process_exit_handler);
 
     /* Thread management */
     sys_ppu_thread_init(tbl);
