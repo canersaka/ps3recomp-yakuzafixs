@@ -197,8 +197,10 @@ int64_t sys_rwlock_wlock(ppu_context* ctx)
     r->writer_tid = ctx->thread_id;
 #else
     /* pthread_rwlock_wrlock by the thread that already holds the lock is
-     * undefined behaviour, and Darwin's implementation blocks forever on it.
-     * Answer EDEADLK before touching the lock, as the Win32 branch does. */
+     * undefined behaviour. Darwin's libpthread does not block or report it,
+     * it returns 0, which is worse: the guest is told it took a second lock
+     * level that no unlock will ever match. Answer EDEADLK before touching
+     * the lock, as the Win32 branch does. */
     if (rwlock_writer(r) == ctx->thread_id)
         return (int64_t)(int32_t)CELL_EDEADLK;
     pthread_rwlock_wrlock(&r->rwl);
