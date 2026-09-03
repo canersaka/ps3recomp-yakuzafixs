@@ -208,8 +208,16 @@ static void stub_clear_ds(void* u, u32 d, u32 f, float z, u8 s)
 
 static void stub_present(void* u, u32 s) { (void)u; (void)s; stub.n_present++; }
 
-static void stub_readback(void* u, u32 s, void* out, u32 pitch)
-{ (void)u; (void)s; (void)out; (void)pitch; }
+/* One pixel of a surface, in the R,G,B,A order rsx_texture_decode produces:
+ * the readback hook has to put those back into the guest's A8R8G8B8. */
+static u8 g_stub_pixel[4] = { 0x11, 0x22, 0x33, 0x44 };
+
+static void stub_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
+                          void* out, u32 pitch)
+{
+    (void)u; (void)s; (void)x; (void)y; (void)pitch;
+    if (w == 1 && h == 1) memcpy(out, g_stub_pixel, 4);
+}
 
 static const rsx_draw_backend g_stub_backend = {
     .user = NULL,
@@ -696,6 +704,21 @@ static void test_scissor(void)
     engine_down();
 }
 
+/* ---- 8. the presented pixel ---------------------------------------------- */
+
+static void test_readback(void)
+{
+    printf("-- readback\n");
+    engine_up();
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    rsx_draw_engine_present();
+    CHECK(stub.n_present == 1, "the flip presented a surface");
+    CHECK(rsx_draw_engine_readback_center() == 0x44112233u,
+          "the presented pixel comes back as A8R8G8B8 (0x%08X)",
+          rsx_draw_engine_readback_center());
+    engine_down();
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -715,6 +738,7 @@ int main(void)
     test_restart_expansion();
     test_indexed_draws();
     test_scissor();
+    test_readback();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",
