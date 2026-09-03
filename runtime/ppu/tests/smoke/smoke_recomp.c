@@ -102,6 +102,7 @@ extern unsigned int cellGcm_flip_request_count(void);
 
 #define SMOKE_OPD_ENTRY     (SMOKE_DATA_BASE + 0x0000u)   /* e_entry */
 #define SMOKE_OPD_THREAD    (SMOKE_DATA_BASE + 0x0008u)   /* thread body */
+#define SMOKE_OPD_VBLANK    (SMOKE_DATA_BASE + 0x0040u)   /* vblank handler */
 #define SMOKE_STRTAB        (SMOKE_DATA_BASE + 0x0100u)
 #define SMOKE_STR_STRIDE    0x60u
 #define SMOKE_THREAD_NAME   (SMOKE_DATA_BASE + 0x0E00u)
@@ -144,6 +145,7 @@ extern unsigned int cellGcm_flip_request_count(void);
 #define NID_cellGcmGetControlRegister 0xA547ADDEu
 #define NID_cellGcmSetFlipCommand     0x5C770579u
 #define NID_cellGcmGetFlipStatus      0x72A577CEu
+#define NID_cellGcmSetVBlankHandler   0xA91B0402u
 #define NID_sys_process_exit          0xE6F2C1E7u
 
 /* cellGcmSys.h's flip states. */
@@ -174,6 +176,7 @@ enum {
     SMOKE_STEP_FRAME_1,
     SMOKE_STEP_FRAME_2,
     SMOKE_STEP_FRAME_3,
+    SMOKE_STEP_VBLANK,
     SMOKE_STEP_EXIT,
     SMOKE_STEP_COUNT
 };
@@ -210,6 +213,12 @@ static void smoke_check(int ok, const char* what)
 static unsigned long g_main_host_tid;
 static unsigned long g_body_host_tid;
 static uint32_t      g_body_arg;
+
+/* What the vblank handler saw: how many times it ran, on which host thread,
+ * and the count the runtime handed it in r3. */
+static atomic_uint   g_vblank_calls;
+static unsigned long g_vblank_host_tid;
+static uint32_t      g_vblank_last_count;
 
 /* ---------------------------------------------------------------------------
  * Guest helpers
@@ -277,6 +286,21 @@ void func_00010500(ppu_context* ctx) { ps3_hle_call(NID_cellGcmSetFlipCommand, c
 void func_00010600(ppu_context* ctx) { ps3_hle_call(NID_cellGcmGetFlipStatus, ctx); return; }
 void func_00010700(ppu_context* ctx) { ps3_hle_call(NID_sys_process_exit, ctx); return; }
 
+/* The vblank handler the guest registers, which is what a title's frame
+ * pacing hangs off. The harness's clock marks a beat pending from its own
+ * thread; the runtime delivers it here, on the guest thread, at the next HLE
+ * boundary, so this runs nested inside one of the status polls in the frame
+ * loop, in a scratch context whose r3 is the vblank count. It records what it
+ * saw and returns; a handler that called back into the runtime would be
+ * testing something else. */
+void func_00010800(ppu_context* ctx)
+{
+    g_vblank_last_count = (uint32_t)ctx->gpr[3];
+    g_vblank_host_tid   = (unsigned long)GetCurrentThreadId();
+    atomic_fetch_add(&g_vblank_calls, 1u);
+}
+void func_00010900(ppu_context* ctx) { ps3_hle_call(NID_cellGcmSetVBlankHandler, ctx); return; }
+
 /* ---------------------------------------------------------------------------
  * The verdict.
  *
@@ -287,7 +311,7 @@ void func_00010700(ppu_context* ctx) { ps3_hle_call(NID_sys_process_exit, ctx); 
  * -----------------------------------------------------------------------*/
 static const char* const k_step_name[SMOKE_STEP_COUNT] = {
     "entry", "image", "hle", "thread-create", "thread-body",
-    "thread-join", "frame-1", "frame-2", "frame-3", "exit",
+    "thread-join", "frame-1", "frame-2", "frame-3", "vblank", "exit",
 };
 
 static void smoke_verify(void)
@@ -337,6 +361,24 @@ static void smoke_verify(void)
         printf("[smoke] FAIL: the backend presented %u frame(s), expected %d\n",
                frames, SMOKE_FRAMES);
         ok = 0;
+    }
+
+    /* The vblank handler: delivered on the guest thread, with the count. */
+    {
+        unsigned calls = atomic_load(&g_vblank_calls);
+        printf("[smoke] vblank handler: %u call(s), last count %u, host thread %lu\n",
+               calls, g_vblank_last_count, g_vblank_host_tid);
+        if (!calls) {
+            printf("[smoke] FAIL: the guest's vblank handler never ran\n");
+            ok = 0;
+        } else if (g_vblank_host_tid != g_main_host_tid) {
+            printf("[smoke] FAIL: the vblank handler ran on host thread %lu, not the guest's %lu\n",
+                   g_vblank_host_tid, g_main_host_tid);
+            ok = 0;
+        } else if (!g_vblank_last_count) {
+            printf("[smoke] FAIL: the vblank handler was handed count 0\n");
+            ok = 0;
+        }
     }
 
     /* The chosen exit status made it through sys_process_exit. */
@@ -483,6 +525,12 @@ void func_00010000(ppu_context* ctx)
     ctrl = (uint32_t)ctx->gpr[3];
     smoke_check(ctrl != 0, "cellGcmGetControlRegister returned null");
 
+    /* Register the vblank handler before the first frame: the frame loop's
+     * status polls are the HLE boundaries the runtime delivers it at. The
+     * argument is the handler's OPD, as a title passes it. */
+    ctx->gpr[3] = SMOKE_OPD_VBLANK;
+    func_00010900(ctx); DRAIN_TRAMPOLINE(ctx);
+
     /* Three frames. Each one appends its commands to the ring, publishes put,
      * asks for a flip and waits for the flip to complete -- the shape of a
      * title's frame loop, and the reason the harness's frame clock has to be
@@ -522,6 +570,21 @@ void func_00010000(ppu_context* ctx)
         smoke_check(vm_read32(ctrl + 4) == g_fifo_len,
                     "the RSX never drained the guest's command stream (get != put)");
     }
+
+    /* The vblank handler ran. Three frames of polling is normally beats
+     * enough, and the poll is itself the boundary that delivers a pending
+     * one, so keep polling, bounded, until it has. The verdict checks what
+     * the handler recorded: that it ran on this thread with a count in r3. */
+    {
+        int waited;
+        for (waited = 0; waited < 2000; waited++) {
+            if (atomic_load(&g_vblank_calls) != 0) break;
+            func_00010600(ctx); DRAIN_TRAMPOLINE(ctx);
+            smoke_usleep(ctx, 1000);
+        }
+        if (waited >= 2000) smoke_fail("the guest's vblank handler never ran");
+    }
+    smoke_mark(ctx, SMOKE_STEP_VBLANK);
 
     /* A flip reads as done the moment the clock ticks it; the backend presents
      * it a step later on the clock's own thread. A guest that exits in that
@@ -566,6 +629,8 @@ const func_entry function_table[] = {
     { 0x00010500ULL, func_00010500, "func_00010500" },
     { 0x00010600ULL, func_00010600, "func_00010600" },
     { 0x00010700ULL, func_00010700, "func_00010700" },
+    { 0x00010800ULL, func_00010800, "func_00010800" },
+    { 0x00010900ULL, func_00010900, "func_00010900" },
     { 0, NULL, NULL }
 };
-const uint64_t function_table_count = 8;
+const uint64_t function_table_count = 10;
