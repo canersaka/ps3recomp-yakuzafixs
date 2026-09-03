@@ -599,7 +599,19 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     case SPU_WrDec:          ctx->decrementer = v;
                              ctx->dec_base_ns = spu_host_ns();              break;
     case SPU_WrEventMask:    ctx->event_mask = v;                           break; /* WrEventMask */
-    case SPU_WrEventAck:     ctx->event_status &= ~v;                       break;
+    case SPU_WrEventAck:
+        /* Under the lock-line lock, because every producer of the LR bit sets
+         * it under that lock: the PPU coherent store, and a peer SPU's PUTLLC,
+         * PUTLLUC or plain PUT. A bare read-modify-write here can read
+         * event_status, have a concurrent |= SPU_EVENT_LR land in between, and
+         * write the stale value back. The edge is then gone, and an SPU that
+         * has just acknowledged the events it read goes back to sleep believing
+         * it still holds a reservation it has already lost, which is the parked
+         * SPURS kernel this whole mechanism exists to wake. */
+        spu_lockline_lock();
+        ctx->event_status &= ~v;
+        spu_lockline_unlock();
+        break;
     case SPU_WrSRR0:         ctx->srr0 = v;                                 break;
     default:
         /* Unknown / unhandled channel write -- ignore (matches a no-op SPU). */

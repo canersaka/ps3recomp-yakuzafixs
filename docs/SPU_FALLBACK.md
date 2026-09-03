@@ -282,9 +282,11 @@ Both writers do it. The PPU store paths consult the reserved-line bitmap and
 notify under the lock-line lock. On the SPU side a committing `PUTLLC`, a
 `PUTLLUC` and a plain DMA `PUT` into a reserved line notify the same way, from
 inside the same lock: five SPURS kernel threads share one management line, so
-another SPU is usually the processor doing the writing. A fallback needs
-nothing for any of this, because its guest writes go through `vm_write*` and
-those are already the coherent paths.
+another SPU is usually the processor doing the writing. `SPU_WrEventAck` takes
+the same lock across its read-modify-write of the event word, so a raise that
+lands between the read and the write is kept rather than overwritten. A
+fallback needs nothing for any of this, because its guest writes go through
+`vm_write*` and those are already the coherent paths.
 
 Three parts of the reference implementation are deliberately left out: the
 per-line write generation counter, the `GETLLAR` path that serves a cached copy

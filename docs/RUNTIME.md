@@ -408,13 +408,15 @@ An SPU is the other writer, and it reaches the same `spu_coh_notify_write`. This
 
 The two atomic writers differ in what they do about the writer's own reservation. `PUTLLC` drops it before notifying, so the committer takes no event: hardware consumes a reservation on a successful commit rather than reporting it lost. `PUTLLUC` is unconditional and made no compare, so it invalidates every reservation on the line including its own and the issuer is told along with everyone else.
 
+`SPU_WrEventAck` takes the lock-line lock across its own read-modify-write, for the same reason. Every producer of the LR bit sets it under that lock, so an acknowledge that read `event_status`, had a raise land, and wrote the stale value back would erase the edge. The SPU then goes back to sleep believing it still holds a reservation it has already lost, which is precisely the parked kernel the notify exists to wake.
+
 `spu_coh_is_reserved` reads a global that stays zero until an SPU reserves its first line, so a title that runs no SPU code pays one predictable branch per store and never touches the bitmap.
 
 `g_spu_lr_raise` counts the events delivered. A SPURS service that never wakes with that counter at zero is a coherence miss; nonzero moves the question downstream to selection and dispatch.
 
 Three pieces of the reference implementation this was mirrored from are deliberately absent: the per-line write generation counter, the `GETLLAR` path that serves a cached copy of the line instead of re-reading it, and the backoff ladder on a repeated same-line `GETLLAR`. They are one mechanism in three parts. The backoff exists to get a spinning SPU off the lock-line lock; skipping the re-read is what makes the backoff cheap; and the generation counter exists so a `GETLLAR` that skipped the re-read can still tell that the line moved while nobody held a reservation. Here `GETLLAR` always re-reads memory under the lock, which is what the first macOS boot measured SPURS dispatch working on, so that re-read already carries the edge and there is nothing for a generation to recover. If a backoff is ever added, all three come back together.
 
-Covered by `runtime/spu/tests/test_spu_coherency.c`, which drives the real PPU store path, and `runtime/spu/tests/test_spu_lockline_peer.c`, which drives the real SPU command path for the commit, the unconditional store and the plain PUT. Both assert the event fires and both assert it stays quiet in the not-reserved and different-line cases, because a notify that fires too eagerly is a livelock rather than a safe over-approximation.
+Covered by `runtime/spu/tests/test_spu_coherency.c`, which drives the real PPU store path, and `runtime/spu/tests/test_spu_lockline_peer.c`, which drives the real SPU command path for the commit, the unconditional store and the plain PUT, and builds the acknowledge-against-a-raise interleaving out of the lock rather than racing for it. Both assert the event fires and both assert it stays quiet in the not-reserved and different-line cases, because a notify that fires too eagerly is a livelock rather than a safe over-approximation.
 
 ---
 
