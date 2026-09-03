@@ -14,6 +14,7 @@
 
 #include "spu_dma.h"
 #include "../platform/win32_compat.h"
+#include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
@@ -236,20 +237,12 @@ static mfc_engine* mfc_for(spu_context* ctx)
  * ===========================================================================*/
 extern uint8_t* vm_base;
 
-/* Global spinlock guarding all atomic line ops. _InterlockedExchange is a
- * clang-cl/MSVC intrinsic (no runtime library symbol needed); elsewhere use the
- * C11 equivalent, which lowers to the same LL/SC or lock-xchg on every target. */
-#if defined(_MSC_VER)
-#include <intrin.h>
-static volatile long g_resv_lock = 0;
-static void resv_lock(void)   { while (_InterlockedExchange(&g_resv_lock, 1)) { } }
-static void resv_unlock(void) { _InterlockedExchange(&g_resv_lock, 0); }
-#else
-#include <stdatomic.h>
-static atomic_flag g_resv_lock = ATOMIC_FLAG_INIT;
-static void resv_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_resv_lock, memory_order_acquire)) { } }
-static void resv_unlock(void) { atomic_flag_clear_explicit(&g_resv_lock, memory_order_release); }
-#endif
+/* The spinlock guarding all atomic line ops now lives in spu_coherency.c as
+ * spu_lockline_lock/unlock. It used to be a file-static here, which serialized
+ * SPU against SPU but left the PPU free to store into a line in the middle of
+ * a PUTLLC's compare-and-commit -- the update the SPU was about to make would
+ * be written over, and the SPU would never learn the line had changed. Same
+ * lock, same critical sections, now shared with the PPU store paths. */
 
 /* Total PUTLLC attempts (all SPUs). The PM flow trace (spurs_policy.c) reads
  * the delta across one policy run to find the run that performed a claim. */
@@ -404,11 +397,15 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * peer that must WRITE the line waits for it (canersaka ticks the
          * GETLLAR fast+slow paths for exactly this reason). */
         yz_lockstep_tick(ctx);
-        resv_lock();
+        spu_lockline_lock();
+        /* Tell the PPU store paths this line is live, so a store into it goes
+         * through the lock and raises SPU_EVENT_LR here instead of landing
+         * unannounced. Nothing else about this transaction changes. */
+        spu_coh_reserve(ctx, ea);
         memcpy(ls, mem, MFC_ATOMIC_LINE);              /* line -> local store */
         memcpy(ctx->resv_line, mem, MFC_ATOMIC_LINE);  /* snapshot for compare */
         ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 0;
-        resv_unlock();
+        spu_lockline_unlock();
         return 1;
 
     case MFC_PUTLLC_CMD:
@@ -416,7 +413,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
           if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
-        resv_lock();
+        spu_lockline_lock();
         if (ctx->resv_valid && ctx->resv_ea == ea &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
@@ -440,15 +437,15 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
               }
           } }
         ctx->resv_valid = 0;                           /* reservation consumed */
-        resv_unlock();
+        spu_lockline_unlock();
         return 1;
 
     case MFC_PUTLLUC_CMD:
     case MFC_PUTQLLUC_CMD:
-        resv_lock();
+        spu_lockline_lock();
         memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
         ctx->resv_valid = 0; ctx->atomic_stat = 0;
-        resv_unlock();
+        spu_lockline_unlock();
         return 1;
 
     default:
