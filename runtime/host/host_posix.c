@@ -82,6 +82,13 @@ uint8_t* vm_base = NULL;
 #define MIP_H       64u
 #define MIP_L0_ARGB 0xFF3060A0u          /* level 0: must NOT be sampled      */
 #define MIP_L1_ARGB 0xFFC0F080u          /* level 1: what --mip must read     */
+/* --rtt: an RSX offset in the IO window that cellGcmSetDisplayBuffer never
+ * registered, so a colour surface there is offscreen, and the size the guest
+ * clips it to. The backing colour is what guest memory at that offset holds,
+ * and it is deliberately not the colour the surface gets rendered. */
+#define RTT_OFFSET  0x00080000u
+#define RTT_DIM     256u
+#define RTT_BACKING 0xFF00FF00u          /* green, like the quad's vertices   */
 
 /* Functions the RSX side exports but does not declare in a public header. */
 extern void cellGcm_rsx_process_fifo(void);
@@ -167,6 +174,22 @@ static void upload_texture(void)
 {
     for (uint32_t i = 0; i < TEX_W * TEX_H; i++)
         guest_w32(IO_ADDR + TEX_OFFSET + i * 4u, TEX_ARGB);
+}
+
+/* Guest memory behind the --rtt surface, filled with a colour that is not the
+ * one the surface gets rendered: titles CPU-initialise their render-target
+ * buffers, so those bytes are really there, and the D3D12 backend seeds a new
+ * offscreen target from them for exactly that reason.
+ *
+ * It is also what gives the check teeth. A backend that misses the
+ * render-to-texture match falls back to uploading this region, and the frame
+ * comes out green instead of red. Left as zeros the failure would present a
+ * transparent black pixel, which is indistinguishable from a backend that has
+ * no headless readback at all -- and would pass. */
+static void upload_rtt_backing(void)
+{
+    for (uint32_t i = 0; i < RTT_DIM * RTT_DIM; i++)
+        guest_w32(IO_ADDR + RTT_OFFSET + i * 4u, RTT_BACKING);
 }
 
 /* The textured draw uses its own vertex block: two triangles covering the
@@ -331,15 +354,18 @@ static void emit_triangle_draw(void)
     emit(NV4097_SET_BEGIN_END, 0u);                       /* end              */
 }
 
-/* Bind the test texture on unit 0 and draw the quad through a guest vertex
- * program that passes position, colour and texcoord0 through (MOV o0,v0 ;
- * MOV o1,v3 ; MOV o7,v8) and the TEX r0, TC0 fragment program, which is how
- * a title samples a texture. A backend with no guest-program path ignores
- * the programs and samples in its own way. The vertex colour is deliberately
+/* Bind a texture on unit 0 and draw the quad through a guest vertex program
+ * that passes position, colour and texcoord0 through (MOV o0,v0 ; MOV o1,v3 ;
+ * MOV o7,v8) and the TEX r0, TC0 fragment program, which is how a title
+ * samples a texture. A backend with no guest-program path ignores the
+ * programs and samples in its own way. The vertex colour is deliberately
  * GREEN while the texture is a different colour, so a pass that ignored the
  * texture would still produce a plausible-looking frame -- and the assertion
- * would catch it. */
-static void emit_textured_draw(void)
+ * would catch it.
+ *
+ * Parameterised on where the texture is and how big it is, because --rtt
+ * points the same draw at a render target instead of an uploaded image. */
+static void emit_textured_draw_at(u32 tex_offset, u32 w, u32 h)
 {
     u8 vp[48];
     rsx_test_vp_mov_out(vp +  0, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);   /* MOV o0, v0      */
@@ -348,7 +374,7 @@ static void emit_textured_draw(void)
     emit_programs(vp, sizeof vp, TFP_OFFSET);
 
     /* NV4097_SET_TEXTURE_* are 0x20 apart per unit; unit 0 is the base. */
-    emit(NV4097_SET_TEXTURE_OFFSET     + 0, TEX_OFFSET);
+    emit(NV4097_SET_TEXTURE_OFFSET     + 0, tex_offset);
     /* SET_TEXTURE_FORMAT as cellGcmSetTexture packs it: location in [1:0]
      * (2 = main memory, where the IO window is), 2D in [7:4], the format
      * byte in [15:8] -- A8R8G8B8 (0x85) with LN (0x20), linear rather than
@@ -356,7 +382,7 @@ static void emit_textured_draw(void)
     emit(NV4097_SET_TEXTURE_FORMAT     + 0, 2u | (2u << 4) | ((0x85u | 0x20u) << 8) | (1u << 16));
     emit(NV4097_SET_TEXTURE_CONTROL0   + 0, 0x80000000u);   /* unit enable */
     emit(NV4097_SET_TEXTURE_CONTROL1   + 0, 0xAAE4u);       /* identity crossbar */
-    emit(NV4097_SET_TEXTURE_IMAGE_RECT + 0, (TEX_W << 16) | TEX_H);
+    emit(NV4097_SET_TEXTURE_IMAGE_RECT + 0, (w << 16) | h);
 
     emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, VTX_MAIN(TVTX_OFFSET +  0));
     emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0 * 4, VFMT(4, 48));
@@ -368,6 +394,43 @@ static void emit_textured_draw(void)
     emit(NV4097_SET_BEGIN_END, 5u);                       /* TRIANGLES       */
     emit(NV4097_DRAW_ARRAYS,   0u | ((6u - 1u) << 24));   /* first=0 count=6 */
     emit(NV4097_SET_BEGIN_END, 0u);
+}
+
+static void emit_textured_draw(void)
+{
+    emit_textured_draw_at(TEX_OFFSET, TEX_W, TEX_H);
+}
+
+/* Render into a surface of the guest's own, then sample it -- the two halves
+ * of render-to-texture, in the order a title does them.
+ *
+ * First, colour target A moves to an offset no display buffer was registered
+ * at, with a 256x256 clip, and the red full-surface triangle is drawn there.
+ * SET_SHADER_PROGRAM 0 leaves the backend no fragment program to run, so that
+ * draw takes the fixed-function path -- which is what a title looks like
+ * before it has loaded one, and what keeps this draw fixed-function on every
+ * frame rather than only the first, since the RSX keeps the previous frame's
+ * programs resident.
+ *
+ * Then target A goes back to display buffer 0 and the full-screen quad is
+ * drawn through the passthrough vertex program and TEX r0, TC0, with texture
+ * unit 0 bound at the SURFACE's offset. Red exists only in the surface the
+ * backend rendered into: the quad's own vertices are green and so are the
+ * guest bytes behind that offset, so every way of getting this wrong -- an
+ * ignored surface, a guest-memory upload, a dropped texture -- shows green. */
+static void emit_rtt_draws(void)
+{
+    emit(NV4097_SET_SURFACE_COLOR_AOFFSET,   RTT_OFFSET);
+    emit(NV4097_SET_SURFACE_COLOR_TARGET,    CELL_GCM_SURFACE_TARGET_0);
+    emit(NV4097_SET_SURFACE_CLIP_HORIZONTAL, RTT_DIM << 16);
+    emit(NV4097_SET_SURFACE_CLIP_VERTICAL,   RTT_DIM << 16);
+    emit(NV4097_SET_SHADER_PROGRAM,          0u);
+    emit_triangle_draw();
+
+    emit(NV4097_SET_SURFACE_COLOR_AOFFSET,   0u);
+    emit(NV4097_SET_SURFACE_CLIP_HORIZONTAL, 1280u << 16);
+    emit(NV4097_SET_SURFACE_CLIP_VERTICAL,   720u << 16);
+    emit_textured_draw_at(RTT_OFFSET, RTT_DIM, RTT_DIM);
 }
 
 /* Bind the two-level texture on unit 0 and draw the small quad through the
@@ -472,7 +535,8 @@ static void submit_frame(int with_draw)
     } else {
         emit(NV4097_CLEAR_SURFACE,            0xF0u);
     }
-    if (with_draw == 5)      emit_mip_draw();
+    if (with_draw == 6)      emit_rtt_draws();
+    else if (with_draw == 5) emit_mip_draw();
     else if (with_draw == 4) emit_depth_draw();
     else if (with_draw == 3) emit_shader_draw();
     else if (with_draw == 2) emit_textured_draw();
@@ -509,12 +573,17 @@ int main(int argc, char** argv)
          * that the sampler reaches level 1. The levels are different colours,
          * so a backend that uploads only level 0 presents the wrong one. */
         else if (strcmp(argv[i], "--mip") == 0)    do_draw = 5;
+        /* --rtt: render into a colour surface of the guest's own and then
+         * sample it, which is what a title does for every reflection, shadow
+         * map and post-processing pass. Needs the guest-program path. */
+        else if (strcmp(argv[i], "--rtt") == 0)    do_draw = 6;
     }
     /* The guest-program modes, which a backend without a translator cannot
      * run. --depth sits between them and is not one: it is fixed-function. */
-    if ((do_draw == 3 || do_draw == 5) && !HOST_BACKEND_GUEST_SHADERS) {
+    if ((do_draw == 3 || do_draw >= 5) && !HOST_BACKEND_GUEST_SHADERS) {
         printf("[host] %s: the %s backend runs no guest programs; nothing to check\n",
-               do_draw == 5 ? "--mip" : "--shader", HOST_BACKEND_NAME);
+               do_draw == 6 ? "--rtt" : do_draw == 5 ? "--mip" : "--shader",
+               HOST_BACKEND_NAME);
         return 0;
     }
 
@@ -541,7 +610,9 @@ int main(int argc, char** argv)
     if (do_draw == 3) upload_shader_triangle();
     if (do_draw == 4) upload_depth_triangles();
     if (do_draw == 5) { upload_mip_texture(); upload_mip_quad(); }
-    if (do_draw == 2 || do_draw == 3 || do_draw == 5) upload_fragment_programs();
+    /* --rtt draws both: the triangle into the surface, the quad out of it. */
+    if (do_draw == 6) { upload_triangle(); upload_textured_quad(); upload_rtt_backing(); }
+    if (do_draw == 2 || do_draw == 3 || do_draw >= 5) upload_fragment_programs();
     submit_frame(do_draw);
 
     u32 got = host_backend_color();
@@ -576,9 +647,14 @@ int main(int argc, char** argv)
          * With --depth it is the NEAR triangle's red, drawn before the far
          * green one: green here means the depth test did nothing. With --mip
          * it is level 1's colour, not level 0's, which no backend that
-         * uploads a single level can produce.
+         * uploads a single level can produce. With --rtt it is red again, and
+         * red exists nowhere but in the offscreen surface the first draw
+         * rendered into: the quad's own vertices are green, and so are the
+         * guest bytes behind the surface, so anything that skips the
+         * render-to-texture path shows green.
          */
-        u32 want = (do_draw == 5) ? MIP_L1_ARGB
+        u32 want = (do_draw == 6) ? 0xFFFF0000u   /* only the surface holds red  */
+                 : (do_draw == 5) ? MIP_L1_ARGB
                  : (do_draw == 4) ? 0xFFFF0000u   /* near red beats far green    */
                  : (do_draw == 3) ? 0xFFFF0000u   /* blue vertices, FP swaps r/b */
                  : (do_draw == 2) ? TEX_ARGB
@@ -588,7 +664,7 @@ int main(int argc, char** argv)
                back, want, (back & 0x00FFFFFFu) == (want & 0x00FFFFFFu) ? "OK" : "MISMATCH");
         if ((back & 0x00FFFFFFu) != (want & 0x00FFFFFFu)) rc = 3;
     }
-    if ((do_draw == 2 || do_draw == 3 || do_draw == 5) && HOST_BACKEND_GUEST_SHADERS) {
+    if ((do_draw == 2 || do_draw == 3 || do_draw >= 5) && HOST_BACKEND_GUEST_SHADERS) {
         /* The pixel alone cannot prove the programs ran: a backend that
          * ignored them would draw the triangle blue, which the check above
          * catches, but one that ran the vertex program and dropped the

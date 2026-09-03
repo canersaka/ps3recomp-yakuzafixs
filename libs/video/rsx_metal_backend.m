@@ -33,6 +33,15 @@
  * direction. NV4097_SET_VERTEX_TEXTURE_* units go through the same path and
  * bind to the vertex stage, so a transform program's TXL samples.
  *
+ * Render targets. SET_SURFACE_COLOR_TARGET picks colour surface A, B or one of
+ * the MRT sets, and a colour offset that is not a registered display buffer is
+ * an offscreen surface: a texture in a registry keyed by that raw offset, kept
+ * across frames because a surface rendered in one frame is sampled in the next.
+ * Each record carries the target it was recorded against, and present walks the
+ * records opening one render pass per contiguous run with the same target. A
+ * texture unit bound at a registered surface's offset then samples that surface
+ * rather than guest memory, which is what render-to-texture is.
+ *
  * Why Metal rather than SDL_Renderer: SDL2's renderer is a 2D sprite API with
  * no route to a custom vertex program, depth/stencil, MRT or render-to-texture,
  * so it cannot grow into the real pipeline.
@@ -97,8 +106,8 @@ typedef struct { float a[MTL_ATTRIBS][4]; } MtlVertex;
  * record ends the open render pass and starts a new one whose flagged
  * attachments load-action Clear and whose others load-action Load.
  *
- * Render targets will hang off the same stream: a target change is one more
- * record that ends the pass and opens the next one somewhere else.
+ * Render targets hang off the same stream: a target change is one more reason
+ * to end the pass and open the next one somewhere else.
  * --------------------------------------------------------------------------*/
 
 /* NV4097_CLEAR_SURFACE flags: 0x01 depth, 0x02 stencil, and one bit per colour
@@ -108,6 +117,22 @@ typedef struct { float a[MTL_ATTRIBS][4]; } MtlVertex;
 #define MTL_CLEAR_DEPTH    0x01u
 #define MTL_CLEAR_STENCIL  0x02u
 #define MTL_CLEAR_COLOR    0xF0u
+
+/* Which surfaces a record is aimed at, latched when the record is made because
+ * the guest retargets several times inside a frame and present replays it long
+ * after the registers moved on. Every record carries one, draws and clears
+ * alike: a clear belongs to a surface as much as a draw does. */
+typedef struct {
+    u32 off;                  /* 0 = a display buffer (the drawable); else the
+                               * raw RSX offset an offscreen surface is keyed by */
+    u32 mrt[3];               /* colour targets B, C, D, 0 = none  */
+    u32 w, h;                 /* the surface's size at record time */
+    u32 fmt;                  /* SET_SURFACE_FORMAT                */
+    u32 zeta_off;             /* SET_SURFACE_ZETA_OFFSET           */
+    /* The guest viewport rect in target pixels. Only draws use it; a clear is
+     * a load action over the whole attachment. */
+    u32 vp_x, vp_y, vp_w, vp_h;
+} MtlTarget;
 
 typedef struct {
     u32 base;        /* first vertex in s_verts               */
@@ -133,6 +158,10 @@ typedef struct {
      * samples. They share the caches with the fragment units. */
     int vtex[RSX_MAX_VERTEX_TEXTURES];
     int vsamp[RSX_MAX_VERTEX_TEXTURES];
+    /* Render-to-texture: the surface-view slot a unit samples, -1 = none. It
+     * takes precedence over tex[], which is the guest-memory upload. */
+    int tex_rt[RSX_MAX_TEXTURES];
+    MtlTarget rt;
     float mvp[16];   /* built-in path: 4 rows of the RSX vertex-constant matrix */
 } MtlDraw;
 
@@ -143,6 +172,7 @@ typedef struct {
     u32   color;     /* ARGB8888                               */
     float depth;     /* [0,1]                                  */
     u8    stencil;
+    MtlTarget rt;
 } MtlClear;
 
 typedef enum { MTL_REC_DRAW, MTL_REC_CLEAR } MtlRecordKind;
@@ -200,7 +230,14 @@ static u32 s_cb_used, s_cb_cap;
 
 typedef struct { u32 hash; id<MTLFunction> fn; } MtlVpEntry;
 typedef struct { u64 key;  id<MTLFunction> fn; u32 nconst; } MtlFpEntry;
-typedef struct { int vs, fs; u32 blend; u32 cmask; } MtlPsoKey;
+/* A pipeline state is bound inside a render pass, so the pass's colour format
+ * and target count are part of what identifies it: the same shaders against a
+ * float surface and against the drawable are two pipelines. The depth format
+ * is not, because every pass binds MTL_DEPTH_FORMAT. */
+typedef struct {
+    int vs, fs; u32 blend; u32 cmask;
+    u32 color_pf, nrt;
+} MtlPsoKey;
 typedef struct { MtlPsoKey key; id<MTLRenderPipelineState> pso; } MtlPsoEntry;
 
 static MtlVpEntry  s_vp_cache[MTL_VP_CACHE];
@@ -272,6 +309,14 @@ static u32 s_last_present_bgra;
 
 /* ---- rsx_backend vtable -------------------------------------------------- */
 
+/* The draw callbacks are not handed the state, so it is latched here. Every
+ * state setter caches it; set_vertex_attribs in particular always fires before
+ * a draw. The D3D12 backend does the same via s_d3d.current_rsx_state. */
+static const rsx_state* s_state;
+
+/* Which surfaces the live state is aimed at; see the guest surfaces section. */
+static void target_for(const rsx_state* st, MtlTarget* t);
+
 static void mtl_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
 {
     (void)ud;
@@ -288,20 +333,30 @@ static void mtl_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
     r->u.clear.color   = color;
     r->u.clear.depth   = depth;
     r->u.clear.stencil = stencil;
+    /* A clear belongs to a surface as much as a draw does: a title clears its
+     * shadow map, renders into it, then clears the display. */
+    target_for(s_state, &r->u.clear.rt);
 }
 
-/* The draw callbacks are not handed the state, so it is latched here. Every
- * state setter caches it; set_vertex_attribs in particular always fires before
- * a draw. The D3D12 backend does the same via s_d3d.current_rsx_state. */
-static const rsx_state* s_state;
-
 static int create_depth(void);
+
+/* Is this raw RSX offset one of the buffers cellGcmSetDisplayBuffer
+ * registered? The D3D12 backend takes the same private hook to tell a draw
+ * aimed at the scanout from one aimed at an offscreen surface. */
+extern int cellGcmOffsetIsDisplay(u32 offset);
 
 static void mtl_set_render_target(void* ud, const rsx_state* state)
 {
     (void)ud;
     if (state) s_state = state;
     if (!state) return;
+    /* The surface clip is the size of whatever surface is bound, so only a
+     * display buffer's clip says anything about the window: a title that
+     * renders a 256x256 effect into an offscreen surface would otherwise
+     * shrink the drawable to it, and never grow it back. */
+    if (!cellGcmOffsetIsDisplay(state->surface_color_offset[
+            state->color_target == CELL_GCM_SURFACE_TARGET_1 ? 1 : 0]))
+        return;
     u32 w = state->surface_clip_w, h = state->surface_clip_h;
     if (!w || !h || (w == s_width && h == s_height)) return;
     s_width = w; s_height = h;
@@ -1094,12 +1149,254 @@ static int samp_slot_for(const rsx_texture_state* t)
     return slot;
 }
 
+/* ---- guest surfaces ---------------------------------------------------------
+ * A title does not render into the scanout. It renders into its own colour
+ * surfaces, samples them, and composites the result; SET_SURFACE_COLOR_TARGET
+ * says which of A, B or an MRT set is bound, and the offsets in
+ * SET_SURFACE_COLOR_[ABCD]OFFSET say where they are.
+ *
+ * A surface is keyed by its RAW RSX offset, as the D3D12 backend's
+ * current_rt_off keys them: surface and texture registers share the offset
+ * space, so a texture bound at a surface's offset is that same buffer, and
+ * matching on the raw value sidesteps guessing which context DMA the surface
+ * lives in. An offset cellGcmSetDisplayBuffer registered is the display and
+ * still draws into the drawable.
+ *
+ * Surfaces outlive the frame that created them -- a surface rendered in one
+ * frame is sampled in the next -- so they are not part of clear_caches. A size
+ * or format change gets a fresh texture; replacing the reference is safe
+ * because a command buffer retains what it uses.
+ * --------------------------------------------------------------------------*/
+
+#define MTL_MAX_SURFACES  32
+#define MTL_MAX_ZETA      16
+#define MTL_RTVIEW_CACHE  64
+
+typedef struct {
+    u32 off;               /* raw RSX colour offset: the key      */
+    u32 w, h, fmt;
+    u32 gen;               /* bumped whenever the texture is replaced */
+    id<MTLTexture> tex;
+} MtlSurface;
+typedef struct { u32 off, w, h; id<MTLTexture> tex; } MtlZeta;
+typedef struct { int surf; u32 gen, control1, format; id<MTLTexture> view; } MtlRtView;
+
+static MtlSurface s_surf[MTL_MAX_SURFACES];
+static MtlZeta    s_zeta[MTL_MAX_ZETA];
+static MtlRtView  s_rtview[MTL_RTVIEW_CACHE];
+static u32 s_surf_count, s_zeta_count, s_rtview_count;
+
+/* RSX surface colour format (SET_SURFACE_FORMAT bits [4:0]) -> Metal, as the
+ * D3D12 backend's rsx_surface_dxgi maps it. The float targets are the reason
+ * this is not one format: a title's height fields and differential planes hold
+ * signed values that an 8-bit target clamps to zero. Everything else is the
+ * drawable's BGRA8Unorm, so the clear colour and the headless readback keep
+ * the conventions they already have. */
+static MTLPixelFormat surface_format_to_metal(u32 fmt)
+{
+    switch (fmt & 0x1Fu) {
+    case 0x0B: return MTLPixelFormatRGBA16Float;   /* F_W16Z16Y16X16 */
+    case 0x0C: return MTLPixelFormatRGBA32Float;   /* F_W32Z32Y32X32 */
+    case 0x0D: return MTLPixelFormatR32Float;      /* F_X32          */
+    default:   return MTLPixelFormatBGRA8Unorm;
+    }
+}
+
+/* Which colour surface the current state renders to, as current_rt_off decides
+ * it: 0 for a display buffer, else the surface's raw offset, with the MRT set
+ * and the surface size alongside. */
+static u32 current_rt_off(const rsx_state* st, u32* out_w, u32* out_h, u32 out_mrt[3])
+{
+    *out_w = 0; *out_h = 0;
+    out_mrt[0] = out_mrt[1] = out_mrt[2] = 0;
+    if (!st) return 0;
+    /* SET_SURFACE_COLOR_TARGET: 1 = A, 2 = B, 0x13 = MRT1 (A+B), 0x17 = MRT2
+     * (A+B+C), 0x1F = MRT3 (A+B+C+D). */
+    const int sel = (st->color_target == CELL_GCM_SURFACE_TARGET_1) ? 1 : 0;
+    const u32 raw = st->surface_color_offset[sel];
+    if (st->color_target >= CELL_GCM_SURFACE_TARGET_MRT1) out_mrt[0] = st->surface_color_offset[1];
+    if (st->color_target >= CELL_GCM_SURFACE_TARGET_MRT2) out_mrt[1] = st->surface_color_offset[2];
+    if (st->color_target >= CELL_GCM_SURFACE_TARGET_MRT3) out_mrt[2] = st->surface_color_offset[3];
+    if (cellGcmOffsetIsDisplay(raw)) return 0;
+    /* The clip dims are the surface's size when they are sane, else the window.
+     * Any size works, since passes draw normalised full-surface geometry; this
+     * only picks the resolution. */
+    u32 w = st->surface_clip_w, h = st->surface_clip_h;
+    if (w < 16 || w > 2048 || h < 16 || h > 2048) { w = 0; h = 0; }
+    *out_w = w; *out_h = h;
+    return raw;
+}
+
+/* The registry slot holding a live texture for this raw offset, or -1. */
+static int surface_find(u32 off)
+{
+    if (!off) return -1;
+    for (u32 i = 0; i < s_surf_count; i++)
+        if (s_surf[i].tex && s_surf[i].off == off) return (int)i;
+    return -1;
+}
+
+/* Make sure a surface exists for this offset at this size and format, and
+ * return its slot. */
+static int surface_get(u32 off, u32 w, u32 h, u32 fmt)
+{
+    if (!off || !s_dev) return -1;
+    if (!w) w = s_width;
+    if (!h) h = s_height;
+    const MTLPixelFormat pf = surface_format_to_metal(fmt);
+
+    int slot = -1;
+    for (u32 i = 0; i < s_surf_count; i++)
+        if (s_surf[i].off == off) { slot = (int)i; break; }
+    if (slot >= 0) {
+        MtlSurface* s = &s_surf[slot];
+        if (s->tex && s->w == w && s->h == h &&
+            surface_format_to_metal(s->fmt) == pf)
+            return slot;
+    } else {
+        if (s_surf_count >= MTL_MAX_SURFACES) return -1;
+        slot = (int)s_surf_count++;
+    }
+
+    MTLTextureDescriptor* td =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf
+                                                           width:w height:h mipmapped:NO];
+    /* PixelFormatView because a draw that samples the surface wears the unit's
+     * TEXTURE_CONTROL1 crossbar as a view swizzle. */
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
+               MTLTextureUsagePixelFormatView;
+    id<MTLTexture> tex = [s_dev newTextureWithDescriptor:td];
+    { static int n = 0; if (n++ < 16)
+        fprintf(stderr, "[RSX metal] surface 0x%08X %ux%u fmt 0x%02X -> %s\n",
+                off, w, h, fmt & 0x1Fu, tex ? "ok" : "FAILED"); }
+
+    MtlSurface* s = &s_surf[slot];
+    s->off = off; s->w = w; s->h = h; s->fmt = fmt;
+    s->gen++;               /* invalidates the views cut from the old texture */
+    s->tex = tex;
+    return tex ? slot : -1;
+}
+
+/* The depth/stencil texture an offscreen surface renders against: one per
+ * zeta offset and size, since a title points several surfaces of one size at
+ * the same zeta buffer. Only the attachment is set up here; the compare and
+ * write state belong to the depth/stencil path. */
+static id<MTLTexture> zeta_get(u32 off, u32 w, u32 h)
+{
+    if (!s_dev || !w || !h) return nil;
+    for (u32 i = 0; i < s_zeta_count; i++)
+        if (s_zeta[i].off == off && s_zeta[i].w == w && s_zeta[i].h == h)
+            return s_zeta[i].tex;
+    if (s_zeta_count >= MTL_MAX_ZETA) return nil;
+
+    MTLTextureDescriptor* td =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
+                                                           width:w height:h mipmapped:NO];
+    td.usage       = MTLTextureUsageRenderTarget;
+    td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> tex = [s_dev newTextureWithDescriptor:td];
+    if (!tex) return nil;
+    const u32 slot = s_zeta_count++;
+    s_zeta[slot].off = off; s_zeta[slot].w = w; s_zeta[slot].h = h;
+    s_zeta[slot].tex = tex;
+    return tex;
+}
+
+/* A view of a surface carrying the sampling unit's TEXTURE_CONTROL1 crossbar
+ * as its swizzle, so a render-to-texture bind reads the channels the guest
+ * asked for. Cached per (surface, generation, crossbar, format) and, like the
+ * shader and texture caches, slot-stable for the whole frame, because a draw
+ * record holds the slot index. A recreated surface bumps its generation, so
+ * the views cut from the old texture simply stop matching. */
+static int rtview_for(int surf, u32 control1, u32 format)
+{
+    MtlSurface* s = &s_surf[surf];
+    if (!s->tex) return -1;
+    for (u32 i = 0; i < s_rtview_count; i++) {
+        const MtlRtView* v = &s_rtview[i];
+        if (v->surf == surf && v->gen == s->gen &&
+            v->control1 == control1 && v->format == format)
+            return v->view ? (int)i : -1;
+    }
+    if (s_rtview_count >= MTL_RTVIEW_CACHE) { s_caches_full = 1; return -1; }
+
+    /* Same field order as an uploaded texture's swizzle: the crossbar's own
+     * A,R,G,B order becomes destR = out[1] .. destA = out[0]. Its selectors
+     * index the sampled vector as R,G,B,A, which is what a surface reads back
+     * as whatever byte order it stores. */
+    u8 remap[4];
+    rsx_texture_component_remap(control1, (format >> 8) & 0x9Fu, remap);
+    id<MTLTexture> view =
+        [s->tex newTextureViewWithPixelFormat:[s->tex pixelFormat]
+                                  textureType:MTLTextureType2D
+                                       levels:NSMakeRange(0, 1)
+                                       slices:NSMakeRange(0, 1)
+                                      swizzle:MTLTextureSwizzleChannelsMake(
+                                                  swizzle_sel(remap[1]), swizzle_sel(remap[2]),
+                                                  swizzle_sel(remap[3]), swizzle_sel(remap[0]))];
+    const int slot = (int)s_rtview_count++;
+    s_rtview[slot].surf     = surf;
+    s_rtview[slot].gen      = s->gen;
+    s_rtview[slot].control1 = control1;
+    s_rtview[slot].format   = format;
+    s_rtview[slot].view     = view;
+    return view ? slot : -1;
+}
+
+/* Is this offset one of the colour targets the record itself renders into?
+ * Reading a surface a pass is writing is undefined on any API. */
+static int rt_is_own_target(const MtlDraw* d, u32 off)
+{
+    if (!off) return 0;
+    if (off == d->rt.off) return 1;
+    for (int m = 0; m < 3; m++) if (off == d->rt.mrt[m]) return 1;
+    return 0;
+}
+
+/* Fill in the colour target, MRT set, zeta and viewport a record was made
+ * against, and make sure the surfaces it names exist. Registering here rather
+ * than at present time is what lets a draw later in the same frame find the
+ * surface an earlier draw rendered into (the D3D12 backend gets the same
+ * effect from its render-to-texture pre-pass). */
+static void target_for(const rsx_state* st, MtlTarget* t)
+{
+    memset(t, 0, sizeof *t);
+    if (!st) return;
+    t->off      = current_rt_off(st, &t->w, &t->h, t->mrt);
+    t->fmt      = st->surface_format;
+    t->zeta_off = st->surface_zeta_offset;
+    t->vp_x = st->viewport_x; t->vp_y = st->viewport_y;
+    t->vp_w = st->viewport_w; t->vp_h = st->viewport_h;
+    if (!t->off) return;
+    surface_get(t->off, t->w, t->h, t->fmt);
+    for (int m = 0; m < 3; m++)
+        if (t->mrt[m]) surface_get(t->mrt[m], t->w, t->h, t->fmt);
+}
+
 /* Resolve every enabled texture unit for a guest-program draw. */
 static void textures_for(const rsx_state* st, MtlDraw* d)
 {
     for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
         const rsx_texture_state* t = &st->textures[u];
         if (!(t->control0 & 0x80000000u)) continue;
+        /* Render-to-texture, the D3D12 backend's tex_rt rule: a unit whose raw
+         * offset is a registered surface samples that surface. Uploading from
+         * guest memory instead would read a buffer the pass that produced the
+         * image never wrote, which is how a reflection or a shadow map comes
+         * out black. */
+        const int surf = surface_find(t->offset);
+        if (surf >= 0) {
+            d->samp[u] = samp_slot_for(t);
+            if (rt_is_own_target(d, t->offset)) {
+                { static int n = 0; if (n++ < 1)
+                    fprintf(stderr, "[RSX metal] unit %u samples the surface the pass "
+                                    "draws into (0x%08X); reading the zero texture\n",
+                            u, t->offset); }
+                continue;                 /* leaves the unit on the zero texture */
+            }
+            d->tex_rt[u] = rtview_for(surf, t->control1, t->format);
+            continue;
+        }
         d->tex[u]  = tex_slot_for(t);
         d->samp[u] = samp_slot_for(t);
     }
@@ -1259,8 +1556,13 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     MtlDraw* d = &r->u.draw;
     memset(d, 0, sizeof *d);
     d->vs_idx = d->fs_idx = d->ds_idx = -1;
-    for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) d->tex[u] = d->samp[u] = -1;
+    for (u32 u = 0; u < RSX_MAX_TEXTURES; u++)
+        d->tex[u] = d->samp[u] = d->tex_rt[u] = -1;
     for (u32 u = 0; u < RSX_MAX_VERTEX_TEXTURES; u++) d->vtex[u] = d->vsamp[u] = -1;
+
+    /* The target before anything else: the surfaces it names have to be
+     * registered before the textures are resolved against them. */
+    target_for(st, &d->rt);
 
     /* Programs first: their translation is what can fail, and a draw that
      * drops to the built-in shader must still fetch its vertices the same
@@ -1403,12 +1705,14 @@ static MTLVertexDescriptor* vertex_descriptor(void)
     return vd;
 }
 
-static id<MTLRenderPipelineState> pso_for(const MtlDraw* d)
+static id<MTLRenderPipelineState> pso_for(const MtlDraw* d, MTLPixelFormat color_pf,
+                                          u32 nrt)
 {
     MtlPsoKey key;
     memset(&key, 0, sizeof key);
     key.vs = d->vs_idx; key.fs = d->fs_idx;
     key.blend = blend_key(d); key.cmask = d->color_mask;
+    key.color_pf = (u32)color_pf; key.nrt = nrt;
     for (u32 i = 0; i < s_pso_count; i++)
         if (memcmp(&s_pso_cache[i].key, &key, sizeof key) == 0) return s_pso_cache[i].pso;
     if (s_pso_count >= MTL_PSO_CACHE) { s_caches_full = 1; return nil; }
@@ -1422,22 +1726,31 @@ static id<MTLRenderPipelineState> pso_for(const MtlDraw* d)
         pd.fragmentFunction = [s_shader_lib newFunctionWithName:@"fs_main"];
     }
     pd.vertexDescriptor = vertex_descriptor();
-    /* The depth/stencil attachment is bound on every pass, so every pipeline
-     * declares it; whether a draw tests or writes is the MTLDepthStencilState's
-     * business, not the pipeline's. */
+    /* A depth/stencil attachment is bound on every pass -- the shared one for
+     * the display, the target's own zeta for an offscreen surface, both
+     * MTL_DEPTH_FORMAT -- so every pipeline declares it; whether a draw tests
+     * or writes is the MTLDepthStencilState's business, not the pipeline's. */
     pd.depthAttachmentPixelFormat   = MTL_DEPTH_FORMAT;
     pd.stencilAttachmentPixelFormat = MTL_DEPTH_FORMAT;
-    MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[0];
-    ca.pixelFormat = MTLPixelFormatBGRA8Unorm;
-    ca.writeMask   = color_mask_to_metal(d->color_mask);
-    if (d->blend_enable) {
-        ca.blendingEnabled             = YES;
-        ca.sourceRGBBlendFactor        = blend_factor_to_metal(d->blend_sfactor);
-        ca.destinationRGBBlendFactor   = blend_factor_to_metal(d->blend_dfactor);
-        ca.sourceAlphaBlendFactor      = blend_factor_to_metal(d->blend_sfactor);
-        ca.destinationAlphaBlendFactor = blend_factor_to_metal(d->blend_dfactor);
-        ca.rgbBlendOperation           = blend_equation_to_metal(d->blend_equation);
-        ca.alphaBlendOperation         = blend_equation_to_metal(d->blend_equation);
+    /* Every bound colour target takes target A's blend and colour mask, which
+     * is what the D3D12 backend does with RTVFormats[1..]: a zero-initialised
+     * secondary attachment writes nothing at all, and a deferred pass would
+     * come back with only its first G-buffer plane filled in. The fragment
+     * decompiler emits one SV_TARGET, so B, C and D stay unwritten for now --
+     * they are attached and cleared, not fed. */
+    for (u32 r = 0; r < nrt; r++) {
+        MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[r];
+        ca.pixelFormat = color_pf;
+        ca.writeMask   = color_mask_to_metal(d->color_mask);
+        if (d->blend_enable) {
+            ca.blendingEnabled             = YES;
+            ca.sourceRGBBlendFactor        = blend_factor_to_metal(d->blend_sfactor);
+            ca.destinationRGBBlendFactor   = blend_factor_to_metal(d->blend_dfactor);
+            ca.sourceAlphaBlendFactor      = blend_factor_to_metal(d->blend_sfactor);
+            ca.destinationAlphaBlendFactor = blend_factor_to_metal(d->blend_dfactor);
+            ca.rgbBlendOperation           = blend_equation_to_metal(d->blend_equation);
+            ca.alphaBlendOperation         = blend_equation_to_metal(d->blend_equation);
+        }
     }
 
     NSError* err = nil;
@@ -1456,8 +1769,8 @@ static id<MTLRenderPipelineState> pso_for(const MtlDraw* d)
 
 /* ---- replay --------------------------------------------------------------
  * Everything a render pass has to bind before its first draw. Encoder state
- * does not outlive endEncoding, so a clear in the middle of a frame pays for
- * this again on the pass it opens.
+ * does not outlive endEncoding, so a clear in the middle of a frame -- or a
+ * switch to another render target -- pays for this again on the pass it opens.
  * --------------------------------------------------------------------------*/
 
 typedef struct {
@@ -1467,7 +1780,36 @@ typedef struct {
     int samp[RSX_MAX_TEXTURES];
     int vtex[RSX_MAX_VERTEX_TEXTURES];
     int vsamp[RSX_MAX_VERTEX_TEXTURES];
+    /* The target this pass is aimed at, and what the attachments turned out
+     * to be. A record whose target differs ends the pass and opens the next. */
+    MtlTarget rt;
+    double w, h;                  /* the target's size, for the viewport */
+    MTLPixelFormat color_pf;
+    u32 nrt;                      /* bound colour attachments */
 } MtlPassState;
+
+/* Do two records belong in the same pass? Only the colour targets decide it:
+ * everything else about a record is encoder or pipeline state. */
+static int target_same(const MtlTarget* a, const MtlTarget* b)
+{
+    return a->off == b->off && memcmp(a->mrt, b->mrt, sizeof a->mrt) == 0;
+}
+
+/* What a unit binds, as one identity covering both sources: a surface view, an
+ * uploaded texture, or the zero texture. Surface views are numbered above the
+ * texture cache so the "already bound?" test stays a single compare. */
+static int tex_binding_id(const MtlDraw* d, int u)
+{
+    return d->tex_rt[u] >= 0 ? MTL_TEX_CACHE + d->tex_rt[u] : d->tex[u];
+}
+
+static id<MTLTexture> tex_binding(const MtlDraw* d, int u)
+{
+    if (d->tex_rt[u] >= 0 && s_rtview[d->tex_rt[u]].view)
+        return s_rtview[d->tex_rt[u]].view;
+    if (d->tex[u] >= 0) return s_tex_cache[d->tex[u]].tex;
+    return s_null_tex;
+}
 
 /* Where a vertex texture binds. The VP decompiler declares unit N's texture
  * at HLSL register t(16+N) and its sampler at sN, and spirv-cross carries
@@ -1476,14 +1818,28 @@ typedef struct {
 #define MTL_VTEX_INDEX(n) ((NSUInteger)(16u + (n)))
 #define MTL_VSAMP_INDEX(n) ((NSUInteger)(n))
 
-/* Open a render pass on `color`. The attachments `clear` flags name load-action
- * Clear with its values; the rest load-action Load, so what an earlier pass in
- * the same frame left behind survives. */
+/* Open a render pass on the record's target: the drawable for a display
+ * buffer, else the offscreen surface registered at that raw offset, with its
+ * MRT set and its own zeta in place of the shared depth buffer. The
+ * attachments `clear` flags name load-action Clear with its values; the rest
+ * load-action Load, so what an earlier pass in the same frame left behind
+ * survives -- which is how a title fills one surface across several runs of
+ * records. */
 static id<MTLRenderCommandEncoder> begin_pass(id<MTLCommandBuffer> cb,
-                                              id<MTLTexture> color,
+                                              id<MTLTexture> display,
+                                              const MtlTarget* t,
                                               const MtlClear* clear,
                                               MtlPassState* ps)
 {
+    /* Latched before anything can fail, so a target that cannot be bound is
+     * still this pass's target: the rest of its run is skipped rather than
+     * reopened once per record. */
+    ps->rt = *t;
+
+    const int surf = surface_find(t->off);
+    id<MTLTexture> color = (surf >= 0) ? s_surf[surf].tex : display;
+    if (!color) return nil;
+
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture     = color;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
@@ -1493,14 +1849,42 @@ static id<MTLRenderCommandEncoder> begin_pass(id<MTLCommandBuffer> cb,
     } else {
         rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
     }
-    /* Both halves of the one Depth32Float_Stencil8 texture. Stored rather than
+
+    /* MRT B, C and D, up to the first one that is not a registered surface --
+     * the D3D12 backend stops at the same gap. Metal wants every attachment
+     * the same size, and surfaces are registered at target A's size, so a set
+     * whose members disagree is one this frame cannot honour. */
+    ps->nrt = 1;
+    for (int m = 0; m < 3 && t->mrt[m]; m++) {
+        const int ms = surface_find(t->mrt[m]);
+        if (ms < 0 || [s_surf[ms].tex width]  != [color width]
+                   || [s_surf[ms].tex height] != [color height]) break;
+        rp.colorAttachments[ps->nrt].texture     = s_surf[ms].tex;
+        rp.colorAttachments[ps->nrt].storeAction = MTLStoreActionStore;
+        if (clear->flags & MTL_CLEAR_COLOR) {
+            rp.colorAttachments[ps->nrt].loadAction = MTLLoadActionClear;
+            rp.colorAttachments[ps->nrt].clearColor = clear_color_from_argb(clear->color);
+        } else {
+            rp.colorAttachments[ps->nrt].loadAction = MTLLoadActionLoad;
+        }
+        ps->nrt++;
+    }
+
+    /* Both halves of one Depth32Float_Stencil8 texture: the shared one for the
+     * display, the surface's own zeta otherwise, so an offscreen pass does not
+     * trample the depth the display pass is building. Stored rather than
      * discarded: a later pass in the same frame loads what this one wrote. */
-    rp.depthAttachment.texture       = s_depth;
+    id<MTLTexture> depth = s_depth;
+    if (surf >= 0) {
+        id<MTLTexture> z = zeta_get(t->zeta_off, s_surf[surf].w, s_surf[surf].h);
+        if (z) depth = z;
+    }
+    rp.depthAttachment.texture       = depth;
     rp.depthAttachment.storeAction   = MTLStoreActionStore;
     rp.depthAttachment.loadAction    = (clear->flags & MTL_CLEAR_DEPTH)
                                            ? MTLLoadActionClear : MTLLoadActionLoad;
     rp.depthAttachment.clearDepth    = (double)clear->depth;
-    rp.stencilAttachment.texture     = s_depth;
+    rp.stencilAttachment.texture     = depth;
     rp.stencilAttachment.storeAction = MTLStoreActionStore;
     rp.stencilAttachment.loadAction  = (clear->flags & MTL_CLEAR_STENCIL)
                                            ? MTLLoadActionClear : MTLLoadActionLoad;
@@ -1508,6 +1892,9 @@ static id<MTLRenderCommandEncoder> begin_pass(id<MTLCommandBuffer> cb,
 
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
     if (!enc) return nil;
+    ps->w        = (double)[color width];
+    ps->h        = (double)[color height];
+    ps->color_pf = [color pixelFormat];
 
     if (ps->vb) [enc setVertexBuffer:ps->vb offset:0 atIndex:MTL_VB_INDEX];
     /* Every fragment texture unit starts on the zero texture -- a guest
@@ -1525,7 +1912,9 @@ static id<MTLRenderCommandEncoder> begin_pass(id<MTLCommandBuffer> cb,
         [enc setVertexSamplerState:s_default_sampler atIndex:MTL_VSAMP_INDEX(u)];
         ps->vtex[u] = ps->vsamp[u] = -1;
     }
-    MTLViewport vp = { 0.0, 0.0, (double)s_width, (double)s_height, 0.0, 1.0 };
+    /* The target's own size, which is not the window's once a title renders
+     * into a surface of its own. Each draw narrows it to the guest rect. */
+    MTLViewport vp = { 0.0, 0.0, ps->w, ps->h, 0.0, 1.0 };
     [enc setViewport:vp];
     return enc;
 }
@@ -1533,7 +1922,7 @@ static id<MTLRenderCommandEncoder> begin_pass(id<MTLCommandBuffer> cb,
 static void encode_draw(id<MTLRenderCommandEncoder> enc, const MtlDraw* d,
                         MtlPassState* ps)
 {
-    id<MTLRenderPipelineState> pso = pso_for(d);
+    id<MTLRenderPipelineState> pso = pso_for(d, ps->color_pf, ps->nrt);
     if (!pso) return;
     [enc setRenderPipelineState:pso];
     [enc setCullMode:d->cull];
@@ -1541,15 +1930,29 @@ static void encode_draw(id<MTLRenderCommandEncoder> enc, const MtlDraw* d,
     [enc setDepthStencilState:(d->ds_idx >= 0 ? s_ds_cache[d->ds_idx].state
                                               : s_ds_default)];
     [enc setStencilReferenceValue:d->stencil_ref];
+    /* The guest viewport rect when it fits inside the target, else the whole
+     * target -- render_frame's rule. Sub-viewport layouts place their quads
+     * with this rect and nothing else, so a forced full-target viewport draws
+     * every one of them target-sized. The scissor tracks it. */
+    MTLViewport vp = { 0.0, 0.0, ps->w, ps->h, 0.0, 1.0 };
+    if (d->rt.vp_w >= 2 && d->rt.vp_h >= 2 &&
+        (double)(d->rt.vp_x + d->rt.vp_w) <= ps->w + 0.5 &&
+        (double)(d->rt.vp_y + d->rt.vp_h) <= ps->h + 0.5) {
+        vp.originX = (double)d->rt.vp_x; vp.originY = (double)d->rt.vp_y;
+        vp.width   = (double)d->rt.vp_w; vp.height  = (double)d->rt.vp_h;
+    }
+    [enc setViewport:vp];
+    [enc setScissorRect:(MTLScissorRect){
+        (NSUInteger)vp.originX, (NSUInteger)vp.originY,
+        (NSUInteger)vp.width,   (NSUInteger)vp.height }];
     if (d->vs_idx >= 0 && ps->cbuf) {
         [enc setVertexBuffer:ps->cbuf offset:d->vp_cb_off atIndex:0];
         [enc setFragmentBuffer:ps->cbuf offset:d->fp_cb_off atIndex:1];
         for (int u = 0; u < RSX_MAX_TEXTURES; u++) {
-            if (d->tex[u] != ps->tex[u]) {
-                [enc setFragmentTexture:(d->tex[u] >= 0 ? s_tex_cache[d->tex[u]].tex
-                                                        : s_null_tex)
-                                atIndex:(NSUInteger)u];
-                ps->tex[u] = d->tex[u];
+            const int want = tex_binding_id(d, u);
+            if (want != ps->tex[u]) {
+                [enc setFragmentTexture:tex_binding(d, u) atIndex:(NSUInteger)u];
+                ps->tex[u] = want;
             }
             if (d->samp[u] != ps->samp[u]) {
                 [enc setFragmentSamplerState:(d->samp[u] >= 0 ? s_samp_cache[d->samp[u]].samp
@@ -1586,10 +1989,21 @@ static void clear_caches(void)
     for (u32 i = 0; i < s_tex_count;  i++) s_tex_cache[i].tex   = nil;
     for (u32 i = 0; i < s_samp_count; i++) s_samp_cache[i].samp = nil;
     for (u32 i = 0; i < s_ds_count;   i++) s_ds_cache[i].state  = nil;
+    for (u32 i = 0; i < s_rtview_count; i++) s_rtview[i].view   = nil;
     s_vp_count = s_fp_count = s_pso_count = s_tex_count = s_samp_count = 0;
-    s_ds_count = 0;
+    s_ds_count = s_rtview_count = 0;
     s_caches_full = 0;
 }
+
+/* Surfaces survive a cache clear -- they hold rendered pixels a later frame
+ * still samples -- so they are released only on the way out. */
+static void release_surfaces(void)
+{
+    for (u32 i = 0; i < s_surf_count; i++) s_surf[i].tex = nil;
+    for (u32 i = 0; i < s_zeta_count; i++) s_zeta[i].tex = nil;
+    s_surf_count = s_zeta_count = 0;
+}
+
 
 /* ---- public API ---------------------------------------------------------- */
 
@@ -1695,6 +2109,7 @@ void rsx_metal_backend_shutdown(void)
         s_vert_count = s_rec_count = 0;
         s_guest_draws = s_last_guest_draws = 0;
         clear_caches();
+        release_surfaces();
         s_shader_lib = nil;
         s_null_tex   = nil;
         s_default_sampler = nil;
@@ -1751,23 +2166,30 @@ void rsx_metal_backend_present(void)
             return;
         }
 
-        /* The frame's first pass clears colour to the last value the guest
-         * asked for, which is what this backend has always done and what keeps
-         * a frame with no clear in it from presenting an undefined drawable.
-         * Depth and stencil start at the nv40 reset values, unless a clear
-         * ahead of the first draw says otherwise -- those clears are folded
-         * into this pass rather than each opening one of their own. */
+        /* The frame's first pass is on the display and clears colour to the
+         * last value the guest asked for, which is what this backend has
+         * always done and what keeps a frame with no clear in it from
+         * presenting an undefined drawable. Depth and stencil start at the
+         * nv40 reset values, unless a clear ahead of the first draw says
+         * otherwise -- those clears are folded into this pass rather than each
+         * opening one of their own. Only display clears fold: one aimed at a
+         * surface belongs to a pass somewhere else. */
         MtlClear first;
+        memset(&first, 0, sizeof first);
         first.flags   = MTL_CLEAR_COLOR | MTL_CLEAR_DEPTH | MTL_CLEAR_STENCIL;
         first.color   = s_clear_argb;
         first.depth   = 1.0f;
         first.stencil = 0;
         u32 r = 0;
-        for (; r < s_rec_count && s_records[r].kind == MTL_REC_CLEAR; r++) {
+        for (; r < s_rec_count && s_records[r].kind == MTL_REC_CLEAR
+                                && s_records[r].u.clear.rt.off == 0; r++) {
             const MtlClear* c = &s_records[r].u.clear;
             if (c->flags & MTL_CLEAR_DEPTH)   first.depth   = c->depth;
             if (c->flags & MTL_CLEAR_STENCIL) first.stencil = c->stencil;
         }
+        /* What a pass opened by a target change asks for: no clear flags at
+         * all, so every attachment loads what the surface already holds. */
+        static const MtlClear load_all = { .flags = 0 };
 
         /* Designated rather than memset: the buffers are ARC-managed. */
         MtlPassState ps = { .vb = nil, .cbuf = nil };
@@ -1781,14 +2203,23 @@ void rsx_metal_backend_present(void)
         }
 
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
-        id<MTLRenderCommandEncoder> enc = begin_pass(cb, target, &first, &ps);
+        id<MTLRenderCommandEncoder> enc = begin_pass(cb, target, &first.rt, &first, &ps);
         for (; enc && r < s_rec_count; r++) {
-            if (s_records[r].kind == MTL_REC_CLEAR) {
+            const MtlRecord* rec = &s_records[r];
+            if (rec->kind == MTL_REC_CLEAR) {
                 [enc endEncoding];
-                enc = begin_pass(cb, target, &s_records[r].u.clear, &ps);
+                enc = begin_pass(cb, target, &rec->u.clear.rt, &rec->u.clear, &ps);
                 continue;
             }
-            encode_draw(enc, &s_records[r].u.draw, &ps);
+            /* A draw aimed somewhere else ends the pass and opens the next,
+             * for the same reason a clear does: an encoder is bound to one set
+             * of attachments for its whole life. */
+            if (!target_same(&rec->u.draw.rt, &ps.rt)) {
+                [enc endEncoding];
+                enc = begin_pass(cb, target, &rec->u.draw.rt, &load_all, &ps);
+                if (!enc) break;
+            }
+            encode_draw(enc, &rec->u.draw, &ps);
         }
         if (enc) [enc endEncoding];
 
@@ -1820,8 +2251,9 @@ void rsx_metal_backend_present(void)
         /* The frame's records are gone, so slots may move now. The command
          * buffer keeps its own references to whatever it still runs. */
         if (s_caches_full) {
-            fprintf(stderr, "[RSX metal] cache full (%u VP, %u FP, %u PSO, %u textures); cleared\n",
-                    s_vp_count, s_fp_count, s_pso_count, s_tex_count);
+            fprintf(stderr, "[RSX metal] cache full (%u VP, %u FP, %u PSO, %u textures,"
+                            " %u surface views); cleared\n",
+                    s_vp_count, s_fp_count, s_pso_count, s_tex_count, s_rtview_count);
             clear_caches();
         }
 
