@@ -42,6 +42,14 @@ void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width)
     (void)addr; (void)val; (void)width;
 }
 
+/* PPU <-> SPU lock-line coherence (runtime/spu/spu_coherency.c), which every
+ * store now consults. This suite runs no SPU, so no line is ever reserved and
+ * the store path is the plain memcpy it always was. */
+int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
+void spu_lockline_lock(void)   { }
+void spu_lockline_unlock(void) { }
+void spu_coh_notify_write(uint32_t addr) { (void)addr; }
+
 static uint32_t g_bump = 4096;   /* keep guest address 0 invalid */
 static uint32_t guest_alloc(uint32_t size)
 {
