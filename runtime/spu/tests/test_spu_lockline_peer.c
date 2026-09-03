@@ -17,6 +17,16 @@
  * cases that must stay quiet are here for the same reason they are in the PPU
  * test -- an over-eager notify is a livelock, not a safe approximation.
  *
+ * The last test is the event acknowledge. An SPU acknowledging the events it
+ * has read is a read-modify-write of the same word every one of those raises
+ * writes, so an edge landing between the read and the write is dropped and the
+ * SPU goes back to sleep holding a reservation it has already lost. The
+ * interleaving is built with the lock-line lock rather than raced for: the main
+ * thread takes the lock, a second thread starts the acknowledge and is held at
+ * that lock, that the acknowledge has NOT completed while the lock is held is
+ * asserted, the raise then happens under the lock, and only afterwards is the
+ * acknowledge let through.
+ *
  * spu_channels.c is compiled in rather than linked, because spu_mfc_atomic()
  * is file-static: the same reason test_spu_mfc_slots.c does it.
  *
@@ -34,6 +44,7 @@
  * Exit code: 0 if all passed, 1 if any failed. Final line prints a summary.
  */
 
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -337,6 +348,74 @@ static void test_wide_put_finds_the_reserved_line(void)
 }
 
 /* ===========================================================================
+ * The event acknowledge against a concurrent raise
+ *
+ * Built with the lock rather than raced for. The main thread holds the
+ * lock-line lock, so the acknowledge cannot get past it, and that it has not
+ * completed is asserted -- which is what makes the interleaving a fact of the
+ * run rather than a hope. The raise then happens under the same lock, and the
+ * acknowledge is let through afterwards: exactly the order that loses the edge
+ * when the acknowledge is a bare read-modify-write.
+ *
+ * The two waits below decide nothing. An acknowledge that has not started yet
+ * lands after the raise and keeps it just the same; what the assertion rules
+ * out is the acknowledge COMPLETING while the lock is held, which is the only
+ * way the raise can be read, overwritten and lost.
+ * ===========================================================================*/
+#define ACK_TAG_EVENT  0x1u    /* MFC tag-status update: what the ack asks for */
+
+static volatile int g_ack_entered;
+static volatile int g_ack_done;
+
+static void* ack_thread(void* arg)
+{
+    (void)arg;
+    g_ack_entered = 1;
+    wrch(&g_a, SPU_WrEventAck, ACK_TAG_EVENT);
+    g_ack_done = 1;
+    return NULL;
+}
+
+static void test_ack_keeps_a_concurrent_raise(void)
+{
+    reset_pair();
+    g_ack_entered = 0;
+    g_ack_done = 0;
+
+    spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
+    g_a.event_status = ACK_TAG_EVENT;      /* the event the SPU is acking */
+
+    spu_lockline_lock();
+
+    pthread_t t;
+    if (pthread_create(&t, NULL, ack_thread, NULL) != 0) {
+        spu_lockline_unlock();
+        TEST("the acknowledging thread starts");
+        CHECK(0);
+        return;
+    }
+
+    while (!g_ack_entered) YieldProcessor();
+    Sleep(2);                              /* time to arrive at the lock */
+
+    TEST("the acknowledge cannot complete while the lock-line lock is held");
+    CHECK(g_ack_done == 0);
+    CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT);
+
+    /* The raise a peer's commit would make, under the lock that peer holds. */
+    spu_coh_notify_write(LINE_A);
+    CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT | SPU_EVENT_LR);
+
+    spu_lockline_unlock();
+    pthread_join(t, NULL);
+
+    TEST("the acknowledge clears what it asked for and keeps the raise");
+    CHECK(g_ack_done == 1);
+    CHECK_EQ_U32(g_a.event_status, SPU_EVENT_LR);
+    CHECK(g_a.resv_valid == 0);
+}
+
+/* ===========================================================================
  * main
  * ===========================================================================*/
 int main(void)
@@ -347,6 +426,7 @@ int main(void)
     test_plain_put_breaks_peer();
     test_plain_put_elsewhere_is_quiet();
     test_wide_put_finds_the_reserved_line();
+    test_ack_keeps_a_concurrent_raise();
 
     printf("\nSPU-to-SPU lock-line coherence tests: %d passed, %d failed\n",
            g_pass, g_fail);
