@@ -32,6 +32,7 @@
 #include "sys_cond.h"
 #include "sys_semaphore.h"
 #include "sys_event.h"
+#include "sys_rwlock.h"
 #include "ppu/ppu_context.h"
 
 /* ---------------------------------------------------------------------------
@@ -1106,6 +1107,174 @@ static int test4_event_queue(void)
 }
 
 /* =========================================================================
+ * TEST 5 -- rwlock write ownership
+ *
+ * The write lock has an owner, and three answers depend on it: a second
+ * wlock or trywlock by the owner is CELL_EDEADLK (never a block, because the
+ * host lock is not recursive), and a wunlock by anyone else is CELL_EPERM
+ * with the owner's lock left standing. The POSIX branch used to carry none
+ * of that: the re-lock blocked forever on Darwin and a foreign wunlock
+ * released whatever the caller happened to hold.
+ *
+ * The owner's sequence runs on its own thread so a regression shows up as a
+ * FAIL with a message rather than wedging the whole suite.
+ * ========================================================================= */
+#define T5_WRITERS   4
+#define T5_READERS   4
+#define T5_ITERS     2000
+
+typedef struct {
+    uint32_t rw_id;
+    HANDLE   owner_has_lock;    /* owner acquired, helper may probe */
+    HANDLE   helper_done;       /* helper finished probing */
+    LONG volatile counter;      /* guarded by the write lock */
+    LONG volatile torn_reads;
+} t5_shared;
+
+static unsigned __stdcall t5_owner(void* p)
+{
+    t5_shared* sh = (t5_shared*)p;
+    uint32_t tid = alloc_tid(); t_tid = tid;
+    ppu_context ctx; ctx_init_for_thread(&ctx, tid);
+
+    int32_t rc = call2((int64_t(*)(ppu_context*))sys_rwlock_wlock, &ctx, sh->rw_id, 0);
+    if (rc != CELL_OK) { fail("test5", "owner wlock rc=0x%08X", (unsigned)rc); return 1; }
+
+    /* Re-entry by the owner: an answer, not a block. */
+    rc = call2((int64_t(*)(ppu_context*))sys_rwlock_wlock, &ctx, sh->rw_id, 0);
+    if (rc != (int32_t)CELL_EDEADLK)
+        fail("test5", "owner re-wlock rc=0x%08X, want CELL_EDEADLK", (unsigned)rc);
+
+    rc = call1((int64_t(*)(ppu_context*))sys_rwlock_trywlock, &ctx, sh->rw_id);
+    if (rc != (int32_t)CELL_EDEADLK)
+        fail("test5", "owner trywlock rc=0x%08X, want CELL_EDEADLK", (unsigned)rc);
+
+    SetEvent(sh->owner_has_lock);
+    WaitForSingleObject(sh->helper_done, 10000);
+
+    rc = call1((int64_t(*)(ppu_context*))sys_rwlock_wunlock, &ctx, sh->rw_id);
+    if (rc != CELL_OK) fail("test5", "owner wunlock rc=0x%08X", (unsigned)rc);
+    return 0;
+}
+
+static unsigned __stdcall t5_helper(void* p)
+{
+    t5_shared* sh = (t5_shared*)p;
+    uint32_t tid = alloc_tid(); t_tid = tid;
+    ppu_context ctx; ctx_init_for_thread(&ctx, tid);
+
+    WaitForSingleObject(sh->owner_has_lock, 10000);
+
+    int32_t rc = call1((int64_t(*)(ppu_context*))sys_rwlock_trywlock, &ctx, sh->rw_id);
+    if (rc != (int32_t)CELL_EBUSY)
+        fail("test5", "non-owner trywlock rc=0x%08X, want CELL_EBUSY", (unsigned)rc);
+
+    /* The unlock a non-owner is not entitled to. */
+    rc = call1((int64_t(*)(ppu_context*))sys_rwlock_wunlock, &ctx, sh->rw_id);
+    if (rc != (int32_t)CELL_EPERM)
+        fail("test5", "non-owner wunlock rc=0x%08X, want CELL_EPERM", (unsigned)rc);
+
+    /* ... and which must not have taken the lock away from its owner. */
+    rc = call1((int64_t(*)(ppu_context*))sys_rwlock_trywlock, &ctx, sh->rw_id);
+    if (rc != (int32_t)CELL_EBUSY)
+        fail("test5", "trywlock after a refused wunlock rc=0x%08X, want CELL_EBUSY "
+                      "(the refused unlock released the owner's lock)", (unsigned)rc);
+
+    SetEvent(sh->helper_done);
+    return 0;
+}
+
+static unsigned __stdcall t5_writer(void* p)
+{
+    t5_shared* sh = (t5_shared*)p;
+    uint32_t tid = alloc_tid(); t_tid = tid;
+    ppu_context ctx; ctx_init_for_thread(&ctx, tid);
+
+    for (int i = 0; i < T5_ITERS; i++) {
+        int32_t rc = call2((int64_t(*)(ppu_context*))sys_rwlock_wlock, &ctx, sh->rw_id, 0);
+        if (rc != CELL_OK) { fail("test5", "writer wlock rc=0x%08X", (unsigned)rc); return 1; }
+        /* Under the exclusive lock the read-modify-write needs no atomic;
+         * that is exactly what is being asserted. */
+        LONG v = sh->counter;
+        sh->counter = v + 1;
+        rc = call1((int64_t(*)(ppu_context*))sys_rwlock_wunlock, &ctx, sh->rw_id);
+        if (rc != CELL_OK) { fail("test5", "writer wunlock rc=0x%08X", (unsigned)rc); return 1; }
+    }
+    return 0;
+}
+
+static unsigned __stdcall t5_reader(void* p)
+{
+    t5_shared* sh = (t5_shared*)p;
+    uint32_t tid = alloc_tid(); t_tid = tid;
+    ppu_context ctx; ctx_init_for_thread(&ctx, tid);
+
+    for (int i = 0; i < T5_ITERS; i++) {
+        int32_t rc = call2((int64_t(*)(ppu_context*))sys_rwlock_rlock, &ctx, sh->rw_id, 0);
+        if (rc != CELL_OK) { fail("test5", "reader rlock rc=0x%08X", (unsigned)rc); return 1; }
+        LONG a = sh->counter;
+        LONG b = sh->counter;
+        if (a != b) InterlockedIncrement(&sh->torn_reads);
+        rc = call1((int64_t(*)(ppu_context*))sys_rwlock_runlock, &ctx, sh->rw_id);
+        if (rc != CELL_OK) { fail("test5", "reader runlock rc=0x%08X", (unsigned)rc); return 1; }
+    }
+    return 0;
+}
+
+static int test5_rwlock_ownership(void)
+{
+    const char* name = "test5_rwlock_ownership";
+    LONG before = g_fail_count;
+    ppu_context ctx; ctx_init_for_thread(&ctx, alloc_tid());
+
+    uint32_t id_addr = guest_alloc(4);
+    int32_t rc = call2((int64_t(*)(ppu_context*))sys_rwlock_create, &ctx, id_addr, 0);
+    if (rc != CELL_OK) { fail(name, "rwlock_create rc=0x%08X", (unsigned)rc); return 1; }
+
+    t5_shared sh; memset(&sh, 0, sizeof(sh));
+    sh.rw_id = read_be32(id_addr);
+    sh.owner_has_lock = CreateEventA(NULL, TRUE, FALSE, NULL);
+    sh.helper_done    = CreateEventA(NULL, TRUE, FALSE, NULL);
+
+    /* Nobody holds it yet, so this unlock belongs to nobody either. */
+    rc = call1((int64_t(*)(ppu_context*))sys_rwlock_wunlock, &ctx, sh.rw_id);
+    if (rc != (int32_t)CELL_EPERM)
+        fail(name, "wunlock with no writer rc=0x%08X, want CELL_EPERM", (unsigned)rc);
+
+    HANDLE owner  = (HANDLE)_beginthreadex(NULL, 0, t5_owner, &sh, 0, NULL);
+    HANDLE helper = (HANDLE)_beginthreadex(NULL, 0, t5_helper, &sh, 0, NULL);
+    if (WaitForSingleObject(owner, 20000) == WAIT_TIMEOUT)
+        fail(name, "owner thread never returned (the owner's re-lock blocked)");
+    if (WaitForSingleObject(helper, 20000) == WAIT_TIMEOUT)
+        fail(name, "helper thread never returned");
+    CloseHandle(owner); CloseHandle(helper);
+    CloseHandle(sh.owner_has_lock); CloseHandle(sh.helper_done);
+
+    /* The lock still works after all that, and still excludes. */
+    HANDLE th[T5_WRITERS + T5_READERS];
+    for (int i = 0; i < T5_WRITERS; i++)
+        th[i] = (HANDLE)_beginthreadex(NULL, 0, t5_writer, &sh, 0, NULL);
+    for (int i = 0; i < T5_READERS; i++)
+        th[T5_WRITERS + i] = (HANDLE)_beginthreadex(NULL, 0, t5_reader, &sh, 0, NULL);
+    if (WaitForMultipleObjects(T5_WRITERS + T5_READERS, th, TRUE, 60000) == WAIT_TIMEOUT)
+        fail(name, "writer/reader threads never returned");
+    for (int i = 0; i < T5_WRITERS + T5_READERS; i++) CloseHandle(th[i]);
+
+    if (sh.counter != (LONG)(T5_WRITERS * T5_ITERS))
+        fail(name, "counter=%ld, want %d (the write lock did not exclude)",
+             (long)sh.counter, T5_WRITERS * T5_ITERS);
+    if (sh.torn_reads != 0)
+        fail(name, "%ld torn reads under the read lock", (long)sh.torn_reads);
+
+    call1((int64_t(*)(ppu_context*))sys_rwlock_destroy, &ctx, sh.rw_id);
+
+    int ok = (g_fail_count == before);
+    printf("[%s] counter=%ld torn_reads=%ld -> %s\n",
+           name, (long)sh.counter, (long)sh.torn_reads, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+/* =========================================================================
  * main
  * ========================================================================= */
 int main(int argc, char** argv)
@@ -1125,11 +1294,12 @@ int main(int argc, char** argv)
     int rc2 = test2_timed_wait_semantics();
     int rc3 = test3_semaphore_counting();
     int rc4 = test4_event_queue();
+    int rc5 = test5_rwlock_ownership();
 
     ULONGLONG total_ms = now_ms() - t_start;
     printf("=== total wall time: %llums ===\n", (unsigned long long)total_ms);
 
-    int failed = rc1a || rc1 || rc2 || rc3 || rc4 || (g_fail_count != 0);
+    int failed = rc1a || rc1 || rc2 || rc3 || rc4 || rc5 || (g_fail_count != 0);
     printf("=== RESULT: %s (fail_count=%ld) ===\n", failed ? "FAIL" : "PASS", (long)g_fail_count);
     return failed ? 1 : 0;
 }
