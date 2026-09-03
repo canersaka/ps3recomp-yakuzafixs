@@ -11,7 +11,7 @@ documents the host shim itself._
 | Runtime library | builds, Debug and Release, verified arm64 |
 | Lifter suites | all eight, including the 1300+ conformance cases compiled and executed with Apple Clang |
 | SPU helper tests | pass |
-| `ps3recomp_host` | clear, flip, a fixed-function NV4097 draw, a draw through **guest vertex and fragment programs**, a draw sampling a **guest texture** from a guest program, a pair of triangles the **depth test** has to order, and a two-level texture whose **second mip level** must be the one sampled -- headless through the **Metal** backend, with 60-frame runs |
+| `ps3recomp_host` | clear, flip, a fixed-function NV4097 draw, a draw through **guest vertex and fragment programs**, a draw sampling a **guest texture** from a guest program, a pair of triangles the **depth test** has to order, a two-level texture whose **second mip level** must be the one sampled, and a triangle drawn into an offscreen **colour surface** that a later draw then **samples** -- headless through the **Metal** backend, with 60-frame runs |
 | Guest shader translation | `test_shader_msl`: hand-assembled NV40 programs through the decompilers, glslang and spirv-cross, checked for the MSL binding contract the backend relies on (runs on Linux too) |
 | PPU boot scaffold | `ppu_loader.cpp`, `ppu_hle.cpp`, `ppu_fs.cpp`, `ppu_sysprx.cpp`, `boot_main.cpp` compile at a recorded baseline of **0** errors (`darwin-clang` in `tools/ppu_scaffold_baseline.json`) |
 | PPU boot path | `ps3recomp_boot_smoke`: the scaffold **linked and run** against the synthetic title in `runtime/ppu/tests/smoke/` -- ELF load, entry OPD, TLS, the NID bridge, lv2 syscalls, a guest thread on a second host thread, three frames cleared and flipped through the FIFO to the Metal backend, and `sys_process_exit` |
@@ -42,11 +42,18 @@ exercised on the Mac without a game. See docs/PPU_RECOMP.md.
    faces with the fragment program compiled to sample a direction, and the
    four vertex-texture units bound to the vertex stage so a transform
    program's `TXL` samples. It has one depth/stencil attachment
-   shared by the frame, the NV4097 depth and stencil state per draw, and
+   shared by the display, the NV4097 depth and stencil state per draw, and
    clears as records in the frame's ordered stream, so a clear in the middle
-   of a frame opens a new pass rather than being lost. It has no
-   render-to-texture or MRT, no surface formats beyond the drawable's, no
-   zeta offsets or per-target depth, no stencil write mask or two-sided
+   of a frame opens a new pass rather than being lost. It renders into the
+   guest's own colour surfaces: `SET_SURFACE_COLOR_TARGET` picks A, B or an
+   MRT set, offsets `cellGcmSetDisplayBuffer` never registered are offscreen
+   surfaces in a registry keyed by raw offset, in the float formats
+   `SET_SURFACE_FORMAT` names, each with its own zeta buffer, and a texture
+   unit bound at a surface's offset samples that surface rather than guest
+   memory. What it does not have: MRT targets B, C and D are attached and
+   cleared but never written, because the fragment decompiler emits one
+   `SV_TARGET`; a vertex-texture unit bound at a surface's offset still
+   uploads from guest memory; there is no stencil write mask or two-sided
    stencil (neither register is decoded upstream), and no anisotropy or
    sampler LOD bias. And it is the simpler engine: a title on Windows runs
    through `rsx_live_draw.c`, so the last step is either a seam under that
@@ -81,10 +88,11 @@ obvious shape for a Linux backend.
 
 What is left, in order:
 
-- **Render targets.** `SET_SURFACE_*` beyond the clip size: colour and zeta
-  surfaces as textures, render-to-texture, MRT, surface formats. The record
-  stream is the seam for it: a target change is one more record that ends the
-  open pass and opens the next one somewhere else, exactly as a clear does.
+- **The rest of MRT.** Targets B, C and D are bound and cleared, and the
+  pipeline mirrors target A's blend and colour mask onto them, but the
+  fragment decompiler emits a single `SV_TARGET` so nothing is written to
+  them. A deferred pass therefore fills its first G-buffer plane and no more.
+  The work is in the decompiler, not the backend.
 - **The rest of texturing.** What is left is narrow: anisotropic filtering,
   the LOD bias in `SET_TEXTURE_FILTER` (Metal has no sampler-side bias, so it
   means patching the sampling call in the fragment program), 3D textures, and
@@ -127,6 +135,7 @@ PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader             # guest V
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --tex                # guest texture via a guest FP
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depth              # near-first pair, depth test
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip                # two mip levels, level 1 sampled
+PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --rtt                # render into a surface, then sample it
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_boot_smoke build/smoke/smoke.elf   # the PPU boot path
 ./build/test_shader_msl -v                        # decompilers -> MSL, sources printed
 
