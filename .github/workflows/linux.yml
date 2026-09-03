@@ -164,6 +164,10 @@ jobs:
           # host stack one frame per guest call, so the default stack is not
           # enough and nothing says so until a title dies with no diagnosis.
           ./build/ps3recomp_host --threads
+          # The SDL2 audio and pad backends, which the Windows build never
+          # reaches (it takes WASAPI and XInput). The dummy audio driver and
+          # no controller are the runner's situation and must both be fine.
+          SDL_AUDIODRIVER=dummy ./build/ps3recomp_host --audio-pad
 
       # RSX texture layout -- format class, row sizes, Morton addressing. Pure
       # arithmetic with no host API in it, so it runs everywhere, and it is the
