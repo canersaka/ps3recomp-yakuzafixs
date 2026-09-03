@@ -121,6 +121,19 @@ jobs:
       - name: Check the PPU boot scaffold (ratchet)
         run: python tools/check_ppu_scaffold.py
 
+      # ...and this one RUNS it. The ratchet above only compiles the scaffold;
+      # the smoke title is a synthetic lifted program that drives the loader,
+      # the NID bridge, the lv2 syscalls, a guest thread, the frame clock and
+      # the Metal backend from guest code, and checks all of it. Exit 0 means
+      # every marker appeared in order, the guest thread ran on its own host
+      # thread, three frames reached the backend and the guest's chosen exit
+      # status came back through sys_process_exit. The binary missing means
+      # CMake skipped the target, which must fail rather than pass quietly.
+      - name: Run the PPU boot smoke title (headless Metal)
+        run: |
+          test -x build/ps3recomp_boot_smoke
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_boot_smoke build/smoke/smoke.elf
+
       # RSX texture layout -- format class, row sizes, Morton addressing. Pure
       # arithmetic with no host API in it, so it runs everywhere, and it is the
       # regression net for having lifted that maths out of the D3D12 uploader.
