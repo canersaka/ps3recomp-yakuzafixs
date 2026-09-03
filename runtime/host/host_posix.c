@@ -109,6 +109,22 @@ extern uint32_t ppu_vm_size;
 #define RTT_OFFSET  0x00080000u
 #define RTT_DIM     256u
 #define RTT_BACKING 0xFF00FF00u          /* green, like the quad's vertices   */
+/* --depthtex: an RSX offset for a depth buffer of the guest's own, the size
+ * the texture unit declares when it comes back to sample it, the NDC z the
+ * first pass writes there, and the pixel that depth has to produce.
+ *
+ * 0.25 is chosen so the sampled depth lands on an exact byte: 0.25 * 255 is
+ * 63.75, which is nearer 64 than 63 and so cannot round either way. */
+#define DTEX_OFFSET  0x00100000u
+#define DTEX_DIM     256u
+#define DTEX_Z       0.25f
+#define DTEX_ARGB    0xFF400000u
+/* What the guest bytes behind that offset hold: Z24S8 for depth 1.0 and
+ * stencil 0, which is what a cleared depth buffer really contains. A
+ * renderer that uploads those bytes instead of sampling the live zeta reads
+ * 1.0 and presents saturated red, and so does one that samples a zeta
+ * nothing wrote -- one recognisable wrong answer rather than two. */
+#define DTEX_BACKING 0xFFFFFF00u
 
 /* Functions the RSX side exports but does not declare in a public header. */
 extern void cellGcm_rsx_process_fifo(void);
@@ -220,6 +236,14 @@ static void upload_rtt_backing(void)
         guest_w32(IO_ADDR + RTT_OFFSET + i * 4u, RTT_BACKING);
 }
 
+/* ...and the same for --depthtex's zeta: the bytes a CPU-cleared depth buffer
+ * would hold at the offset the second pass binds a texture unit to. */
+static void upload_depthtex_backing(void)
+{
+    for (uint32_t i = 0; i < DTEX_DIM * DTEX_DIM; i++)
+        guest_w32(IO_ADDR + DTEX_OFFSET + i * 4u, DTEX_BACKING);
+}
+
 /* The textured draw uses its own vertex block: two triangles covering the
  * screen, with texcoord0 (attribute 8) alongside position and colour.
  * Layout per vertex: float4 pos, float4 colour, float4 uv -- stride 48. */
@@ -318,6 +342,28 @@ static void upload_depth_triangles(void)
     for (int i = 0; i < 6; i++)
         for (int k = 0; k < 8; k++)
             guest_f32(IO_ADDR + ZVTX_OFFSET + (uint32_t)(i * 32 + k * 4), v[i][k]);
+}
+
+/* --depthtex's first pass: one full-viewport triangle at DTEX_Z, drawn with
+ * the depth test and depth writes on, so the zeta it is aimed at ends the
+ * pass holding that one value everywhere.
+ *
+ * Flat on purpose. What the mode asserts is the depth VALUE that comes back
+ * through a sampler, and a centre-pixel readback is all the harness can
+ * observe; a depth that varied across the surface would make the assertion
+ * depend on where in the image the resolve landed rather than on what it
+ * read. Layout as upload_triangle's: float4 position, float4 colour. */
+#define DVTX_OFFSET (VTX_OFFSET + 0x5000u)
+static void upload_depthtex_triangle(void)
+{
+    static const float v[3][8] = {
+        { -1.0f, -1.0f, DTEX_Z, 1.0f,   1.0f, 1.0f, 1.0f, 1.0f },
+        {  3.0f, -1.0f, DTEX_Z, 1.0f,   1.0f, 1.0f, 1.0f, 1.0f },
+        { -1.0f,  3.0f, DTEX_Z, 1.0f,   1.0f, 1.0f, 1.0f, 1.0f },
+    };
+    for (int i = 0; i < 3; i++)
+        for (int k = 0; k < 8; k++)
+            guest_f32(IO_ADDR + DVTX_OFFSET + (uint32_t)(i * 32 + k * 4), v[i][k]);
 }
 
 /* --quads: the two primitives that have no host equivalent and are not simply
@@ -437,7 +483,7 @@ static void emit_triangle_draw(void)
  *
  * Parameterised on where the texture is and how big it is, because --rtt
  * points the same draw at a render target instead of an uploaded image. */
-static void emit_textured_draw_at(u32 tex_offset, u32 w, u32 h)
+static void emit_textured_draw_fmt(u32 tex_offset, u32 w, u32 h, u32 fmt_byte)
 {
     u8 vp[48];
     rsx_test_vp_mov_out(vp +  0, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);   /* MOV o0, v0      */
@@ -450,8 +496,9 @@ static void emit_textured_draw_at(u32 tex_offset, u32 w, u32 h)
     /* SET_TEXTURE_FORMAT as cellGcmSetTexture packs it: location in [1:0]
      * (2 = main memory, where the IO window is), 2D in [7:4], the format
      * byte in [15:8] -- A8R8G8B8 (0x85) with LN (0x20), linear rather than
-     * swizzled -- and one mip level in [19:16]. */
-    emit(NV4097_SET_TEXTURE_FORMAT     + 0, 2u | (2u << 4) | ((0x85u | 0x20u) << 8) | (1u << 16));
+     * swizzled, or DEPTH24_D8 (0x90) for --depthtex -- and one mip level in
+     * [19:16]. */
+    emit(NV4097_SET_TEXTURE_FORMAT     + 0, 2u | (2u << 4) | (fmt_byte << 8) | (1u << 16));
     emit(NV4097_SET_TEXTURE_CONTROL0   + 0, 0x80000000u);   /* unit enable */
     emit(NV4097_SET_TEXTURE_CONTROL1   + 0, 0xAAE4u);       /* identity crossbar */
     emit(NV4097_SET_TEXTURE_IMAGE_RECT + 0, (w << 16) | h);
@@ -466,6 +513,12 @@ static void emit_textured_draw_at(u32 tex_offset, u32 w, u32 h)
     emit(NV4097_SET_BEGIN_END, 5u);                       /* TRIANGLES       */
     emit(NV4097_DRAW_ARRAYS,   0u | ((6u - 1u) << 24));   /* first=0 count=6 */
     emit(NV4097_SET_BEGIN_END, 0u);
+}
+
+/* A8R8G8B8 with the LN bit, which is every mode but --depthtex. */
+static void emit_textured_draw_at(u32 tex_offset, u32 w, u32 h)
+{
+    emit_textured_draw_fmt(tex_offset, w, h, 0x85u | 0x20u);
 }
 
 static void emit_textured_draw(void)
@@ -511,6 +564,56 @@ static void emit_rtt_draws(void)
     emit(NV4097_SET_SURFACE_CLIP_HORIZONTAL, 1280u << 16);
     emit(NV4097_SET_SURFACE_CLIP_VERTICAL,   720u << 16);
     emit_textured_draw_at(RTT_OFFSET, RTT_DIM, RTT_DIM);
+}
+
+/* Write a depth buffer of the guest's own, then sample it -- the two halves
+ * of depth-as-texture, in the order a title's shadow or depth-of-field pass
+ * does them.
+ *
+ * First the zeta moves to an address of its own in main memory, is cleared to
+ * 1.0, and the flat triangle at DTEX_Z is drawn into it with the depth test
+ * and depth writes on. That the write happened is what a renderer has to
+ * observe before it may publish the buffer as a texture: a write-enable bit
+ * alone does not prove the pass produced a depth map, and a clear-only zeta
+ * has nothing worth sampling.
+ *
+ * Then the zeta moves elsewhere -- a pass may not sample the depth buffer it
+ * is rendering into -- the depth test comes off, and texture unit 0 is bound
+ * at the FIRST zeta's address as DEPTH24_D8, with the full-screen quad drawn
+ * through the passthrough vertex program and TEX r0, TC0. The sampled depth
+ * arrives in the red channel, so the centre pixel is DTEX_Z as a byte and
+ * nothing else: 1.0 for a zeta nothing wrote or for the guest bytes behind
+ * that offset, 0 for a unit left on the zero texture.
+ *
+ * The depth clear is emitted here rather than with the frame's colour clear
+ * because it has to land while the FIRST zeta is the bound one -- it is what
+ * makes each frame resolve the depth again instead of reusing frame 1's. */
+static void emit_depthtex_draws(void)
+{
+    emit(NV4097_SET_CONTEXT_DMA_ZETA,      CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER);
+    emit(NV4097_SET_SURFACE_ZETA_OFFSET,   DTEX_OFFSET);
+    emit(NV4097_SET_ZSTENCIL_CLEAR_VALUE,  0xFFFFFF00u);   /* depth 1.0, stencil 0 */
+    emit(NV4097_CLEAR_SURFACE,             0x3u);          /* depth + stencil */
+
+    emit(NV4097_SET_DEPTH_TEST_ENABLE, 1u);
+    emit(NV4097_SET_DEPTH_FUNC,        0x0201u);   /* GL_LESS */
+    emit(NV4097_SET_DEPTH_MASK,        1u);
+    emit(NV4097_SET_SHADER_PROGRAM,    0u);        /* fixed-function pass */
+
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, VTX_MAIN(DVTX_OFFSET +  0));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0 * 4, VFMT(4, 32));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4, VTX_MAIN(DVTX_OFFSET + 16));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 3 * 4, VFMT(4, 32));
+    emit(NV4097_SET_BEGIN_END, 5u);                       /* TRIANGLES       */
+    emit(NV4097_DRAW_ARRAYS,   0u | ((3u - 1u) << 24));   /* first=0 count=3 */
+    emit(NV4097_SET_BEGIN_END, 0u);
+
+    /* Another zeta for the sampling pass, and no depth test: the quad must
+     * reach the target on every frame, not only the first. */
+    emit(NV4097_SET_SURFACE_ZETA_OFFSET, 0u);
+    emit(NV4097_SET_DEPTH_TEST_ENABLE,   0u);
+    emit(NV4097_SET_DEPTH_MASK,          0u);
+    emit_textured_draw_fmt(DTEX_OFFSET, DTEX_DIM, DTEX_DIM, 0x90u | 0x20u);
 }
 
 /* Bind the two-level texture on unit 0 and draw the small quad through the
@@ -636,7 +739,8 @@ static void submit_frame(int with_draw)
     } else {
         emit(NV4097_CLEAR_SURFACE,            0xF0u);
     }
-    if (with_draw == 7)      emit_quad_draws();
+    if (with_draw == 8)      emit_depthtex_draws();
+    else if (with_draw == 7) emit_quad_draws();
     else if (with_draw == 6) emit_rtt_draws();
     else if (with_draw == 5) emit_mip_draw();
     else if (with_draw == 4) emit_depth_draw();
@@ -842,7 +946,7 @@ static int run_audio_pad_check(void)
  * software path, which is why Linux runs that mode and not these. */
 static int mode_needs_translator(int mode)
 {
-    return mode == 3 || mode == 5 || mode == 6;
+    return mode == 3 || mode == 5 || mode == 6 || mode == 8;
 }
 
 /* ...and which ones must, on a backend that has a translator, have run the
@@ -858,6 +962,7 @@ static const char* mode_flag_name(int mode)
     case 3:  return "--shader";
     case 5:  return "--mip";
     case 6:  return "--rtt";
+    case 8:  return "--depthtex";
     default: return "(mode)";
     }
 }
@@ -914,6 +1019,12 @@ int main(int argc, char** argv)
          * to be expanded into triangles before they can be drawn at all.
          * Fixed-function, so every backend can run it. */
         else if (strcmp(argv[i], "--quads") == 0)  do_draw = 7;
+        /* --depthtex: write a depth buffer of the guest's own and then sample
+         * it as a DEPTH24_D8 texture, which is what a shadow map, a soft
+         * particle and every depth-of-field pass does. Needs a renderer that
+         * tracks a zeta per address and can publish one as a texture; the
+         * vtable path does not, so this mode is the draw engine's. */
+        else if (strcmp(argv[i], "--depthtex") == 0) do_draw = 8;
     }
     /* The guest-program modes, which a backend without a translator cannot
      * run. --depth and --quads are not among them: both are fixed-function. */
@@ -949,6 +1060,13 @@ int main(int argc, char** argv)
     /* --rtt draws both: the triangle into the surface, the quad out of it. */
     if (do_draw == 6) { upload_triangle(); upload_textured_quad(); upload_rtt_backing(); }
     if (do_draw == 7) upload_quad_geometry();
+    /* --depthtex draws both too: the flat triangle into the zeta, the quad
+     * out of it. */
+    if (do_draw == 8) {
+        upload_depthtex_triangle();
+        upload_textured_quad();
+        upload_depthtex_backing();
+    }
     if (mode_runs_guest_programs(do_draw)) upload_fragment_programs();
     submit_frame(do_draw);
 
@@ -991,9 +1109,13 @@ int main(int argc, char** argv)
          * render-to-texture path shows green. With --quads it is the quad
          * strip's red over the pentagon's green, and the centre belongs to
          * the strip's second quad, so a dropped or half-expanded strip is
-         * green.
+         * green. With --depthtex it is the DEPTH the first pass wrote, come
+         * back through a sampler into the red channel: a zeta nothing wrote,
+         * or the guest bytes behind its address, both read 1.0 and present
+         * saturated red instead.
          */
-        u32 want = (do_draw == 7) ? 0xFFFF0000u   /* the quad strip over the polygon */
+        u32 want = (do_draw == 8) ? DTEX_ARGB     /* the sampled depth as a byte */
+                 : (do_draw == 7) ? 0xFFFF0000u   /* the quad strip over the polygon */
                  : (do_draw == 6) ? 0xFFFF0000u   /* only the surface holds red  */
                  : (do_draw == 5) ? MIP_L1_ARGB
                  : (do_draw == 4) ? 0xFFFF0000u   /* near red beats far green    */
