@@ -1736,8 +1736,11 @@ static id<MTLRenderPipelineState> pso_for(const MtlDraw* d, MTLPixelFormat color
      * is what the D3D12 backend does with RTVFormats[1..]: a zero-initialised
      * secondary attachment writes nothing at all, and a deferred pass would
      * come back with only its first G-buffer plane filled in. The fragment
-     * decompiler emits one SV_TARGET, so B, C and D stay unwritten for now --
-     * they are attached and cleared, not fed. */
+     * decompiler feeds them now -- a program writing r2/r3/r4 (or h4/h6/h8)
+     * returns that many SV_TARGETs. The two counts need not agree: Metal
+     * accepts a function with fewer outputs than the pipeline has attachments
+     * AND one with more, discarding the surplus, which is how the guest's own
+     * hardware behaves when a program exports past the bound set. */
     for (u32 r = 0; r < nrt; r++) {
         MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[r];
         ca.pixelFormat = color_pf;
@@ -2492,9 +2495,10 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
     if ((rs->color_mask >> 24) & 0xFF) wm |= MTLColorWriteMaskAlpha;
     /* Every attachment of an MRT set takes target A's blend and colour mask,
      * as the vtable path's pso_for does with RTVFormats[1..]: a
-     * zero-initialised secondary attachment writes nothing at all. The
-     * fragment decompiler still emits one SV_TARGET, so B, C and D are
-     * attached and cleared, not fed. */
+     * zero-initialised secondary attachment writes nothing at all. The count
+     * is rt_count, the set the engine resolved, and the fragment function's
+     * own output count is whatever its program exports; Metal accepts either
+     * side being the larger one, so the two do not have to agree. */
     for (u32 r = 0; r < rt_count; r++) {
         MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[r];
         ca.pixelFormat = eng_pixel_format(rt_fmt);
