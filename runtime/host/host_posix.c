@@ -201,6 +201,32 @@ static void upload_shader_triangle(void)
             guest_f32(IO_ADDR + SVTX_OFFSET + (uint32_t)(i * 32 + k * 4), v[i][k]);
 }
 
+/* Two full-viewport triangles the depth test has to order, drawn NEAR LAST:
+ * red at NDC z = 0.25 first, then green at z = 0.75. With SET_DEPTH_FUNC LESS
+ * and a depth buffer cleared to 1.0 the red one wins the centre pixel, and a
+ * backend with no working depth test draws the green one over it -- which is
+ * the whole point of drawing them in that order.
+ *
+ * The vertex block is laid out as upload_triangle's: float4 pos, float4
+ * colour, stride 32. No vertex program, so these coordinates land in NDC
+ * through the backend's identity fallback and z arrives at the depth test
+ * unchanged. */
+#define ZVTX_OFFSET (VTX_OFFSET + 0x3000u)
+static void upload_depth_triangles(void)
+{
+    static const float v[6][8] = {
+        { -1.0f, -1.0f, 0.25f, 1.0f,   1.0f, 0.0f, 0.0f, 1.0f },   /* near, red   */
+        {  3.0f, -1.0f, 0.25f, 1.0f,   1.0f, 0.0f, 0.0f, 1.0f },
+        { -1.0f,  3.0f, 0.25f, 1.0f,   1.0f, 0.0f, 0.0f, 1.0f },
+        { -1.0f, -1.0f, 0.75f, 1.0f,   0.0f, 1.0f, 0.0f, 1.0f },   /* far, green  */
+        {  3.0f, -1.0f, 0.75f, 1.0f,   0.0f, 1.0f, 0.0f, 1.0f },
+        { -1.0f,  3.0f, 0.75f, 1.0f,   0.0f, 1.0f, 0.0f, 1.0f },
+    };
+    for (int i = 0; i < 6; i++)
+        for (int k = 0; k < 8; k++)
+            guest_f32(IO_ADDR + ZVTX_OFFSET + (uint32_t)(i * 32 + k * 4), v[i][k]);
+}
+
 /* The fragment programs live in guest memory, where SET_SHADER_PROGRAM points
  * the RSX at them, stored the way rsx_fp_read_word expects (big-endian,
  * half-words swapped). Each is one instruction, 16 bytes:
@@ -322,6 +348,28 @@ static void emit_shader_draw(void)
     emit(NV4097_SET_BEGIN_END, 0u);                       /* end              */
 }
 
+/* Depth test on, LESS, writes on -- the state a title sets for opaque
+ * geometry -- and the two triangles as separate BEGIN/END pairs, which is how
+ * a title issues two draws rather than one split primitive stream. */
+static void emit_depth_draw(void)
+{
+    emit(NV4097_SET_DEPTH_TEST_ENABLE, 1u);
+    emit(NV4097_SET_DEPTH_FUNC,        0x0201u);   /* GL_LESS */
+    emit(NV4097_SET_DEPTH_MASK,        1u);
+
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, VTX_MAIN(ZVTX_OFFSET +  0));  /* position */
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0 * 4, VFMT(4, 32));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4, VTX_MAIN(ZVTX_OFFSET + 16));  /* colour   */
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 3 * 4, VFMT(4, 32));
+
+    emit(NV4097_SET_BEGIN_END, 5u);                       /* TRIANGLES        */
+    emit(NV4097_DRAW_ARRAYS,   0u | ((3u - 1u) << 24));   /* first=0 count=3  */
+    emit(NV4097_SET_BEGIN_END, 0u);
+    emit(NV4097_SET_BEGIN_END, 5u);
+    emit(NV4097_DRAW_ARRAYS,   3u | ((3u - 1u) << 24));   /* first=3 count=3  */
+    emit(NV4097_SET_BEGIN_END, 0u);
+}
+
 /* Append this frame's commands to the ring and advance `put`, exactly as a
  * title does. The RSX's `get` pointer lives inside cellGcmSys and chases `put`;
  * it is never rewound, so each frame must occupy fresh ring space rather than
@@ -329,8 +377,18 @@ static void emit_shader_draw(void)
 static void submit_frame(int with_draw)
 {
     emit(NV4097_SET_COLOR_CLEAR_VALUE, CLEAR_ARGB);
-    emit(NV4097_CLEAR_SURFACE,         0xF0u);
-    if (with_draw == 3)      emit_shader_draw();
+    if (with_draw == 4) {
+        /* CLEAR_SURFACE bits: 0x01 depth, 0x02 stencil, 0xF0 the four colour
+         * channels. ZSTENCIL_CLEAR_VALUE is Z24S8, so 0xFFFFFF00 is depth 1.0
+         * and stencil 0 -- the nv40 reset values, and what a title writes
+         * before drawing an opaque scene. */
+        emit(NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0xFFFFFF00u);
+        emit(NV4097_CLEAR_SURFACE,            0xF3u);
+    } else {
+        emit(NV4097_CLEAR_SURFACE,            0xF0u);
+    }
+    if (with_draw == 4)      emit_depth_draw();
+    else if (with_draw == 3) emit_shader_draw();
     else if (with_draw == 2) emit_textured_draw();
     else if (with_draw == 1) emit_triangle_draw();
 
@@ -356,6 +414,11 @@ int main(int argc, char** argv)
          * decompile -> translate -> compile -> bind path a real title's
          * draws take. Only a backend with that path can pass it. */
         else if (strcmp(argv[i], "--shader") == 0) do_draw = 3;
+        /* --depth: two full-viewport triangles, the near one drawn FIRST, so
+         * the centre pixel is red only if the depth test rejected the later
+         * far one. A backend with no depth buffer draws them in submission
+         * order and fails. Fixed-function, so every backend can run it. */
+        else if (strcmp(argv[i], "--depth") == 0)  do_draw = 4;
     }
     if (do_draw == 3 && !HOST_BACKEND_GUEST_SHADERS) {
         printf("[host] --shader: the %s backend runs no guest programs; nothing to check\n",
@@ -384,7 +447,8 @@ int main(int argc, char** argv)
     if (do_draw == 1) upload_triangle();
     if (do_draw == 2) { upload_texture(); upload_textured_quad(); }
     if (do_draw == 3) upload_shader_triangle();
-    if (do_draw >= 2) upload_fragment_programs();
+    if (do_draw == 4) upload_depth_triangles();
+    if (do_draw == 2 || do_draw == 3) upload_fragment_programs();
     submit_frame(do_draw);
 
     u32 got = host_backend_color();
@@ -416,8 +480,11 @@ int main(int argc, char** argv)
          * primitive path, pipeline state and draw all worked. With --tex it is
          * the TEXTURE's colour, not the quad's green -- so it also proves the
          * texture reached the sampler through layout, decode and the crossbar.
+         * With --depth it is the NEAR triangle's red, drawn before the far
+         * green one: green here means the depth test did nothing.
          */
-        u32 want = (do_draw == 3) ? 0xFFFF0000u   /* blue vertices, FP swaps r/b */
+        u32 want = (do_draw == 4) ? 0xFFFF0000u   /* near red beats far green    */
+                 : (do_draw == 3) ? 0xFFFF0000u   /* blue vertices, FP swaps r/b */
                  : (do_draw == 2) ? TEX_ARGB
                  : (do_draw == 1) ? 0xFFFF0000u
                                   : CLEAR_ARGB;
@@ -425,7 +492,7 @@ int main(int argc, char** argv)
                back, want, (back & 0x00FFFFFFu) == (want & 0x00FFFFFFu) ? "OK" : "MISMATCH");
         if ((back & 0x00FFFFFFu) != (want & 0x00FFFFFFu)) rc = 3;
     }
-    if (do_draw >= 2 && HOST_BACKEND_GUEST_SHADERS) {
+    if ((do_draw == 2 || do_draw == 3) && HOST_BACKEND_GUEST_SHADERS) {
         /* The pixel alone cannot prove the programs ran: a backend that
          * ignored them would draw the triangle blue, which the check above
          * catches, but one that ran the vertex program and dropped the
