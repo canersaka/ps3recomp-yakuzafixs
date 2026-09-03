@@ -270,9 +270,14 @@ s32 cellFiberPpuSwitchFiber(CellFiber fiber)
     if (s_fibers[idx].state == CELL_FIBER_STATE_TERMINATED)
         return (s32)CELL_FIBER_ERROR_STAT;
 
+    /* Who is being switched away from, decided before s_current_fiber moves.
+     * Both branches below need it and one of them used to read it after the
+     * assignment, by which point it always said "the target". */
+    s32 prev = s_current_fiber;
+
     /* Suspend current fiber if one is running */
-    if (s_current_fiber >= 0 && s_current_fiber != (s32)idx)
-        s_fibers[s_current_fiber].state = CELL_FIBER_STATE_SUSPENDED;
+    if (prev >= 0 && prev != (s32)idx)
+        s_fibers[prev].state = CELL_FIBER_STATE_SUSPENDED;
 
     s_current_fiber = (s32)idx;
     s_fibers[idx].state = CELL_FIBER_STATE_RUNNING;
@@ -280,14 +285,22 @@ s32 cellFiberPpuSwitchFiber(CellFiber fiber)
 #ifdef _WIN32
     SwitchToFiber(s_fibers[idx].native_fiber);
 #else
-    if (s_current_fiber == -1) {
-        swapcontext(&s_scheduler_context, &s_fibers[idx].context);
-    } else {
-        ucontext_t* from = (s_current_fiber >= 0 && s_current_fiber != (s32)idx)
-                           ? &s_fibers[s_current_fiber].context
-                           : &s_scheduler_context;
-        swapcontext(from, &s_fibers[idx].context);
-    }
+    /* SwitchToFiber saves the running fiber's state into the running fiber,
+     * whichever one that is; swapcontext has to be told. A switch issued from
+     * inside a fiber saves that fiber, and only a switch issued from the
+     * scheduler saves the scheduler.
+     *
+     * The old selection tested s_current_fiber after assigning idx to it, so
+     * "the caller is a different fiber" was never true and every switch saved
+     * into s_scheduler_context. Two costs, both silent: the scheduler's own
+     * saved context was overwritten by a fiber's, so the eventual return to
+     * the scheduler resumed a fiber's stack instead of main's; and the
+     * calling fiber's context was never updated, so switching back to it
+     * restarted it from its entry point on the stack it was already using. */
+    ucontext_t* from = (prev >= 0 && prev != (s32)idx)
+                       ? &s_fibers[prev].context
+                       : &s_scheduler_context;
+    swapcontext(from, &s_fibers[idx].context);
 #endif
 
     return CELL_OK;

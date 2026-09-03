@@ -7,10 +7,14 @@
  * fair question of whether they still work on arm64 -- so ask, several
  * thousand switches at a time, instead of assuming either way.
  *
- * The shape here is scheduler -> fiber -> yield -> scheduler, run thousands
- * of times, with each fiber checking the argument it was created with. A
- * fiber that starts with the wrong argument is the readable symptom of a
- * context save that landed outside the struct it was given.
+ * Two shapes matter and they are not the same code path:
+ *
+ *   1. scheduler -> fiber -> yield -> scheduler, with each fiber checking the
+ *      argument it was created with. A fiber that starts with the wrong
+ *      argument is the readable symptom of a context save that landed
+ *      outside the struct it was given.
+ *   2. fiber -> fiber directly. cellFiberPpuSwitchFiber called from inside a
+ *      running fiber has to save the CALLER's context, not the scheduler's.
  *
  * Exit code 0 = pass.
  */
@@ -100,6 +104,91 @@ static int case_scheduler_roundtrip(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * Case 2: the two fibers hand off to each other and only the last one back
+ * returns to the scheduler.
+ *
+ * Every switch appends to a trace, so a run that produces the right counts by
+ * the wrong route still fails: the sequence has to alternate.
+ * -----------------------------------------------------------------------*/
+static CellFiber p_a, p_b;
+static long ping_a, ping_b;
+static int  last_seen;              /* 1 = A ran last, 2 = B */
+static long order_violations;
+static long deep_stack_damage;
+
+static void note(int who)
+{
+    if (last_seen == who) order_violations++;
+    last_seen = who;
+}
+
+/* A local array touched either side of the switch: if the switch resumed the
+ * wrong stack, these do not survive. */
+static void ping_entry_a(u64 arg)
+{
+    (void)arg;
+    for (;;) {
+        volatile uint64_t canary[8];
+        for (int i = 0; i < 8; i++) canary[i] = 0x1111111100000000ull + (uint64_t)i;
+        note(1);
+        ping_a++;
+        cellFiberPpuSwitchFiber(p_b);          /* fiber -> fiber */
+        for (int i = 0; i < 8; i++)
+            if (canary[i] != 0x1111111100000000ull + (uint64_t)i) { deep_stack_damage++; break; }
+    }
+}
+
+static void ping_entry_b(u64 arg)
+{
+    (void)arg;
+    for (;;) {
+        volatile uint64_t canary[8];
+        for (int i = 0; i < 8; i++) canary[i] = 0x2222222200000000ull + (uint64_t)i;
+        note(2);
+        ping_b++;
+        if (ping_b >= SWITCHES) cellFiberPpuYieldFiber();   /* back to the scheduler */
+        else                    cellFiberPpuSwitchFiber(p_a);
+        for (int i = 0; i < 8; i++)
+            if (canary[i] != 0x2222222200000000ull + (uint64_t)i) { deep_stack_damage++; break; }
+    }
+}
+
+static int case_fiber_to_fiber(void)
+{
+    long before = g_fails;
+
+    uint32_t ha = guest_alloc(4), hb = guest_alloc(4);
+    s32 rc = cellFiberPpuCreateFiber((CellFiber*)(uintptr_t)ha, ping_entry_a, 0, NULL);
+    if (rc != CELL_OK) { FAILF("create ping A: 0x%08X", (unsigned)rc); return 1; }
+    rc = cellFiberPpuCreateFiber((CellFiber*)(uintptr_t)hb, ping_entry_b, 0, NULL);
+    if (rc != CELL_OK) { FAILF("create ping B: 0x%08X", (unsigned)rc); return 1; }
+    p_a = read_be32(ha);
+    p_b = read_be32(hb);
+
+    /* Enter the chain once; it comes back only when B has had its fill. */
+    rc = cellFiberPpuSwitchFiber(p_a);
+    if (rc != CELL_OK) FAILF("entering the ping-pong chain: 0x%08X", (unsigned)rc);
+
+    if (ping_a != SWITCHES) FAILF("ping A ran %ld times, want %d", ping_a, SWITCHES);
+    if (ping_b != SWITCHES) FAILF("ping B ran %ld times, want %d", ping_b, SWITCHES);
+    if (order_violations)   FAILF("%ld switches did not alternate A/B", order_violations);
+    if (deep_stack_damage)  FAILF("%ld resumes came back on the wrong stack", deep_stack_damage);
+
+    /* The scheduler is still the scheduler: a plain round trip must work
+     * after all that. A switch that clobbered the scheduler context tends to
+     * survive the loop above and die here. */
+    ran_a = 0;
+    rc = cellFiberPpuSwitchFiber(f_a);
+    if (rc != CELL_OK) FAILF("switch after the ping-pong chain: 0x%08X", (unsigned)rc);
+    if (ran_a != 1) FAILF("fiber A ran %ld times after the chain, want 1", ran_a);
+
+    int ok = (g_fails == before);
+    printf("[fiber_to_fiber] A=%ld B=%ld order_violations=%ld stack_damage=%ld -> %s\n",
+           ping_a, ping_b, order_violations, deep_stack_damage, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+/* ---------------------------------------------------------------------------
  * main
  * -----------------------------------------------------------------------*/
 int main(void)
@@ -135,11 +224,12 @@ int main(void)
     if (f_a == f_b) FAILF("both fibers got id %u", (unsigned)f_a);
 
     int rc1 = case_scheduler_roundtrip();
+    int rc2 = case_fiber_to_fiber();
 
     rc = cellFiberPpuFinalize();
     if (rc != CELL_OK) FAILF("Finalize: 0x%08X", (unsigned)rc);
 
-    int failed = rc1 || g_fails;
+    int failed = rc1 || rc2 || g_fails;
     printf("=== RESULT: %s (fails=%d) ===\n", failed ? "FAIL" : "PASS", g_fails);
     return failed ? 1 : 0;
 }
