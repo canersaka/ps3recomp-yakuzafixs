@@ -25,6 +25,8 @@
 #include "sys_fs.h"
 #include "ps3emu/spu_fallback.h"
 #include "../spu/spu_lifted_job.h"   /* spu_run_interp_job — run un-lifted SPU images */
+#include "../spu/spu_lifted_thread.h" /* run a thread's own image, lifted */
+#include "../spu/spu_context.h"       /* the architectural context that runs it */
 #include "sys_event.h"
 
 #include <stdio.h>
@@ -239,7 +241,16 @@ typedef struct {
      * the registered job expects. */
     uint32_t args_ea;
     uint32_t args_size;
+    /* The four u64 arguments, COPIED when the thread is initialized rather than
+     * read at start time. lv2 copies them there, and games reuse one guest args
+     * block for every thread in a group, rewriting it between calls -- reading
+     * it lazily hands every thread the last thread's values. */
+    uint64_t args[4];
     uint32_t img_ea;         /* sys_spu_image descriptor EA (for LS segment load) */
+    /* Real SPU execution: the architectural context a thread running its own
+     * lifted image owns, allocated at group_start and holding that thread's
+     * local store. NULL for fallback and interpreter threads. */
+    struct spu_context* sctx;
     /* Async fallback execution. host_thread is set when group_start spawned
      * a host thread for this SPU thread's PPU fallback; finish_event is
      * signalled when the handler returns; running indicates the thread is
@@ -505,6 +516,12 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
     t->img_ea    = img_ea;
     t->args_ea   = args_ea;
     t->args_size = 0;  /* not known until decoder reads it; sys_spu_thread_args is 32 B */
+    /* lv2 copy semantics: take the four u64s now (see spu_thread_t.args). */
+    for (int a = 0; a < 4; a++) {
+        uint64_t hi = args_ea ? vm_read_be32(args_ea + (uint32_t)a * 8)     : 0;
+        uint64_t lo = args_ea ? vm_read_be32(args_ea + (uint32_t)a * 8 + 4) : 0;
+        t->args[a] = (hi << 32) | lo;
+    }
 
     /* Empty image (entry=0) OR the real SPURS kernel-A entry (0x818, now that
      * _sys_spu_image_import parses the kernel ELF) on a cellSpurs SPU thread ->
@@ -556,6 +573,76 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
+}
+
+/* Reserved stack for an SPU host thread. Lifted SPU code turns a guest loop
+ * into a chain of host calls, so a thread that gets the host default -- 512 KB
+ * on Darwin against 16 MB on Windows -- dies inside code that has done nothing
+ * wrong. YDKJ_BIGSTACK raises it further for chasing a runaway chain. */
+static size_t spu_host_stack_bytes(void)
+{
+    return getenv("YDKJ_BIGSTACK") ? (size_t)512 * 1024 * 1024
+                                   : (size_t)16 * 1024 * 1024;
+}
+
+#ifndef _WIN32
+/* pthread_create with that stack, falling back to the host default if the size
+ * is refused -- a thread with a small stack beats no thread at all. */
+static void spu_spawn_host_thread(spu_thread_handle_t* out,
+                                  void* (*fn)(void*), void* arg)
+{
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    int rc = EINVAL;
+    if (pthread_attr_setstacksize(&attr, spu_host_stack_bytes()) == 0)
+        rc = pthread_create(out, &attr, fn, arg);
+    pthread_attr_destroy(&attr);
+    if (rc != 0)
+        pthread_create(out, NULL, fn, arg);
+}
+#endif
+
+/* Host-thread entry for a thread running its image's own lifted SPU code.
+ *
+ * Everything SPU here is in runtime/spu/spu_lifted_thread.c; this is the part
+ * that belongs to the group state machine: apply the classified stop to the
+ * thread and, for a GROUP_EXIT, to the group, then release group_join. */
+#ifdef _WIN32
+static DWORD WINAPI spu_exec_thread_proc(LPVOID arg)
+#else
+static void* spu_exec_thread_proc(void* arg)
+#endif
+{
+#ifdef _WIN32
+    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
+#endif
+    spu_thread_t* t = (spu_thread_t*)arg;
+    spu_lifted_thread_result r;
+    spu_lifted_thread_run(t->sctx, &r);
+    t->exit_status = r.exit_status;
+    if (r.group_exit) {
+        spu_group_t* g = spu_find_group(t->group_id);
+        if (g) {
+            g->exit_status = r.group_status;
+            /* Say the group exited on its own request. group_join used to
+             * overwrite the cause unconditionally, which made a guest-initiated
+             * sys_spu_thread_group_exit indistinguishable from every thread
+             * simply running out. */
+            g->cause = SPU_GROUP_CAUSE_GROUP_EXIT;
+        }
+    }
+#ifdef _WIN32
+    t->running = 0;
+    SetEvent(t->finish_event);
+    return 0;
+#else
+    pthread_mutex_lock(&t->finish_event.mu);
+    t->running = 0;
+    t->finish_event.done = 1;
+    pthread_cond_broadcast(&t->finish_event.cv);
+    pthread_mutex_unlock(&t->finish_event.mu);
+    return NULL;
+#endif
 }
 
 /* Host-thread entry for a PPU-fallback SPU thread. */
@@ -748,6 +835,11 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
     spu_group_t* g = spu_find_group(id);
     if (!g) { ctx->gpr[3] = (uint64_t)(int64_t)-1; return -1; }
     g->state = SPU_GROUP_STATE_RUNNING;
+    /* This run has produced no cause yet. group_join now preserves a cause a
+     * thread reported, so a group id started a second time has to begin with a
+     * clean one or it would report the previous run's exit forever. */
+    g->cause       = 0;
+    g->exit_status = 0;
 
     /* DIAG: dump the CellSpurs instance @0x40009D00 at group_start time, to see
      * whether libsre has populated it BEFORE the SPU kernel threads spawn. */
@@ -783,6 +875,50 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         if (idx >= MAX_SPU_THREADS) continue;
         spu_thread_t* t = &s_spu_threads[idx];
         if (!t->in_use) continue;
+
+        /* Real SPU execution first. If the title registered lifted code for
+         * this thread's image, the thread runs THAT -- on its own host thread,
+         * as a real SPU would, with group_join waiting on it exactly as it
+         * waits on a fallback thread. Images with no lifted code fall through
+         * to the fallback and interpreter paths below, unchanged. */
+        if (spu_lifted_thread_available(t->entry_point)) {
+            if (!t->sctx) t->sctx = (spu_context*)calloc(1, sizeof(spu_context));
+            if (t->sctx) {
+                spu_lifted_thread_desc d;
+                d.tid      = t->tid;
+                d.group_id = id;
+                d.entry    = t->entry_point;
+                d.img_ea   = t->img_ea;
+                for (int a = 0; a < 4; a++) d.args[a] = t->args[a];
+                spu_lifted_thread_setup(t->sctx, &d);
+                t->running = 1;
+#ifdef _WIN32
+                if (!t->finish_event)
+                    t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+                else
+                    ResetEvent(t->finish_event);
+                t->host_thread = CreateThread(NULL, spu_host_stack_bytes(),
+                                              spu_exec_thread_proc, t,
+                                              STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+#else
+                pthread_mutex_init(&t->finish_event.mu, NULL);
+                pthread_cond_init(&t->finish_event.cv, NULL);
+                t->finish_event.done = 0;
+                spu_spawn_host_thread(&t->host_thread, spu_exec_thread_proc, t);
+#endif
+                fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X entry=0x%08X "
+                        "args=0x%08X -> LIFTED SPU execution (image %d, "
+                        "r3=0x%08X%08X r4=0x%08X%08X r5=0x%08X%08X r6=0x%08X%08X)\n",
+                        id, t->tid, t->entry_point, t->args_ea, t->sctx->image_id,
+                        t->sctx->gpr[3]._u32[0], t->sctx->gpr[3]._u32[1],
+                        t->sctx->gpr[4]._u32[0], t->sctx->gpr[4]._u32[1],
+                        t->sctx->gpr[5]._u32[0], t->sctx->gpr[5]._u32[1],
+                        t->sctx->gpr[6]._u32[0], t->sctx->gpr[6]._u32[1]);
+                spawned++;
+                continue;
+            }
+        }
+
         void* user = NULL;
         spu_ppu_fallback_fn fb = spu_lookup_ppu_fallback(t->entry_point, &user);
         if (!fb && getenv("RD_SPU_INTERP") && t->img_ea) {
@@ -821,34 +957,14 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
             t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
         else
             ResetEvent(t->finish_event);
-        /* Lifted SPU loops can become deep C tail-call recursion; give SPU host
-         * threads a large stack (reserved). Bumped to 512 MB to diagnose whether
-         * the cri/taskset-policy dispatch chain overflows (env YDKJ_BIGSTACK). */
-        SIZE_T _stk = getenv("YDKJ_BIGSTACK") ? (SIZE_T)512 * 1024 * 1024
-                                              : (SIZE_T)16 * 1024 * 1024;
-        t->host_thread = CreateThread(NULL, _stk,
+        t->host_thread = CreateThread(NULL, spu_host_stack_bytes(),
                                       spu_fallback_thread_proc, t,
                                       STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
 #else
         pthread_mutex_init(&t->finish_event.mu, NULL);
         pthread_cond_init(&t->finish_event.cv, NULL);
         t->finish_event.done = 0;
-        /* Same reservation and the same YDKJ_BIGSTACK lever as the Win32
-         * branch. Without it a lifted SPU loop that became deep C recursion
-         * got the host default, 512 KB on Darwin against 16 MB there. */
-        {
-            size_t stk = getenv("YDKJ_BIGSTACK") ? (size_t)512 * 1024 * 1024
-                                                 : (size_t)16 * 1024 * 1024;
-            pthread_attr_t attr;
-            pthread_attr_init(&attr);
-            int prc = EINVAL;
-            if (pthread_attr_setstacksize(&attr, stk) == 0)
-                prc = pthread_create(&t->host_thread, &attr,
-                                     spu_fallback_thread_proc, t);
-            pthread_attr_destroy(&attr);
-            if (prc != 0)
-                pthread_create(&t->host_thread, NULL, spu_fallback_thread_proc, t);
-        }
+        spu_spawn_host_thread(&t->host_thread, spu_fallback_thread_proc, t);
 #endif
         fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X entry=0x%08X args=0x%08X -> spawned host thread\n",
                 id, t->tid, t->entry_point, t->args_ea);
@@ -930,8 +1046,17 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
             }
             if (t->exit_status < worst) worst = t->exit_status;
         }
-        g->exit_status = worst;
-        g->cause       = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
+        /* ALL_THREADS_EXIT is only the DEFAULT. A thread that stopped on
+         * the SPU-side sys_spu_thread_group_exit already recorded GROUP_EXIT
+         * and the status it asked for, and a terminate recorded TERMINATED;
+         * overwriting either made a group the guest deliberately exited
+         * indistinguishable from one whose threads merely ran out. Cause 0 is
+         * the unset sentinel (GROUP_EXIT=1, ALL_THREADS_EXIT=2, TERMINATED=4). */
+        if (g->cause != SPU_GROUP_CAUSE_GROUP_EXIT &&
+            g->cause != SPU_GROUP_CAUSE_TERMINATED) {
+            g->cause       = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
+            g->exit_status = worst;
+        }
         g->state       = SPU_GROUP_STATE_STOPPED;
     }
 
@@ -982,6 +1107,10 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
                 if (t->local_store) {
                     free(t->local_store);
                     t->local_store = NULL;
+                }
+                if (t->sctx) {
+                    free(t->sctx);
+                    t->sctx = NULL;
                 }
                 t->in_use = 0;
             }
@@ -1049,7 +1178,14 @@ static int64_t sys_spu_thread_set_argument_handler(ppu_context* ctx)
      * struct at arg_ea is whatever the game registered for — typically
      * a packed (arg1,arg2,arg3,arg4) tuple of 4 u64s on real SPUs. */
     spu_thread_t* t = spu_find_thread(tid);
-    if (t) t->args_ea = arg_ea;
+    if (t) {
+        t->args_ea = arg_ea;
+        for (int a = 0; a < 4; a++) {     /* lv2 copy semantics, as above */
+            uint64_t hi = arg_ea ? vm_read_be32(arg_ea + (uint32_t)a * 8)     : 0;
+            uint64_t lo = arg_ea ? vm_read_be32(arg_ea + (uint32_t)a * 8 + 4) : 0;
+            t->args[a] = (hi << 32) | lo;
+        }
+    }
 
     fprintf(stderr, "[SPU] thread_set_argument tid=0x%X arg=0x%08X\n",
             tid, arg_ea);
@@ -1153,6 +1289,11 @@ static void ydkj_spu_out_mbox_deliver(uint32_t group_id, uint32_t spu_id,
 static uint8_t* spu_thread_get_or_alloc_ls(spu_thread_t* t)
 {
     if (!t) return NULL;
+    /* A thread running lifted code owns its local store inside the SPU context,
+     * and that is the store the SPU code reads and writes. Hand back the same
+     * 256 KB so sys_spu_thread_read_ls sees what the SPU actually wrote instead
+     * of a second, empty buffer. Nothing frees this one: the context owns it. */
+    if (t->sctx) return t->sctx->ls;
     if (!t->local_store) {
         t->local_store = (uint8_t*)calloc(1, SPU_LS_SIZE);
     }
