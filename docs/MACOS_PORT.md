@@ -16,7 +16,10 @@ documents the host shim itself._
 | PPU boot scaffold | `ppu_loader.cpp`, `ppu_hle.cpp`, `ppu_fs.cpp`, `ppu_sysprx.cpp`, `boot_main.cpp` compile at a recorded baseline of **0** errors (`darwin-clang` in `tools/ppu_scaffold_baseline.json`) |
 | PPU boot path | `ps3recomp_boot_smoke`: the scaffold **linked and run** against the synthetic title in `runtime/ppu/tests/smoke/` -- ELF load, entry OPD, TLS, the NID bridge, lv2 syscalls, a guest thread on a second host thread, three frames cleared and flipped through the FIFO to the Metal backend, and `sys_process_exit` |
 | Win32 host shim | `runtime/platform/tests/test_win32_compat.c`, 298 checks |
-| lv2 sync primitives | `tests/sync_stress`: mutex, cond, semaphore and event-queue stress on host threads |
+| lv2 sync primitives | `tests/sync_stress`: mutex, cond, semaphore, event-queue and rwlock stress on host threads, including recursive-mutex re-entry and write-lock ownership |
+| lv2 threads | `ps3recomp_host --threads`: a guest PPU thread created and joined through the syscalls, and the host stack it got |
+| cellFiber | `tests/fiber_switch`: 4000 scheduler round trips and 4000 direct fiber-to-fiber switches on ucontext (runs on Linux too) |
+| Audio and pad | `ps3recomp_host --audio-pad`: the SDL2 backends up and down twice with `SDL_AUDIODRIVER=dummy` and no controller |
 | RSX self-contained tests | texture layout and primitive tables |
 
 The scaffold check is compile-only. What links and runs it is the smoke title:
@@ -117,6 +120,33 @@ exercised: the `#else` branches in `runtime/syscalls/sys_*`, `cellSpurs.c`,
 against its Windows twin for the wait/repark, priority and timeout behaviour
 added since; do not assume equivalence.
 
+A first pass over those branches has been made and what it found is fixed:
+the rwlock had no write-lock owner off Windows, so a foreign unlock released
+somebody else's lock; a recursive mutex re-entered through `trylock` never
+took the host mutex, so the first guest unlock let another thread in;
+`cellFiber` defined `_XOPEN_SOURCE` after its includes, which on Darwin
+leaves `ucontext_t` the 64-byte header while `getcontext` writes 816 bytes
+into it, and its fiber-to-fiber switch saved into the scheduler's context
+rather than the calling fiber's; guest PPU threads took the default host
+stack, 512 KB here against the 256 MB Windows reserves; and the three
+`cellSpurs` host threads -- kernel poll, policy-module workers, job-chain
+walker -- were inside `#ifdef _WIN32` with no `#else`, so SPURS initialised
+and then did nothing at all. Each has a check in the table above except the
+last, which needs a title to have anything to run.
+
+The SDL2 audio and pad backends were the other unknown and they were fine as
+written: init, poll and shutdown complete on CoreAudio and on the dummy
+driver, with and without a controller.
+
+What is left there is what a title has to settle. The known differences that
+were left alone are the ones where POSIX is already the stricter branch --
+`pthread_cond_timedwait` honours a microsecond deadline, so the POSIX side
+has no equivalent of the sub-millisecond poll loops the Win32 branches carry
+to work around a 15.6 ms timer -- plus the diagnostic levers (`FLOW_CONDKICK`,
+`YDKJ_THREADGATE`, the `POKESEM`/`UNSTICK` semaphore pokes, `GetThreadTimes`
+CPU accounting) that exist only on Windows and only under an environment
+variable.
+
 ### 3. arm64 hardening (overlaps everything above)
 
 The checklist is in `docs/PLATFORM_ABSTRACTION.md`, "Apple Silicon Notes".
@@ -140,6 +170,8 @@ PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depth              # near-fi
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip                # two mip levels, level 1 sampled
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --rtt                # render into a surface, then sample it
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_boot_smoke build/smoke/smoke.elf   # the PPU boot path
+./build/ps3recomp_host --threads                  # lv2 thread create/join + host stack
+SDL_AUDIODRIVER=dummy ./build/ps3recomp_host --audio-pad   # SDL2 audio + pad up and down
 ./build/test_shader_msl -v                        # decompilers -> MSL, sources printed
 
 for t in tools/test_*.py; do python3 "$t"; done          # lifter suites
@@ -147,6 +179,7 @@ python3 tools/check_ppu_scaffold.py                     # scaffold ratchet
 clang -std=gnu17 -I runtime/platform -o /tmp/twc \
       runtime/platform/tests/test_win32_compat.c runtime/platform/win32_compat.c && /tmp/twc
 cmake -S tests/sync_stress -B build-ss -G Ninja && cmake --build build-ss && ./build-ss/sync_stress
+cmake -S tests/fiber_switch -B build-fb -G Ninja && cmake --build build-fb && ./build-fb/fiber_switch
 ```
 
 Two switches on the backend: `PS3RECOMP_METAL_SHADER_DUMP=<dir>` writes every

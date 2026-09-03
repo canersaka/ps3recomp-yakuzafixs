@@ -403,7 +403,20 @@ makecontext(&ctx, fiber_proc, 1, param);
 swapcontext(&current, &ctx);
 ```
 
-**Note:** `ucontext` is deprecated on macOS but still works. For production macOS builds, consider using `setjmp`/`longjmp` with manual stack management, or platform-specific alternatives.
+**Note:** `ucontext` is deprecated on macOS and still works. `tests/fiber_switch`
+is the evidence: 4000 scheduler round trips and 4000 direct fiber-to-fiber
+switches on arm64, in CI. No replacement mechanism is needed.
+
+What does bite is the header. Darwin declares `ucontext_t`'s embedded
+`__mcontext_data` only under `_XOPEN_SOURCE`, while `getcontext` points
+`uc_mcontext` at that member and writes `uc_mcsize` (816) bytes through it
+regardless. Define `_XOPEN_SOURCE` too late -- after any include that has
+already reached `<sys/_types/_ucontext.h>` -- and the type is the 64-byte
+header alone, every context operation overruns it by 752 bytes, and the
+`#error` in `<ucontext.h>` does not catch it because that header was not the
+one that mattered. `libs/spurs/cellFiber.c` defines it on its first line and
+carries a `_Static_assert` on `sizeof(ucontext_t)` so an added `#include`
+cannot quietly undo it.
 
 ---
 
@@ -510,7 +523,7 @@ validated on, and where each is handled:
 | **A protection fault is `SIGBUS`, not `SIGSEGV`.** Darwin routes an access to a page that is mapped but inaccessible -- a `PROT_NONE` reservation, most of all -- to `SIGBUS`, and only an address with nothing mapped at it to `SIGSEGV`. So a handler installed for one signal and not the other misses half the faults. Worse, `si_code` there is 1, the value that spells `BUS_ADRALN`, whether the access was misaligned or merely forbidden; the direction and the real cause come from the trap frame's ESR instead. | `runtime/platform/win32_compat.c` |
 | **No thread affinity.** `SetThreadAffinityMask` is a no-op; thread priority maps to QoS classes (`USER_INTERACTIVE` for above-normal and up), which is what keeps a thread on the P-cores. | `runtime/platform/win32_compat.c` |
 | **FMA in the base ISA.** Clang contracts `a*b+c` into a fused multiply-add by default on arm64; MSVC never does and x86-64 without `-mfma` cannot. The library builds with `-ffp-contract=off` so results match the validated x86 builds and a PPC `fmadd` is fused only where the lifter spells one -- and a port's own build of the lifted code must set the same flag. | `CMakeLists.txt` |
-| **`ucontext` is deprecated** and hidden unless `_XOPEN_SOURCE` is defined first. | `libs/spurs/cellFiber.c` |
+| **`ucontext` is deprecated**, and `_XOPEN_SOURCE` gates two things: whether `<ucontext.h>` compiles, which it says with an `#error`, and whether `ucontext_t` carries the machine state `getcontext` writes into it, which it does not say at all. Defined first, or every context operation overruns its target by 752 bytes. | `libs/spurs/cellFiber.c`, `tests/fiber_switch` |
 | **Darwin names only the calling thread** (`pthread_setname_np(name)`), and `pthread_threadid_np` is the kernel tid. | `runtime/platform/win32_compat.c` |
 | **x86 intrinsics.** Spin hints are `pause` on x86 and `yield` on arm64; SSE paths in `stb_image` are guarded by its own `STBI_SSE2` detection. | `runtime/spu/spu_lockstep.c`, `win32_compat.h` |
 
