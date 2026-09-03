@@ -790,6 +790,12 @@ static MTLPixelFormat texfmt_to_metal(rsx_texfmt f)
     case RSX_TEXFMT_BC1:      return MTLPixelFormatBC1_RGBA;
     case RSX_TEXFMT_BC2:      return MTLPixelFormatBC2_RGBA;
     case RSX_TEXFMT_BC3:      return MTLPixelFormatBC3_RGBA;
+    case RSX_TEXFMT_R16:      return MTLPixelFormatR16Unorm;
+    case RSX_TEXFMT_R16G16:   return MTLPixelFormatRG16Unorm;
+    case RSX_TEXFMT_R16G16F:  return MTLPixelFormatRG16Float;
+    case RSX_TEXFMT_R16G16B16A16F: return MTLPixelFormatRGBA16Float;
+    case RSX_TEXFMT_R32F:     return MTLPixelFormatR32Float;
+    case RSX_TEXFMT_R32G32B32A32F: return MTLPixelFormatRGBA32Float;
     default:                  return MTLPixelFormatR8Unorm;
     }
 }
@@ -829,13 +835,18 @@ static id<MTLTexture> upload_texture(const u8* src, u32 w, u32 h, u32 fmt, u32 c
     rsx_tex_layout tl;
     rsx_texture_layout(fmt, w, h, &tl);
     if (tl.face_bytes == 0) return nil;
-    if (s_tex_staging_cap < tl.face_bytes) {
-        u8* n = (u8*)realloc(s_tex_staging, tl.face_bytes);
+    /* Staging is sized by the DECODED image, which is wider than the source
+     * for a format the host has to be handed unpacked. */
+    const u32 staged = tl.dst_row_bytes * tl.rows;
+    if (s_tex_staging_cap < staged) {
+        u8* n = (u8*)realloc(s_tex_staging, staged);
         if (!n) return nil;
-        s_tex_staging = n; s_tex_staging_cap = tl.face_bytes;
+        s_tex_staging = n; s_tex_staging_cap = staged;
     }
-    rsx_texture_decode(s_tex_staging, tl.row_bytes, src, w, h, &tl,
-                       tl.fmt == RSX_TEXFMT_R8G8B8A8 ? rsx_texture_argb_is_rgba() : 0);
+    /* TEX_RGBA is consulted unconditionally, as the D3D12 backend does: the
+     * decode only reads it for the two formats whose bytes are A,R,G,B. */
+    rsx_texture_decode(s_tex_staging, tl.dst_row_bytes, src, w, h, &tl,
+                       rsx_texture_argb_is_rgba());
 
     MTLTextureDescriptor* td =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:texfmt_to_metal(tl.fmt)
@@ -851,7 +862,7 @@ static id<MTLTexture> upload_texture(const u8* src, u32 w, u32 h, u32 fmt, u32 c
     id<MTLTexture> tex = [s_dev newTextureWithDescriptor:td];
     if (!tex) return nil;
     [tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
-             withBytes:s_tex_staging bytesPerRow:tl.row_bytes];
+             withBytes:s_tex_staging bytesPerRow:tl.dst_row_bytes];
     return tex;
 }
 
