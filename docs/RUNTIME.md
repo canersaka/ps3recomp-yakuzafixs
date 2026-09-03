@@ -330,6 +330,27 @@ typedef struct spu_context {
 #define SPU_STATUS_SINGLE_STEP      0x10  // Single-step mode
 ```
 
+### Guest Loads Stay Out of Line
+
+A title polls memory the way hardware lets it: a `lwz`, a compare and a
+branch back, with nothing else in the loop. Lowered to C, that loop is a
+load the compiler is entitled to hoist out of it, because nothing in the
+loop body writes memory as far as the compiler can see. The guest then
+spins on a register while the RSX, an SPU or another PPU thread changes
+the word underneath it, and the port hangs in a place that looks like a
+missing wake.
+
+The lifter therefore emits every guest load as a call to the out-of-line
+`vm_read8/16/32/64` in `ppu_loader.cpp`, which the compiler has to treat
+as touching arbitrary memory, and the recompiled objects are built without
+link-time optimisation so those calls stay calls. Both halves are part of
+the contract. A port that inlines the loads, either by taking the
+`static inline` versions in `ppu_memory.h` into recompiled code or by
+enabling `-flto` across the runtime and the lift, reintroduces the
+hoisting, and the failure it produces is a poll that never sees its
+value. The inline versions are for HLE modules, whose waits go through
+calls of their own.
+
 ### Local Store Access
 
 All local store access uses a mask (`SPU_LS_MASK = 0x3FFFF`) to wrap addresses within the 256 KB range:
