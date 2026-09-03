@@ -106,6 +106,19 @@ extern "C" {
  * depth of a 3D one. */
 #define NV4097_SET_TEXTURE_CONTROL3             0x00001840
 
+/* Vertex textures: four units of eight words at 0x0900 + unit*0x20. The block
+ * is laid out like a fragment unit's with one substitution -- CONTROL3 sits
+ * where CONTROL1 does, so a vertex unit has a row pitch and no component
+ * crossbar. A transform program's TXL instruction samples these. */
+#define NV4097_SET_VERTEX_TEXTURE_OFFSET        0x00000900
+#define NV4097_SET_VERTEX_TEXTURE_FORMAT        0x00000904
+#define NV4097_SET_VERTEX_TEXTURE_ADDRESS       0x00000908
+#define NV4097_SET_VERTEX_TEXTURE_CONTROL0      0x0000090C
+#define NV4097_SET_VERTEX_TEXTURE_CONTROL3      0x00000910
+#define NV4097_SET_VERTEX_TEXTURE_FILTER        0x00000914
+#define NV4097_SET_VERTEX_TEXTURE_IMAGE_RECT    0x00000918
+#define NV4097_SET_VERTEX_TEXTURE_BORDER_COLOR  0x0000091C
+
 /* Shader programs */
 #define NV4097_SET_SHADER_PROGRAM               0x000008E4
 #define NV4097_SET_SHADER_CONTROL               0x00001D60
@@ -177,6 +190,7 @@ extern "C" {
  * -----------------------------------------------------------------------*/
 
 #define RSX_MAX_TEXTURES          16
+#define RSX_MAX_VERTEX_TEXTURES    4
 #define RSX_MAX_VERTEX_ATTRIBS    16
 #define RSX_MAX_RENDER_TARGETS     4
 
@@ -258,6 +272,12 @@ typedef struct rsx_state {
 
     /* Textures */
     rsx_texture_state textures[RSX_MAX_TEXTURES];
+    /* Vertex textures reuse rsx_texture_state deliberately: a vertex unit's
+     * registers are a fragment unit's with CONTROL3 in CONTROL1's slot, so
+     * decoding one into the same struct with control1 left at zero -- which
+     * reads as the identity crossbar -- lets a backend resolve, upload and
+     * cache both kinds through one path. */
+    rsx_texture_state vertex_textures[RSX_MAX_VERTEX_TEXTURES];
 
     /* Vertex attributes */
     rsx_vertex_attrib vertex_attribs[RSX_MAX_VERTEX_ATTRIBS];

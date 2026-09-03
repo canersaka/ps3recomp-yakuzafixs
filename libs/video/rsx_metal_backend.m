@@ -30,7 +30,8 @@
  * SET_TEXTURE_FILTER and SET_TEXTURE_CONTROL0. A unit SET_TEXTURE_FORMAT
  * bit 2 marks as a cube map becomes an MTLTextureTypeCube of six faces, and
  * the fragment program is compiled against that so it samples with a
- * direction.
+ * direction. NV4097_SET_VERTEX_TEXTURE_* units go through the same path and
+ * bind to the vertex stage, so a transform program's TXL samples.
  *
  * Why Metal rather than SDL_Renderer: SDL2's renderer is a 2D sprite API with
  * no route to a custom vertex program, depth/stencil, MRT or render-to-texture,
@@ -128,6 +129,10 @@ typedef struct {
      * zero texture / default sampler. Guest-program draws only. */
     int tex[RSX_MAX_TEXTURES];
     int samp[RSX_MAX_TEXTURES];
+    /* The same, for the four vertex-texture units a transform program's TXL
+     * samples. They share the caches with the fragment units. */
+    int vtex[RSX_MAX_VERTEX_TEXTURES];
+    int vsamp[RSX_MAX_VERTEX_TEXTURES];
     float mvp[16];   /* built-in path: 4 rows of the RSX vertex-constant matrix */
 } MtlDraw;
 
@@ -605,7 +610,7 @@ static id<MTLFunction> compile_guest_function(const char* msl, const char* what)
  * the D3D12 backend's vp_get_vs: the program starts at the instruction
  * SET_TRANSFORM_PROGRAM_START selects (the store holds every resident
  * program), falling back to 0 when that lies past what was uploaded. */
-static int vp_slot_for(const rsx_state* st)
+static int vp_slot_for(const rsx_state* st, u32 vtex_mask)
 {
     if (st->vp_ucode_bytes < 16) return -1;
     u32 vstart = st->transform_program_start * 16u;
@@ -616,7 +621,10 @@ static int vp_slot_for(const rsx_state* st)
      * in the store: another program uploaded behind it must not miss. */
     const u32 instrs = rsx_vp_program_size_instrs(uc, avail);
     const u32 len = instrs ? instrs * 16u : avail;
-    const u32 hash = fnv1a32(uc, len);
+    /* The bound vertex-texture units are part of the key: an unbound unit's
+     * TXL decompiles to a defined zero and declares no sampler at all, so the
+     * same microcode with a different mask is a different program. */
+    const u32 hash = fnv1a32(uc, len) ^ (vtex_mask * 0x9E3779B9u);
 
     for (u32 i = 0; i < s_vp_count; i++)
         if (s_vp_cache[i].hash == hash) return s_vp_cache[i].fn ? (int)i : -1;
@@ -625,7 +633,7 @@ static int vp_slot_for(const rsx_state* st)
     char name[64];
     snprintf(name, sizeof name, "vertex program %08X", hash);
     id<MTLFunction> fn = nil;
-    const int ni = rsx_vp_decompile(uc, len, s_hlsl, sizeof s_hlsl);
+    const int ni = rsx_vp_decompile_ex(uc, len, vtex_mask, s_hlsl, sizeof s_hlsl);
     if (ni <= 0) {
         fprintf(stderr, "[RSX metal] %s: decompile failed (%d)\n", name, ni);
     } else {
@@ -649,10 +657,11 @@ static int vp_slot_for(const rsx_state* st)
     return fn ? slot : -1;
 }
 
-/* Which texture units are cube maps, from the texture registers. Defined with
- * the rest of the texture code below; declared here because the fragment
- * program is compiled against it. */
+/* Which texture units are cube maps, and which vertex-texture units are
+ * bound. Defined with the rest of the texture code below; declared here
+ * because the guest programs are compiled against them. */
 static u32 cube_mask_for(const rsx_state* st);
+static u32 vtex_mask_for(const rsx_state* st);
 
 /* The fragment program the draw would run, resolved as the D3D12 backend's
  * vp_get_fp_pso does: SET_SHADER_PROGRAM's low bits are the location (1 =
@@ -751,7 +760,7 @@ static int cb_alloc(u32 bytes, u32* off)
  * outputs do not link with the built-in fragment shader's inputs. */
 static int guest_programs_for(const rsx_state* st, MtlDraw* d)
 {
-    const int vs = vp_slot_for(st);
+    const int vs = vp_slot_for(st, vtex_mask_for(st));
     if (vs < 0) return 0;
     const u8* fp_uc = NULL;
     const int fs = fp_slot_for(st, &fp_uc, cube_mask_for(st));
@@ -865,6 +874,19 @@ static u32 cube_mask_for(const rsx_state* st)
     u32 m = 0;
     for (u32 u = 0; u < RSX_MAX_TEXTURES; u++)
         if ((st->textures[u].control0 & 0x80000000u) && texture_is_cube(&st->textures[u]))
+            m |= 1u << u;
+    return m;
+}
+
+/* The enabled vertex-texture units. The vertex program is decompiled against
+ * this: an unmasked unit's TXL becomes a defined zero and declares nothing,
+ * so a program compiled with the wrong mask samples the wrong thing or reads
+ * a slot the backend never bound. */
+static u32 vtex_mask_for(const rsx_state* st)
+{
+    u32 m = 0;
+    for (u32 u = 0; u < RSX_MAX_VERTEX_TEXTURES; u++)
+        if (st->vertex_textures[u].control0 & 0x80000000u)
             m |= 1u << u;
     return m;
 }
@@ -1081,6 +1103,15 @@ static void textures_for(const rsx_state* st, MtlDraw* d)
         d->tex[u]  = tex_slot_for(t);
         d->samp[u] = samp_slot_for(t);
     }
+    /* Vertex textures go through the same resolve, upload and caches: a
+     * vertex unit's registers are decoded into the same rsx_texture_state,
+     * with no crossbar, so nothing below here knows the difference. */
+    for (u32 u = 0; u < RSX_MAX_VERTEX_TEXTURES; u++) {
+        const rsx_texture_state* t = &st->vertex_textures[u];
+        if (!(t->control0 & 0x80000000u)) continue;
+        d->vtex[u]  = tex_slot_for(t);
+        d->vsamp[u] = samp_slot_for(t);
+    }
 }
 
 /* Guest face culling, packed as the D3D12 backend's rsx_cull_key reads it:
@@ -1229,6 +1260,7 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     memset(d, 0, sizeof *d);
     d->vs_idx = d->fs_idx = d->ds_idx = -1;
     for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) d->tex[u] = d->samp[u] = -1;
+    for (u32 u = 0; u < RSX_MAX_VERTEX_TEXTURES; u++) d->vtex[u] = d->vsamp[u] = -1;
 
     /* Programs first: their translation is what can fail, and a draw that
      * drops to the built-in shader must still fetch its vertices the same
@@ -1433,7 +1465,16 @@ typedef struct {
     id<MTLBuffer> cbuf;
     int tex[RSX_MAX_TEXTURES];    /* what each unit currently holds, or -1 */
     int samp[RSX_MAX_TEXTURES];
+    int vtex[RSX_MAX_VERTEX_TEXTURES];
+    int vsamp[RSX_MAX_VERTEX_TEXTURES];
 } MtlPassState;
+
+/* Where a vertex texture binds. The VP decompiler declares unit N's texture
+ * at HLSL register t(16+N) and its sampler at sN, and spirv-cross carries
+ * both numbers into the vertex function -- so the two do NOT share an index.
+ * test_shader_msl asserts exactly that. */
+#define MTL_VTEX_INDEX(n) ((NSUInteger)(16u + (n)))
+#define MTL_VSAMP_INDEX(n) ((NSUInteger)(n))
 
 /* Open a render pass on `color`. The attachments `clear` flags name load-action
  * Clear with its values; the rest load-action Load, so what an earlier pass in
@@ -1478,6 +1519,12 @@ static id<MTLRenderCommandEncoder> begin_pass(id<MTLCommandBuffer> cb,
         [enc setFragmentSamplerState:s_default_sampler atIndex:(NSUInteger)u];
         ps->tex[u] = ps->samp[u] = -1;
     }
+    /* The vertex stage's units get the same treatment, for the same reason. */
+    for (int u = 0; u < RSX_MAX_VERTEX_TEXTURES; u++) {
+        [enc setVertexTexture:s_null_tex atIndex:MTL_VTEX_INDEX(u)];
+        [enc setVertexSamplerState:s_default_sampler atIndex:MTL_VSAMP_INDEX(u)];
+        ps->vtex[u] = ps->vsamp[u] = -1;
+    }
     MTLViewport vp = { 0.0, 0.0, (double)s_width, (double)s_height, 0.0, 1.0 };
     [enc setViewport:vp];
     return enc;
@@ -1509,6 +1556,20 @@ static void encode_draw(id<MTLRenderCommandEncoder> enc, const MtlDraw* d,
                                                               : s_default_sampler)
                                      atIndex:(NSUInteger)u];
                 ps->samp[u] = d->samp[u];
+            }
+        }
+        for (int u = 0; u < RSX_MAX_VERTEX_TEXTURES; u++) {
+            if (d->vtex[u] != ps->vtex[u]) {
+                [enc setVertexTexture:(d->vtex[u] >= 0 ? s_tex_cache[d->vtex[u]].tex
+                                                       : s_null_tex)
+                              atIndex:MTL_VTEX_INDEX(u)];
+                ps->vtex[u] = d->vtex[u];
+            }
+            if (d->vsamp[u] != ps->vsamp[u]) {
+                [enc setVertexSamplerState:(d->vsamp[u] >= 0 ? s_samp_cache[d->vsamp[u]].samp
+                                                             : s_default_sampler)
+                                   atIndex:MTL_VSAMP_INDEX(u)];
+                ps->vsamp[u] = d->vsamp[u];
             }
         }
     } else {

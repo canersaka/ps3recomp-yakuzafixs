@@ -31,6 +31,7 @@
  * ---------------------------------------------------------------------------*/
 
 #define RSX_TEST_VP_OP_MOV      0x01u
+#define RSX_TEST_VP_OP_TXL      0x19u
 #define RSX_TEST_VP_SRC_TEMP    1u
 #define RSX_TEST_VP_SRC_INPUT   2u
 /* Component selectors, 0 = x .. 3 = w, in x,y,z,w lane order. */
@@ -50,9 +51,14 @@ static inline u32 rsx_test_vp_src(u32 type, u32 reg, u32 swz)
 
 /* One instruction at `p`: `vec_op` reading input register v[input] with
  * swizzle `swz` as src0, writing all four lanes of output register o[out],
- * no temp write, scalar unit idle. `end` sets the program's end bit. */
-static inline void rsx_test_vp_vec_out(u8* p, u32 vec_op, u32 input, u32 swz,
-                                       u32 out, int end)
+ * no temp write, scalar unit idle. `end` sets the program's end bit.
+ *
+ * `tex_unit` is TXL's vertex-texture unit, D2 bits [8:9]. Those bits sit
+ * inside the src1 field, which is why they can simply be OR-ed in: src1 here
+ * is temp register 0, whose encoding leaves both of them clear, and TXL reads
+ * its coordinate from src0 anyway. */
+static inline void rsx_test_vp_vec_out_tex(u8* p, u32 vec_op, u32 input, u32 swz,
+                                           u32 tex_unit, u32 out, int end)
 {
     const u32 src0 = rsx_test_vp_src(RSX_TEST_VP_SRC_INPUT, 0, swz);
     const u32 src1 = rsx_test_vp_src(RSX_TEST_VP_SRC_TEMP, 0, RSX_TEST_VP_SWZ_IDENT);
@@ -65,6 +71,7 @@ static inline void rsx_test_vp_vec_out(u8* p, u32 vec_op, u32 input, u32 swz,
                  | (0u << 27);               /* sca_opcode: NOP          */
     const u32 d2 = (src2 >> 11)              /* src2 high 6 bits         */
                  | ((src1 & 0x1FFFFu) << 6)  /* src1                     */
+                 | ((tex_unit & 3u) << 8)    /* TXL texture unit         */
                  | ((src0 & 0x1FFu) << 23);  /* src0 low 9 bits          */
     const u32 d3 = (end ? 1u : 0u)           /* end                      */
                  | ((out & 0x1Fu) << 2)      /* dst (output register)    */
@@ -76,10 +83,25 @@ static inline void rsx_test_vp_vec_out(u8* p, u32 vec_op, u32 input, u32 swz,
     rsx_test_put_le32(p + 8, d2); rsx_test_put_le32(p + 12, d3);
 }
 
+static inline void rsx_test_vp_vec_out(u8* p, u32 vec_op, u32 input, u32 swz,
+                                       u32 out, int end)
+{
+    rsx_test_vp_vec_out_tex(p, vec_op, input, swz, 0, out, end);
+}
+
 /* MOV o[out], v[input].swz */
 static inline void rsx_test_vp_mov_out(u8* p, u32 input, u32 swz, u32 out, int end)
 {
     rsx_test_vp_vec_out(p, RSX_TEST_VP_OP_MOV, input, swz, out, end);
+}
+
+/* TXL o[out], v[input].swz on vertex-texture unit `unit` -- a transform
+ * program sampling a texture, which is what a title uses for per-instance
+ * placement and displacement data. */
+static inline void rsx_test_vp_txl_out(u8* p, u32 input, u32 swz, u32 unit,
+                                       u32 out, int end)
+{
+    rsx_test_vp_vec_out_tex(p, RSX_TEST_VP_OP_TXL, input, swz, unit, out, end);
 }
 
 /* ---- fragment program --------------------------------------------------------
