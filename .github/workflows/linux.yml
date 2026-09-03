@@ -273,6 +273,13 @@ jobs:
           /tmp/test_texture_layout
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_primitives libs/video/tests/test_rsx_primitives.c
           /tmp/test_rsx_primitives
+          # The fragment-program decoder on its own: the word swap, source
+          # swizzles and types, the dest mask, inline constants, which
+          # register file the colour export comes from, and how many
+          # SV_TARGETs a program that writes more than one export gets. It
+          # had rotted to the point of not compiling while nothing ran it.
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -o /tmp/test_fp_decompiler libs/video/tests/test_fp_decompiler.c libs/video/rsx_fp_decompiler.c
+          /tmp/test_fp_decompiler
           # The register-file draw engine's platform-neutral halves, driven
           # through its dispatch sink against a stub backend: the surface set's
           # keying and reallocation, a texture unit that names a render target

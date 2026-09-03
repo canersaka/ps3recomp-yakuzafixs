@@ -179,6 +179,20 @@ jobs:
           # those bytes instead, which is exactly the failure above.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depthtex
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depthtex --frames=60
+          # Multiple render targets: an MRT1 set at two offscreen offsets,
+          # both members written by ONE draw whose fragment program exports
+          # r0 and r2 -- a deferred renderer's G-buffer pass. The display
+          # quad then samples one of them, and a centre pixel can only speak
+          # for one, so --mrt asserts target B (blue, the export that had
+          # nowhere to go until the decompiler grew a second SV_TARGET) and
+          # --mrt-a asserts target A (red, that growing it disturbed
+          # nothing). Every way of getting it wrong has its own colour: the
+          # set's clear colour for a target attached and cleared but never
+          # fed, and the surfaces' green guest bytes for a renderer that
+          # uploads those instead of binding what the pass wrote.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mrt
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mrt-a
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mrt --frames=60
           # A guest program pair that will not translate has no fallback in
           # the draw engine, so forcing the built-in shader leaves --shader
           # with nothing to draw: it must still fail, or the check is not
@@ -219,6 +233,9 @@ jobs:
           ./build/ps3recomp_host --rtt
           ./build/ps3recomp_host --rtt --frames=60
           ./build/ps3recomp_host --quads
+          ./build/ps3recomp_host --mrt
+          ./build/ps3recomp_host --mrt-a
+          ./build/ps3recomp_host --mrt --frames=60
           if PS3RECOMP_METAL_FIXED_FUNCTION=1 ./build/ps3recomp_host --shader; then
             echo "--shader passed with the built-in shader forced; the check is not checking"
             exit 1
@@ -292,6 +309,12 @@ jobs:
           /tmp/test_texture_layout
           clang -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_primitives libs/video/tests/test_rsx_primitives.c
           /tmp/test_rsx_primitives
+          # The fragment-program decoder on its own: the word swap, source
+          # swizzles and types, the dest mask, inline constants, which
+          # register file the colour export comes from, and how many
+          # SV_TARGETs a program that writes more than one export gets.
+          clang -std=gnu17 -Wall -Wextra -I include -o /tmp/test_fp_decompiler libs/video/tests/test_fp_decompiler.c libs/video/rsx_fp_decompiler.c
+          /tmp/test_fp_decompiler
           # The register-file draw engine's platform-neutral halves against a
           # stub backend -- surface keying and reallocation, render-target
           # aliasing on a texture bind, the texture cache's revalidation and
