@@ -155,8 +155,10 @@ with a chosen status.
 
 `ps3recomp_boot_smoke` (UNIX) is `boot_main.cpp` plus the scaffold plus that
 program, and it exits 0 only if every marker appeared in order, the guest
-thread really ran on a second host thread, three frames reached the backend
-and the chosen status came back through `sys_process_exit`. CI runs it on
+thread really ran on a second host thread, three frames reached the backend,
+the vblank handler the title registered was delivered on the guest thread
+with the count in r3, and the chosen status came back through
+`sys_process_exit`. CI runs it on
 macOS through headless Metal and on Linux through the null backend.
 
 Four defects surfaced the moment it ran, all of them POSIX-only and all of
