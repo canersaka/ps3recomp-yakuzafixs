@@ -105,6 +105,16 @@ jobs:
             -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c
           /tmp/test_spu_helpers
 
+      # An SPU parked on a GETLLAR reservation has to be told when the PPU
+      # writes that line. Nothing else in the tree fails when that notify is
+      # missing -- the SPU just never wakes -- so it gets its own check.
+      - name: Run the PPU/SPU lock-line coherence tests
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+            -std=gnu17 -I include -I runtime/spu \
+            -o /tmp/test_spu_coherency runtime/spu/tests/test_spu_coherency.c
+          /tmp/test_spu_coherency
+
       # Guest vertex and fragment programs through the decompilers, glslang
       # and spirv-cross: asserts the MSL carries the buffer, texture, sampler
       # and attribute slots the Metal backend binds to. The binary missing

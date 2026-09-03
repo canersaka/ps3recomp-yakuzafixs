@@ -67,6 +67,15 @@ jobs:
                 -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c
           /tmp/test_spu_helpers
 
+      # An SPU parked on a GETLLAR reservation has to be told when the PPU
+      # writes that line. Nothing else in the tree fails when that notify is
+      # missing -- the SPU just never wakes -- so it gets its own check.
+      - name: Run the PPU/SPU lock-line coherence tests
+        run: |
+          clang -std=gnu17 -I include -I runtime/spu \
+                -o /tmp/test_spu_coherency runtime/spu/tests/test_spu_coherency.c
+          /tmp/test_spu_coherency
+
       # Drives a real NV4097 command buffer through cellGcm -> RSX -> the Metal
       # backend and asserts the presented pixel matches the guest clear colour.
       # Headless, so it needs no display: exit 0 means the whole graphics bridge
