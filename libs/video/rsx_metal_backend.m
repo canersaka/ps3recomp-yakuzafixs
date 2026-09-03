@@ -2005,6 +2005,1005 @@ static void release_surfaces(void)
 }
 
 
+/* ---- the register-file draw engine's backend --------------------------------
+ * rsx_draw_engine.c implements rsx_dispatch_sink over the whole NV4097
+ * register file and drives a backend through rsx_draw_backend. Everything
+ * below is this file's implementation of that interface. It is a second
+ * record stream rather than a reworking of the one above, because the two
+ * front ends are different -- the vtable one is fed rsx_state and resolves a
+ * draw's programs and textures itself, while the engine hands over resolved
+ * handles -- and the vtable path stays the default until they have parity.
+ *
+ * What is shared is everything below the front end: the device and queue, the
+ * shader translation, the texture decode, the sampler decode tables and the
+ * blend, compare and stencil translations.
+ *
+ * Handles are indices into one object table, because the engine binds colour
+ * targets, depth snapshots and uploaded textures through the same array and a
+ * bind cannot tell them apart. Pipelines have their own table: only
+ * bind_pipeline ever names one.
+ * --------------------------------------------------------------------------*/
+
+#include "rsx_draw_engine.h"
+
+#define ENG_MAX_OBJECTS  4096
+#define ENG_MAX_PIPES    4096
+#define ENG_MAX_RECORDS  8192
+#define ENG_MAX_VIEWS    256
+#define ENG_MAX_FUNCS    4096
+#define ENG_MAX_SAMPLERS 256
+#define ENG_ALIGN        256u
+/* One frame's staging. Past it the backend submits and waits rather than
+ * dropping the rest of the frame: dropping "discarded 181/184 sampled a010
+ * groups" once the orphanage workload filled the D3D12 engine's ring. */
+#define ENG_STAGE_MAX    (384u << 20)
+
+static int s_eng_active;
+
+static id<MTLTexture> s_eng_obj[ENG_MAX_OBJECTS];
+static u32 s_eng_obj_count;
+static u32 s_eng_obj_free[ENG_MAX_OBJECTS];
+static u32 s_eng_obj_free_count;
+
+typedef struct {
+    id<MTLRenderPipelineState> pso;
+    id<MTLDepthStencilState>   ds;
+    MTLCullMode cull;
+    MTLWinding  winding;
+} EngPipeline;
+static EngPipeline s_eng_pipe[ENG_MAX_PIPES];
+static u32 s_eng_pipe_count;
+
+/* Compiled MSL functions, keyed on the HLSL the decompilers emitted: one
+ * program is translated and compiled once however many pipeline variants
+ * reference it. */
+typedef struct { u64 hash; id<MTLFunction> fn; } EngFunc;
+static EngFunc s_eng_func[ENG_MAX_FUNCS];
+static u32 s_eng_func_count;
+
+typedef struct { u64 key; id<MTLSamplerState> samp; } EngSampler;
+static EngSampler s_eng_samp[ENG_MAX_SAMPLERS];
+static u32 s_eng_samp_count;
+
+typedef struct { u32 surface, remap, format, view; } EngView;
+static EngView s_eng_view[ENG_MAX_VIEWS];
+static u32 s_eng_view_count;
+
+typedef enum {
+    ENG_REC_DRAW, ENG_REC_CLEAR_COLOR, ENG_REC_CLEAR_DS, ENG_REC_DEPTH_RESOLVE
+} EngRecKind;
+
+typedef struct {
+    EngRecKind kind;
+    u32 surface, depth;
+    u32 pipeline;
+    u32 vb_off, stride, vertex_count;
+    u32 ib_off, index_count;
+    u32 vs_cb_off, vs_cb_bytes;
+    u32 ps_cb_off, ps_cb_bytes;
+    u32 tex[RSX_BE_MAX_TEXTURES];
+    int samp[RSX_BE_MAX_TEXTURES];
+    u32 vtex[RSX_BE_MAX_VERTEX_TEXTURES];
+    int vsamp[RSX_BE_MAX_VERTEX_TEXTURES];
+    float vp[4];
+    u32   sc[4];
+    u32   stencil_ref;
+    float clear_rgba[4];
+    u32   clear_flags;
+    float clear_depth;
+    u8    clear_stencil;
+    u32   resolve_dst;          /* ENG_REC_DEPTH_RESOLVE target texture */
+} EngRecord;
+
+static EngRecord s_eng_rec[ENG_MAX_RECORDS];
+static u32 s_eng_rec_count;
+static u32 s_eng_dropped;
+
+static u8* s_eng_stage;
+static u32 s_eng_stage_used, s_eng_stage_cap;
+
+/* What the bind_* calls have accumulated for the next draw. */
+static EngRecord s_eng_pending;
+
+/* The blit and depth-resolve helpers, and their sampler. */
+static id<MTLLibrary>             s_eng_helper_lib;
+static id<MTLRenderPipelineState> s_eng_blit_pso;
+static MTLPixelFormat             s_eng_blit_pso_fmt;
+static id<MTLRenderPipelineState> s_eng_depth_pso;
+static id<MTLSamplerState>        s_eng_point_sampler;
+
+static NSString* const kEngHelperMSL = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct BOut { float4 pos [[position]]; float2 uv; };\n"
+"vertex BOut eng_fullscreen_vs(uint vid [[vertex_id]]) {\n"
+"    float2 p = float2((vid << 1) & 2, vid & 2);\n"
+"    BOut o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+"    o.uv = float2(p.x, 1.0 - p.y);\n"
+"    return o;\n"
+"}\n"
+"fragment float4 eng_blit_fs(BOut i [[stage_in]],\n"
+"                            texture2d<float> src [[texture(0)]],\n"
+"                            sampler s [[sampler(0)]]) {\n"
+"    return src.sample(s, i.uv);\n"
+"}\n"
+"fragment float eng_depth_fs(BOut i [[stage_in]],\n"
+"                            depth2d<float> src [[texture(0)]],\n"
+"                            sampler s [[sampler(0)]]) {\n"
+"    return src.sample(s, i.uv);\n"
+"}\n";
+
+static u32 eng_obj_add(id<MTLTexture> t)
+{
+    if (!t) return 0;
+    u32 slot;
+    if (s_eng_obj_free_count) {
+        slot = s_eng_obj_free[--s_eng_obj_free_count];
+    } else {
+        if (s_eng_obj_count >= ENG_MAX_OBJECTS) return 0;
+        slot = s_eng_obj_count++;
+    }
+    s_eng_obj[slot] = t;
+    return slot + 1;
+}
+
+static id<MTLTexture> eng_obj(u32 handle)
+{
+    return (handle && handle <= s_eng_obj_count) ? s_eng_obj[handle - 1] : nil;
+}
+
+static void eng_obj_release(void* user, u32 handle)
+{
+    (void)user;
+    if (!handle || handle > s_eng_obj_count || !s_eng_obj[handle - 1]) return;
+    s_eng_obj[handle - 1] = nil;
+    if (s_eng_obj_free_count < ENG_MAX_OBJECTS)
+        s_eng_obj_free[s_eng_obj_free_count++] = handle - 1;
+    /* Any view cut from this object stops being valid with it. */
+    for (u32 i = 0; i < s_eng_view_count; i++)
+        if (s_eng_view[i].surface == handle) {
+            eng_obj_release(NULL, s_eng_view[i].view);
+            s_eng_view[i] = s_eng_view[--s_eng_view_count];
+            i--;
+        }
+}
+
+static MTLPixelFormat eng_pixel_format(rsx_be_format f)
+{
+    switch (f) {
+    case RSX_BE_FMT_R8:              return MTLPixelFormatR8Unorm;
+    case RSX_BE_FMT_R8G8:            return MTLPixelFormatRG8Unorm;
+    case RSX_BE_FMT_R8G8B8A8:        return MTLPixelFormatRGBA8Unorm;
+    case RSX_BE_FMT_BC1:             return MTLPixelFormatBC1_RGBA;
+    case RSX_BE_FMT_BC2:             return MTLPixelFormatBC2_RGBA;
+    case RSX_BE_FMT_BC3:             return MTLPixelFormatBC3_RGBA;
+    case RSX_BE_FMT_R16:             return MTLPixelFormatR16Unorm;
+    case RSX_BE_FMT_R16G16:          return MTLPixelFormatRG16Unorm;
+    case RSX_BE_FMT_R16G16F:         return MTLPixelFormatRG16Float;
+    case RSX_BE_FMT_R16G16B16A16F:   return MTLPixelFormatRGBA16Float;
+    case RSX_BE_FMT_R32F:            return MTLPixelFormatR32Float;
+    case RSX_BE_FMT_R32G32B32A32F:   return MTLPixelFormatRGBA32Float;
+    default:                         return MTLPixelFormatR8Unorm;
+    }
+}
+
+/* ---- staging ------------------------------------------------------------- */
+
+static void eng_encode_and_commit(id<MTLTexture> present_dst);
+
+static int eng_stage_reserve(u32 bytes, u32* out_off)
+{
+    const u32 start = (s_eng_stage_used + ENG_ALIGN - 1u) & ~(ENG_ALIGN - 1u);
+    if ((u64)start + bytes > ENG_STAGE_MAX) {
+        /* Submit and wait rather than drop the rest of the frame; everything
+         * already recorded has been encoded, so the arena is free again. */
+        eng_encode_and_commit(nil);
+        return eng_stage_reserve(bytes, out_off);
+    }
+    if (start + bytes > s_eng_stage_cap) {
+        u32 cap = s_eng_stage_cap ? s_eng_stage_cap : (4u << 20);
+        while (start + bytes > cap) cap *= 2u;
+        u8* n = (u8*)realloc(s_eng_stage, cap);
+        if (!n) return 0;
+        s_eng_stage = n;
+        s_eng_stage_cap = cap;
+    }
+    *out_off = start;
+    s_eng_stage_used = start + bytes;
+    return 1;
+}
+
+static int eng_stage_copy(const void* src, u32 bytes, u32* out_off)
+{
+    if (!bytes) { *out_off = 0; return 1; }
+    if (!eng_stage_reserve(bytes, out_off)) return 0;
+    memcpy(s_eng_stage + *out_off, src, bytes);
+    return 1;
+}
+
+/* ---- lifecycle ----------------------------------------------------------- */
+
+static int eng_init(void* user, u32 width, u32 height)
+{
+    (void)user; (void)width; (void)height;
+    if (!s_dev) return -1;
+    NSError* err = nil;
+    s_eng_helper_lib = [s_dev newLibraryWithSource:kEngHelperMSL options:nil error:&err];
+    if (!s_eng_helper_lib) {
+        fprintf(stderr, "[rsx engine/metal] helper shader compile failed: %s\n",
+                [[err localizedDescription] UTF8String]);
+        return -1;
+    }
+    MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
+    sd.minFilter = MTLSamplerMinMagFilterNearest;
+    sd.magFilter = MTLSamplerMinMagFilterNearest;
+    sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
+    sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    s_eng_point_sampler = [s_dev newSamplerStateWithDescriptor:sd];
+    return s_eng_point_sampler ? 0 : -1;
+}
+
+static void eng_shutdown(void* user)
+{
+    (void)user;
+    for (u32 i = 0; i < s_eng_obj_count; i++) s_eng_obj[i] = nil;
+    for (u32 i = 0; i < s_eng_pipe_count; i++) {
+        s_eng_pipe[i].pso = nil;
+        s_eng_pipe[i].ds = nil;
+    }
+    for (u32 i = 0; i < s_eng_func_count; i++) s_eng_func[i].fn = nil;
+    for (u32 i = 0; i < s_eng_samp_count; i++) s_eng_samp[i].samp = nil;
+    s_eng_obj_count = s_eng_obj_free_count = 0;
+    s_eng_pipe_count = s_eng_func_count = s_eng_samp_count = s_eng_view_count = 0;
+    s_eng_rec_count = 0;
+    free(s_eng_stage); s_eng_stage = NULL;
+    s_eng_stage_used = s_eng_stage_cap = 0;
+    s_eng_helper_lib = nil;
+    s_eng_blit_pso = nil;
+    s_eng_depth_pso = nil;
+    s_eng_point_sampler = nil;
+    s_eng_active = 0;
+}
+
+static void eng_submit_and_wait(void* user, u32 reason)
+{
+    (void)user; (void)reason;
+    eng_encode_and_commit(nil);
+}
+
+/* ---- resources ----------------------------------------------------------- */
+
+static u32 eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
+                              u32 mips, u32 faces, u32 remap, u32 rsx_fmt)
+{
+    (void)user;
+    if (!s_dev || !w || !h) return 0;
+    MTLTextureDescriptor* td = [MTLTextureDescriptor new];
+    td.textureType      = (faces == 6) ? MTLTextureTypeCube : MTLTextureType2D;
+    td.pixelFormat      = eng_pixel_format(fmt);
+    td.width            = w;
+    td.height           = h;
+    td.mipmapLevelCount = mips ? mips : 1;
+    td.usage            = MTLTextureUsageShaderRead;
+    /* The crossbar's selectors arrive in its own A,R,G,B field order; destR is
+     * out[1] .. destA is out[0], as everywhere else in this file. */
+    u8 sel[4];
+    rsx_texture_component_remap(remap, rsx_fmt & 0x9Fu, sel);
+    td.swizzle = MTLTextureSwizzleChannelsMake(
+        swizzle_sel(sel[1]), swizzle_sel(sel[2]),
+        swizzle_sel(sel[3]), swizzle_sel(sel[0]));
+    return eng_obj_add([s_dev newTextureWithDescriptor:td]);
+}
+
+static void eng_texture_upload(void* user, u32 handle, u32 face, u32 mip,
+                               u32 w, u32 h, const void* src, u32 row_bytes,
+                               u32 rows)
+{
+    (void)user; (void)rows;
+    id<MTLTexture> t = eng_obj(handle);
+    if (!t || !src || !row_bytes) return;
+    [t replaceRegion:MTLRegionMake2D(0, 0, w, h)
+         mipmapLevel:mip
+               slice:face
+           withBytes:src
+         bytesPerRow:row_bytes
+       bytesPerImage:0];
+}
+
+static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
+                                   const void* seed, u32 seed_row_bytes)
+{
+    (void)user;
+    if (!s_dev || !w || !h) return 0;
+    MTLTextureDescriptor* td =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:eng_pixel_format(fmt)
+                                                           width:w height:h
+                                                       mipmapped:NO];
+    /* PixelFormatView because a unit sampling this target wears its own
+     * TEXTURE_CONTROL1 crossbar as a view swizzle. */
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
+               MTLTextureUsagePixelFormatView;
+    id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
+    if (!t) return 0;
+    if (seed && seed_row_bytes)
+        [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
+               withBytes:seed bytesPerRow:seed_row_bytes];
+    return eng_obj_add(t);
+}
+
+static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
+{
+    (void)user;
+    id<MTLTexture> t = eng_obj(surface);
+    if (!t) return 0;
+    for (u32 i = 0; i < s_eng_view_count; i++)
+        if (s_eng_view[i].surface == surface && s_eng_view[i].remap == remap &&
+            s_eng_view[i].format == rsx_format)
+            return s_eng_view[i].view;
+    if (s_eng_view_count >= ENG_MAX_VIEWS) return 0;
+    u8 sel[4];
+    rsx_texture_component_remap(remap, (rsx_format >> 8) & 0x9Fu, sel);
+    id<MTLTexture> v =
+        [t newTextureViewWithPixelFormat:[t pixelFormat]
+                             textureType:MTLTextureType2D
+                                  levels:NSMakeRange(0, 1)
+                                  slices:NSMakeRange(0, 1)
+                                 swizzle:MTLTextureSwizzleChannelsMake(
+                                             swizzle_sel(sel[1]), swizzle_sel(sel[2]),
+                                             swizzle_sel(sel[3]), swizzle_sel(sel[0]))];
+    const u32 handle = eng_obj_add(v);
+    if (!handle) return 0;
+    s_eng_view[s_eng_view_count].surface = surface;
+    s_eng_view[s_eng_view_count].remap   = remap;
+    s_eng_view[s_eng_view_count].format  = rsx_format;
+    s_eng_view[s_eng_view_count].view    = handle;
+    s_eng_view_count++;
+    return handle;
+}
+
+static u32 eng_depth_target_create(void* user, u32 w, u32 h)
+{
+    (void)user;
+    if (!s_dev || !w || !h) return 0;
+    MTLTextureDescriptor* td =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTL_DEPTH_FORMAT
+                                                           width:w height:h
+                                                       mipmapped:NO];
+    /* ShaderRead as well as RenderTarget: depth-as-texture resolves through a
+     * pass that samples this as a depth2d, so it cannot be write-only. */
+    td.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModePrivate;
+    return eng_obj_add([s_dev newTextureWithDescriptor:td]);
+}
+
+/* The sampleable copy of a depth target. The copy is a record in the stream,
+ * not an immediate blit, because it has to observe the depth the passes
+ * recorded so far actually wrote. */
+static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
+{
+    (void)user;
+    if (!eng_obj(depth) || !s_eng_helper_lib) return 0;
+    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return 0; }
+    if (!s_eng_depth_pso) {
+        MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction   = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
+        pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:@"eng_depth_fs"];
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatR32Float;
+        NSError* err = nil;
+        s_eng_depth_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (!s_eng_depth_pso) {
+            fprintf(stderr, "[rsx engine/metal] depth resolve pipeline failed: %s\n",
+                    [[err localizedDescription] UTF8String]);
+            return 0;
+        }
+    }
+    MTLTextureDescriptor* td =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                                                           width:w height:h
+                                                       mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    const u32 dst = eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    if (!dst) return 0;
+
+    EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+    memset(r, 0, sizeof *r);
+    r->kind = ENG_REC_DEPTH_RESOLVE;
+    r->depth = depth;
+    r->resolve_dst = dst;
+    return dst;
+}
+
+/* ---- pipelines ----------------------------------------------------------- */
+
+static id<MTLFunction> eng_function(const char* hlsl, int stage,
+                                    const char* what)
+{
+    const u64 hash = fnv1a64(hlsl, (u32)strlen(hlsl), 1469598103934665603ull);
+    for (u32 i = 0; i < s_eng_func_count; i++)
+        if (s_eng_func[i].hash == hash) return s_eng_func[i].fn;
+    if (s_eng_func_count >= ENG_MAX_FUNCS) return nil;
+
+    id<MTLFunction> fn = nil;
+    char name[64];
+    snprintf(name, sizeof name, "%s_%016llx.hlsl", what, (unsigned long long)hash);
+    dump_shader(name, hlsl);
+    if (rsx_hlsl_to_msl(hlsl, stage, s_msl, sizeof s_msl, s_log, sizeof s_log) != 0) {
+        fprintf(stderr, "[rsx engine/metal] %s %016llx: %s\n", what,
+                (unsigned long long)hash, s_log);
+    } else {
+        snprintf(name, sizeof name, "%s_%016llx.msl", what, (unsigned long long)hash);
+        dump_shader(name, s_msl);
+        snprintf(name, sizeof name, "%s %016llx", what, (unsigned long long)hash);
+        fn = compile_guest_function(s_msl, name);
+    }
+    s_eng_func[s_eng_func_count].hash = hash;
+    s_eng_func[s_eng_func_count].fn   = fn;
+    s_eng_func_count++;
+    return fn;
+}
+
+static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
+                               const rsx_be_render_state* rs,
+                               const rsx_vertex_layout_plan* layout,
+                               u32 vertex_stride, rsx_be_format rt_fmt)
+{
+    (void)user;
+    if (!s_dev || !s_guest_shaders || !vertex_stride) return 0;
+    if (s_eng_pipe_count >= ENG_MAX_PIPES) return 0;
+    id<MTLFunction> vs = eng_function(vs_hlsl, RSX_SHADER_STAGE_VERTEX, "vp");
+    if (!vs) return 0;
+    id<MTLFunction> fs = eng_function(ps_hlsl, RSX_SHADER_STAGE_FRAGMENT, "fp");
+    if (!fs) return 0;
+
+    /* Attribute index is the layout SLOT, not the guest's ATTRn number.
+     * glslang numbers an HLSL input struct's members in DECLARATION order --
+     * a compact VSInput declaring ATTR0 and ATTR3 puts a3 at location 1 --
+     * and spirv-cross carries those locations into [[attribute(n)]]. The two
+     * agree for the all-sixteen layout, where slot is the attribute number,
+     * which is why the vtable path above can index by either. */
+    MTLVertexDescriptor* vd = [MTLVertexDescriptor vertexDescriptor];
+    for (u32 slot = 0; slot < layout->count; slot++) {
+        vd.attributes[slot].format      = MTLVertexFormatFloat4;
+        vd.attributes[slot].offset      = (NSUInteger)(slot * 16u);
+        vd.attributes[slot].bufferIndex = MTL_VB_INDEX;
+    }
+    vd.layouts[MTL_VB_INDEX].stride = vertex_stride;
+
+    MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction   = vs;
+    pd.fragmentFunction = fs;
+    pd.vertexDescriptor = vd;
+    pd.depthAttachmentPixelFormat   = MTL_DEPTH_FORMAT;
+    pd.stencilAttachmentPixelFormat = MTL_DEPTH_FORMAT;
+    MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[0];
+    ca.pixelFormat = eng_pixel_format(rt_fmt);
+    /* nv40 COLOR_MASK byte layout: B=[0:7] G=[8:15] R=[16:23] A=[24:31], any
+     * nonzero byte turning that channel on. */
+    MTLColorWriteMask wm = MTLColorWriteMaskNone;
+    if ((rs->color_mask >>  0) & 0xFF) wm |= MTLColorWriteMaskBlue;
+    if ((rs->color_mask >>  8) & 0xFF) wm |= MTLColorWriteMaskGreen;
+    if ((rs->color_mask >> 16) & 0xFF) wm |= MTLColorWriteMaskRed;
+    if ((rs->color_mask >> 24) & 0xFF) wm |= MTLColorWriteMaskAlpha;
+    ca.writeMask = wm;
+    if (rs->blend_enable) {
+        ca.blendingEnabled             = YES;
+        ca.sourceRGBBlendFactor        = blend_factor_to_metal(rs->sf_rgb);
+        ca.destinationRGBBlendFactor   = blend_factor_to_metal(rs->df_rgb);
+        ca.sourceAlphaBlendFactor      = blend_factor_to_metal(rs->sf_a);
+        ca.destinationAlphaBlendFactor = blend_factor_to_metal(rs->df_a);
+        ca.rgbBlendOperation           = blend_equation_to_metal(rs->eq_rgb);
+        ca.alphaBlendOperation         = blend_equation_to_metal(rs->eq_a);
+    }
+
+    NSError* err = nil;
+    id<MTLRenderPipelineState> pso =
+        [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!pso) {
+        fprintf(stderr, "[rsx engine/metal] pipeline state failed: %s\n",
+                [[err localizedDescription] UTF8String]);
+        return 0;
+    }
+
+    /* Depth and stencil are pipeline state in D3D12 and an encoder object in
+     * Metal, so the engine's render state splits here rather than upstream. */
+    MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
+    dd.depthCompareFunction = rs->depth_test ? gcm_compare_to_metal(rs->depth_func)
+                                             : MTLCompareFunctionAlways;
+    dd.depthWriteEnabled    = (rs->depth_test && rs->depth_write) ? YES : NO;
+    if (rs->stencil_enable) {
+        MTLStencilDescriptor* fsd = [MTLStencilDescriptor new];
+        fsd.stencilCompareFunction    = gcm_compare_to_metal(rs->s_func);
+        fsd.stencilFailureOperation   = gcm_stencil_op_to_metal(rs->s_fail);
+        fsd.depthFailureOperation     = gcm_stencil_op_to_metal(rs->s_zfail);
+        fsd.depthStencilPassOperation = gcm_stencil_op_to_metal(rs->s_zpass);
+        fsd.readMask                  = rs->s_func_mask & 0xFFu;
+        fsd.writeMask                 = rs->s_write_mask & 0xFFu;
+        dd.frontFaceStencil = fsd;
+        if (rs->stencil_two_sided) {
+            MTLStencilDescriptor* bsd = [MTLStencilDescriptor new];
+            bsd.stencilCompareFunction    = gcm_compare_to_metal(rs->bs_func);
+            bsd.stencilFailureOperation   = gcm_stencil_op_to_metal(rs->bs_fail);
+            bsd.depthFailureOperation     = gcm_stencil_op_to_metal(rs->bs_zfail);
+            bsd.depthStencilPassOperation = gcm_stencil_op_to_metal(rs->bs_zpass);
+            bsd.readMask                  = rs->s_func_mask & 0xFFu;
+            bsd.writeMask                 = rs->s_write_mask & 0xFFu;
+            dd.backFaceStencil = bsd;
+        } else {
+            /* Two-sided off: nv40 applies the front state to both faces. */
+            dd.backFaceStencil = fsd;
+        }
+    }
+    id<MTLDepthStencilState> ds = [s_dev newDepthStencilStateWithDescriptor:dd];
+    if (!ds) return 0;
+
+    const u32 slot = s_eng_pipe_count++;
+    s_eng_pipe[slot].pso = pso;
+    s_eng_pipe[slot].ds  = ds;
+    /* CULL_FACE FRONT=0x0404 BACK=0x0405 FRONT_AND_BACK=0x0408 (front here,
+     * as in the D3D12 engine); FRONT_FACE CW=0x0900 CCW=0x0901. */
+    s_eng_pipe[slot].cull = MTLCullModeNone;
+    if (rs->cull_enable && rs->cull_face)
+        s_eng_pipe[slot].cull = (rs->cull_face == 0x0404u || rs->cull_face == 0x0408u)
+                                    ? MTLCullModeFront
+                                    : (rs->cull_face == 0x0405u ? MTLCullModeBack
+                                                                : MTLCullModeNone);
+    s_eng_pipe[slot].winding = (rs->front_face == 0x0901u)
+                                   ? MTLWindingCounterClockwise
+                                   : MTLWindingClockwise;
+    return slot + 1;
+}
+
+static void eng_pipeline_release(void* user, u32 pipeline)
+{
+    (void)user;
+    if (pipeline && pipeline <= s_eng_pipe_count) {
+        s_eng_pipe[pipeline - 1].pso = nil;
+        s_eng_pipe[pipeline - 1].ds  = nil;
+    }
+}
+
+/* ---- per-draw binding ---------------------------------------------------- */
+
+static int eng_sampler_slot(const rsx_be_sampler_desc* d)
+{
+    const u64 key = (u64)d->min_linear | ((u64)d->mag_linear << 1)
+                  | ((u64)d->mip_linear << 2) | ((u64)d->mip_present << 3)
+                  | ((u64)d->wrap_s << 4) | ((u64)d->wrap_t << 8)
+                  | ((u64)d->wrap_r << 12)
+                  | ((u64)(u32)(d->min_lod * 256.0f) << 16)
+                  | ((u64)(u32)(d->max_lod * 256.0f) << 32);
+    for (u32 i = 0; i < s_eng_samp_count; i++)
+        if (s_eng_samp[i].key == key) return (int)i;
+    if (s_eng_samp_count >= ENG_MAX_SAMPLERS) return -1;
+    MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
+    sd.minFilter = d->min_linear ? MTLSamplerMinMagFilterLinear
+                                 : MTLSamplerMinMagFilterNearest;
+    sd.magFilter = d->mag_linear ? MTLSamplerMinMagFilterLinear
+                                 : MTLSamplerMinMagFilterNearest;
+    sd.mipFilter = !d->mip_present ? MTLSamplerMipFilterNotMipmapped
+                 : d->mip_linear   ? MTLSamplerMipFilterLinear
+                                   : MTLSamplerMipFilterNearest;
+    sd.lodMinClamp = d->min_lod;
+    sd.lodMaxClamp = d->max_lod;
+    sd.sAddressMode = gcm_wrap_to_metal(d->wrap_s);
+    sd.tAddressMode = gcm_wrap_to_metal(d->wrap_t);
+    sd.rAddressMode = gcm_wrap_to_metal(d->wrap_r);
+    sd.borderColor  = MTLSamplerBorderColorTransparentBlack;
+    id<MTLSamplerState> s = [s_dev newSamplerStateWithDescriptor:sd];
+    if (!s) return -1;
+    const int slot = (int)s_eng_samp_count++;
+    s_eng_samp[slot].key  = key;
+    s_eng_samp[slot].samp = s;
+    return slot;
+}
+
+static void eng_bind_targets(void* user, u32 surface, u32 depth)
+{
+    (void)user;
+    s_eng_pending.surface = surface;
+    s_eng_pending.depth   = depth;
+}
+
+static void eng_bind_pipeline(void* user, u32 pipeline)
+{ (void)user; s_eng_pending.pipeline = pipeline; }
+
+static void eng_bind_vs_constants(void* user, const void* data, u32 bytes)
+{
+    (void)user;
+    if (!eng_stage_copy(data, bytes, &s_eng_pending.vs_cb_off)) bytes = 0;
+    s_eng_pending.vs_cb_bytes = bytes;
+}
+
+static void eng_bind_ps_constants(void* user, const void* data, u32 bytes)
+{
+    (void)user;
+    if (!eng_stage_copy(data, bytes, &s_eng_pending.ps_cb_off)) bytes = 0;
+    s_eng_pending.ps_cb_bytes = bytes;
+}
+
+static void eng_bind_textures(void* user, const u32* textures,
+                              const rsx_be_sampler_desc* samplers, u32 mask)
+{
+    (void)user;
+    for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
+        s_eng_pending.tex[u]  = ((mask >> u) & 1u) ? textures[u] : 0;
+        s_eng_pending.samp[u] = ((mask >> u) & 1u) ? eng_sampler_slot(&samplers[u]) : -1;
+    }
+}
+
+static void eng_bind_vertex_textures(void* user, const u32* textures,
+                                     const rsx_be_sampler_desc* samplers, u32 mask)
+{
+    (void)user;
+    for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) {
+        s_eng_pending.vtex[u]  = ((mask >> u) & 1u) ? textures[u] : 0;
+        s_eng_pending.vsamp[u] = ((mask >> u) & 1u) ? eng_sampler_slot(&samplers[u]) : -1;
+    }
+}
+
+static void eng_set_viewport(void* user, float x, float y, float w, float h)
+{
+    (void)user;
+    s_eng_pending.vp[0] = x; s_eng_pending.vp[1] = y;
+    s_eng_pending.vp[2] = w; s_eng_pending.vp[3] = h;
+}
+
+static void eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
+{
+    (void)user;
+    s_eng_pending.sc[0] = x; s_eng_pending.sc[1] = y;
+    s_eng_pending.sc[2] = w; s_eng_pending.sc[3] = h;
+}
+
+static void eng_set_stencil_ref(void* user, u32 ref)
+{ (void)user; s_eng_pending.stencil_ref = ref; }
+
+static void eng_draw(void* user, const void* vertices, u32 vertex_count,
+                     u32 stride, const u32* indices, u32 index_count)
+{
+    (void)user;
+    if (!vertex_count || !stride) return;
+    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
+    u32 vb_off = 0, ib_off = 0;
+    if (!eng_stage_copy(vertices, vertex_count * stride, &vb_off)) return;
+    if (indices && index_count &&
+        !eng_stage_copy(indices, index_count * (u32)sizeof(u32), &ib_off))
+        return;
+
+    EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+    *r = s_eng_pending;
+    r->kind         = ENG_REC_DRAW;
+    r->vb_off       = vb_off;
+    r->stride       = stride;
+    r->vertex_count = vertex_count;
+    r->ib_off       = ib_off;
+    r->index_count  = indices ? index_count : 0;
+}
+
+static void eng_clear_color(void* user, u32 surface, const float rgba[4])
+{
+    (void)user;
+    /* The debug hook reports the last colour the guest asked for whether or
+     * not the record stream had room for the clear. */
+    s_clear_argb = ((u32)(rgba[3] * 255.0f + 0.5f) << 24) |
+                   ((u32)(rgba[0] * 255.0f + 0.5f) << 16) |
+                   ((u32)(rgba[1] * 255.0f + 0.5f) <<  8) |
+                    (u32)(rgba[2] * 255.0f + 0.5f);
+    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
+    EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+    memset(r, 0, sizeof *r);
+    r->kind = ENG_REC_CLEAR_COLOR;
+    r->surface = surface;
+    memcpy(r->clear_rgba, rgba, sizeof r->clear_rgba);
+}
+
+static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
+                                    float depth_value, u8 stencil)
+{
+    (void)user;
+    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
+    EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+    memset(r, 0, sizeof *r);
+    r->kind = ENG_REC_CLEAR_DS;
+    r->depth = depth;
+    r->clear_flags = flags;
+    r->clear_depth = depth_value;
+    r->clear_stencil = stencil;
+}
+
+/* ---- replay -------------------------------------------------------------- */
+
+static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
+                            id<MTLBuffer> stage)
+{
+    if (!r->pipeline || r->pipeline > s_eng_pipe_count) return;
+    const EngPipeline* p = &s_eng_pipe[r->pipeline - 1];
+    if (!p->pso) return;
+    [enc setRenderPipelineState:p->pso];
+    [enc setDepthStencilState:p->ds];
+    [enc setCullMode:p->cull];
+    [enc setFrontFacingWinding:p->winding];
+    [enc setStencilReferenceValue:r->stencil_ref];
+    MTLViewport vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3], 0.0, 1.0 };
+    [enc setViewport:vp];
+    if (r->sc[2] && r->sc[3])
+        [enc setScissorRect:(MTLScissorRect){ r->sc[0], r->sc[1], r->sc[2], r->sc[3] }];
+    [enc setVertexBuffer:stage offset:r->vb_off atIndex:MTL_VB_INDEX];
+    if (r->vs_cb_bytes) [enc setVertexBuffer:stage offset:r->vs_cb_off atIndex:0];
+    if (r->ps_cb_bytes) [enc setFragmentBuffer:stage offset:r->ps_cb_off atIndex:1];
+    for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
+        id<MTLTexture> t = eng_obj(r->tex[u]);
+        [enc setFragmentTexture:(t ? t : s_null_tex) atIndex:(NSUInteger)u];
+        [enc setFragmentSamplerState:(r->samp[u] >= 0 ? s_eng_samp[r->samp[u]].samp
+                                                      : s_default_sampler)
+                             atIndex:(NSUInteger)u];
+    }
+    for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) {
+        id<MTLTexture> t = eng_obj(r->vtex[u]);
+        [enc setVertexTexture:(t ? t : s_null_tex) atIndex:MTL_VTEX_INDEX(u)];
+        [enc setVertexSamplerState:(r->vsamp[u] >= 0 ? s_eng_samp[r->vsamp[u]].samp
+                                                     : s_default_sampler)
+                           atIndex:MTL_VSAMP_INDEX(u)];
+    }
+    /* Every expansion the engine performs comes out as a triangle list, and
+     * an indexed draw is really indexed here: the index buffer is what keeps
+     * a strip's shared vertices from being fetched and uploaded per triangle. */
+    if (r->index_count)
+        [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                        indexCount:r->index_count
+                         indexType:MTLIndexTypeUInt32
+                       indexBuffer:stage
+                 indexBufferOffset:r->ib_off];
+    else
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle
+                vertexStart:0 vertexCount:r->vertex_count];
+}
+
+/* One pass per contiguous run of draws against the same attachments, with any
+ * clears immediately ahead of it folded into its load actions. A clear whose
+ * targets the following draw does not share becomes a pass of its own, which
+ * is what keeps a mid-frame clear ordered against the draws around it. */
+static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+{
+    u32 i = 0;
+    while (i < s_eng_rec_count) {
+        if (s_eng_rec[i].kind == ENG_REC_DEPTH_RESOLVE) {
+            const EngRecord* r = &s_eng_rec[i++];
+            id<MTLTexture> src = eng_obj(r->depth);
+            id<MTLTexture> dst = eng_obj(r->resolve_dst);
+            if (!src || !dst || !s_eng_depth_pso) continue;
+            MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture     = dst;
+            rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+            if (!e) continue;
+            [e setRenderPipelineState:s_eng_depth_pso];
+            [e setFragmentTexture:src atIndex:0];
+            [e setFragmentSamplerState:s_eng_point_sampler atIndex:0];
+            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [e endEncoding];
+            continue;
+        }
+
+        int have_clear_color = 0, have_clear_ds = 0;
+        u32 cs = 0, cd = 0, ds_flags = 0;
+        float crgba[4] = { 0, 0, 0, 0 };
+        float cdepth = 1.0f;
+        u8 cstencil = 0;
+        while (i < s_eng_rec_count && s_eng_rec[i].kind != ENG_REC_DRAW &&
+               s_eng_rec[i].kind != ENG_REC_DEPTH_RESOLVE) {
+            const EngRecord* r = &s_eng_rec[i];
+            if (r->kind == ENG_REC_CLEAR_COLOR) {
+                if (have_clear_color && r->surface != cs) break;
+                cs = r->surface;
+                memcpy(crgba, r->clear_rgba, sizeof crgba);
+                have_clear_color = 1;
+            } else {
+                if (have_clear_ds && r->depth != cd) break;
+                cd = r->depth;
+                ds_flags |= r->clear_flags;
+                cdepth = r->clear_depth;
+                cstencil = r->clear_stencil;
+                have_clear_ds = 1;
+            }
+            i++;
+        }
+
+        u32 surface = have_clear_color ? cs : 0;
+        u32 depth   = have_clear_ds ? cd : 0;
+        if (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
+            (!have_clear_color || s_eng_rec[i].surface == cs) &&
+            (!have_clear_ds    || s_eng_rec[i].depth   == cd)) {
+            surface = s_eng_rec[i].surface;
+            depth   = s_eng_rec[i].depth;
+        }
+
+        id<MTLTexture> color = eng_obj(surface);
+        id<MTLTexture> zbuf  = eng_obj(depth);
+        if (!color && !zbuf) { if (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW) i++; continue; }
+        /* A pipeline always declares the depth attachment, so a draw pass
+         * always has to have one; the display's shared buffer is the fallback
+         * for a guest that never declared a zeta. */
+        if (color && !zbuf) zbuf = s_depth;
+
+        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        if (color) {
+            rp.colorAttachments[0].texture     = color;
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            if (have_clear_color && surface == cs) {
+                rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+                rp.colorAttachments[0].clearColor =
+                    MTLClearColorMake(crgba[0], crgba[1], crgba[2], crgba[3]);
+            } else {
+                rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+            }
+        }
+        if (zbuf) {
+            const int clear_here = have_clear_ds && depth == cd;
+            rp.depthAttachment.texture       = zbuf;
+            rp.depthAttachment.storeAction   = MTLStoreActionStore;
+            rp.depthAttachment.loadAction    =
+                (clear_here && (ds_flags & RSX_BE_CLEAR_DEPTH))
+                    ? MTLLoadActionClear : MTLLoadActionLoad;
+            rp.depthAttachment.clearDepth    = (double)cdepth;
+            rp.stencilAttachment.texture     = zbuf;
+            rp.stencilAttachment.storeAction = MTLStoreActionStore;
+            rp.stencilAttachment.loadAction  =
+                (clear_here && (ds_flags & RSX_BE_CLEAR_STENCIL))
+                    ? MTLLoadActionClear : MTLLoadActionLoad;
+            rp.stencilAttachment.clearStencil = cstencil;
+        }
+        if (!color) {
+            rp.renderTargetWidth  = [zbuf width];
+            rp.renderTargetHeight = [zbuf height];
+        }
+
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        if (!enc) {
+            while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW) i++;
+            continue;
+        }
+        while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
+               s_eng_rec[i].surface == surface &&
+               (s_eng_rec[i].depth == depth ||
+                (!s_eng_rec[i].depth && zbuf == s_depth))) {
+            eng_encode_draw(enc, &s_eng_rec[i], stage);
+            i++;
+        }
+        [enc endEncoding];
+    }
+}
+
+/* Put a surface on the drawable. A straight blit would need matching formats
+ * and sizes; a full-screen sample needs neither, and the guest's surfaces are
+ * routinely a different size from the window. */
+static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
+                                id<MTLTexture> dst)
+{
+    if (!src || !dst || !s_eng_helper_lib) return;
+    if (!s_eng_blit_pso || s_eng_blit_pso_fmt != [dst pixelFormat]) {
+        MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction   = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
+        pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:@"eng_blit_fs"];
+        pd.colorAttachments[0].pixelFormat = [dst pixelFormat];
+        NSError* err = nil;
+        s_eng_blit_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (!s_eng_blit_pso) {
+            fprintf(stderr, "[rsx engine/metal] present pipeline failed: %s\n",
+                    [[err localizedDescription] UTF8String]);
+            return;
+        }
+        s_eng_blit_pso_fmt = [dst pixelFormat];
+    }
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture     = dst;
+    rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+    if (!e) return;
+    [e setRenderPipelineState:s_eng_blit_pso];
+    [e setFragmentTexture:src atIndex:0];
+    [e setFragmentSamplerState:s_eng_point_sampler atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+}
+
+/* Encode everything recorded so far, commit, and wait. The engine recycles
+ * its own staging the moment this returns, and the headless readback has to
+ * observe a finished frame, so the wait is the contract rather than a
+ * pessimisation. */
+static void eng_encode_and_commit(id<MTLTexture> present_dst)
+{
+    @autoreleasepool {
+        id<CAMetalDrawable> drawable = nil;
+        id<MTLTexture> dst = nil;
+        if (present_dst) {
+            if (s_headless) {
+                dst = s_offscreen;
+            } else {
+                drawable = [s_layer nextDrawable];
+                if (!drawable) return;     /* compositor is busy; skip */
+                dst = [drawable texture];
+            }
+        }
+
+        id<MTLBuffer> stage = nil;
+        if (s_eng_stage_used)
+            stage = [s_dev newBufferWithBytes:s_eng_stage length:s_eng_stage_used
+                                      options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+        eng_encode_records(cb, stage);
+        if (present_dst && dst) eng_blit_to_display(cb, present_dst, dst);
+        if (drawable) [cb presentDrawable:drawable];
+        [cb commit];
+        [cb waitUntilCompleted];
+
+        if (s_dropped_records || s_eng_dropped) {
+            fprintf(stderr, "[rsx engine/metal] dropped %u record(s) (cap %d)\n",
+                    s_eng_dropped, ENG_MAX_RECORDS);
+            s_eng_dropped = 0;
+        }
+        s_eng_rec_count  = 0;
+        s_eng_stage_used = 0;
+    }
+}
+
+static void eng_present(void* user, u32 surface)
+{
+    (void)user;
+    id<MTLTexture> src = eng_obj(surface);
+    if (!src) { eng_encode_and_commit(nil); return; }
+    eng_encode_and_commit(src);
+    if (s_headless && s_offscreen) {
+        u32 px = 0;
+        MTLRegion r = MTLRegionMake2D(s_width / 2, s_height / 2, 1, 1);
+        [s_offscreen getBytes:&px bytesPerRow:4 fromRegion:r mipmapLevel:0];
+        s_last_present_bgra = px;
+    }
+}
+
+static void eng_readback(void* user, u32 surface, void* out, u32 out_pitch)
+{
+    (void)user;
+    id<MTLTexture> t = eng_obj(surface);
+    if (!t || !out || !out_pitch) return;
+    [t getBytes:out bytesPerRow:out_pitch
+     fromRegion:MTLRegionMake2D(0, 0, [t width], [t height]) mipmapLevel:0];
+}
+
+static const rsx_draw_backend s_engine_backend = {
+    .user                 = NULL,
+    .init                 = eng_init,
+    .shutdown             = eng_shutdown,
+    .submit_and_wait      = eng_submit_and_wait,
+    .texture_create       = eng_texture_create,
+    .texture_upload       = eng_texture_upload,
+    .texture_release      = eng_obj_release,
+    .color_target_create  = eng_color_target_create,
+    .color_target_release = eng_obj_release,
+    .surface_view         = eng_surface_view,
+    .depth_target_create  = eng_depth_target_create,
+    .depth_target_release = eng_obj_release,
+    .depth_snapshot       = eng_depth_snapshot,
+    .pipeline_create      = eng_pipeline_create,
+    .pipeline_release     = eng_pipeline_release,
+    .bind_targets         = eng_bind_targets,
+    .bind_pipeline        = eng_bind_pipeline,
+    .bind_vs_constants    = eng_bind_vs_constants,
+    .bind_ps_constants    = eng_bind_ps_constants,
+    .bind_textures        = eng_bind_textures,
+    .bind_vertex_textures = eng_bind_vertex_textures,
+    .set_viewport         = eng_set_viewport,
+    .set_scissor          = eng_set_scissor,
+    .set_stencil_ref      = eng_set_stencil_ref,
+    .draw                 = eng_draw,
+    .clear_color          = eng_clear_color,
+    .clear_depth_stencil  = eng_clear_depth_stencil,
+    .present              = eng_present,
+    .readback             = eng_readback,
+};
+
 /* ---- public API ---------------------------------------------------------- */
 
 int rsx_metal_backend_init(u32 width, u32 height, const char* title)
@@ -2073,13 +3072,24 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
             return -1;
         }
 
-        rsx_set_backend(&s_backend_vtable);
+        /* PS3RECOMP_RSX_ENGINE=dispatch drives the register-file draw engine
+         * instead of the rsx_state vtable. The vtable stays registered only on
+         * the path that uses it: the FIFO walker feeds both models, so leaving
+         * both live would record every draw twice. */
         s_ready  = 1;
         s_closed = 0;
-        fprintf(stderr, "[RSX metal] %s on %s (%ux%u), guest shaders %s\n",
+        rsx_draw_engine_set_backend(&s_engine_backend);
+        if (rsx_draw_engine_enabled() &&
+            rsx_draw_engine_init(s_width, s_height) == 0) {
+            s_eng_active = 1;
+        } else {
+            rsx_set_backend(&s_backend_vtable);
+        }
+        fprintf(stderr, "[RSX metal] %s on %s (%ux%u), guest shaders %s, %s path\n",
                 s_headless ? "headless" : "windowed",
                 [[s_dev name] UTF8String], s_width, s_height,
-                s_guest_shaders ? "on" : (rsx_hlsl_to_msl_available() ? "off (env)" : "off (translator not built)"));
+                s_guest_shaders ? "on" : (rsx_hlsl_to_msl_available() ? "off (env)" : "off (translator not built)"),
+                s_eng_active ? "register-file draw engine" : "vtable");
         return 0;
     }
 }
@@ -2088,6 +3098,8 @@ void rsx_metal_backend_shutdown(void)
 {
     @autoreleasepool {
         if (s_ready) rsx_set_backend(NULL);
+        if (s_eng_active) rsx_draw_engine_shutdown();
+        rsx_draw_engine_set_backend(NULL);
         /* Reclaim every in-flight slot so no command buffer is still
          * referencing the device, queue or textures when they are released,
          * then hand the slots back. libdispatch traps if a semaphore is
@@ -2145,6 +3157,10 @@ int rsx_metal_backend_pump_messages(void)
 void rsx_metal_backend_present(void)
 {
     if (!s_ready) return;
+    /* Under the draw engine the frame belongs to it: a host that drives the
+     * flip itself (the harness, the boot smoke title) calls here, and a title
+     * whose FIFO carries 0xE944 presents through the engine's own sink. */
+    if (s_eng_active) { rsx_draw_engine_present(); return; }
     /* Block only when MTL_MAX_INFLIGHT frames are already queued. */
     if (!s_headless) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
     @autoreleasepool {
@@ -2268,4 +3284,9 @@ void rsx_metal_backend_present(void)
 
 u32 rsx_metal_backend_debug_color(void)     { return s_clear_argb; }
 u32 rsx_metal_backend_readback_center(void) { return s_last_present_bgra; }
-u32 rsx_metal_backend_guest_draws(void)     { return s_last_guest_draws; }
+/* The draw engine has no fixed-function fallback: every draw it executes runs
+ * the guest's own programs, so its own count is the answer under that path. */
+u32 rsx_metal_backend_guest_draws(void)
+{
+    return s_eng_active ? rsx_draw_engine_guest_draws() : s_last_guest_draws;
+}
