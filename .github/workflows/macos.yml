@@ -70,7 +70,9 @@ jobs:
       # Drives a real NV4097 command buffer through cellGcm -> RSX -> the Metal
       # backend and asserts the presented pixel matches the guest clear colour.
       # Headless, so it needs no display: exit 0 means the whole graphics bridge
-      # is intact, not merely that it compiled.
+      # is intact, not merely that it compiled. No environment set, so this is
+      # the DEFAULT path -- rsx_dispatch's register file into rsx_draw_engine.c
+      # and the record-oriented backend under it.
       - name: Run the POSIX host (headless Metal end-to-end)
         run: |
           # Clear + flip: asserts the guest clear colour reaches the drawable.
@@ -107,6 +109,11 @@ jobs:
           # rendered into presents green and fails.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --rtt
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --rtt --frames=60
+          # A guest program pair that will not translate has no fallback in
+          # the draw engine, so forcing the built-in shader leaves --shader
+          # with nothing to draw: it must still fail, or the check is not
+          # checking. On the vtable path it falls back and draws the wrong
+          # colour instead, which fails the same assertion.
           if PS3RECOMP_METAL_FIXED_FUNCTION=1 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader; then
             echo "--shader passed with the built-in shader forced; the check is not checking"
             exit 1
@@ -121,17 +128,15 @@ jobs:
           # no controller are the runner's situation and must both be fine.
           SDL_AUDIODRIVER=dummy ./build/ps3recomp_host --audio-pad
 
-      # ...and the same modes again through the register-file draw engine,
-      # which is what a real title's frame goes through: rsx_dispatch's whole
-      # NV4097 register file into rsx_draw_engine.c, and a record-oriented
-      # backend under it, instead of rsx_state and the vtable. Both paths have
-      # to pass every mode for as long as both exist, so this is the same list
-      # with one environment variable set -- the pixel assertions are what say
-      # the two agree.
-      - name: Run the POSIX host (register-file draw engine)
+      # ...and the same modes again through the older vtable path, the one
+      # driven by rsx_state rather than by the register file. Both have to
+      # pass every mode for as long as both exist, and the pixel assertions
+      # are what say the two agree; this is also the check that the way back
+      # still works.
+      - name: Run the POSIX host (vtable path)
         env:
           PS3RECOMP_METAL_HEADLESS: "1"
-          PS3RECOMP_RSX_ENGINE: dispatch
+          PS3RECOMP_RSX_ENGINE: vtable
         run: |
           ./build/ps3recomp_host
           ./build/ps3recomp_host --draw
@@ -143,9 +148,6 @@ jobs:
           ./build/ps3recomp_host --mip
           ./build/ps3recomp_host --rtt
           ./build/ps3recomp_host --rtt --frames=60
-          # A guest program pair that will not translate has no fallback in
-          # this engine, so forcing the built-in shader leaves --shader with
-          # nothing to draw: it must still fail, or the check is not checking.
           if PS3RECOMP_METAL_FIXED_FUNCTION=1 ./build/ps3recomp_host --shader; then
             echo "--shader passed with the built-in shader forced; the check is not checking"
             exit 1

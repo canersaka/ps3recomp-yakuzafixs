@@ -11,7 +11,7 @@ documents the host shim itself._
 | Runtime library | builds, Debug and Release, verified arm64 |
 | Lifter suites | all eight, including the 1300+ conformance cases compiled and executed with Apple Clang |
 | SPU helper tests | pass |
-| `ps3recomp_host` | clear, flip, a fixed-function NV4097 draw, a draw through **guest vertex and fragment programs**, a draw sampling a **guest texture** from a guest program, a pair of triangles the **depth test** has to order, a two-level texture whose **second mip level** must be the one sampled, and a triangle drawn into an offscreen **colour surface** that a later draw then **samples** -- headless through the **Metal** backend, with 60-frame runs |
+| `ps3recomp_host` | clear, flip, a fixed-function NV4097 draw, a draw through **guest vertex and fragment programs**, a draw sampling a **guest texture** from a guest program, a pair of triangles the **depth test** has to order, a two-level texture whose **second mip level** must be the one sampled, and a triangle drawn into an offscreen **colour surface** that a later draw then **samples** -- headless through the **Metal** backend, with 60-frame runs, and **every mode twice**: once through the register-file draw engine, which is the default, and once through the older vtable path |
 | Guest shader translation | `test_shader_msl`: hand-assembled NV40 programs through the decompilers, glslang and spirv-cross, checked for the MSL binding contract the backend relies on (runs on Linux too) |
 | PPU boot scaffold | `ppu_loader.cpp`, `ppu_hle.cpp`, `ppu_fs.cpp`, `ppu_sysprx.cpp`, `boot_main.cpp` compile at a recorded baseline of **0** errors (`darwin-clang` in `tools/ppu_scaffold_baseline.json`) |
 | PPU boot path | `ps3recomp_boot_smoke`: the scaffold **linked and run** against the synthetic title in `runtime/ppu/tests/smoke/` -- ELF load, entry OPD, TLS, the NID bridge, lv2 syscalls, a guest thread on a second host thread, three frames cleared and flipped through the FIFO to the Metal backend, and `sys_process_exit` |
@@ -20,7 +20,7 @@ documents the host shim itself._
 | lv2 threads | `ps3recomp_host --threads`: a guest PPU thread created and joined through the syscalls, and the host stack it got |
 | cellFiber | `tests/fiber_switch`: 4000 scheduler round trips and 4000 direct fiber-to-fiber switches on ucontext (runs on Linux too) |
 | Audio and pad | `ps3recomp_host --audio-pad`: the SDL2 backends up and down twice with `SDL_AUDIODRIVER=dummy` and no controller |
-| RSX self-contained tests | texture layout and primitive tables |
+| RSX self-contained tests | texture layout, the primitive tables, and `test_rsx_draw_engine`: the draw engine driven through its dispatch sink against a stub backend, with no GPU -- surface keying and reallocation, render-target aliasing on a texture bind, the texture cache's revalidation and LRU eviction, the pipeline key's stability under constant changes, restart cuts bounding topology expansion (runs on Linux too) |
 
 The scaffold check is compile-only. What links and runs it is the smoke title:
 a hand-written program in the lifter's ABI, with an image
@@ -29,38 +29,64 @@ exercised on the Mac without a game. See docs/PPU_RECOMP.md.
 
 ## What a title still needs
 
-1. **A renderer.** The production draw path is `libs/video/rsx_live_draw.c`,
-   the live NV4097 draw engine, and it is D3D12-only: off Windows the whole file
-   compiles to a stub (`#if !defined(_WIN32)`). The Metal backend
-   (`rsx_metal_backend.m`) is the vtable-style backend. It runs the guest's
-   own vertex and fragment programs -- decompiler HLSL, lowered to MSL by
-   glslang and spirv-cross (`rsx_shader_msl.cpp`) and compiled at runtime --
-   with per-draw constant blocks, the alpha test, culling and the colour
-   mask, and it binds guest textures through the shared layout/decode path
-   with the `TEXTURE_CONTROL1` crossbar as the texture's swizzle and the
-   sampler registers decoded; every one of those semantics is copied field
-   for field from the D3D12 backend. Texturing is complete enough for a
-   title's usual bindings: the formats the live draw engine handles, whole
-   mip chains with the sampler's mip filter and LOD range, cube maps as six
-   faces with the fragment program compiled to sample a direction, and the
-   four vertex-texture units bound to the vertex stage so a transform
-   program's `TXL` samples. It has one depth/stencil attachment
-   shared by the display, the NV4097 depth and stencil state per draw, and
-   clears as records in the frame's ordered stream, so a clear in the middle
-   of a frame opens a new pass rather than being lost. It renders into the
-   guest's own colour surfaces: `SET_SURFACE_COLOR_TARGET` picks A, B or an
-   MRT set, offsets `cellGcmSetDisplayBuffer` never registered are offscreen
-   surfaces in a registry keyed by raw offset, in the float formats
-   `SET_SURFACE_FORMAT` names, each with its own zeta buffer, and a texture
-   unit bound at a surface's offset samples that surface rather than guest
-   memory. What it does not have: MRT targets B, C and D are attached and
-   cleared but never written, because the fragment decompiler emits one
-   `SV_TARGET`; a vertex-texture unit bound at a surface's offset still
-   uploads from guest memory; there is no stencil write mask or two-sided
-   stencil (neither register is decoded upstream), and no anisotropy or
-   sampler LOD bias. And it is the simpler engine: a title on Windows runs
-   through `rsx_live_draw.c`; the order of work below says how that gap is
-   being closed.
+1. **A renderer.** There are two on macOS, and the default is now the
+   **register-file draw engine**: `libs/video/rsx_draw_engine.c` implements
+   `rsx_dispatch_sink` over the whole NV4097 register file and drives
+   `rsx_metal_backend.m` through `rsx_draw_backend`, a record-oriented
+   interface of resources, pipelines and per-draw bindings with no host API
+   in it. `PS3RECOMP_RSX_ENGINE=vtable` selects the older path, the one
+   driven by `rsx_state`, and CI runs every host mode both ways.
+
+   The engine's logic is carried across from `libs/video/rsx_live_draw.c`,
+   the NV4097 to D3D12 engine a title has shipped on; that file is vendored
+   and is not touched, so it keeps merging with upstream. What came across:
+   vertex fetch through `rsx_vertex_compact` with **primitive restart** cuts
+   and topology rebuilt into an indexed triangle list whose strip winding
+   alternates per segment; a pipeline key over the vertex program's bytes,
+   the fragment program's structure, `SHADER_CONTROL`'s export bit, the cube
+   and vertex-texture masks, the input layout and the structural render
+   state, with negative results cached; a colour surface set keyed by
+   **(context DMA, offset)**, reallocated on a size or format change and
+   seeded from the guest's own bytes; **one depth target per zeta address**;
+   surface aliasing, so a texture unit that names a render target's address
+   samples the live target; depth-as-texture behind the had-write contract;
+   a texture cache keyed on where the bytes are and what the registers say,
+   revalidated by content hash once per frame and evicted least-recently-used
+   under pressure; the transform constant block with the viewport epilogue
+   and the buffered fragment constants; the guest scissor intersected with
+   the surface; the stencil reference kept dynamic; the FP16 HDR surface
+   format; and a flip that resolves a display buffer id to a **registered**
+   surface rather than to whatever happens to be bound. Indexed draws are
+   really indexed, through an index buffer, and points and lines are drawn
+   as the guest issued them.
+
+   Both paths run the guest's own vertex and fragment programs -- decompiler
+   HLSL, lowered to MSL by glslang and spirv-cross (`rsx_shader_msl.cpp`) and
+   compiled at runtime -- with the alpha test, culling and the colour mask,
+   and both bind guest textures through the shared layout/decode path with
+   the `TEXTURE_CONTROL1` crossbar as the texture's swizzle and the sampler
+   registers decoded. Texturing is complete enough for a title's usual
+   bindings: the formats the live draw engine handles, whole mip chains with
+   the sampler's mip filter and LOD range, cube maps as six faces with the
+   fragment program compiled to sample a direction, and the four
+   vertex-texture units bound to the vertex stage so a transform program's
+   `TXL` samples.
+
+   What the engine does **not** have. Only colour target A is bound: the
+   vtable path at least attaches and clears B, C and D, and this one does
+   not, so an MRT set loses those clears (nothing writes them on either path,
+   because the fragment decompiler emits one `SV_TARGET`). A vertex-texture
+   unit bound at a surface's offset still uploads from guest memory. A
+   colour target is seeded only when its context DMA says main memory and the
+   IO table says the page is mapped; a VRAM surface is not seeded, because
+   this tree's guest VM reserves local memory without backing it. Quad strips
+   and polygons are dropped rather than expanded. A guest program pair that
+   will not translate drops its draw rather than falling back, as the
+   reference engine drops it, so `PS3RECOMP_METAL_FIXED_FUNCTION=1` is a
+   vtable-path lever now. Depth-as-texture is implemented and nothing in CI
+   exercises it: no host mode samples a depth surface. And nothing carries
+   across the movie compositor, the a010 probe, the shader disk cache or the
+   profiling instrumentation, none of which a port wants.
 
 2. **A game's host code.** The scaffold in `runtime/ppu/` is game-agnostic; a
    port adds its own runner (imports, overrides, the window, diagnostics). A
@@ -93,45 +119,54 @@ exercised on the Mac without a game. See docs/PPU_RECOMP.md.
 
 The Metal-native route was taken. `rsx_metal_backend.m` runs guest programs
 through `libs/video/rsx_shader_msl.cpp` -- HLSL to SPIR-V with glslang,
-SPIR-V to MSL with spirv-cross, both optional at configure time and the
-backend fixed-function without them -- and binds guest textures through the
-shared `rsx_texture_layout` path. There is no second emitter: the decompilers'
-HLSL is the one source, and `test_shader_msl` checks on every push, on Linux
-as well, that glslang's front end still accepts what they emit and that the
-MSL carries the buffer, texture, sampler and attribute slots the backend binds
-to. The alternative -- Vulkan through MoltenVK under a seam in
-`rsx_live_draw.c`, with a Windows A/B through `rsx_live_replay` -- remains the
-obvious shape for a Linux backend.
+SPIR-V to MSL with spirv-cross, both optional at configure time -- and binds
+guest textures through the shared `rsx_texture_layout` path. Without those two
+the vtable path falls back to a built-in shader and the draw engine has no
+pipeline to build at all, so a build meant to render needs them. There is no
+second emitter: the decompilers' HLSL is the one source, and `test_shader_msl`
+checks on every push, on Linux as well, that glslang's front end still accepts
+what they emit and that the MSL carries the buffer, texture, sampler and
+attribute slots the backend binds to.
+
+A Linux backend now has a shape to fill in rather than a design question:
+`rsx_draw_backend` is where Vulkan (or Vulkan through MoltenVK) would go, and
+`rsx_draw_engine.c` above it is already built and tested on Linux.
+
+The production engine question is settled, and the answer was neither of the
+two it was posed as. There is **no seam under `rsx_live_draw.c`**: that file
+is vendored, upstream grew it from 1,566 to 8,453 lines in seven weeks, only
+about 7% of it is D3D12, and a third of it is diagnostics and one title's
+private behaviour that a port does not want. It cannot even be initialised
+from this repository, so a refactor of it could not be validated here on any
+platform. Instead the macOS path drives `rsx_dispatch`'s register file
+through `libs/video/rsx_draw_engine.c`, which carries the proven engine logic
+across into platform-neutral C over a backend interface `rsx_metal_backend.m`
+implements. `rsx_live_draw.c` keeps working on Windows and keeps merging.
 
 What is left, in order:
 
-- **The rest of MRT.** Targets B, C and D are bound and cleared, and the
-  pipeline mirrors target A's blend and colour mask onto them, but the
-  fragment decompiler emits a single `SV_TARGET` so nothing is written to
-  them. A deferred pass therefore fills its first G-buffer plane and no more.
-  The work is in the decompiler, not the backend.
+- **MRT.** The engine binds one colour target. Targets B, C and D need
+  attaching and clearing, and then the fragment decompiler needs to emit more
+  than a single `SV_TARGET` before anything can be written to them. A
+  deferred pass fills its first G-buffer plane and no more until both land.
 - **The rest of texturing.** What is left is narrow: anisotropic filtering,
   the LOD bias in `SET_TEXTURE_FILTER` (Metal has no sampler-side bias, so it
   means patching the sampling call in the fragment program), 3D textures, and
   `HILO_S8`'s signed channels.
-- **The production engine.** Decided: no seam under `rsx_live_draw.c`.
+- **The production engine: decided.** No seam under `rsx_live_draw.c`.
   Measured, that file is 6.8% D3D12 by line; the rest is engine logic,
   diagnostics and one title's features. It grew by about 145 lines a day
   upstream over the summer, and nothing in this repository initialises or
   tests it, so a refactor of it could neither be validated here nor kept
-  merging. The macOS path gets a platform-neutral engine instead:
-  `rsx_draw_engine.c` implements `rsx_dispatch_sink` over the register-file
-  dispatcher `rsx_dispatch.c` already provides (portable, and already fed by
-  `cellGcmSys.c`'s FIFO walker) and drives the Metal backend through a
-  record-oriented interface. The game-proven logic is carried across from
-  `rsx_live_draw.c` one behaviour at a time, with its line numbers cited:
-  the address-keyed surface set seeded from guest memory, per-zeta depth,
-  surface aliasing on texture bind, depth-as-texture, the texture cache with
-  content-hash revalidation and eviction, restart cuts, the pipeline key,
-  buffered fragment constants, scissor, and the flip resolving a registered
-  display buffer. `rsx_live_draw.c` stays exactly as vendored and keeps
-  merging with upstream. Until the new path has parity with every host
-  check it is opt-in (`PS3RECOMP_RSX_ENGINE=dispatch`).
+  merging. The register-file draw engine above is the answer, and the
+  vendored file keeps merging with upstream untouched.
+- **A check that samples a depth surface.** Per-zeta depth targets and the
+  depth snapshot are implemented; no host mode exercises them, so they are
+  the one part of the engine CI does not cover.
+- **Quad strips and polygons**, which the engine drops and the vtable path
+  expands.
+- **Time with a title.** Everything above is a known gap. What a real
+  frame turns up will not be.
 
 ### 2. Bring up a title
 
@@ -191,10 +226,17 @@ PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --tex                # guest t
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depth              # near-first pair, depth test
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip                # two mip levels, level 1 sampled
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --rtt                # render into a surface, then sample it
+PS3RECOMP_RSX_ENGINE=vtable PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --rtt  # ... through the older path
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_boot_smoke build/smoke/smoke.elf   # the PPU boot path
 ./build/ps3recomp_host --threads                  # lv2 thread create/join + host stack
 SDL_AUDIODRIVER=dummy ./build/ps3recomp_host --audio-pad   # SDL2 audio + pad up and down
 ./build/test_shader_msl -v                        # decompilers -> MSL, sources printed
+
+clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video \
+      -o /tmp/tde libs/video/tests/test_rsx_draw_engine.c \
+      libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c \
+      libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c \
+      libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c && /tmp/tde
 
 for t in tools/test_*.py; do python3 "$t"; done          # lifter suites
 python3 tools/check_ppu_scaffold.py                     # scaffold ratchet
@@ -204,11 +246,19 @@ cmake -S tests/sync_stress -B build-ss -G Ninja && cmake --build build-ss && ./b
 cmake -S tests/fiber_switch -B build-fb -G Ninja && cmake --build build-fb && ./build-fb/fiber_switch
 ```
 
-Two switches on the backend: `PS3RECOMP_METAL_SHADER_DUMP=<dir>` writes every
-translated program's HLSL and MSL there, named by cache key, and
-`PS3RECOMP_METAL_FIXED_FUNCTION=1` pins every draw to the built-in shader --
-the first thing to flip when a title's draws vanish, to tell a translation
-problem from a fetch or state one.
+Switches on the render path:
+
+- `PS3RECOMP_RSX_ENGINE=vtable` goes back to the `rsx_state` vtable path;
+  `=dispatch` is the default and asks for the register-file draw engine
+  explicitly. Every host mode above passes both ways, which is what the
+  second CI block checks.
+- `PS3RECOMP_METAL_SHADER_DUMP=<dir>` writes every translated program's HLSL
+  and MSL there, named by cache key.
+- `PS3RECOMP_METAL_FIXED_FUNCTION=1` pins every draw to the built-in shader,
+  the first thing to flip when a title's draws vanish, to tell a translation
+  problem from a fetch or state one. On the draw engine it disables the
+  translator outright and nothing draws, so pair it with
+  `PS3RECOMP_RSX_ENGINE=vtable`.
 
 Profiling moves from WPR/uProf to Instruments (`xctrace`) and `sample`. An
 M1 Pro has 8 (or 6) performance cores and 2 efficiency cores; count busy host
