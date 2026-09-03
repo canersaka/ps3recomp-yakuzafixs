@@ -5,6 +5,14 @@
  * Each CellFiber maps to a native fiber for true cooperative switching.
  */
 
+/* Darwin gates the ucontext routines AND the shape of ucontext_t itself on
+ * _XOPEN_SOURCE, so this has to come before the first system header any
+ * include below reaches -- see the static assertion further down for what
+ * defining it late costs. Nothing above this line. */
+#if defined(__APPLE__) && !defined(_XOPEN_SOURCE)
+#  define _XOPEN_SOURCE 600
+#endif
+
 #include "cellFiber.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host pointer */
 #include <stdio.h>
@@ -15,12 +23,25 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
-/* Darwin marks the ucontext routines deprecated and hides them unless
- * _XOPEN_SOURCE is defined before the header is pulled in. */
-#if defined(__APPLE__) && !defined(_XOPEN_SOURCE)
-#  define _XOPEN_SOURCE 600
-#endif
 #include <ucontext.h>
+
+#if defined(__APPLE__)
+/* getcontext() points uc_mcontext at ucontext_t's own __mcontext_data member
+ * and writes uc_mcsize (816) bytes there. That member is declared only when
+ * _XOPEN_SOURCE was defined before <sys/_types/_ucontext.h> was first pulled
+ * in; without it the struct is the 64-byte header alone and every getcontext,
+ * swapcontext and makecontext writes 752 bytes off the end of it -- over
+ * FiberSlot::stack, over the next FiberSlot in the array, and past
+ * s_scheduler_context into whatever .bss follows. The symptom is not a crash
+ * at the write but a fiber that starts with somebody else's argument, or a
+ * slot that reports itself in use having never been created.
+ *
+ * The define above is the fix; this is the tripwire, because moving an
+ * #include up here would silently undo it. */
+_Static_assert(sizeof(ucontext_t) > 64,
+               "ucontext_t has no embedded machine state: _XOPEN_SOURCE was "
+               "defined too late and getcontext will write past the struct");
+#endif
 #endif
 
 /* ---------------------------------------------------------------------------

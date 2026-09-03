@@ -174,3 +174,13 @@ jobs:
           cmake -S tests/sync_stress -B build-sync-stress -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           cmake --build build-sync-stress
           ./build-sync-stress/sync_stress
+
+      # cellFiber's cooperative switching on ucontext. Apple deprecated those
+      # routines in 10.6 and gates the shape of ucontext_t itself on
+      # _XOPEN_SOURCE, so this is the evidence that the path works on arm64
+      # rather than an assumption that it does.
+      - name: Build and run fiber_switch
+        run: |
+          cmake -S tests/fiber_switch -B build-fiber -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          cmake --build build-fiber
+          ./build-fiber/fiber_switch
