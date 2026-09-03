@@ -234,6 +234,19 @@ static int process_texture_method(rsx_state* state, u32 method, u32 data)
     return 0;
 }
 
+/* SET_TEXTURE_CONTROL3: 0x1840 + unit*4, one word per unit rather than a slot
+ * in the 0x20-byte unit block. */
+static int process_texture_control3(rsx_state* state, u32 method, u32 data)
+{
+    u32 unit = (method - NV4097_SET_TEXTURE_CONTROL3) / 4;
+    if (unit >= RSX_MAX_TEXTURES)
+        return -1;
+    state->textures[unit].control3 = data;
+    state->textures[unit].dirty = 1;
+    state->texture_dirty = 1;
+    return 0;
+}
+
 /* ---------------------------------------------------------------------------
  * Vertex attribute method processing
  *
@@ -329,6 +342,11 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     /* Texture methods: 0x1A00..0x1A00 + 16*0x20 - 1 */
     if (method >= 0x1A00 && method < 0x1A00 + RSX_MAX_TEXTURES * 0x20)
         return process_texture_method(state, method, data);
+
+    /* Texture CONTROL3: 0x1840..0x187C */
+    if (method >= NV4097_SET_TEXTURE_CONTROL3 &&
+        method < NV4097_SET_TEXTURE_CONTROL3 + RSX_MAX_TEXTURES * 4)
+        return process_texture_control3(state, method, data);
 
     /* Vertex attribute FORMAT: 0x1740..0x177C */
     if (method >= 0x1740 && method < 0x1740 + RSX_MAX_VERTEX_ATTRIBS * 4)

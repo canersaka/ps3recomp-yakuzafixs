@@ -92,6 +92,49 @@ void rsx_texture_layout(u32 rsx_fmt, u32 w, u32 h, rsx_tex_layout* out);
 void rsx_texture_layout_pitched(u32 rsx_fmt, u32 w, u32 h, u32 pitch,
                                 rsx_tex_layout* out);
 
+/* --- mip chains and cube faces -------------------------------------------
+ *
+ * A guest texture is not one image. SET_TEXTURE_FORMAT's level count says how
+ * many mip levels follow level 0, packed one after another, and bit 2 says the
+ * whole thing is repeated for six cube faces. Where each of those starts is
+ * arithmetic on the format and the dimensions, so it lives here with the rest
+ * of the layout rather than in each backend.
+ */
+
+/* 1x1 is 13 halvings below 4096, the largest texture the hardware takes; the
+ * live draw engine caps its own level arrays at 14 for the same reason. */
+#define RSX_MAX_TEXTURE_LEVELS 14
+
+typedef struct {
+    u32 w, h;            /* texel dimensions of this level              */
+    u32 offset;          /* byte offset from the start of the face      */
+    rsx_tex_layout tl;   /* this level's own layout                     */
+} rsx_tex_level;
+
+/* Describe the mip chain of a `w` x `h` `rsx_fmt` texture into `out`, which
+ * holds RSX_MAX_TEXTURE_LEVELS entries. Returns how many levels were written:
+ * `levels` (SET_TEXTURE_FORMAT's count, 0 read as 1) clamped to the levels the
+ * dimensions can actually produce, since a texture cannot have more levels
+ * than halvings down to 1x1.
+ *
+ * A swizzled texture's levels are each Morton-ordered within themselves, which
+ * falls out of classifying every level separately: halving a power of two
+ * stays a power of two, so a swizzled level 0 has swizzled levels below it.
+ * `pitch` is SET_TEXTURE_CONTROL3's row pitch and applies to level 0 only --
+ * the levels below it are packed at their own width. */
+u32 rsx_texture_mip_chain(u32 rsx_fmt, u32 w, u32 h, u32 levels, u32 pitch,
+                          rsx_tex_level* out);
+
+/* Stride from one cube face to the next.
+ *
+ * The face stride is NOT one level-0 image: RSX stores each face as its own
+ * complete mip pyramid, aligned to 128 bytes. Assuming mip-0-sized strides
+ * makes face 1 land inside face 0's mip chain, which is what the D3D12
+ * backend's dumps showed before it was fixed -- every face after the first a
+ * progressively smaller copy of the first. */
+u32 rsx_texture_cube_face_stride(u32 rsx_fmt, u32 w, u32 h, u32 levels,
+                                 u32 pitch);
+
 /* Byte offset of texel (x, y) within a swizzled (Morton-ordered) image whose
  * dimensions are 2^log2w by 2^log2h, in texels -- multiply by bytes_per_texel.
  * Interleaves the low bits of x and y, then appends whichever axis still has

@@ -25,7 +25,9 @@
  * way the D3D12 backend does: SET_TEXTURE_FORMAT's location bits say where
  * the bytes are, rsx_texture_layout says what shape they are,
  * rsx_texture_decode turns them into host rows, and the TEXTURE_CONTROL1
- * crossbar becomes the texture's swizzle. Level 0 only for now.
+ * crossbar becomes the texture's swizzle. Every mip level the register says
+ * is there is uploaded, and the sampler's mip filter and LOD range come from
+ * SET_TEXTURE_FILTER and SET_TEXTURE_CONTROL0.
  *
  * Why Metal rather than SDL_Renderer: SDL2's renderer is a 2D sprite API with
  * no route to a custom vertex program, depth/stencil, MRT or render-to-texture,
@@ -220,19 +222,20 @@ static id<MTLDepthStencilState> s_ds_default;
  * sparse checksum of the bytes themselves, because titles animate textures
  * in place (the D3D12 backend's tex_csum exists for the same reason). A
  * changed checksum gets a fresh MTLTexture rather than an in-place write: a
- * frame in flight may still be sampling the old one. Same slot-stability
- * rule as the shader caches. Samplers are keyed on the wrap and filter
- * registers. Level 0 only; mip levels and cube faces are still to come.
+ * frame in flight may still be sampling the old one. The checksum covers the
+ * whole mip chain, not just level 0, so a title animating a lower level is
+ * noticed. Same slot-stability rule as the shader caches. Samplers are keyed
+ * on the wrap, filter and LOD registers.
  * --------------------------------------------------------------------------*/
 
 #define MTL_TEX_CACHE   1024
 #define MTL_SAMP_CACHE  64
 
 typedef struct {
-    u32 ea, w, h, format, control1, csum;
+    u32 ea, w, h, format, control1, control3, csum;
     id<MTLTexture> tex;
 } MtlTexEntry;
-typedef struct { u32 key; id<MTLSamplerState> samp; } MtlSampEntry;
+typedef struct { u64 key; id<MTLSamplerState> samp; } MtlSampEntry;
 
 static MtlTexEntry  s_tex_cache[MTL_TEX_CACHE];
 static MtlSampEntry s_samp_cache[MTL_SAMP_CACHE];
@@ -827,30 +830,43 @@ static u32 tex_csum(const u8* base, u32 nbytes)
     return h;
 }
 
-/* Decode one level-0 image out of guest memory into a new texture whose
- * swizzle applies the TEXTURE_CONTROL1 crossbar. `fmt` is the format byte
- * with its LN/UN flags. */
-static id<MTLTexture> upload_texture(const u8* src, u32 w, u32 h, u32 fmt, u32 control1)
+/* How many guest bytes a texture occupies: the whole mip chain, which is what
+ * the checksum has to cover -- a title that animates only a lower level would
+ * otherwise keep the stale upload. */
+static u32 texture_source_span(u32 fmt, u32 w, u32 h, u32 levels, u32 pitch)
 {
-    rsx_tex_layout tl;
-    rsx_texture_layout(fmt, w, h, &tl);
-    if (tl.face_bytes == 0) return nil;
-    /* Staging is sized by the DECODED image, which is wider than the source
-     * for a format the host has to be handed unpacked. */
-    const u32 staged = tl.dst_row_bytes * tl.rows;
-    if (s_tex_staging_cap < staged) {
-        u8* n = (u8*)realloc(s_tex_staging, staged);
-        if (!n) return nil;
-        s_tex_staging = n; s_tex_staging_cap = staged;
-    }
-    /* TEX_RGBA is consulted unconditionally, as the D3D12 backend does: the
-     * decode only reads it for the two formats whose bytes are A,R,G,B. */
-    rsx_texture_decode(s_tex_staging, tl.dst_row_bytes, src, w, h, &tl,
-                       rsx_texture_argb_is_rgba());
+    rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
+    const u32 n = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
+    if (!n) return 0;
+    return lv[n - 1].offset + lv[n - 1].tl.face_bytes;
+}
+
+/* Room for one decoded level. Levels shrink as the chain descends, so the
+ * buffer is sized once by level 0 and reused. */
+static int tex_staging_reserve(u32 bytes)
+{
+    if (s_tex_staging_cap >= bytes) return 1;
+    u8* n = (u8*)realloc(s_tex_staging, bytes);
+    if (!n) return 0;
+    s_tex_staging = n; s_tex_staging_cap = bytes;
+    return 1;
+}
+
+/* Decode a guest texture out of guest memory into a new texture whose swizzle
+ * applies the TEXTURE_CONTROL1 crossbar. `fmt` is the format byte with its
+ * LN/UN flags, `levels` SET_TEXTURE_FORMAT's level count and `pitch`
+ * SET_TEXTURE_CONTROL3's row pitch. */
+static id<MTLTexture> upload_texture(const u8* src, u32 w, u32 h, u32 fmt,
+                                     u32 control1, u32 levels, u32 pitch)
+{
+    rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
+    const u32 nlv = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
+    if (!nlv || lv[0].tl.face_bytes == 0) return nil;
 
     MTLTextureDescriptor* td =
-        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:texfmt_to_metal(tl.fmt)
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:texfmt_to_metal(lv[0].tl.fmt)
                                                            width:w height:h mipmapped:NO];
+    td.mipmapLevelCount = nlv;
     td.usage = MTLTextureUsageShaderRead;
     /* The crossbar's selectors arrive in its own field order A,R,G,B; the
      * D3D12 backend maps them to destR = out[1], destG = out[2],
@@ -861,8 +877,21 @@ static id<MTLTexture> upload_texture(const u8* src, u32 w, u32 h, u32 fmt, u32 c
                                                swizzle_sel(remap[3]), swizzle_sel(remap[0]));
     id<MTLTexture> tex = [s_dev newTextureWithDescriptor:td];
     if (!tex) return nil;
-    [tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
-             withBytes:s_tex_staging bytesPerRow:tl.dst_row_bytes];
+
+    for (u32 m = 0; m < nlv; m++) {
+        const rsx_tex_layout* tl = &lv[m].tl;
+        if (!tex_staging_reserve(tl->dst_row_bytes * tl->rows)) return nil;
+        /* TEX_RGBA is consulted unconditionally, as the D3D12 backend does:
+         * the decode only reads it for the two formats whose bytes are
+         * A,R,G,B. */
+        rsx_texture_decode(s_tex_staging, tl->dst_row_bytes,
+                           src + lv[m].offset, lv[m].w, lv[m].h, tl,
+                           rsx_texture_argb_is_rgba());
+        [tex replaceRegion:MTLRegionMake2D(0, 0, lv[m].w, lv[m].h)
+               mipmapLevel:m
+                 withBytes:s_tex_staging
+               bytesPerRow:tl->dst_row_bytes];
+    }
     return tex;
 }
 
@@ -878,17 +907,27 @@ static int tex_slot_for(const rsx_texture_state* t)
     const u32 ea = cellGcmResolveLocated((t->format & 3u) == 1u, t->offset);
     if (ea == 0xFFFFFFFFu) return -1;
     const u32 fmt = (t->format >> 8) & 0xFFu;
-    rsx_tex_layout tl;
-    rsx_texture_layout(fmt, w, h, &tl);
-    const u32 csum = tex_csum(vm_base + ea, tl.face_bytes);
+    /* SET_TEXTURE_FORMAT's level count. gcm packs it into bits [19:16], but
+     * the D3D12 backend and the method dispatcher both read the whole field
+     * above bit 15; rsx_texture_mip_chain clamps whatever comes out to the
+     * levels the dimensions allow, so the two readings agree. */
+    const u32 levels = (t->format >> 16) & 0xFFFFu;
+    const u32 pitch  = t->control3 & 0xFFFFFu;
+    const u32 span   = texture_source_span(fmt, w, h, levels, pitch);
+    if (!span) return -1;
+    const u32 csum = tex_csum(vm_base + ea, span);
 
     for (u32 i = 0; i < s_tex_count; i++) {
         MtlTexEntry* e = &s_tex_cache[i];
+        /* `format` carries the level count and the cube bit as well as the
+         * format byte, so the key covers both; the pitch has its own
+         * register and has to be compared on its own. */
         if (e->ea != ea || e->w != w || e->h != h || e->format != t->format ||
-            e->control1 != t->control1)
+            e->control1 != t->control1 || e->control3 != t->control3)
             continue;
         if (e->csum != csum) {
-            id<MTLTexture> fresh = upload_texture(vm_base + ea, w, h, fmt, t->control1);
+            id<MTLTexture> fresh = upload_texture(vm_base + ea, w, h, fmt,
+                                                  t->control1, levels, pitch);
             if (!fresh) return -1;
             e->tex = fresh; e->csum = csum;
         }
@@ -896,15 +935,17 @@ static int tex_slot_for(const rsx_texture_state* t)
     }
     if (s_tex_count >= MTL_TEX_CACHE) { s_caches_full = 1; return -1; }
 
-    id<MTLTexture> tex = upload_texture(vm_base + ea, w, h, fmt, t->control1);
+    id<MTLTexture> tex = upload_texture(vm_base + ea, w, h, fmt, t->control1,
+                                        levels, pitch);
     { static int n = 0; if (n++ < 16)
-        fprintf(stderr, "[RSX metal] texture %ux%u fmt 0x%02X at 0x%08X (%s) -> %s\n",
-                w, h, fmt, ea, (t->format & 3u) == 1u ? "local" : "main",
+        fprintf(stderr, "[RSX metal] texture %ux%u fmt 0x%02X %u level(s) at 0x%08X (%s) -> %s\n",
+                w, h, fmt, levels ? levels : 1u, ea,
+                (t->format & 3u) == 1u ? "local" : "main",
                 tex ? "ok" : "FAILED"); }
     const int slot = (int)s_tex_count++;
     MtlTexEntry* e = &s_tex_cache[slot];
     e->ea = ea; e->w = w; e->h = h; e->format = t->format; e->control1 = t->control1;
-    e->csum = csum; e->tex = tex;
+    e->control3 = t->control3; e->csum = csum; e->tex = tex;
     return tex ? slot : -1;
 }
 
@@ -923,23 +964,45 @@ static MTLSamplerAddressMode gcm_wrap_to_metal(u32 w)
     }
 }
 
-/* Sampler from the unit's wrap and filter registers, as the live draw
+/* Sampler from the unit's wrap, filter and LOD registers, as the live draw
  * engine's decode_sampler reads them: SET_TEXTURE_FILTER min at [18:16]
- * (1 NEAREST, 2 LINEAR, 3..6 with a mip filter), mag at [26:24]. One
- * level is uploaded, so the mip filter is left off. */
+ * (1 NEAREST, 2 LINEAR, then 3..6, which are the four combinations of a
+ * nearest/linear minification with a nearest/linear mip filter), mag at
+ * [26:24], and SET_TEXTURE_CONTROL0's max LOD at [18:7] and min LOD at
+ * [30:19], both 4.8 fixed point.
+ *
+ * RSX's LOD bias is SET_TEXTURE_FILTER [12:0] and is not applied: Metal has
+ * no sampler-side bias -- it is an argument to the sampling call, which means
+ * patching the fragment program rather than the sampler -- and the live draw
+ * engine leaves MipLODBias at zero too. */
 static int samp_slot_for(const rsx_texture_state* t)
 {
     const u32 minf = (t->filter >> 16) & 7u, magf = (t->filter >> 24) & 7u;
-    const u32 key = minf | (magf << 3) | ((t->address & 0x000F0F0Fu) << 6);
+    const u32 lod  = (t->control0 >> 7) & 0xFFFFFFu;   /* max then min LOD */
+    const u64 key = (u64)minf | ((u64)magf << 3)
+                  | ((u64)(t->address & 0x000F0F0Fu) << 6)
+                  | ((u64)lod << 26);
     for (u32 i = 0; i < s_samp_count; i++)
         if (s_samp_cache[i].key == key) return (int)i;
     if (s_samp_count >= MTL_SAMP_CACHE) return -1;
+
+    const int mip_present = (minf >= 3);
+    const int mip_linear  = (minf == 5 || minf == 6);
 
     MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
     sd.minFilter = (minf == 2 || minf == 4 || minf == 6) ? MTLSamplerMinMagFilterLinear
                                                          : MTLSamplerMinMagFilterNearest;
     sd.magFilter = (magf == 2) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
-    sd.mipFilter = MTLSamplerMipFilterNotMipmapped;
+    sd.mipFilter = !mip_present ? MTLSamplerMipFilterNotMipmapped
+                 : mip_linear   ? MTLSamplerMipFilterLinear
+                                : MTLSamplerMipFilterNearest;
+    /* A min filter with no mip term samples level 0 only, which is what
+     * pinning the LOD range to the minimum says. */
+    const float min_lod = (float)((t->control0 >> 19) & 0xFFFu) / 256.0f;
+    float max_lod = mip_present ? (float)((t->control0 >> 7) & 0xFFFu) / 256.0f : 0.0f;
+    if (max_lod < min_lod) max_lod = min_lod;
+    sd.lodMinClamp = min_lod;
+    sd.lodMaxClamp = max_lod;
     sd.sAddressMode = gcm_wrap_to_metal(t->address);
     sd.tAddressMode = gcm_wrap_to_metal(t->address >> 8);
     sd.rAddressMode = gcm_wrap_to_metal(t->address >> 16);

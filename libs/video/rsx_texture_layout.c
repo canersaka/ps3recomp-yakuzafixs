@@ -113,6 +113,39 @@ void rsx_texture_layout_pitched(u32 rsx_fmt, u32 w, u32 h, u32 pitch,
     out->face_bytes = out->row_bytes * out->rows;
 }
 
+u32 rsx_texture_mip_chain(u32 rsx_fmt, u32 w, u32 h, u32 levels, u32 pitch,
+                          rsx_tex_level* out)
+{
+    if (!out || !w || !h) return 0;
+    if (levels == 0) levels = 1;
+    if (levels > RSX_MAX_TEXTURE_LEVELS) levels = RSX_MAX_TEXTURE_LEVELS;
+
+    u32 mw = w, mh = h, off = 0, n = 0;
+    while (n < levels) {
+        rsx_tex_level* lv = &out[n];
+        lv->w = mw; lv->h = mh; lv->offset = off;
+        /* Only level 0 has a pitch register; the rest are packed at their own
+         * width, as the live draw engine's texture_source_span walks them. */
+        rsx_texture_layout_pitched(rsx_fmt, mw, mh, n == 0 ? pitch : 0, &lv->tl);
+        off += lv->tl.face_bytes;
+        n++;
+        if (mw == 1 && mh == 1) break;   /* no level below 1x1 */
+        if (mw > 1) mw >>= 1;
+        if (mh > 1) mh >>= 1;
+    }
+    return n;
+}
+
+u32 rsx_texture_cube_face_stride(u32 rsx_fmt, u32 w, u32 h, u32 levels,
+                                 u32 pitch)
+{
+    rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
+    const u32 n = rsx_texture_mip_chain(rsx_fmt, w, h, levels, pitch, lv);
+    if (!n) return 0;
+    const u32 total = lv[n - 1].offset + lv[n - 1].tl.face_bytes;
+    return (total + 127u) & ~127u;
+}
+
 int rsx_texture_argb_is_rgba(void)
 {
     static int cached = -1;

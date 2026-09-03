@@ -77,6 +77,11 @@ uint8_t* vm_base = NULL;
 #define TEX_W       4u
 #define TEX_H       4u
 #define TEX_ARGB    0xFF20C040u          /* what a textured pixel must read   */
+#define MIP_OFFSET  0x00040000u          /* RSX offset of the mipped texture  */
+#define MIP_W       64u
+#define MIP_H       64u
+#define MIP_L0_ARGB 0xFF3060A0u          /* level 0: must NOT be sampled      */
+#define MIP_L1_ARGB 0xFFC0F080u          /* level 1: what --mip must read     */
 
 /* Functions the RSX side exports but does not declare in a public header. */
 extern void cellGcm_rsx_process_fifo(void);
@@ -181,6 +186,43 @@ static void upload_textured_quad(void)
     for (int i = 0; i < 6; i++)
         for (int k = 0; k < 12; k++)
             guest_f32(IO_ADDR + TVTX_OFFSET + (uint32_t)(i * 48 + k * 4), v[i][k]);
+}
+
+/* A 64x64 A8R8G8B8 texture with TWO levels, each a flat colour: level 0 at the
+ * bound offset and level 1 immediately behind it, which is where the hardware
+ * expects the next level of a linear image.
+ *
+ * The two colours differ so the presented pixel says which level was sampled.
+ * That is the whole point of --mip: a backend that uploads level 0 and stops
+ * has a one-level texture, its sampler clamps to that level however wide the
+ * LOD range says, and the centre pixel comes out level 0's colour. */
+static void upload_mip_texture(void)
+{
+    for (uint32_t i = 0; i < MIP_W * MIP_H; i++)
+        guest_w32(IO_ADDR + MIP_OFFSET + i * 4u, MIP_L0_ARGB);
+    const uint32_t l1 = MIP_OFFSET + MIP_W * MIP_H * 4u;
+    for (uint32_t i = 0; i < (MIP_W / 2u) * (MIP_H / 2u); i++)
+        guest_w32(IO_ADDR + l1 + i * 4u, MIP_L1_ARGB);
+}
+
+/* The mip draw's quad: a few pixels around the centre of the 1280x720 target,
+ * with texcoord0 spanning the whole texture. Squeezing 64 texels into ~26x14
+ * pixels is what drives the LOD past level 0; the sampler's max LOD then pins
+ * it at level 1. Layout as the textured quad: float4 pos, colour, uv. */
+#define MVTX_OFFSET (VTX_OFFSET + 0x3000u)
+static void upload_mip_quad(void)
+{
+    static const float v[6][12] = {
+        { -0.02f,-0.02f,0,1,  0,1,0,1,  0,0,0,0 },
+        {  0.02f,-0.02f,0,1,  0,1,0,1,  1,0,0,0 },
+        {  0.02f, 0.02f,0,1,  0,1,0,1,  1,1,0,0 },
+        { -0.02f,-0.02f,0,1,  0,1,0,1,  0,0,0,0 },
+        {  0.02f, 0.02f,0,1,  0,1,0,1,  1,1,0,0 },
+        { -0.02f, 0.02f,0,1,  0,1,0,1,  0,1,0,0 },
+    };
+    for (int i = 0; i < 6; i++)
+        for (int k = 0; k < 12; k++)
+            guest_f32(IO_ADDR + MVTX_OFFSET + (uint32_t)(i * 48 + k * 4), v[i][k]);
 }
 
 /* The guest-shader draw's vertex block: the same full-viewport triangle, but
@@ -328,6 +370,49 @@ static void emit_textured_draw(void)
     emit(NV4097_SET_BEGIN_END, 0u);
 }
 
+/* Bind the two-level texture on unit 0 and draw the small quad through the
+ * same passthrough vertex program and TEX r0, TC0 fragment program --tex uses,
+ * so the only thing that differs is the texture's mip state.
+ *
+ * SET_TEXTURE_FILTER's min field is 4, LINEAR_MIPMAP_NEAREST: linear within a
+ * level and NEAREST between levels, so the sampled pixel is exactly one
+ * level's colour rather than a blend of two. SET_TEXTURE_CONTROL0 carries the
+ * LOD range in 4.8 fixed point, max at [18:7] and min at [30:19]: max 1.0
+ * (256) with min 0 lets the sampler reach level 1 and no further, and the
+ * quad's derivatives put the computed LOD above 1 so it lands there. */
+static void emit_mip_draw(void)
+{
+    u8 vp[48];
+    rsx_test_vp_mov_out(vp +  0, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);   /* MOV o0, v0      */
+    rsx_test_vp_mov_out(vp + 16, 3, RSX_TEST_VP_SWZ_IDENT, 1, 0);   /* MOV o1, v3      */
+    rsx_test_vp_mov_out(vp + 32, 8, RSX_TEST_VP_SWZ_IDENT, 7, 1);   /* MOV o7, v8, END */
+    emit_programs(vp, sizeof vp, TFP_OFFSET);
+
+    emit(NV4097_SET_TEXTURE_OFFSET     + 0, MIP_OFFSET);
+    /* ... and two mip levels in [19:16] rather than one. */
+    emit(NV4097_SET_TEXTURE_FORMAT     + 0, 2u | (2u << 4) | ((0x85u | 0x20u) << 8) | (2u << 16));
+    emit(NV4097_SET_TEXTURE_CONTROL0   + 0, 0x80000000u | (256u << 7));
+    emit(NV4097_SET_TEXTURE_CONTROL1   + 0, 0xAAE4u);
+    /* CONTROL3's low 20 bits are the row pitch. The natural pitch is what a
+     * title writes for a texture with no padding, and it is load-bearing here:
+     * a backend that read the wrong bits would size level 0 wrong and read
+     * level 1 from the wrong place. */
+    emit(NV4097_SET_TEXTURE_CONTROL3   + 0, MIP_W * 4u);
+    emit(NV4097_SET_TEXTURE_FILTER     + 0, (4u << 16) | (2u << 24));
+    emit(NV4097_SET_TEXTURE_IMAGE_RECT + 0, (MIP_W << 16) | MIP_H);
+
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, VTX_MAIN(MVTX_OFFSET +  0));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0 * 4, VFMT(4, 48));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4, VTX_MAIN(MVTX_OFFSET + 16));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 3 * 4, VFMT(4, 48));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 8 * 4, VTX_MAIN(MVTX_OFFSET + 32));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 8 * 4, VFMT(4, 48));
+
+    emit(NV4097_SET_BEGIN_END, 5u);                       /* TRIANGLES       */
+    emit(NV4097_DRAW_ARRAYS,   0u | ((6u - 1u) << 24));   /* first=0 count=6 */
+    emit(NV4097_SET_BEGIN_END, 0u);
+}
+
 /* Draw the blue triangle through MOV o0, v0 ; MOV o1, v3 (END) -- position
  * and diffuse colour straight through -- and the red/blue-swapping fragment
  * program, so it must come out red. */
@@ -387,7 +472,8 @@ static void submit_frame(int with_draw)
     } else {
         emit(NV4097_CLEAR_SURFACE,            0xF0u);
     }
-    if (with_draw == 4)      emit_depth_draw();
+    if (with_draw == 5)      emit_mip_draw();
+    else if (with_draw == 4) emit_depth_draw();
     else if (with_draw == 3) emit_shader_draw();
     else if (with_draw == 2) emit_textured_draw();
     else if (with_draw == 1) emit_triangle_draw();
@@ -419,10 +505,16 @@ int main(int argc, char** argv)
          * far one. A backend with no depth buffer draws them in submission
          * order and fails. Fixed-function, so every backend can run it. */
         else if (strcmp(argv[i], "--depth") == 0)  do_draw = 4;
+        /* --mip: bind a texture with TWO levels and draw a quad small enough
+         * that the sampler reaches level 1. The levels are different colours,
+         * so a backend that uploads only level 0 presents the wrong one. */
+        else if (strcmp(argv[i], "--mip") == 0)    do_draw = 5;
     }
-    if (do_draw == 3 && !HOST_BACKEND_GUEST_SHADERS) {
-        printf("[host] --shader: the %s backend runs no guest programs; nothing to check\n",
-               HOST_BACKEND_NAME);
+    /* The guest-program modes, which a backend without a translator cannot
+     * run. --depth sits between them and is not one: it is fixed-function. */
+    if ((do_draw == 3 || do_draw == 5) && !HOST_BACKEND_GUEST_SHADERS) {
+        printf("[host] %s: the %s backend runs no guest programs; nothing to check\n",
+               do_draw == 5 ? "--mip" : "--shader", HOST_BACKEND_NAME);
         return 0;
     }
 
@@ -448,7 +540,8 @@ int main(int argc, char** argv)
     if (do_draw == 2) { upload_texture(); upload_textured_quad(); }
     if (do_draw == 3) upload_shader_triangle();
     if (do_draw == 4) upload_depth_triangles();
-    if (do_draw == 2 || do_draw == 3) upload_fragment_programs();
+    if (do_draw == 5) { upload_mip_texture(); upload_mip_quad(); }
+    if (do_draw == 2 || do_draw == 3 || do_draw == 5) upload_fragment_programs();
     submit_frame(do_draw);
 
     u32 got = host_backend_color();
@@ -481,9 +574,12 @@ int main(int argc, char** argv)
          * the TEXTURE's colour, not the quad's green -- so it also proves the
          * texture reached the sampler through layout, decode and the crossbar.
          * With --depth it is the NEAR triangle's red, drawn before the far
-         * green one: green here means the depth test did nothing.
+         * green one: green here means the depth test did nothing. With --mip
+         * it is level 1's colour, not level 0's, which no backend that
+         * uploads a single level can produce.
          */
-        u32 want = (do_draw == 4) ? 0xFFFF0000u   /* near red beats far green    */
+        u32 want = (do_draw == 5) ? MIP_L1_ARGB
+                 : (do_draw == 4) ? 0xFFFF0000u   /* near red beats far green    */
                  : (do_draw == 3) ? 0xFFFF0000u   /* blue vertices, FP swaps r/b */
                  : (do_draw == 2) ? TEX_ARGB
                  : (do_draw == 1) ? 0xFFFF0000u
@@ -492,7 +588,7 @@ int main(int argc, char** argv)
                back, want, (back & 0x00FFFFFFu) == (want & 0x00FFFFFFu) ? "OK" : "MISMATCH");
         if ((back & 0x00FFFFFFu) != (want & 0x00FFFFFFu)) rc = 3;
     }
-    if ((do_draw == 2 || do_draw == 3) && HOST_BACKEND_GUEST_SHADERS) {
+    if ((do_draw == 2 || do_draw == 3 || do_draw == 5) && HOST_BACKEND_GUEST_SHADERS) {
         /* The pixel alone cannot prove the programs ran: a backend that
          * ignored them would draw the triangle blue, which the check above
          * catches, but one that ran the vertex program and dropped the
