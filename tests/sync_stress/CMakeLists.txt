@@ -57,6 +57,7 @@ add_executable(sync_stress
     "${RUNTIME_SYNC_DIR}/sys_cond.c"
     "${RUNTIME_SYNC_DIR}/sys_semaphore.c"
     "${RUNTIME_SYNC_DIR}/sys_event.c"
+    "${RUNTIME_SYNC_DIR}/sys_rwlock.c"
 )
 if(NOT WIN32)
     # The Win32 handle, wait and thread API the harness drives.
