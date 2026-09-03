@@ -373,6 +373,7 @@ if(UNIX)
             "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
             "${CMAKE_CURRENT_SOURCE_DIR}/runtime/memory"
             "${CMAKE_CURRENT_SOURCE_DIR}/runtime/syscalls"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform"
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
         )
         target_link_libraries(ps3recomp_boot_smoke PRIVATE ps3recomp_runtime)
