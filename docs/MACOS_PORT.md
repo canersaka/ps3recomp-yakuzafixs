@@ -11,7 +11,7 @@ documents the host shim itself._
 | Runtime library | builds, Debug and Release, verified arm64 |
 | Lifter suites | all eight, including the 1300+ conformance cases compiled and executed with Apple Clang |
 | SPU helper tests | pass |
-| `ps3recomp_host` | clear, flip, a fixed-function NV4097 draw, a draw through **guest vertex and fragment programs**, a draw sampling a **guest texture** from a guest program, a pair of triangles the **depth test** has to order, a two-level texture whose **second mip level** must be the one sampled, and a triangle drawn into an offscreen **colour surface** that a later draw then **samples** -- headless through the **Metal** backend, with 60-frame runs, and **every mode twice**: once through the register-file draw engine, which is the default, and once through the older vtable path |
+| `ps3recomp_host` | clear, flip, a fixed-function NV4097 draw, a draw through **guest vertex and fragment programs**, a draw sampling a **guest texture** from a guest program, a pair of triangles the **depth test** has to order, a two-level texture whose **second mip level** must be the one sampled, a triangle drawn into an offscreen **colour surface** that a later draw then **samples**, a **polygon and a quad strip** that only exist once expanded into triangles, and a **depth surface** one pass writes and the next samples as a texture -- headless through the **Metal** backend, with 60-frame runs, and **twice over**: once through the register-file draw engine, which is the default, and once through the older vtable path. The depth-texture mode is the one exception, and runs on the draw engine alone: the vtable path tracks no zeta as a texture |
 | Guest shader translation | `test_shader_msl`: hand-assembled NV40 programs through the decompilers, glslang and spirv-cross, checked for the MSL binding contract the backend relies on (runs on Linux too) |
 | PPU boot scaffold | `ppu_loader.cpp`, `ppu_hle.cpp`, `ppu_fs.cpp`, `ppu_sysprx.cpp`, `boot_main.cpp` compile at a recorded baseline of **0** errors (`darwin-clang` in `tools/ppu_scaffold_baseline.json`) |
 | PPU boot path | `ps3recomp_boot_smoke`: the scaffold **linked and run** against the synthetic title in `runtime/ppu/tests/smoke/` -- ELF load, entry OPD, TLS, the NID bridge, lv2 syscalls, a guest thread on a second host thread, three frames cleared and flipped through the FIFO to the Metal backend, and `sys_process_exit` |
@@ -20,7 +20,7 @@ documents the host shim itself._
 | lv2 threads | `ps3recomp_host --threads`: a guest PPU thread created and joined through the syscalls, and the host stack it got |
 | cellFiber | `tests/fiber_switch`: 4000 scheduler round trips and 4000 direct fiber-to-fiber switches on ucontext (runs on Linux too) |
 | Audio and pad | `ps3recomp_host --audio-pad`: the SDL2 backends up and down twice with `SDL_AUDIODRIVER=dummy` and no controller |
-| RSX self-contained tests | texture layout, the primitive tables, and `test_rsx_draw_engine`: the draw engine driven through its dispatch sink against a stub backend, with no GPU -- surface keying and reallocation, render-target aliasing on a texture bind, the texture cache's revalidation and LRU eviction, the pipeline key's stability under constant changes, restart cuts bounding topology expansion (runs on Linux too) |
+| RSX self-contained tests | texture layout, the primitive tables, and `test_rsx_draw_engine`: the draw engine driven through its dispatch sink against a stub backend, with no GPU -- surface keying and reallocation, render-target aliasing on a texture bind, an MRT set registered, cleared and bound whole, the texture cache's revalidation and LRU eviction, the pipeline key's stability under constant changes, restart cuts bounding topology expansion with quad strips and polygons among them (runs on Linux too) |
 
 The scaffold check is compile-only. What links and runs it is the smoke title:
 a hand-written program in the lifter's ABI, with an image
@@ -72,21 +72,23 @@ exercised on the Mac without a game. See docs/PPU_RECOMP.md.
    vertex-texture units bound to the vertex stage so a transform program's
    `TXL` samples.
 
-   What the engine does **not** have. Only colour target A is bound: the
-   vtable path at least attaches and clears B, C and D, and this one does
-   not, so an MRT set loses those clears (nothing writes them on either path,
-   because the fragment decompiler emits one `SV_TARGET`). A vertex-texture
-   unit bound at a surface's offset still uploads from guest memory. A
-   colour target is seeded only when its context DMA says main memory and the
-   IO table says the page is mapped; a VRAM surface is not seeded, because
-   this tree's guest VM reserves local memory without backing it. Quad strips
-   and polygons are dropped rather than expanded. A guest program pair that
-   will not translate drops its draw rather than falling back, as the
+   An MRT set is attached and cleared whole on both paths now, and quad
+   strips and polygons are expanded into the engine's indexed triangle list
+   the way the vtable path expands them, so those two differences are gone.
+   Depth-as-texture has a check: `--depthtex` writes a zeta and samples it.
+
+   What the engine does **not** have. Nothing writes colour targets B, C and
+   D on either path, because the fragment decompiler emits one `SV_TARGET`;
+   they are attached and cleared, not fed. A vertex-texture unit bound at a
+   surface's offset still uploads from guest memory. A colour target is
+   seeded only when its context DMA says main memory and the IO table says
+   the page is mapped; a VRAM surface is not seeded, because this tree's
+   guest VM reserves local memory without backing it. A guest program pair
+   that will not translate drops its draw rather than falling back, as the
    reference engine drops it, so `PS3RECOMP_METAL_FIXED_FUNCTION=1` is a
-   vtable-path lever now. Depth-as-texture is implemented and nothing in CI
-   exercises it: no host mode samples a depth surface. And nothing carries
-   across the movie compositor, the a010 probe, the shader disk cache or the
-   profiling instrumentation, none of which a port wants.
+   vtable-path lever now. And nothing carries across the movie compositor,
+   the a010 probe, the shader disk cache or the profiling instrumentation,
+   none of which a port wants.
 
 2. **A game's host code.** The scaffold in `runtime/ppu/` is game-agnostic; a
    port adds its own runner (imports, overrides, the window, diagnostics). A
@@ -145,10 +147,10 @@ implements. `rsx_live_draw.c` keeps working on Windows and keeps merging.
 
 What is left, in order:
 
-- **MRT.** The engine binds one colour target. Targets B, C and D need
-  attaching and clearing, and then the fragment decompiler needs to emit more
-  than a single `SV_TARGET` before anything can be written to them. A
-  deferred pass fills its first G-buffer plane and no more until both land.
+- **MRT.** Both paths now attach and clear every target the set names, so
+  half of it is done. What is left is the fragment decompiler, which emits a
+  single `SV_TARGET`: until it emits more, a deferred pass still fills its
+  first G-buffer plane and no other, over a correctly cleared one.
 - **The rest of texturing.** What is left is narrow: anisotropic filtering,
   the LOD bias in `SET_TEXTURE_FILTER` (Metal has no sampler-side bias, so it
   means patching the sampling call in the fragment program), 3D textures, and
@@ -160,11 +162,6 @@ What is left, in order:
   tests it, so a refactor of it could neither be validated here nor kept
   merging. The register-file draw engine above is the answer, and the
   vendored file keeps merging with upstream untouched.
-- **A check that samples a depth surface.** Per-zeta depth targets and the
-  depth snapshot are implemented; no host mode exercises them, so they are
-  the one part of the engine CI does not cover.
-- **Quad strips and polygons**, which the engine drops and the vtable path
-  expands.
 - **Time with a title.** Everything above is a known gap. What a real
   frame turns up will not be.
 
@@ -226,6 +223,8 @@ PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --tex                # guest t
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depth              # near-first pair, depth test
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip                # two mip levels, level 1 sampled
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --rtt                # render into a surface, then sample it
+PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --quads              # a polygon and a quad strip, expanded
+PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depthtex           # write a zeta, then sample it (draw engine only)
 PS3RECOMP_RSX_ENGINE=vtable PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --rtt  # ... through the older path
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_boot_smoke build/smoke/smoke.elf   # the PPU boot path
 ./build/ps3recomp_host --threads                  # lv2 thread create/join + host stack
@@ -251,7 +250,9 @@ Switches on the render path:
 - `PS3RECOMP_RSX_ENGINE=vtable` goes back to the `rsx_state` vtable path;
   `=dispatch` is the default and asks for the register-file draw engine
   explicitly. Every host mode above passes both ways, which is what the
-  second CI block checks.
+  second CI block checks -- except `--depthtex`, which is the draw engine's:
+  the vtable path has no depth-as-texture, so it uploads the guest bytes
+  behind the zeta and presents the wrong pixel.
 - `PS3RECOMP_METAL_SHADER_DUMP=<dir>` writes every translated program's HLSL
   and MSL there, named by cache key.
 - `PS3RECOMP_METAL_FIXED_FUNCTION=1` pins every draw to the built-in shader,
