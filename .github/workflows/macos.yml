@@ -313,7 +313,7 @@ jobs:
           # binary, and the marker-order verdict spelt out rather than inferred
           # from the exit status alone.
           grep -q "=== ps3recomp game runner ===" template.log
-          grep -q "\[smoke\] OK: all 10 markers, in order" template.log
+          grep -q "\[smoke\] OK: all 11 markers, in order" template.log
           grep -q "\[smoke\] PASS" template.log
 
       # RSX texture layout -- format class, row sizes, Morton addressing. Pure
