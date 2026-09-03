@@ -18,22 +18,49 @@
  * lets go last frees it. That is why a thread routine may return after its
  * handle was closed, and why CloseHandle right after CreateThread -- the
  * "spawn and forget" pattern all over this tree -- leaks nothing.
+ *
+ * The same objects form the thread table that OpenThread and the toolhelp
+ * snapshot walk, so a thread the shim did not create is adopted into one on
+ * first use. Stopping a running thread and reading its registers is a
+ * debugger's job done with a debugger's mechanism -- Mach on Darwin, a
+ * real-time signal on Linux -- and the exception layer at the bottom of this
+ * file is sigaction wearing the vectored-handler interface. The header
+ * documents the contract of each; this file is about how they are kept
+ * correct, and the ordering rules they must not break.
  */
 #ifndef _WIN32
 
 #if defined(__linux__) && !defined(_GNU_SOURCE)
-#  define _GNU_SOURCE          /* pthread_setaffinity_np, CPU_SET */
+#  define _GNU_SOURCE          /* pthread_setaffinity_np, CPU_SET, REG_RIP */
 #endif
 
 #include "win32_compat.h"
 
 #include <errno.h>
+#include <signal.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/time.h>
 #if defined(__APPLE__)
+/* <sys/ucontext.h>, not <ucontext.h>: the latter is the deprecated
+ * makecontext/swapcontext family and refuses to compile without _XOPEN_SOURCE,
+ * while all that is wanted here is the ucontext_t a signal handler is given. */
+#  include <sys/ucontext.h>
+#  include <mach/mach.h>
+#  include <mach/mach_vm.h>
+#  include <mach/thread_act.h>
 #  include <pthread/qos.h>
+#else
+#  include <semaphore.h>
+#  include <ucontext.h>
+#endif
+
+/* The signal that parks a thread for SuspendThread on Linux. SIGRTMIN and the
+ * two above it belong to the C library's own threading, and SIGRTMIN is not a
+ * compile-time constant there, so this is only ever evaluated at run time. */
+#if defined(__linux__)
+#  define PS3_SUSPEND_SIGNAL (SIGRTMIN + 4)
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -46,7 +73,7 @@ void  SetLastError(DWORD e)  { t_last_error = e; }
 /* ---------------------------------------------------------------------------
  * Waitable objects
  * -----------------------------------------------------------------------*/
-enum { OBJ_EVENT = 1, OBJ_SEMAPHORE, OBJ_THREAD, OBJ_TIMER };
+enum { OBJ_EVENT = 1, OBJ_SEMAPHORE, OBJ_THREAD, OBJ_TIMER, OBJ_SNAPSHOT };
 #define OBJ_MAGIC 0x57333234u   /* 'W324' */
 
 typedef struct ps3_obj {
@@ -65,22 +92,38 @@ typedef struct ps3_obj {
     pthread_t      pt;
     DWORD          tid;                /* kernel tid, known once it runs */
     int            started, done, suspend_count;
+    int            adopted;            /* not created here; see thread_self() */
     int            priority;           /* THREAD_PRIORITY_*, applied at start too */
     DWORD_PTR      affinity;           /* 0 = unset */
     DWORD          exit_code;
     PS3_THREAD_FN  fn;
     unsigned     (*fn_crt)(void*);
     LPVOID         arg;
+    struct ps3_obj* thr_next;          /* the thread table, guarded by s_lock */
+    unsigned long long created_ft, exited_ft;   /* FILETIME units */
+#if defined(__APPLE__)
+    mach_port_t    port;               /* the thread's Mach port, once it runs */
+#else
+    sem_t          park_ack, park_go;  /* the suspend handshake, both ways */
+    CONTEXT        park_ctx;           /* saved by the parking handler */
+    int            park_ctx_dirty;     /* SetThreadContext wants it put back */
+    int            park_ready;         /* the two semaphores exist */
+#endif
 
     /* waitable timer */
     unsigned long long due_ns;         /* CLOCK_MONOTONIC */
     unsigned long long period_ns;
     int            timer_set;
+
+    /* toolhelp snapshot */
+    DWORD*         snap_tids;
+    int            snap_count, snap_pos;
 } ps3_obj;
 
 static pthread_mutex_t s_lock  = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  s_multi = PTHREAD_COND_INITIALIZER;
 static int             s_multi_waiters;
+static ps3_obj*        s_threads;                 /* the thread table head */
 
 static _Thread_local ps3_obj* t_current_thread;   /* set by the trampoline */
 
@@ -107,6 +150,14 @@ static ps3_obj* obj_of(HANDLE h)
 static void obj_release_locked(ps3_obj* o)
 {
     if (--o->refs > 0) return;
+    if (o->kind == OBJ_THREAD) {
+        for (ps3_obj** p = &s_threads; *p; p = &(*p)->thr_next)
+            if (*p == o) { *p = o->thr_next; break; }
+#if !defined(__APPLE__)
+        if (o->park_ready) { sem_destroy(&o->park_ack); sem_destroy(&o->park_go); }
+#endif
+    }
+    free(o->snap_tids);
     o->magic = 0;
     pthread_cond_destroy(&o->cv);
     free(o);
@@ -124,6 +175,22 @@ static unsigned long long mono_ns(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+
+/* Now, in FILETIME units: 100 ns since 1601, which is what GetThreadTimes
+ * reports its creation and exit stamps in. */
+static unsigned long long now_ft(void)
+{
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    return ((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+}
+
+static void ft_store(FILETIME* out, unsigned long long v)
+{
+    if (!out) return;
+    out->dwLowDateTime  = (DWORD)v;
+    out->dwHighDateTime = (DWORD)(v >> 32);
 }
 
 /* Is the object signaled right now? For a timer that means its due time has
@@ -400,10 +467,23 @@ static void thread_finish(ps3_obj* t, DWORD code)
 {
     pthread_mutex_lock(&s_lock);
     t->exit_code = code;
+    t->exited_ft = now_ft();
     t->done = 1;
     obj_changed_locked(t);
     obj_release_locked(t);       /* the running thread's reference */
     pthread_mutex_unlock(&s_lock);
+}
+
+/* Record what only the thread itself can tell us: its kernel tid, and on
+ * Darwin the Mach port that thread_suspend and thread_get_state take. Both are
+ * published before the CREATE_SUSPENDED gate, so a handle is fully usable the
+ * moment the thread exists. Call with s_lock held. */
+static void thread_publish_self_locked(ps3_obj* t)
+{
+    t->tid = GetCurrentThreadId();
+#if defined(__APPLE__)
+    t->port = pthread_mach_thread_np(pthread_self());
+#endif
 }
 
 static void* thread_trampoline(void* p)
@@ -412,7 +492,7 @@ static void* thread_trampoline(void* p)
     t_current_thread = t;
 
     pthread_mutex_lock(&s_lock);
-    t->tid = GetCurrentThreadId();
+    thread_publish_self_locked(t);
     while (t->suspend_count > 0)                 /* CREATE_SUSPENDED gate */
         pthread_cond_wait(&t->cv, &s_lock);
     t->started = 1;
@@ -428,6 +508,24 @@ static void* thread_trampoline(void* p)
     return NULL;
 }
 
+/* Everything a thread record needs that is not about how the thread started:
+ * the Linux park handshake and the creation stamp, plus the table link. Call
+ * without s_lock; it takes it. Returns 0 if the semaphores could not be made. */
+static int thread_arm(ps3_obj* t)
+{
+#if !defined(__APPLE__)
+    if (sem_init(&t->park_ack, 0, 0) != 0) return 0;
+    if (sem_init(&t->park_go, 0, 0) != 0) { sem_destroy(&t->park_ack); return 0; }
+    t->park_ready = 1;
+#endif
+    t->created_ft = now_ft();
+    pthread_mutex_lock(&s_lock);
+    t->thr_next = s_threads;
+    s_threads = t;
+    pthread_mutex_unlock(&s_lock);
+    return 1;
+}
+
 static HANDLE create_thread(SIZE_T stack, PS3_THREAD_FN fn, unsigned (*fn_crt)(void*),
                             LPVOID arg, DWORD flags, DWORD* out_tid)
 {
@@ -439,6 +537,11 @@ static HANDLE create_thread(SIZE_T stack, PS3_THREAD_FN fn, unsigned (*fn_crt)(v
     t->fn_crt = fn_crt;
     t->arg    = arg;
     t->suspend_count = (flags & CREATE_SUSPENDED) ? 1 : 0;
+    if (!thread_arm(t)) {
+        t->magic = 0; pthread_cond_destroy(&t->cv); free(t);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
@@ -455,7 +558,12 @@ static HANDLE create_thread(SIZE_T stack, PS3_THREAD_FN fn, unsigned (*fn_crt)(v
     int rc = pthread_create(&t->pt, &attr, thread_trampoline, t);
     pthread_attr_destroy(&attr);
     if (rc != 0) {
-        t->magic = 0; pthread_cond_destroy(&t->cv); free(t);
+        /* Through the release path: the record is already in the thread table
+         * and, off Darwin, owns two semaphores. */
+        pthread_mutex_lock(&s_lock);
+        t->refs = 1;
+        obj_release_locked(t);
+        pthread_mutex_unlock(&s_lock);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
@@ -475,10 +583,68 @@ uintptr_t _beginthreadex(void* sa, unsigned stack, unsigned (*fn)(void*), void* 
     return (uintptr_t)h;
 }
 
+/* --- adopting a thread the shim did not create ------------------------------
+ *
+ * main() is the case that matters: a runner duplicates GetCurrentThread() into
+ * a real handle so a watchdog on another thread can freeze it and read its
+ * program counter. There is no record for it, so one is made on demand.
+ *
+ * The record is owned by the thread itself and released by a TLS destructor at
+ * its exit, which is what keeps a stale pthread_t -- and on Darwin a Mach port
+ * that the kernel may since have handed to a different thread -- out of the
+ * table. A handle taken while the thread lived keeps the record alive past
+ * that, reporting `done`, exactly as a shim-created thread's does. */
+static pthread_key_t  s_adopt_key;
+static pthread_once_t s_adopt_once = PTHREAD_ONCE_INIT;
+static int            s_adopt_key_ready;
+
+static void adopt_dtor(void* p)
+{
+    ps3_obj* t = (ps3_obj*)p;
+    t_current_thread = NULL;
+    thread_finish(t, 0);
+}
+static void adopt_key_init(void)
+{
+    if (pthread_key_create(&s_adopt_key, adopt_dtor) == 0) s_adopt_key_ready = 1;
+}
+
+/* Drop the destructor's claim before finishing a record by hand, so the record
+ * is not released twice. */
+static void adopt_forget_self(void)
+{
+    if (s_adopt_key_ready) pthread_setspecific(s_adopt_key, NULL);
+}
+
+/* The calling thread's record, made if this is the first time it has been
+ * asked for. NULL only if the allocation failed. */
+static ps3_obj* thread_self(void)
+{
+    if (t_current_thread) return t_current_thread;
+    pthread_once(&s_adopt_once, adopt_key_init);
+    ps3_obj* t = obj_new(OBJ_THREAD);
+    if (!t) return NULL;
+    t->refs    = 1;                     /* the thread's own */
+    t->pt      = pthread_self();
+    t->started = 1;
+    t->adopted = 1;
+    if (!thread_arm(t)) {
+        t->magic = 0; pthread_cond_destroy(&t->cv); free(t);
+        return NULL;
+    }
+    pthread_mutex_lock(&s_lock);
+    thread_publish_self_locked(t);
+    pthread_mutex_unlock(&s_lock);
+    t_current_thread = t;
+    if (s_adopt_key_ready) pthread_setspecific(s_adopt_key, t);
+    return t;
+}
+
 void ExitThread(DWORD code)
 {
     ps3_obj* t = t_current_thread;
     t_current_thread = NULL;
+    adopt_forget_self();
     if (t) thread_finish(t, code);
     pthread_exit(NULL);
 }
@@ -494,28 +660,263 @@ BOOL GetExitCodeThread(HANDLE h, DWORD* code)
     return TRUE;
 }
 
+/* --- the register file ------------------------------------------------------
+ *
+ * A CONTEXT is filled from two kinds of source: a Mach thread state, and a
+ * signal frame. Both the suspend machinery below and the exception layer at
+ * the bottom of this file go through these, so the two cannot drift.
+ *
+ * Only what the header declares is carried. Whatever a caller asks for in
+ * ContextFlags, one thread_get_state or one signal frame delivers all of it at
+ * once, so everything is filled and ContextFlags reports that. */
+#if defined(__APPLE__) && defined(__aarch64__)
+typedef arm_thread_state64_t ps3_native_state;
+#define PS3_NATIVE_STATE_FLAVOR ARM_THREAD_STATE64
+#define PS3_NATIVE_STATE_COUNT  ARM_THREAD_STATE64_COUNT
+
+static void ctx_from_native(CONTEXT* c, const arm_thread_state64_t* s)
+{
+    for (int i = 0; i < 29; i++) c->X[i] = s->__x[i];
+    c->Pc   = (ULONGLONG)arm_thread_state64_get_pc(*s);
+    c->Sp   = (ULONGLONG)arm_thread_state64_get_sp(*s);
+    c->Fp   = (ULONGLONG)arm_thread_state64_get_fp(*s);
+    c->Lr   = (ULONGLONG)arm_thread_state64_get_lr(*s);
+    c->Cpsr = (DWORD)s->__cpsr;
+}
+static void ctx_to_native(arm_thread_state64_t* s, const CONTEXT* c, int all)
+{
+    arm_thread_state64_set_pc_fptr(*s, (void*)(uintptr_t)c->Pc);
+    arm_thread_state64_set_sp(*s, c->Sp);
+    if (!all) return;
+    for (int i = 0; i < 29; i++) s->__x[i] = c->X[i];
+    arm_thread_state64_set_fp(*s, c->Fp);
+    arm_thread_state64_set_lr_fptr(*s, (void*)(uintptr_t)c->Lr);
+    s->__cpsr = (__uint32_t)c->Cpsr;
+}
+#elif defined(__APPLE__) && defined(__x86_64__)
+typedef x86_thread_state64_t ps3_native_state;
+#define PS3_NATIVE_STATE_FLAVOR x86_THREAD_STATE64
+#define PS3_NATIVE_STATE_COUNT  x86_THREAD_STATE64_COUNT
+
+static void ctx_from_native(CONTEXT* c, const x86_thread_state64_t* s)
+{
+    c->Rax = s->__rax; c->Rbx = s->__rbx; c->Rcx = s->__rcx; c->Rdx = s->__rdx;
+    c->Rsi = s->__rsi; c->Rdi = s->__rdi;
+    c->R8  = s->__r8;  c->R9  = s->__r9;  c->R10 = s->__r10; c->R11 = s->__r11;
+    c->R12 = s->__r12; c->R13 = s->__r13; c->R14 = s->__r14; c->R15 = s->__r15;
+    c->Rip = s->__rip; c->Rsp = s->__rsp; c->Rbp = s->__rbp;
+    c->EFlags = (DWORD)s->__rflags;
+    c->Lr = 0;
+}
+static void ctx_to_native(x86_thread_state64_t* s, const CONTEXT* c, int all)
+{
+    s->__rip = c->Rip; s->__rsp = c->Rsp;
+    if (!all) return;
+    s->__rax = c->Rax; s->__rbx = c->Rbx; s->__rcx = c->Rcx; s->__rdx = c->Rdx;
+    s->__rsi = c->Rsi; s->__rdi = c->Rdi;
+    s->__r8  = c->R8;  s->__r9  = c->R9;  s->__r10 = c->R10; s->__r11 = c->R11;
+    s->__r12 = c->R12; s->__r13 = c->R13; s->__r14 = c->R14; s->__r15 = c->R15;
+    s->__rbp = c->Rbp;
+    s->__rflags = c->EFlags;
+}
+#endif
+
+/* The only thing that reads a signal frame so far is the Linux park
+ * handler below; Darwin asks Mach and never sees one. */
+#if !defined(__APPLE__)
+static void ctx_from_uc(CONTEXT* c, const ucontext_t* uc)
+{
+    memset(c, 0, sizeof *c);
+    c->ContextFlags = CONTEXT_FULL;
+#if defined(__APPLE__)
+    ctx_from_native(c, &uc->uc_mcontext->__ss);
+#elif defined(__linux__) && defined(__x86_64__)
+    const greg_t* g = uc->uc_mcontext.gregs;
+    c->Rax = (ULONGLONG)g[REG_RAX]; c->Rbx = (ULONGLONG)g[REG_RBX];
+    c->Rcx = (ULONGLONG)g[REG_RCX]; c->Rdx = (ULONGLONG)g[REG_RDX];
+    c->Rsi = (ULONGLONG)g[REG_RSI]; c->Rdi = (ULONGLONG)g[REG_RDI];
+    c->R8  = (ULONGLONG)g[REG_R8];  c->R9  = (ULONGLONG)g[REG_R9];
+    c->R10 = (ULONGLONG)g[REG_R10]; c->R11 = (ULONGLONG)g[REG_R11];
+    c->R12 = (ULONGLONG)g[REG_R12]; c->R13 = (ULONGLONG)g[REG_R13];
+    c->R14 = (ULONGLONG)g[REG_R14]; c->R15 = (ULONGLONG)g[REG_R15];
+    c->Rip = (ULONGLONG)g[REG_RIP]; c->Rsp = (ULONGLONG)g[REG_RSP];
+    c->Rbp = (ULONGLONG)g[REG_RBP];
+    c->EFlags = (DWORD)g[REG_EFL];
+#elif defined(__linux__) && defined(__aarch64__)
+    for (int i = 0; i < 29; i++) c->X[i] = uc->uc_mcontext.regs[i];
+    c->Fp   = uc->uc_mcontext.regs[29];
+    c->Lr   = uc->uc_mcontext.regs[30];
+    c->Sp   = uc->uc_mcontext.sp;
+    c->Pc   = uc->uc_mcontext.pc;
+    c->Cpsr = (DWORD)uc->uc_mcontext.pstate;
+#else
+    (void)uc;
+    c->ContextFlags = 0;
+#endif
+}
+
+/* `all` false writes back only Pc and Sp: a redirection of the thread and
+ * nothing else. */
+static void ctx_to_uc(ucontext_t* uc, const CONTEXT* c, int all)
+{
+#if defined(__APPLE__)
+    ctx_to_native(&uc->uc_mcontext->__ss, c, all);
+#elif defined(__linux__) && defined(__x86_64__)
+    greg_t* g = uc->uc_mcontext.gregs;
+    g[REG_RIP] = (greg_t)c->Rip; g[REG_RSP] = (greg_t)c->Rsp;
+    if (!all) return;
+    g[REG_RAX] = (greg_t)c->Rax; g[REG_RBX] = (greg_t)c->Rbx;
+    g[REG_RCX] = (greg_t)c->Rcx; g[REG_RDX] = (greg_t)c->Rdx;
+    g[REG_RSI] = (greg_t)c->Rsi; g[REG_RDI] = (greg_t)c->Rdi;
+    g[REG_R8]  = (greg_t)c->R8;  g[REG_R9]  = (greg_t)c->R9;
+    g[REG_R10] = (greg_t)c->R10; g[REG_R11] = (greg_t)c->R11;
+    g[REG_R12] = (greg_t)c->R12; g[REG_R13] = (greg_t)c->R13;
+    g[REG_R14] = (greg_t)c->R14; g[REG_R15] = (greg_t)c->R15;
+    g[REG_RBP] = (greg_t)c->Rbp;
+    g[REG_EFL] = (greg_t)c->EFlags;
+#elif defined(__linux__) && defined(__aarch64__)
+    uc->uc_mcontext.pc = c->Pc;
+    uc->uc_mcontext.sp = c->Sp;
+    if (!all) return;
+    for (int i = 0; i < 29; i++) uc->uc_mcontext.regs[i] = c->X[i];
+    uc->uc_mcontext.regs[29] = c->Fp;
+    uc->uc_mcontext.regs[30] = c->Lr;
+    uc->uc_mcontext.pstate   = c->Cpsr;
+#else
+    (void)uc; (void)c; (void)all;
+#endif
+}
+#endif
+
+/* --- stopping a running thread ----------------------------------------------
+ *
+ * Darwin does it with the Mach calls a debugger would use. Linux has no such
+ * call, so the thread stops itself: a real-time signal parks it inside its own
+ * handler until the resume, with the interrupted registers saved into the
+ * record on the way in and any SetThreadContext put back on the way out.
+ *
+ * The park handshake runs entirely on two semaphores, both async-signal-safe,
+ * and the handler never touches s_lock. That is deliberate: SuspendThread
+ * holds s_lock across the handshake, so a handler that wanted the lock would
+ * deadlock instantly, and a fault or a wait on the target thread must be able
+ * to proceed to the point where the signal is taken.
+ *
+ * Which record the handler is for comes through a global rather than the
+ * thread-local pointer: the only thread that can be mid-handshake is the one
+ * SuspendThread is holding s_lock for, and a thread whose routine has already
+ * returned has cleared its own thread-local while still being alive enough to
+ * take the signal. */
+#if !defined(__APPLE__)
+static ps3_obj* s_park_target;               /* set under s_lock */
+static int      s_park_installed;
+
+static void sem_wait_uninterrupted(sem_t* s)
+{
+    while (sem_wait(s) != 0 && errno == EINTR) { }
+}
+
+static void park_handler(int sig, siginfo_t* si, void* uctx)
+{
+    (void)sig; (void)si;
+    ps3_obj* t = (ps3_obj*)__atomic_load_n(&s_park_target, __ATOMIC_ACQUIRE);
+    if (!t || !pthread_equal(pthread_self(), t->pt)) return;   /* not ours */
+
+    /* The thread resumes exactly where it was interrupted, which may be between
+     * a failed call and its errno check. sem_wait writes errno on every
+     * interruption, so the handler has to put it back. */
+    int saved_errno = errno;
+    ucontext_t* uc = (ucontext_t*)uctx;
+    ctx_from_uc(&t->park_ctx, uc);
+    t->park_ctx_dirty = 0;
+    sem_post(&t->park_ack);                  /* the registers are readable now */
+    sem_wait_uninterrupted(&t->park_go);
+    if (t->park_ctx_dirty) ctx_to_uc(uc, &t->park_ctx, 1);
+    errno = saved_errno;
+}
+
+/* Call with s_lock held. Returns 0 if the thread could not be stopped. */
+static int park_thread_locked(ps3_obj* t)
+{
+    if (!t->park_ready) return 0;
+    if (!s_park_installed) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = park_handler;
+        sa.sa_flags     = SA_SIGINFO | SA_RESTART;
+        sigemptyset(&sa.sa_mask);
+        if (sigaction(PS3_SUSPEND_SIGNAL, &sa, NULL) != 0) return 0;
+        s_park_installed = 1;
+    }
+    __atomic_store_n(&s_park_target, t, __ATOMIC_RELEASE);
+    if (pthread_kill(t->pt, PS3_SUSPEND_SIGNAL) != 0) {
+        __atomic_store_n(&s_park_target, NULL, __ATOMIC_RELEASE);
+        return 0;
+    }
+    sem_wait_uninterrupted(&t->park_ack);
+    __atomic_store_n(&s_park_target, NULL, __ATOMIC_RELEASE);
+    return 1;
+}
+
+static void unpark_thread_locked(ps3_obj* t) { sem_post(&t->park_go); }
+#endif /* !__APPLE__ */
+
+/* Can this record be stopped by the host right now? A thread that has not run
+ * its trampoline yet is held on the CREATE_SUSPENDED gate instead, and a
+ * finished one cannot be held at all. Call with s_lock held. */
+static int thread_stoppable_locked(const ps3_obj* t)
+{
+    return t->started && !t->done;
+}
+
 DWORD ResumeThread(HANDLE h)
 {
     ps3_obj* t = obj_of(h);
     if (!t || t->kind != OBJ_THREAD) { SetLastError(ERROR_INVALID_HANDLE); return (DWORD)-1; }
     pthread_mutex_lock(&s_lock);
     DWORD prev = (DWORD)t->suspend_count;
-    if (t->suspend_count > 0 && --t->suspend_count == 0) pthread_cond_broadcast(&t->cv);
+    if (t->suspend_count > 0 && --t->suspend_count == 0) {
+        if (!t->started) {
+            pthread_cond_broadcast(&t->cv);       /* the CREATE_SUSPENDED gate */
+        } else if (!t->done) {
+#if defined(__APPLE__)
+            thread_resume(t->port);
+#else
+            unpark_thread_locked(t);
+#endif
+        }
+    }
     pthread_mutex_unlock(&s_lock);
     return prev;
 }
 
-/* Only a thread that has not started yet can be held: bumping its gate count
- * is exact. Stopping a running pthread from outside is not a thing POSIX
- * offers, so that case reports failure the way the Win32 callers already
- * handle. */
+/* Returns the PREVIOUS suspend count, or (DWORD)-1 on failure -- the value
+ * Win32 code already checks for. Suspending the CALLING thread is one of the
+ * failures: Win32 lets a thread suspend itself and wait for a rescuer, but
+ * here the caller holds s_lock, so it would take the whole shim down with it. */
 DWORD SuspendThread(HANDLE h)
 {
     ps3_obj* t = obj_of(h);
     if (!t || t->kind != OBJ_THREAD) { SetLastError(ERROR_INVALID_HANDLE); return (DWORD)-1; }
+    if (t == t_current_thread || pthread_equal(t->pt, pthread_self())) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return (DWORD)-1;
+    }
     pthread_mutex_lock(&s_lock);
     DWORD r = (DWORD)-1;
-    if (!t->started) { r = (DWORD)t->suspend_count; t->suspend_count++; }
+    if (!t->started) {
+        r = (DWORD)t->suspend_count;              /* held on the gate instead */
+        t->suspend_count++;
+    } else if (thread_stoppable_locked(t)) {
+        int ok = 1;
+        if (t->suspend_count == 0) {
+#if defined(__APPLE__)
+            ok = (thread_suspend(t->port) == KERN_SUCCESS);
+#else
+            ok = park_thread_locked(t);
+#endif
+        }
+        if (ok) { r = (DWORD)t->suspend_count; t->suspend_count++; }
+    }
     pthread_mutex_unlock(&s_lock);
     if (r == (DWORD)-1) SetLastError(ERROR_INVALID_PARAMETER);
     return r;
@@ -612,6 +1013,246 @@ LONG SetThreadDescription(HANDLE h, PCWSTR description)
 
 BOOL  SetPriorityClass(HANDLE process, DWORD cls) { (void)process; (void)cls; return TRUE; }
 DWORD GetPriorityClass(HANDLE process)            { (void)process; return NORMAL_PRIORITY_CLASS; }
+
+/* --- thread records by handle ----------------------------------------------- */
+
+/* The record a thread handle names. The current-thread pseudo handle adopts
+ * the caller, so every one of the calls below works on a thread the shim did
+ * not create. NULL if the handle is not a thread. */
+static ps3_obj* thread_of(HANDLE h)
+{
+    if (h == GetCurrentThread()) return thread_self();
+    ps3_obj* t = obj_of(h);
+    return (t && t->kind == OBJ_THREAD) ? t : NULL;
+}
+
+BOOL GetThreadContext(HANDLE h, CONTEXT* ctx)
+{
+    ps3_obj* t = thread_of(h);
+    if (!t || !ctx) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+#if defined(__APPLE__)
+    pthread_mutex_lock(&s_lock);
+    mach_port_t port = thread_stoppable_locked(t) ? t->port : MACH_PORT_NULL;
+    pthread_mutex_unlock(&s_lock);
+    if (port == MACH_PORT_NULL) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+
+    ps3_native_state st;
+    mach_msg_type_number_t n = PS3_NATIVE_STATE_COUNT;
+    if (thread_get_state(port, PS3_NATIVE_STATE_FLAVOR, (thread_state_t)&st, &n) != KERN_SUCCESS) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    memset(ctx, 0, sizeof *ctx);
+    ctx->ContextFlags = CONTEXT_FULL;
+    ctx_from_native(ctx, &st);
+    return TRUE;
+#else
+    /* Only the parking handler has a frame to answer from. */
+    pthread_mutex_lock(&s_lock);
+    BOOL ok = FALSE;
+    if (t->suspend_count > 0 && thread_stoppable_locked(t)) { *ctx = t->park_ctx; ok = TRUE; }
+    pthread_mutex_unlock(&s_lock);
+    if (!ok) SetLastError(ERROR_INVALID_PARAMETER);
+    return ok;
+#endif
+}
+
+BOOL SetThreadContext(HANDLE h, const CONTEXT* ctx)
+{
+    ps3_obj* t = thread_of(h);
+    if (!t || !ctx) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+#if defined(__APPLE__)
+    pthread_mutex_lock(&s_lock);
+    mach_port_t port = (t->suspend_count > 0 && thread_stoppable_locked(t)) ? t->port : MACH_PORT_NULL;
+    pthread_mutex_unlock(&s_lock);
+    if (port == MACH_PORT_NULL) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+
+    /* Read, overwrite what a CONTEXT carries, write back: the flavour holds
+     * state this struct has no room for, and none of it should change. */
+    ps3_native_state st;
+    mach_msg_type_number_t n = PS3_NATIVE_STATE_COUNT;
+    if (thread_get_state(port, PS3_NATIVE_STATE_FLAVOR, (thread_state_t)&st, &n) != KERN_SUCCESS) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    ctx_to_native(&st, ctx, 1);
+    if (thread_set_state(port, PS3_NATIVE_STATE_FLAVOR, (thread_state_t)&st, n) != KERN_SUCCESS) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    return TRUE;
+#else
+    /* Handed to the parking handler, which puts it back into the signal frame
+     * as it returns. */
+    pthread_mutex_lock(&s_lock);
+    BOOL ok = FALSE;
+    if (t->suspend_count > 0 && thread_stoppable_locked(t)) {
+        t->park_ctx = *ctx;
+        t->park_ctx_dirty = 1;
+        ok = TRUE;
+    }
+    pthread_mutex_unlock(&s_lock);
+    if (!ok) SetLastError(ERROR_INVALID_PARAMETER);
+    return ok;
+#endif
+}
+
+HANDLE OpenThread(DWORD access, BOOL inherit, DWORD tid)
+{
+    (void)access; (void)inherit;
+    if (tid == GetCurrentThreadId()) {
+        ps3_obj* self = thread_self();          /* so main() can open itself */
+        if (self) {
+            pthread_mutex_lock(&s_lock);
+            self->refs++;
+            pthread_mutex_unlock(&s_lock);
+            return (HANDLE)self;
+        }
+    }
+    HANDLE h = NULL;
+    pthread_mutex_lock(&s_lock);
+    /* A record whose thread has not run yet has no id, and must not be found
+     * by an id of zero. */
+    for (ps3_obj* t = s_threads; t; t = t->thr_next)
+        if (t->tid && t->tid == tid) { t->refs++; h = (HANDLE)t; break; }
+    pthread_mutex_unlock(&s_lock);
+    if (!h) SetLastError(ERROR_INVALID_PARAMETER);
+    return h;
+}
+
+BOOL DuplicateHandle(HANDLE src_process, HANDLE src, HANDLE dst_process,
+                     HANDLE* out, DWORD access, BOOL inherit, DWORD options)
+{
+    (void)access; (void)inherit;
+    if (!out) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    *out = NULL;
+    if (src_process != GetCurrentProcess() || dst_process != GetCurrentProcess()) {
+        SetLastError(ERROR_INVALID_PARAMETER);       /* one process, one address space */
+        return FALSE;
+    }
+    ps3_obj* o = (src == GetCurrentThread()) ? thread_self() : obj_of(src);
+    if (!o) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    pthread_mutex_lock(&s_lock);
+    o->refs++;
+    pthread_mutex_unlock(&s_lock);
+    *out = (HANDLE)o;
+    /* DUPLICATE_CLOSE_SOURCE on the pseudo handle is a no-op, as on Win32. */
+    if ((options & DUPLICATE_CLOSE_SOURCE) && src != GetCurrentThread()) CloseHandle(src);
+    return TRUE;
+}
+
+BOOL GetThreadTimes(HANDLE h, FILETIME* creation, FILETIME* exit,
+                    FILETIME* kernel, FILETIME* user)
+{
+    ps3_obj* t = thread_of(h);
+    if (!t) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+
+    pthread_mutex_lock(&s_lock);
+    unsigned long long born = t->created_ft, died = t->exited_ft;
+    /* A record whose thread has not started, or has ended, has no CPU clock to
+     * read: the pthread_t is not valid in the first case and gone in the
+     * second. The creation and exit stamps are the shim's own and always are. */
+    int live = thread_stoppable_locked(t);
+    pthread_t pt = t->pt;
+#if defined(__APPLE__)
+    mach_port_t port = t->port;
+#endif
+    pthread_mutex_unlock(&s_lock);
+
+    ft_store(creation, born);
+    ft_store(exit, died);
+    ft_store(kernel, 0);
+    ft_store(user, 0);
+    if (!live) return TRUE;
+
+#if defined(__APPLE__)
+    struct thread_basic_info info;
+    mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
+    if (port == MACH_PORT_NULL ||
+        thread_info(port, THREAD_BASIC_INFO, (thread_info_t)&info, &n) != KERN_SUCCESS)
+        return TRUE;                             /* the stamps are still good */
+    ft_store(kernel, (unsigned long long)info.system_time.seconds * 10000000ull
+                     + (unsigned long long)info.system_time.microseconds * 10ull);
+    ft_store(user,   (unsigned long long)info.user_time.seconds * 10000000ull
+                     + (unsigned long long)info.user_time.microseconds * 10ull);
+#else
+    /* Per-thread user and system time apart needs /proc/self/task/<tid>/stat;
+     * the CPU clock gives the sum, reported as user time. */
+    clockid_t clk;
+    struct timespec ts;
+    if (pthread_getcpuclockid(pt, &clk) == 0 && clock_gettime(clk, &ts) == 0)
+        ft_store(user, (unsigned long long)ts.tv_sec * 10000000ull
+                       + (unsigned long long)ts.tv_nsec / 100ull);
+#endif
+    (void)pt;
+    return TRUE;
+}
+
+/* --- toolhelp thread enumeration -------------------------------------------- */
+HANDLE CreateToolhelp32Snapshot(DWORD flags, DWORD pid)
+{
+    if (!(flags & TH32CS_SNAPTHREAD) || (pid != 0 && pid != GetCurrentProcessId())) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+    thread_self();               /* the caller belongs in its own snapshot */
+
+    ps3_obj* s = obj_new(OBJ_SNAPSHOT);
+    if (!s) return INVALID_HANDLE_VALUE;
+
+    pthread_mutex_lock(&s_lock);
+    int n = 0;
+    for (ps3_obj* t = s_threads; t; t = t->thr_next) if (t->tid && !t->done) n++;
+    DWORD* ids = n ? (DWORD*)calloc((size_t)n, sizeof *ids) : NULL;
+    if (ids) {
+        int i = 0;
+        for (ps3_obj* t = s_threads; t && i < n; t = t->thr_next)
+            if (t->tid && !t->done) ids[i++] = t->tid;
+        n = i;
+    } else {
+        n = 0;
+    }
+    s->snap_tids  = ids;
+    s->snap_count = n;
+    s->snap_pos   = 0;
+    pthread_mutex_unlock(&s_lock);
+    return (HANDLE)s;
+}
+
+/* Call with s_lock held. */
+static BOOL snap_fill_locked(ps3_obj* s, THREADENTRY32* e)
+{
+    if (s->snap_pos >= s->snap_count) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    DWORD size = e->dwSize;
+    memset(e, 0, sizeof *e);
+    e->dwSize             = size ? size : (DWORD)sizeof *e;
+    e->cntUsage           = 1;
+    e->th32ThreadID       = s->snap_tids[s->snap_pos++];
+    e->th32OwnerProcessID = GetCurrentProcessId();
+    e->tpBasePri          = THREAD_PRIORITY_NORMAL;
+    return TRUE;
+}
+
+BOOL Thread32First(HANDLE snapshot, THREADENTRY32* entry)
+{
+    ps3_obj* s = obj_of(snapshot);
+    if (!s || s->kind != OBJ_SNAPSHOT || !entry) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    pthread_mutex_lock(&s_lock);
+    s->snap_pos = 0;
+    BOOL ok = snap_fill_locked(s, entry);
+    pthread_mutex_unlock(&s_lock);
+    return ok;
+}
+
+BOOL Thread32Next(HANDLE snapshot, THREADENTRY32* entry)
+{
+    ps3_obj* s = obj_of(snapshot);
+    if (!s || s->kind != OBJ_SNAPSHOT || !entry) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    pthread_mutex_lock(&s_lock);
+    BOOL ok = snap_fill_locked(s, entry);
+    pthread_mutex_unlock(&s_lock);
+    return ok;
+}
 
 /* --- waits ----------------------------------------------------------------- */
 DWORD WaitForSingleObject(HANDLE h, DWORD ms)
@@ -816,7 +1457,10 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD type, DWORD protect)
         }
         pthread_mutex_lock(&s_lock);
         for (int i = 0; i < VA_REGIONS; i++)
-            if (!s_regions[i].base) { s_regions[i].base = p; s_regions[i].size = sz; break; }
+            if (!s_regions[i].base) {
+                s_regions[i].base = p; s_regions[i].size = sz;
+                break;
+            }
         pthread_mutex_unlock(&s_lock);
         return p;
     }

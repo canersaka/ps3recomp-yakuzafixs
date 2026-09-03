@@ -6,7 +6,8 @@
  * against each lock kind, events (auto and manual reset), semaphores,
  * joinable threads with exit codes and the CREATE_SUSPENDED gate,
  * WaitForMultipleObjects in both modes, WaitOnAddress, waitable timers,
- * timing, virtual memory, and the MSVC CRT spellings.
+ * timing, virtual memory, stopping a running thread and reading its
+ * registers, and the MSVC CRT spellings.
  *
  * Build (any POSIX host):
  *   cc -std=gnu17 -Wall -Wextra -I runtime/platform \
@@ -446,6 +447,110 @@ static void test_virtual_memory(void)
     CHECK(VirtualFree(rr, 0, MEM_RELEASE));
 }
 
+/* ---- stopping a running thread ------------------------------------------- */
+static volatile LONG g_spin_counter;
+static volatile LONG g_spin_stop;
+static volatile LONG g_spin_tid;
+
+/* Holds no lock of any kind while it runs, which is what makes it safe to
+ * freeze: a thread stopped inside malloc would take the process with it, on
+ * Windows exactly as here. */
+static DWORD WINAPI spin_worker(LPVOID a)
+{
+    (void)a;
+    InterlockedExchange(&g_spin_tid, (LONG)GetCurrentThreadId());
+    while (!g_spin_stop) {
+        InterlockedIncrement(&g_spin_counter);
+        SwitchToThread();
+    }
+    return 0;
+}
+
+static void test_thread_control(void)
+{
+    g_spin_stop = 0; g_spin_counter = 0; g_spin_tid = 0;
+    HANDLE h = CreateThread(NULL, 0, spin_worker, NULL, 0, NULL);
+    CHECK(h != NULL);
+    for (int i = 0; i < 1000 && (g_spin_counter == 0 || g_spin_tid == 0); i++) Sleep(2);
+    CHECK(g_spin_counter > 0 && g_spin_tid != 0);
+
+    /* frozen: the counter stops moving */
+    CHECK(SuspendThread(h) == 0);
+    LONG at_suspend = g_spin_counter;
+    Sleep(50);
+    CHECK(g_spin_counter == at_suspend);
+
+    CONTEXT ctx;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.ContextFlags = CONTEXT_FULL;
+    CHECK(GetThreadContext(h, &ctx));
+    CHECK(ctx.Pc != 0 && ctx.Sp != 0);
+    CHECK(SetThreadContext(h, &ctx));            /* write the same state back */
+
+    /* nesting: two suspends need two resumes */
+    CHECK(SuspendThread(h) == 1);
+    CHECK(ResumeThread(h) == 2);
+    Sleep(30);
+    CHECK(g_spin_counter == at_suspend);         /* still held by the first */
+    CHECK(ResumeThread(h) == 1);
+    for (int i = 0; i < 1000 && g_spin_counter == at_suspend; i++) Sleep(2);
+    CHECK(g_spin_counter > at_suspend);
+    CHECK(ResumeThread(h) == 0);                 /* already running */
+    CHECK(!SetThreadContext(h, &ctx));           /* not suspended: no frame to set */
+
+    /* the same thread through OpenThread, by the id it published itself */
+    HANDLE oh = OpenThread(THREAD_ALL_ACCESS, FALSE, (DWORD)g_spin_tid);
+    CHECK(oh != NULL);
+    CHECK(SuspendThread(oh) == 0);
+    CHECK(GetThreadContext(oh, &ctx) && ctx.Sp != 0);
+    CHECK(ResumeThread(oh) == 1);
+    CHECK(CloseHandle(oh));
+    CHECK(OpenThread(THREAD_ALL_ACCESS, FALSE, 0) == NULL);
+
+    /* the snapshot sees this thread and the worker, and nothing else's */
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    CHECK(snap != INVALID_HANDLE_VALUE);
+    THREADENTRY32 te;
+    te.dwSize = sizeof te;
+    int seen_self = 0, seen_worker = 0, foreign = 0, count = 0;
+    DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+    if (snap != INVALID_HANDLE_VALUE && Thread32First(snap, &te)) do {
+        count++;
+        if (te.th32OwnerProcessID != pid) foreign++;
+        if (te.th32ThreadID == self)              seen_self = 1;
+        if (te.th32ThreadID == (DWORD)g_spin_tid) seen_worker = 1;
+    } while (Thread32Next(snap, &te));
+    CHECK(count >= 2 && foreign == 0);
+    CHECK(seen_self && seen_worker);
+    CHECK(te.dwSize == sizeof te);
+    CHECK(CloseHandle(snap));
+
+    /* a real handle to the calling thread, which the shim never created */
+    HANDLE me = NULL;
+    CHECK(DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                          &me, 0, FALSE, DUPLICATE_SAME_ACCESS));
+    CHECK(me != NULL && me != GetCurrentThread());
+    CHECK(SuspendThread(me) == (DWORD)-1);       /* suspending yourself is refused */
+
+    FILETIME born, died, kern, user;
+    CHECK(GetThreadTimes(me, &born, &died, &kern, &user));
+    ULONGLONG t_born = ((ULONGLONG)born.dwHighDateTime << 32) | born.dwLowDateTime;
+    CHECK(t_born > 132000000000000000ull);       /* after 2019, like the wall clock */
+    CHECK(died.dwLowDateTime == 0 && died.dwHighDateTime == 0);   /* still running */
+    volatile double burn = 0;
+    for (int i = 0; i < 3000000; i++) burn += (double)i;
+    CHECK(GetThreadTimes(me, &born, &died, &kern, &user));
+    ULONGLONG cpu = (((ULONGLONG)kern.dwHighDateTime << 32) | kern.dwLowDateTime)
+                  + (((ULONGLONG)user.dwHighDateTime << 32) | user.dwLowDateTime);
+    CHECK(cpu > 0 && burn > 0);
+    CHECK(CloseHandle(me));
+
+    InterlockedExchange(&g_spin_stop, 1);
+    CHECK(WaitForSingleObject(h, 5000) == WAIT_OBJECT_0);
+    CHECK(SuspendThread(h) == (DWORD)-1);        /* finished: nothing to stop */
+    CHECK(CloseHandle(h));
+}
+
 /* ---- MSVC CRT and intrinsic spellings ------------------------------------ */
 static __declspec(thread) int t_tls_probe;
 
@@ -511,6 +616,7 @@ int main(void)
     test_timers();
     test_timing();
     test_virtual_memory();
+    test_thread_control();
     test_msvc_compat();
     printf("win32_compat tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail;
