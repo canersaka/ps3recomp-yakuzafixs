@@ -382,6 +382,31 @@ if(UNIX)
         # Where the runnable image lands, so CI and a developer both say
         #   ./build/ps3recomp_boot_smoke build/smoke/smoke.elf
         message(STATUS "  Boot smoke:   ps3recomp_boot_smoke + smoke/smoke.elf")
+
+        # The same lift again, arranged the way a port's own tree arranges one:
+        # the generated ppu_recomp.h and the lifted source in one directory,
+        # which is what templates/project wants for -DRECOMP_DIR. The header is
+        # generated into the build tree and the source lives in the repository,
+        # so a directory holding both has to be made rather than pointed at.
+        #
+        # This is what lets CI build the project template against a real lift
+        # and run it -- the check that a port started from templates/project
+        # still boots, on a platform where it can be run.
+        set(SMOKE_LIFT "${SMOKE_GEN}/lift")
+        set(SMOKE_LIFT_SRC
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/ppu/tests/smoke/smoke_recomp.c")
+        add_custom_command(
+            OUTPUT "${SMOKE_LIFT}/ppu_recomp.h" "${SMOKE_LIFT}/smoke_recomp.c"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${SMOKE_LIFT}"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${SMOKE_GEN}/ppu_recomp.h" "${SMOKE_LIFT}/ppu_recomp.h"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${SMOKE_LIFT_SRC}" "${SMOKE_LIFT}/smoke_recomp.c"
+            DEPENDS "${SMOKE_GEN}/ppu_recomp.h" "${SMOKE_LIFT_SRC}"
+            COMMENT "Staging the smoke title's lift as a RECOMP_DIR")
+        add_custom_target(ps3recomp_smoke_lift ALL
+            DEPENDS "${SMOKE_LIFT}/ppu_recomp.h" "${SMOKE_LIFT}/smoke_recomp.c")
+        message(STATUS "  Smoke lift:   smoke/lift (a RECOMP_DIR for templates/project)")
     endif()
 endif()
 

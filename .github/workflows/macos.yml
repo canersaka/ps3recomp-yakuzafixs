@@ -211,6 +211,33 @@ jobs:
           test -x build/ps3recomp_boot_smoke
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_boot_smoke build/smoke/smoke.elf
 
+      # templates/project is what "start a port" means -- docs/GETTING_STARTED.md
+      # says to copy it -- and until now nothing built it on any platform. This
+      # is the same smoke title again, booted through the TEMPLATE's runner and
+      # the template's own CMakeLists: the toolkit from PS3RECOMP_DIR, the lift
+      # from RECOMP_DIR, exactly the two directories a real port passes. Exit 0
+      # is the smoke title's own verdict, so a template that builds but boots
+      # nothing cannot pass.
+      - name: Build and run the game template (headless Metal)
+        run: |
+          # pipefail, or tee below would swallow the runner's exit status --
+          # which IS the smoke title's verdict.
+          set -eo pipefail
+          test -f build/smoke/lift/ppu_recomp.h
+          cmake -S templates/project -B build-template -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DPS3RECOMP_DIR="$PWD" \
+            -DRECOMP_DIR="$PWD/build/smoke/lift"
+          cmake --build build-template
+          PS3RECOMP_METAL_HEADLESS=1 \
+            ./build-template/MyGameRecomp build/smoke/smoke.elf 2>&1 | tee template.log
+          # The runner's own banner, so a pass cannot come from some other
+          # binary, and the marker-order verdict spelt out rather than inferred
+          # from the exit status alone.
+          grep -q "=== ps3recomp game runner ===" template.log
+          grep -q "\[smoke\] OK: all 10 markers, in order" template.log
+          grep -q "\[smoke\] PASS" template.log
+
       # RSX texture layout -- format class, row sizes, Morton addressing. Pure
       # arithmetic with no host API in it, so it runs everywhere, and it is the
       # regression net for having lifted that maths out of the D3D12 uploader.
