@@ -841,24 +841,46 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
     g->cause       = 0;
     g->exit_status = 0;
 
-    /* DIAG: dump the CellSpurs instance @0x40009D00 at group_start time, to see
-     * whether libsre has populated it BEFORE the SPU kernel threads spawn. */
-    { extern uint8_t* vm_base; static int s_d=0;
-      if (vm_base && s_d++ < 4) {
+    /* DIAG (YDKJ_INSTDUMP): dump the CellSpurs instance at group_start time, to
+     * see whether libsre has populated it BEFORE the SPU kernel threads spawn.
+     *
+     * The address is one title's, and the read used to happen on every group
+     * start of every title. A runtime whose guest memory is the full 4 GB
+     * reservation gets away with that; one that maps only what it has handed
+     * out faults here, in a diagnostic, before the title has done anything
+     * wrong. So the read is off unless asked for, and it is bounds-checked
+     * against what the runtime knows of the mapped range: ppu_vm_size is 0
+     * where the whole 32-bit space is backed and there is nothing to check,
+     * and otherwise the size of the arena. */
+    { extern uint8_t* vm_base; extern uint32_t ppu_vm_size;
+      static int s_d = 0;
+      if (vm_base && s_d < 4) {
+        s_d++;
+        static int _idump = -1;
+        if (_idump < 0) _idump = getenv("YDKJ_INSTDUMP") ? 1 : 0;
         /* Dump BOTH candidate instance addrs: the real one is 0x40009F00 (init arg);
          * 0x40009D00 was the old hardcoded guess. See which libsre actually populated. */
-        for (uint32_t _ia = 0x40009D00; _ia <= 0x40009F00; _ia += 0x200) {
-        const uint8_t* in = vm_base + _ia;
-        fprintf(stderr, "[INSTDUMP] group_start id=0x%X CellSpurs@0x%08X (0x140 bytes):\n", id, _ia);
-        for (int row=0; row<10; row++){
-            fprintf(stderr, "  +0x%03X:", row*16);
-            for (int i=0;i<4;i++){ int o=row*16+i*4; uint32_t w=((uint32_t)in[o]<<24)|((uint32_t)in[o+1]<<16)|((uint32_t)in[o+2]<<8)|in[o+3]; fprintf(stderr," %08X",w);}
-            fprintf(stderr, "\n");
+        if (_idump) {
+          for (uint32_t _ia = 0x40009D00; _ia <= 0x40009F00; _ia += 0x200) {
+            if (ppu_vm_size && (uint64_t)_ia + 0xA0u > (uint64_t)ppu_vm_size) {
+                fprintf(stderr, "[INSTDUMP] group_start id=0x%X CellSpurs@0x%08X is past "
+                        "the mapped guest range (0x%08X), not read\n", id, _ia, ppu_vm_size);
+                continue;
+            }
+            const uint8_t* in = vm_base + _ia;
+            fprintf(stderr, "[INSTDUMP] group_start id=0x%X CellSpurs@0x%08X (0x140 bytes):\n", id, _ia);
+            for (int row=0; row<10; row++){
+                fprintf(stderr, "  +0x%03X:", row*16);
+                for (int i=0;i<4;i++){ int o=row*16+i*4; uint32_t w=((uint32_t)in[o]<<24)|((uint32_t)in[o+1]<<16)|((uint32_t)in[o+2]<<8)|in[o+3]; fprintf(stderr," %08X",w);}
+                fprintf(stderr, "\n");
+            }
+          }
+          fflush(stderr);
         }
-        }
-        fflush(stderr);
         /* Arm a page-guard on the instance page so we catch the libsre function
-         * that writes the CellSpurs struct (WWATCH misses memcpy/DMA writes). */
+         * that writes the CellSpurs struct (WWATCH misses memcpy/DMA writes).
+         * Its own lever, so it still arms with the dump off; it protects a page
+         * rather than reading one, and is a no-op away from Windows. */
         if (getenv("YDKJ_GUARD_INST")) { extern void ppu_guard_page(uint32_t); ppu_guard_page(0x40009D00); }
       } }
 
