@@ -95,6 +95,11 @@ jobs:
           # decode, upload, the CONTROL1 crossbar as a swizzle, and the
           # sampler registers. The quad is green and the texture is not.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --tex
+          # A texture with TWO mip levels, each a different colour, sampled
+          # through a quad small enough that the LOD reaches level 1. A
+          # backend that uploads level 0 and stops presents level 0's colour
+          # and fails, so this cannot pass without the whole mip chain.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip
           if PS3RECOMP_METAL_FIXED_FUNCTION=1 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader; then
             echo "--shader passed with the built-in shader forced; the check is not checking"
             exit 1

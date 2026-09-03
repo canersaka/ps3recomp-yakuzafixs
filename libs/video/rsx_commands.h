@@ -100,6 +100,11 @@ extern "C" {
 #define NV4097_SET_TEXTURE_FILTER               0x00001A14
 #define NV4097_SET_TEXTURE_IMAGE_RECT           0x00001A18
 #define NV4097_SET_TEXTURE_BORDER_COLOR         0x00001A1C
+/* CONTROL3 sits in its own block, 4 bytes per unit rather than 0x20, because
+ * it was added to the register file after the per-unit blocks were laid out.
+ * Its low 20 bits are the row pitch of a linear texture and the rest is the
+ * depth of a 3D one. */
+#define NV4097_SET_TEXTURE_CONTROL3             0x00001840
 
 /* Shader programs */
 #define NV4097_SET_SHADER_PROGRAM               0x000008E4
@@ -184,6 +189,7 @@ typedef struct rsx_texture_state {
     u32 filter;
     u32 image_rect;
     u32 border_color;
+    u32 control3;    /* row pitch [19:0], depth [31:20] -- a separate block */
     int dirty;
 } rsx_texture_state;
 
