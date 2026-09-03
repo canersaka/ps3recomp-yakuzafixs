@@ -54,7 +54,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # unregistered code address makes ppu_run refuse to dispatch and say so).
 # ---------------------------------------------------------------------------
 TEXT_BASE = 0x00010000       # .text, R+X
-TEXT_SIZE = 0x00000800
+TEXT_SIZE = 0x00001000
 FUNC_STRIDE = 0x100          # one guest function per 256 bytes
 
 DATA_BASE = 0x00020000       # .data + .rodata + .tbss, R+W
@@ -87,6 +87,8 @@ FUNCTIONS = [
     "stub_cellGcmSetFlipCommand",
     "stub_cellGcmGetFlipStatus",
     "stub_sys_process_exit",
+    "vblank_handler",              # cellGcmSetVBlankHandler's OPD
+    "stub_cellGcmSetVBlankHandler",
 ]
 
 # The line each step prints through sys_tty_write. Indexed by the step id in
@@ -103,6 +105,7 @@ MARKERS = [
     "[smoke] frame 1: cleared and flipped through the FIFO",
     "[smoke] frame 2: cleared and flipped through the FIFO",
     "[smoke] frame 3: cleared and flipped through the FIFO",
+    "[smoke] vblank: the guest's handler ran on the guest thread",
     "[smoke] exit: calling sys_process_exit",
 ]
 
