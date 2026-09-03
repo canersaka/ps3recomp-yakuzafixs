@@ -287,6 +287,62 @@ static void test_store_conditional(void)
 }
 
 /* ===========================================================================
+ * Block stores: a memset or memcpy is a store to every line it touches
+ * ===========================================================================*/
+static void test_block_stores(void)
+{
+    const uint32_t LINE_D = 0x00040400u;       /* never reserved by anyone */
+    uint8_t buf[512];
+    memset(buf, 0x5A, sizeof(buf));
+
+    /* One block from inside LINE_A to inside LINE_B, with a different SPU
+     * holding each: both reservations go, both SPUs wake, once each. */
+    spu_reset(&g_spu_a, 0);
+    spu_reset(&g_spu_b, 1);
+    spu_getllar(&g_spu_a, LINE_A);
+    spu_getllar(&g_spu_b, LINE_B);
+    g_wakes = 0;
+
+    TEST("a memset spanning two reserved lines breaks both reservations");
+    vm_memset(LINE_A + 100, 0x77, (LINE_B + 10) - (LINE_A + 100));
+    CHECK(vm_read8(LINE_A + 100) == 0x77u);
+    CHECK(vm_read8(LINE_B + 9) == 0x77u);
+    CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
+    CHECK_EQ_U32(g_spu_b.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
+    CHECK(g_spu_a.resv_valid == 0);
+    CHECK(g_spu_b.resv_valid == 0);
+    CHECK(g_wakes == 2);
+
+    TEST("a memcpy into a reserved line breaks it");
+    spu_reset(&g_spu_a, 0);
+    spu_getllar(&g_spu_a, LINE_C);
+    g_wakes = 0;
+    vm_memcpy_to(LINE_C + 120, buf, 16);       /* straddles into the next line */
+    CHECK(vm_read8(LINE_C + 120) == 0x5Au);
+    CHECK(vm_read8(LINE_C + 135) == 0x5Au);
+    CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
+    CHECK(g_spu_a.resv_valid == 0);
+    CHECK(g_wakes == 1);
+
+    TEST("a block that touches no reserved line raises nothing");
+    spu_reset(&g_spu_a, 0);
+    spu_getllar(&g_spu_a, LINE_C);
+    g_wakes = 0;
+    vm_memcpy_to(LINE_D, buf, sizeof(buf));
+    vm_memset(LINE_D, 0, 300);
+    CHECK_EQ_U32(g_spu_a.event_status, 0);
+    CHECK(g_spu_a.resv_valid == 1);
+    CHECK(g_wakes == 0);
+
+    TEST("an empty block is not a store");
+    vm_memset(LINE_C, 0, 0);
+    vm_memcpy_to(LINE_C, buf, 0);
+    CHECK_EQ_U32(g_spu_a.event_status, 0);
+    CHECK(g_spu_a.resv_valid == 1);
+    CHECK(g_wakes == 0);
+}
+
+/* ===========================================================================
  * main: run all and report
  * ===========================================================================*/
 int main(void)
@@ -296,6 +352,7 @@ int main(void)
     test_no_false_raise();
     test_all_store_widths();
     test_store_conditional();
+    test_block_stores();
 
     printf("\nSPU lock-line coherence tests: %d passed, %d failed\n",
            g_pass, g_fail);
