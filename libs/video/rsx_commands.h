@@ -41,6 +41,16 @@ extern "C" {
  * nouveau. The original table here was shuffled: only COLOR_AOFFSET was
  * right, so SET_SURFACE_COLOR_TARGET (MRT selection) was never decoded and
  * clip dims read the format register). */
+/* Which context DMA a colour surface's offset is an offset INTO: handle
+ * 0xFEED0000 is RSX local memory and 0xFEED0001 is IO-mapped main memory.
+ * RSX offsets are two overlapping number spaces, so this is what tells a
+ * surface at offset X from a texture at offset X in the other one. Decoded
+ * by rsx_dispatch (rsx_dsp_surface.color_location); rsx_state has no field
+ * for it and rsx_process_method ignores it. */
+#define NV4097_SET_CONTEXT_DMA_COLOR_A         0x00000194
+#define CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER 0xFEED0000
+#define CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER  0xFEED0001
+
 #define NV4097_SET_SURFACE_CLIP_HORIZONTAL     0x00000200
 #define NV4097_SET_SURFACE_CLIP_VERTICAL       0x00000204
 #define NV4097_SET_SURFACE_FORMAT              0x00000208

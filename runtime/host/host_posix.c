@@ -67,6 +67,13 @@
 
 /* The guest address space this host hands to the HLE layer. */
 uint8_t* vm_base = NULL;
+/* ...and how much of it is really there. runtime/memory/vm.h treats 0 as "the
+ * whole 32-bit space is backed, no check needed", which is true of a runner
+ * that reserves 4 GB and false of this harness: it callocs a few hundred MB,
+ * so an RSX offset that resolves into VRAM (localAddress is 0xC0000000) is off
+ * the end of the allocation. A title's registers make those resolves happen
+ * whether or not the harness ever wrote there. */
+extern uint32_t ppu_vm_size;
 
 /* Must reach VM_HLE_INJECT_BASE: cellGcmSetupContext plants the GCM label
  * window, the control register and the IO<->EA offset tables there, so a VM
@@ -114,6 +121,14 @@ static void guest_w32(uint32_t addr, uint32_t v)
     uint8_t* p = vm_base + addr;
     p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
     p[2] = (uint8_t)(v >>  8); p[3] = (uint8_t)v;
+}
+
+/* One guest VM, with its size published for the OOB guard above. */
+static uint8_t* host_vm_alloc(void)
+{
+    uint8_t* p = (uint8_t*)calloc(1, VM_SIZE);
+    if (p) ppu_vm_size = VM_SIZE;
+    return p;
 }
 
 static uint32_t g_heap = HEAP_BASE;
@@ -433,6 +448,13 @@ static void emit_textured_draw(void)
  * ignored surface, a guest-memory upload, a dropped texture -- shows green. */
 static void emit_rtt_draws(void)
 {
+    /* Which memory the surface's offset is an offset into. This harness's
+     * surface really does live in the IO window, and saying so is what lets a
+     * renderer that keys surfaces by (context, offset) match the texture unit
+     * bound at the same offset in the same context. Leaving it at the reset
+     * value declared the surface in VRAM while the texture said main memory,
+     * so the two never met and the quad sampled the guest bytes. */
+    emit(NV4097_SET_CONTEXT_DMA_COLOR_A,     CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER);
     emit(NV4097_SET_SURFACE_COLOR_AOFFSET,   RTT_OFFSET);
     emit(NV4097_SET_SURFACE_COLOR_TARGET,    CELL_GCM_SURFACE_TARGET_0);
     emit(NV4097_SET_SURFACE_CLIP_HORIZONTAL, RTT_DIM << 16);
@@ -440,6 +462,7 @@ static void emit_rtt_draws(void)
     emit(NV4097_SET_SHADER_PROGRAM,          0u);
     emit_triangle_draw();
 
+    emit(NV4097_SET_CONTEXT_DMA_COLOR_A,     CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER);
     emit(NV4097_SET_SURFACE_COLOR_AOFFSET,   0u);
     emit(NV4097_SET_SURFACE_CLIP_HORIZONTAL, 1280u << 16);
     emit(NV4097_SET_SURFACE_CLIP_VERTICAL,   720u << 16);
@@ -758,7 +781,7 @@ int main(int argc, char** argv)
         else if (strcmp(argv[i], "--draw") == 0)   do_draw = 1;
         /* --threads: no graphics at all, just the lv2 thread path. */
         else if (strcmp(argv[i], "--threads") == 0) {
-            vm_base = (uint8_t*)calloc(1, VM_SIZE);
+            vm_base = host_vm_alloc();
             if (!vm_base) { fprintf(stderr, "[host] guest VM alloc failed\n"); return 1; }
             int trc = run_thread_check();
             free(vm_base);
@@ -766,7 +789,7 @@ int main(int argc, char** argv)
         }
         /* --audio-pad: no graphics either, just the SDL2 backends. */
         else if (strcmp(argv[i], "--audio-pad") == 0) {
-            vm_base = (uint8_t*)calloc(1, VM_SIZE);
+            vm_base = host_vm_alloc();
             if (!vm_base) { fprintf(stderr, "[host] guest VM alloc failed\n"); return 1; }
             int arc = run_audio_pad_check();
             free(vm_base);
@@ -805,7 +828,7 @@ int main(int argc, char** argv)
         return 0;
     }
 
-    vm_base = (uint8_t*)calloc(1, VM_SIZE);
+    vm_base = host_vm_alloc();
     if (!vm_base) { fprintf(stderr, "[host] guest VM alloc failed\n"); return 1; }
 
     printf("[host] backend: %s\n", HOST_BACKEND_NAME);
