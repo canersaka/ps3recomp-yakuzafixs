@@ -1041,7 +1041,7 @@ static int dc_reserve_indices(u32 count)
  * than fetching a phantom vertex wherever the restart sentinel appears, then
  * collapse repeated references and fetch each unique vertex once.
  * rsx_live_draw.c's fetch_batches_hoisted (4165-4292). */
-static void dc_fetch(const rsx_vertex_layout_plan* layout)
+static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 {
     for (u32 b = 0; b < dc.n_arr && dc.fetch_ok; b++)
         for (u32 i = 0; i < dc.arr[b].count && dc.fetch_ok; i++)
@@ -1086,7 +1086,10 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout)
     if (!dc.fetch_ok) return;
 
     dc.n_source_refs = dc.n_refs;
-    if (dc.n_refs > 1) {
+    /* Only a topology this engine rebuilds through an index buffer may share
+     * repeated references. A line strip or a point list is drawn in the order
+     * it arrived, so collapsing duplicates would reorder it. */
+    if (allow_remap && dc.n_refs > 1) {
         u32 unique = dc.n_refs;
         if (rsx_vertex_remap_build(&dc.ref_remap, dc.refs, dc.n_refs, &unique)) {
             dc.refs_remapped = unique < dc.n_refs;
@@ -1215,18 +1218,37 @@ static void sink_end(void* user, const rsx_dispatch* r)
     if (!g.ready || !dc.n_packets) return;
 
     const u32 prim = g.rsx.current_primitive;
+    /* Triangles, strips, fans and quads are REBUILT into one triangle list
+     * through an index buffer. A host strip topology cannot express a restart
+     * cut -- that is the whole reason the reference engine rebuilds them --
+     * and rebuilding is also what lets repeated references share an uploaded
+     * vertex. Points and lines pass through as the guest issued them. Quad
+     * strips and polygons need an expansion this engine does not have, so
+     * they are dropped rather than drawn as something else. */
+    rsx_topology topology = RSX_TOPOLOGY_TRIANGLES;
+    int scratch = 0;
+    const int rebuild = rsx_vertex_topology_plan(prim, 0, &scratch) != 0;
+    if (!rebuild) {
+        if (rsx_primitive_needs_expansion(prim)) return;
+        topology = rsx_primitive_topology(prim);
+        if (topology == RSX_TOPOLOGY_UNSUPPORTED) return;
+    }
+
     rsx_vertex_layout_plan layout;
     eng_vertex_layout(&layout);
-    dc_fetch(&layout);
+    dc_fetch(&layout, rebuild);
     if (!dc.n_verts || !dc.fetch_ok) return;
 
     int indexed = 0;
-    if (!rsx_vertex_topology_plan(prim, dc.refs_remapped, &indexed)) return;
-    const u32 n_tri = indexed
-        ? rsx_draw_engine_topology_index_count(prim, dc.n_source_refs,
-                                               dc.cuts, dc.n_cuts)
-        : dc.n_source_refs - dc.n_source_refs % 3u;
-    if (!n_tri) return;
+    u32 n_draw = dc.n_source_refs;
+    if (rebuild) {
+        if (!rsx_vertex_topology_plan(prim, dc.refs_remapped, &indexed)) return;
+        n_draw = indexed
+            ? rsx_draw_engine_topology_index_count(prim, dc.n_source_refs,
+                                                   dc.cuts, dc.n_cuts)
+            : dc.n_source_refs - dc.n_source_refs % 3u;
+    }
+    if (!n_draw) return;
 
     rsx_be_render_state rs;
     rsx_draw_engine_decode_render_state(&g.rsx, &rs);
@@ -1266,7 +1288,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     if (!pipeline) return;
 
     if (indexed) {
-        if (!dc_reserve_indices(n_tri)) return;
+        if (!dc_reserve_indices(n_draw)) return;
         rsx_draw_engine_write_topology_indices(
             prim, dc.n_source_refs, dc.cuts, dc.n_cuts,
             dc.refs_remapped ? dc.ref_remap.occurrence_to_unique : NULL,
@@ -1352,9 +1374,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
     g.be->set_stencil_ref(g.be->user,
                           rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
 
-    const u32 uploaded = indexed ? dc.n_verts : n_tri;
-    g.be->draw(g.be->user, dc.verts, uploaded, layout.stride,
-               indexed ? g.indices : NULL, indexed ? n_tri : 0);
+    const u32 uploaded = indexed ? dc.n_verts : n_draw;
+    g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
+               indexed ? g.indices : NULL, indexed ? n_draw : 0);
     /* Counted only when the draw ran the guest's OWN programs, which is what
      * the test hook means: a draw through the built-in pair is a draw, not
      * evidence that the decompile-translate-compile path worked. */
