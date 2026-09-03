@@ -48,6 +48,9 @@ extern "C" {
  * by rsx_dispatch (rsx_dsp_surface.color_location); rsx_state has no field
  * for it and rsx_process_method ignores it. */
 #define NV4097_SET_CONTEXT_DMA_COLOR_A         0x00000194
+/* ...and the same question for the depth buffer, which a texture unit coming
+ * back to sample it has to agree with. */
+#define NV4097_SET_CONTEXT_DMA_ZETA            0x00000198
 #define CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER 0xFEED0000
 #define CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER  0xFEED0001
 

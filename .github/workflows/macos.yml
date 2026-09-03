@@ -115,6 +115,16 @@ jobs:
           # to the strip's SECOND quad, so a renderer that drops quad strips
           # or expands only the first quad presents green and fails.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --quads
+          # Depth-as-texture: a flat triangle written into a zeta of the
+          # guest's own with the depth test on, then that zeta sampled as a
+          # DEPTH24_D8 texture by a guest fragment program in a second pass.
+          # The centre pixel is the depth itself, 0.25 as a byte; a zeta
+          # nothing wrote, and the guest bytes behind its address, both read
+          # 1.0 and present saturated red. This one runs on the draw engine
+          # only: the vtable path tracks no zeta as a texture and uploads
+          # those bytes instead, which is exactly the failure above.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depthtex
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depthtex --frames=60
           # A guest program pair that will not translate has no fallback in
           # the draw engine, so forcing the built-in shader leaves --shader
           # with nothing to draw: it must still fail, or the check is not
