@@ -100,6 +100,13 @@ jobs:
           # backend that uploads level 0 and stops presents level 0's colour
           # and fails, so this cannot pass without the whole mip chain.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip
+          # Render-to-texture: a red triangle drawn into a colour surface of
+          # the guest's own, then sampled by a full-screen quad through the
+          # guest programs. The guest bytes behind that surface are green, so
+          # a backend that uploads them instead of binding the surface it
+          # rendered into presents green and fails.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --rtt
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --rtt --frames=60
           if PS3RECOMP_METAL_FIXED_FUNCTION=1 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader; then
             echo "--shader passed with the built-in shader forced; the check is not checking"
             exit 1
