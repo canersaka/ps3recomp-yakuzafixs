@@ -128,34 +128,46 @@ extern "C" void ps3_install_guest_ptr_trap(void)
 
 #else  /* POSIX */
 
-static struct sigaction s_prev_segv;
-static int              s_prev_segv_valid = 0;
+/* Both signals a fault in the reserved window can arrive on, each with its own
+ * saved predecessor, because the two are separate sigaction slots and chaining
+ * to the wrong one would run a handler that was never registered for this
+ * signal. See the install below for which host produces which. */
+enum { PS3_FAULT_SEGV = 0, PS3_FAULT_BUS = 1, PS3_FAULT_SLOTS = 2 };
+static struct sigaction s_prev_fault[PS3_FAULT_SLOTS];
+static int              s_prev_fault_valid[PS3_FAULT_SLOTS];
+
+static inline int ps3_fault_slot(int sig)
+{ return sig == SIGBUS ? PS3_FAULT_BUS : PS3_FAULT_SEGV; }
 
 /* Not async-signal-safe, and deliberately so: this runs on a path that is about
  * to end the process anyway, and the whole value of the report is the guest
  * function name -- which means walking the stack and formatting. The Windows
  * handler makes exactly the same trade. */
-static void ps3_guest_ptr_sigsegv(int sig, siginfo_t* si, void* uctx)
+static void ps3_guest_ptr_fault(int sig, siginfo_t* si, void* uctx)
 {
+    /* si_addr is the faulting address on both signals and on both hosts, which
+     * is the only thing this needs out of the frame. */
     if (si && ps3_is_guest_ptr_fault((uintptr_t)si->si_addr)) {
-        /* si_code separates unmapped from protected, not read from write, so
-         * unlike the Windows report this cannot name the direction without
-         * decoding a machine-specific trap frame. The address and the guest
-         * caller are what actually locate the bug. */
+        /* Neither the signal nor si_code says read or write -- they separate
+         * unmapped from protected -- so unlike the Windows report this cannot
+         * name the direction without decoding a machine-specific trap frame.
+         * The address and the guest caller are what actually locate the bug. */
         ps3_report_guest_ptr((uintptr_t)si->si_addr, "access");
     }
 
     /* Do NOT swallow it, matching the Windows handler: hand back to whoever was
      * installed before, or restore the default so the faulting instruction
      * re-runs and the process dies exactly as it would have. */
-    if (s_prev_segv_valid) {
-        if ((s_prev_segv.sa_flags & SA_SIGINFO) && s_prev_segv.sa_sigaction) {
-            s_prev_segv.sa_sigaction(sig, si, uctx);
+    const int slot = ps3_fault_slot(sig);
+    if (s_prev_fault_valid[slot]) {
+        const struct sigaction& prev = s_prev_fault[slot];
+        if ((prev.sa_flags & SA_SIGINFO) && prev.sa_sigaction) {
+            prev.sa_sigaction(sig, si, uctx);
             return;
         }
-        if (s_prev_segv.sa_handler && s_prev_segv.sa_handler != SIG_DFL &&
-            s_prev_segv.sa_handler != SIG_IGN) {
-            s_prev_segv.sa_handler(sig);
+        if (prev.sa_handler && prev.sa_handler != SIG_DFL &&
+            prev.sa_handler != SIG_IGN) {
+            prev.sa_handler(sig);
             return;
         }
     }
@@ -191,15 +203,50 @@ extern "C" void ps3_install_guest_ptr_trap(void)
         got += len;
     }
 
-    /* PROT_NONE faults arrive as SIGSEGV on both Linux and Darwin; SIGBUS is for
-     * mapped-but-unbacked access, which this scheme never produces. */
+    /* SIGSEGV *and* SIGBUS. Which signal an inaccessible page produces is the
+     * host's choice, and the two hosts do not agree:
+     *
+     *   Linux delivers an access to a mapped-but-forbidden page as SIGSEGV
+     *   (si_code SEGV_ACCERR) and one to nothing at all as SIGSEGV
+     *   (SEGV_MAPERR), so one signal covers the reservation and the gaps in it
+     *   alike.
+     *
+     *   Darwin turns the Mach EXC_BAD_ACCESS into SIGBUS whenever the page WAS
+     *   mapped and its protection refused the access, and into SIGSEGV only
+     *   where nothing is mapped. A PROT_NONE mapping is the first case exactly:
+     *   the reservation made just above is what converts the fault this exists
+     *   to report into one a SIGSEGV-only handler cannot see. Measured, arm64:
+     *   SIGBUS with si_code 1 -- the value that spells BUS_ADRALN -- for a read
+     *   and for a write of a perfectly aligned PROT_NONE byte.
+     *
+     * The reason macOS nevertheless survived the SIGSEGV-only handler this
+     * replaces is worth writing down, because it is luck and not design. A
+     * 64-bit Mach-O carries a __PAGEZERO segment over 0 .. 0x100000000 with no
+     * protections at all, and mmap will not place anything inside it, so every
+     * chunk of the loop above fails and the guest window stays __PAGEZERO --
+     * which faults as SIGSEGV, si_code 2, a zero-maxprot region reading as
+     * unmapped rather than as forbidden. The report fired on that accident, and
+     * the accident stops holding the moment a process shrinks its __PAGEZERO or
+     * anything else maps low.
+     *
+     * si_code discriminates on neither host and is not consulted. si_addr
+     * carries the faulting address on both signals and both hosts, which is all
+     * the report needs. runtime/platform/tests/test_guest_ptr_trap.c is the
+     * evidence, and runtime/platform/win32_compat.c's dispatcher takes both
+     * signals for the same reason. */
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
-    sa.sa_sigaction = ps3_guest_ptr_sigsegv;
+    sa.sa_sigaction = ps3_guest_ptr_fault;
     sa.sa_flags     = SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGSEGV, &sa, &s_prev_segv) == 0) s_prev_segv_valid = 1;
+    if (sigaction(SIGSEGV, &sa, &s_prev_fault[PS3_FAULT_SEGV]) == 0)
+        s_prev_fault_valid[PS3_FAULT_SEGV] = 1;
+    if (sigaction(SIGBUS, &sa, &s_prev_fault[PS3_FAULT_BUS]) == 0)
+        s_prev_fault_valid[PS3_FAULT_BUS] = 1;
 
+    /* 0 MB is the expected answer on macOS, for the __PAGEZERO reason above,
+     * and does not mean the trap is off: the fault lands on __PAGEZERO instead
+     * of on a reservation and si_addr is the same either way. */
     fprintf(stderr, "[ps3] guest-pointer trap armed (%zu MB of the low 4 GB reserved)\n",
             got >> 20);
 }

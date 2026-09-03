@@ -1073,12 +1073,12 @@ BOOL   IsBadCodePtr(LPCVOID p);
  *   filter, and then to whatever sigaction was installed before the shim.
  *
  * That last step is the load-bearing one. runtime/ppu/ppu_loader.cpp installs
- * its own SIGSEGV handler for the untranslated-guest-pointer report and chains
- * to its predecessor by hand; the two compose in either installation order
- * because both keep the previous action and call it in its own form, SIGINFO
- * or not, and both restore SIG_DFL and return when there is nothing to chain
- * to -- which re-runs the faulting instruction and lets the process die
- * exactly as it would have.
+ * its own SIGSEGV and SIGBUS handlers for the untranslated-guest-pointer report
+ * and chains to their predecessors by hand, keeping one saved action per
+ * signal; the two compose in either installation order because both keep the
+ * previous action and call it in its own form, SIGINFO or not, and both restore
+ * SIG_DFL and return when there is nothing to chain to -- which re-runs the
+ * faulting instruction and lets the process die exactly as it would have.
  *
  * The dispatcher takes no lock: the handler list is read through atomic loads
  * so a fault on a thread that happens to hold the shim's lock is not a

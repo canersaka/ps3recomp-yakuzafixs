@@ -169,6 +169,15 @@ jobs:
           clang -std=gnu17 -Wall -Wextra -I runtime/platform -o /tmp/test_win32_compat runtime/platform/tests/test_win32_compat.c runtime/platform/win32_compat.c -lpthread
           /tmp/test_win32_compat
 
+      # Which signal an inaccessible guest window faults with, and whether one
+      # can be reserved at all. This is the host that makes the question real:
+      # a PROT_NONE page here raises SIGBUS, not SIGSEGV, so the untranslated-
+      # guest-pointer trap in runtime/ppu/ppu_loader.cpp has to take both.
+      - name: Run the guest-pointer trap signal test
+        run: |
+          clang -std=gnu17 -Wall -Wextra -o /tmp/test_guest_ptr_trap runtime/platform/tests/test_guest_ptr_trap.c
+          /tmp/test_guest_ptr_trap
+
       # The lv2 sync-primitive stress suite on host threads. Windows-only until
       # the shim grew joinable handles and multi-object waits; on Apple Silicon
       # it is the arm64 memory-model regression net for the primitives a game
