@@ -7,7 +7,8 @@
  * joinable threads with exit codes and the CREATE_SUSPENDED gate,
  * WaitForMultipleObjects in both modes, WaitOnAddress, waitable timers,
  * timing, virtual memory, stopping a running thread and reading its
- * registers, the address-space queries, and the MSVC CRT spellings.
+ * registers, the address-space queries, vectored exception handlers,
+ * and the MSVC CRT spellings.
  *
  * Build (any POSIX host):
  *   cc -std=gnu17 -Wall -Wextra -I runtime/platform \
@@ -18,6 +19,7 @@
 #include "../win32_compat.h"
 #include "../msvc_compat.h"
 
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -603,6 +605,97 @@ static void test_virtual_query(void)
     CHECK(IsBadReadPtr(r, pg));
 }
 
+/* ---- vectored exception handlers ----------------------------------------- */
+/* Everything the handler reports is volatile. The fault is a volatile store,
+ * not a call, so an optimiser is entitled to carry a plain global's value
+ * across it -- and at -O2 it does, folding the zero these are cleared to
+ * straight into the comparison below. */
+static unsigned char*  g_veh_page;
+static size_t          g_veh_len;
+static volatile LONG   g_veh_hits;
+static volatile ULONG_PTR g_veh_at;
+static volatile ULONG_PTR g_veh_rw;
+static volatile LONG   g_search_hits;
+static volatile LONG   g_filter_hits;
+static volatile LONG   g_after_fault;
+static sigjmp_buf      g_escape;
+
+/* Makes the store that faulted succeed: open the page and re-run it. */
+static LONG CALLBACK veh_fixup(EXCEPTION_POINTERS* ep)
+{
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
+        ep->ExceptionRecord->NumberParameters < 2)
+        return EXCEPTION_CONTINUE_SEARCH;
+    ULONG_PTR at = ep->ExceptionRecord->ExceptionInformation[1];
+    if (at < (ULONG_PTR)g_veh_page || at >= (ULONG_PTR)g_veh_page + g_veh_len)
+        return EXCEPTION_CONTINUE_SEARCH;
+    g_veh_at = at;
+    g_veh_rw = ep->ExceptionRecord->ExceptionInformation[0];
+    InterlockedIncrement(&g_veh_hits);
+    DWORD old;
+    VirtualProtect(g_veh_page, g_veh_len, PAGE_READWRITE, &old);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static LONG CALLBACK veh_decline(EXCEPTION_POINTERS* ep)
+{
+    (void)ep;
+    InterlockedIncrement(&g_search_hits);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static LONG WINAPI filter_escape(EXCEPTION_POINTERS* ep)
+{
+    (void)ep;
+    InterlockedIncrement(&g_filter_hits);
+    siglongjmp(g_escape, 1);
+}
+
+static void test_exceptions(void)
+{
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    g_veh_len = si.dwPageSize;
+
+    /* a handler that repairs the fault and continues */
+    g_veh_page = (unsigned char*)VirtualAlloc(NULL, g_veh_len,
+                                              MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+    CHECK(g_veh_page != NULL);
+    PVOID hfix = AddVectoredExceptionHandler(1, veh_fixup);
+    CHECK(hfix != NULL);
+    g_veh_hits = 0; g_veh_at = 0; g_veh_rw = 0;
+    volatile unsigned char* target = g_veh_page + 8;
+    *target = 0x5A;
+    CHECK(g_veh_hits == 1);                          /* once, not a loop */
+    CHECK(g_veh_at == (ULONG_PTR)(g_veh_page + 8));
+    CHECK(g_veh_rw == 1);                            /* a write */
+    CHECK(*target == 0x5A);                          /* and it landed */
+    *target = 0x77;
+    CHECK(g_veh_hits == 1 && *target == 0x77);       /* page open now: no fault */
+    CHECK(RemoveVectoredExceptionHandler(hfix) != 0);
+    CHECK(RemoveVectoredExceptionHandler(hfix) == 0);          /* already gone */
+    CHECK(RemoveVectoredExceptionHandler((PVOID)&si) == 0);    /* never was ours */
+    CHECK(VirtualFree(g_veh_page, 0, MEM_RELEASE));
+
+    /* a handler that declines falls through to the unhandled filter */
+    g_veh_page = (unsigned char*)VirtualAlloc(NULL, g_veh_len,
+                                              MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+    CHECK(g_veh_page != NULL);
+    PVOID hdecline = AddVectoredExceptionHandler(1, veh_decline);
+    CHECK(hdecline != NULL);
+    CHECK(SetUnhandledExceptionFilter(filter_escape) == NULL);
+    g_search_hits = 0; g_filter_hits = 0; g_after_fault = 0;
+    if (sigsetjmp(g_escape, 1) == 0) {
+        *(volatile unsigned char*)g_veh_page = 1;
+        InterlockedIncrement(&g_after_fault);        /* must not be reached */
+    }
+    CHECK(g_search_hits == 1);
+    CHECK(g_filter_hits == 1);
+    CHECK(g_after_fault == 0);
+    CHECK(SetUnhandledExceptionFilter(NULL) == filter_escape);
+    CHECK(RemoveVectoredExceptionHandler(hdecline) != 0);
+    CHECK(VirtualFree(g_veh_page, 0, MEM_RELEASE));
+}
+
 /* ---- MSVC CRT and intrinsic spellings ------------------------------------ */
 static __declspec(thread) int t_tls_probe;
 
@@ -670,6 +763,7 @@ int main(void)
     test_virtual_memory();
     test_thread_control();
     test_virtual_query();
+    test_exceptions();
     test_msvc_compat();
     printf("win32_compat tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail;
