@@ -849,9 +849,32 @@ s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id)
     printf("[sysPrxForUser] sys_prx_get_module_id_by_name('%s')\n",
            hname ? hname : "(null)");
 
-    if (!hid) return CELL_EFAULT;
-    *hid = 0; /* fake module ID */
-    return CELL_OK;
+    /* A null id is not an error. The caller that only wants to know whether a
+     * module is present passes one -- libsre's tuner probe does exactly that,
+     * with r5 = 0 -- and answering CELL_EFAULT tells it the question was
+     * malformed rather than that the module is absent. Report the lookup
+     * result either way and write the id only if there is somewhere to put it.
+     *
+     * No module is loaded by name here, so the honest answer is that the name
+     * is not known: CELL_PRX_ERROR_UNKNOWN_MODULE. This used to write a module
+     * id of 0 and report CELL_OK, which is worse than it looks -- a caller asks
+     * this question precisely to find out whether some optional module is
+     * present, and success hands it an id that indexes nothing.
+     *
+     * libsre is the caller that shows the cost. _cellSpursIsLaunchedFromTuner
+     * asks whether the SPURS profiler is loaded; told yes, it asserts on the
+     * id, reports the title as launched from the tuner, and runs tuner and
+     * trace setup that then fails with CELL_SPURS_CORE_ERROR_STAT -- and the
+     * SPURS task workload never attaches, so a title waiting on its first
+     * workload waits forever. The failure is four layers from the lie and says
+     * nothing about it; runtime/ppu/ppu_hle.cpp has carried an env-gated
+     * override returning exactly this code, with a comment spelling out that
+     * chain, since long before the reason was traced back to here.
+     *
+     * A runtime that grows real load-by-name has a module table to answer
+     * from, and this becomes a lookup miss rather than a constant. */
+    if (hid) *hid = 0;
+    return (s32)0x8001112E;   /* CELL_PRX_ERROR_UNKNOWN_MODULE */
 }
 
 /* ---------------------------------------------------------------------------
