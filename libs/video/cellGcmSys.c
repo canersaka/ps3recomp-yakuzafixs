@@ -1179,6 +1179,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * own command ring, so everything after the jump (including the reference
      * writes its waits spin on) silently never executed. */
     u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+    /* The words behind `put` were stored by another thread (the title, or the
+     * recycle below) before it stored `put`. On x86 the hardware keeps loads
+     * in order; on arm64 it does not, so without an acquire here the ring
+     * word can be fetched before `put` was and come back stale -- the walker
+     * then runs off the end of the previous frame's bytes until it meets a
+     * word that is not a command, and parks there forever. */
+    atomic_thread_fence(memory_order_acquire);
 
     if (getenv("GCM_DRAINDBG")) {
         static int n = 0;
@@ -1485,6 +1492,11 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     u32 io_begin = gcm_ea2io(begin);
     if (io_begin != 0xFFFFFFFFu) {
         vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
+        /* The jump has to be in guest memory before `put` moves behind the
+         * walker's `get`. Program order is not enough on arm64: the walker
+         * may observe the new `put`, find `get` != `put`, and read the old
+         * word at `current` before the jump lands there. */
+        atomic_thread_fence(memory_order_release);
         vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);        /* put = begin */
     }
 
