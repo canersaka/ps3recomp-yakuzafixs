@@ -293,9 +293,60 @@ static uint32_t rd_be32(uint32_t ea)
            ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
 }
 
+/* ---------------------------------------------------------------------------
+ * The SMC micro-interpreter steps past branch hints.
+ *
+ * Runtime-generated stub code -- the WWS/SPURS jobmanager writes it into local
+ * store and calls it, so it is never lifted -- reaches spu_indirect_branch,
+ * which finds no lifted function for it and micro-interprets the live bytes
+ * until a branch lands back in lifted code. hbra and hbrr are RI18-form branch
+ * hints, 7-bit opcodes 0x08 and 0x09 (the same op7 group as ila), and no-ops
+ * for execution. A decoder that reads the wrong opcode field treats the hint
+ * as UNKNOWN, bails, and drops the SPU into branch-to-0: Yakuza: Dead Souls'
+ * EDGE geometry task carried an hbrr and died exactly there. The snippet puts
+ * a real hbrr (0x12033296, the word from that task) and an hbra between two
+ * il's and an indirect branch -- if either hint is not stepped over, the il
+ * after it never runs and the branch is never reached.
+ * -----------------------------------------------------------------------*/
+static void ls_put_be32(uint8_t* p, uint32_t w)
+{ p[0]=(uint8_t)(w>>24); p[1]=(uint8_t)(w>>16); p[2]=(uint8_t)(w>>8); p[3]=(uint8_t)w; }
+
+static void test_smc_branch_hints(void)
+{
+    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
+    if (!ctx) { check(0, "calloc spu_context for the SMC hint test"); return; }
+
+    const uint32_t PC = 0x400, TARGET = 0x2000;
+    ls_put_be32(&ctx->ls[PC + 0x00], 0x40800282u);   /* il   $2, 5            */
+    ls_put_be32(&ctx->ls[PC + 0x04], 0x10000000u);   /* hbra  (op7 0x08) hint */
+    ls_put_be32(&ctx->ls[PC + 0x08], 0x12033296u);   /* hbrr  (op7 0x09) hint */
+    ls_put_be32(&ctx->ls[PC + 0x0C], 0x40800383u);   /* il   $3, 7            */
+    ls_put_be32(&ctx->ls[PC + 0x10], 0x35000380u);   /* bi   $7               */
+
+    ctx->gpr[7]._u32[0] = TARGET;                    /* the bi's target        */
+    ctx->pc = PC;                                    /* 0x400: nothing lifted here */
+    ctx->image_id = 0;
+    ctx->resident_ovl = 0;
+    ctx->policy_mode = 0;
+
+    spu_indirect_branch(ctx);
+
+    check(ctx->gpr[2]._u32[0] == 5, "the il before the hints ran");
+    check(ctx->gpr[3]._u32[0] == 7,
+          "the il after the hints ran (a hint left as UNKNOWN is the branch-to-0 bug)");
+    check(ctx->pc == TARGET, "the indirect branch past the hints was reached");
+
+    g_spu_trampoline_fn = 0;                          /* don't leak the pending transfer */
+    free(ctx);
+}
+
 int main(void)
 {
     printf("SPU lifted thread-group start\n");
+
+    /* Runtime-generated branch hints, before the registry has anything in it
+     * so the micro-interpreter path is the one that runs. */
+    test_smc_branch_hints();
 
     signal(SIGSEGV, guard_fault);
     signal(SIGBUS,  guard_fault);
