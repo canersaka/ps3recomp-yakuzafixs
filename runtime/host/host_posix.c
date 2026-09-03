@@ -47,6 +47,8 @@
 #include "rsx_test_programs.h"
 
 #include "../syscalls/sys_ppu_thread.h"   /* --threads: the lv2 thread path */
+#include "../../libs/audio/cellAudio.h"   /* --audio-pad: the SDL2 backends */
+#include "../../libs/input/cellPad.h"
 
 #include <ps3emu/guest_call.h>
 #include <pthread.h>
@@ -54,6 +56,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* The guest address space this host hands to the HLE layer. */
 uint8_t* vm_base = NULL;
@@ -646,6 +649,98 @@ static int run_thread_check(void)
     return g_reported_stack >= HOST_STACK_FLOOR ? 0 : 5;
 }
 
+/* ---------------------------------------------------------------------------
+ * --audio-pad: bring the SDL2 audio and pad backends up and back down
+ *
+ * Neither had ever been initialised off Windows -- the Windows build takes
+ * WASAPI and XInput -- so nothing said whether they even run. This is not a
+ * sound or input test: it is the assertion that init, a few polls and
+ * shutdown complete, twice, and that a shutdown with no device open is
+ * survivable. With SDL_AUDIODRIVER=dummy and no controller plugged in it
+ * needs no hardware, which is what lets CI run it.
+ * -----------------------------------------------------------------------*/
+static int run_audio_pad_check(void)
+{
+    int rc = 0;
+    printf("[host] --audio-pad: SDL2 audio and pad backends\n");
+
+    /* Quit before init: the guest is entitled to do this and lv2 answers
+     * NOT_INIT / NOT_OPENED rather than tearing down state that was never
+     * built. It is also where an unguarded join or close would fall over. */
+    s32 r = cellAudioQuit();
+    printf("[host] cellAudioQuit before init -> 0x%08X %s\n", (unsigned)r,
+           r == (s32)CELL_AUDIO_ERROR_NOT_INIT ? "OK" : "UNEXPECTED");
+    if (r != (s32)CELL_AUDIO_ERROR_NOT_INIT) rc = 6;
+
+    r = cellPadEnd();
+    printf("[host] cellPadEnd before init -> 0x%08X %s\n", (unsigned)r,
+           r == (s32)CELL_PAD_ERROR_NOT_OPENED ? "OK" : "UNEXPECTED");
+    if (r != (s32)CELL_PAD_ERROR_NOT_OPENED) rc = 6;
+
+    /* Twice through, because the second cycle is where a shutdown that left
+     * a stale handle behind shows up. */
+    for (int pass = 0; pass < 2; pass++) {
+        printf("[host] pass %d\n", pass);
+
+        r = cellAudioInit();
+        if (r != CELL_OK) {
+            fprintf(stderr, "[host] cellAudioInit -> 0x%08X\n", (unsigned)r);
+            return 6;
+        }
+        r = cellPadInit(7);
+        if (r != CELL_OK) {
+            fprintf(stderr, "[host] cellPadInit -> 0x%08X\n", (unsigned)r);
+            return 6;
+        }
+
+        /* A double init is the guest's mistake and gets an error, not a
+         * second backend. */
+        r = cellAudioInit();
+        if (r != (s32)CELL_AUDIO_ERROR_ALREADY_INIT) {
+            fprintf(stderr, "[host] second cellAudioInit -> 0x%08X, want ALREADY_INIT\n",
+                    (unsigned)r);
+            rc = 6;
+        }
+        r = cellPadInit(7);
+        if (r != (s32)CELL_PAD_ERROR_ALREADY_OPENED) {
+            fprintf(stderr, "[host] second cellPadInit -> 0x%08X, want ALREADY_OPENED\n",
+                    (unsigned)r);
+            rc = 6;
+        }
+
+        /* Let the mixing thread run a few blocks and poll the pad the way a
+         * frame loop would. No controller is expected to be attached. */
+        for (int i = 0; i < 30; i++) {
+            cellPad_poll();
+            struct timespec ts = { 0, 2 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+        }
+
+        r = cellPadEnd();
+        if (r != CELL_OK) { fprintf(stderr, "[host] cellPadEnd -> 0x%08X\n", (unsigned)r); rc = 6; }
+        r = cellAudioQuit();
+        if (r != CELL_OK) { fprintf(stderr, "[host] cellAudioQuit -> 0x%08X\n", (unsigned)r); rc = 6; }
+
+        /* And again, on the state the shutdown just left behind. */
+        r = cellAudioQuit();
+        if (r != (s32)CELL_AUDIO_ERROR_NOT_INIT) {
+            fprintf(stderr, "[host] repeat cellAudioQuit -> 0x%08X, want NOT_INIT\n",
+                    (unsigned)r);
+            rc = 6;
+        }
+        r = cellPadEnd();
+        if (r != (s32)CELL_PAD_ERROR_NOT_OPENED) {
+            fprintf(stderr, "[host] repeat cellPadEnd -> 0x%08X, want NOT_OPENED\n",
+                    (unsigned)r);
+            rc = 6;
+        }
+    }
+
+    printf("[host] audio and pad backends came up and down twice %s\n",
+           rc == 0 ? "OK" : "with failures");
+    return rc;
+}
+
 int main(int argc, char** argv)
 {
     /* frames = 0 runs until the window is closed, which is what the .app
@@ -661,6 +756,14 @@ int main(int argc, char** argv)
             int trc = run_thread_check();
             free(vm_base);
             return trc;
+        }
+        /* --audio-pad: no graphics either, just the SDL2 backends. */
+        else if (strcmp(argv[i], "--audio-pad") == 0) {
+            vm_base = (uint8_t*)calloc(1, VM_SIZE);
+            if (!vm_base) { fprintf(stderr, "[host] guest VM alloc failed\n"); return 1; }
+            int arc = run_audio_pad_check();
+            free(vm_base);
+            return arc;
         }
         /* --tex: bind a texture and sample it, which exercises the shared
          * rsx_texture_layout/decode path end to end rather than in a unit
