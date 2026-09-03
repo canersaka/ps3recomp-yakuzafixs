@@ -59,11 +59,11 @@ u32 rsx_null_backend_readback_center(void);
 u32 rsx_null_backend_guest_draws(void);
 #endif
 
-#ifdef __cplusplus
-}
-#endif
-
 /* The live draw engine binds to this window and takes over presentation. */
 void* rsx_null_backend_get_hwnd(void);
 void  rsx_null_backend_suppress_present(int on);
+
+#ifdef __cplusplus
+}
+#endif
 #endif
