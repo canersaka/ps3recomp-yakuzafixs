@@ -1340,7 +1340,13 @@ static int spu_smc_microstep(spu_context* ctx)
         if (op7 == 0x21)  { ctx->gpr[rt] = spu_splat_u32((w >> 7) & 0x3FFFF); pc += 4; continue; } /* ila */
         if (op11 == 0x201 || op11 == 0x001) { pc += 4; continue; }  /* nop/lnop */
         if (op11 == 0x002 || op11 == 0x003) { pc += 4; continue; }  /* sync/dsync */
-        if (op11 == 0x1AC || op9 == 0x008 || op9 == 0x009) { pc += 4; continue; } /* hbr hints */
+        /* Branch hints, all no-ops for execution: hbr is the 11-bit-opcode RR
+         * form (0x1AC), hbra and hbrr are the 7-bit-opcode RI18 form (0x08,
+         * 0x09) -- the same op7 group as ila (0x21) above, NOT op9. Testing
+         * op9 here never matched either (hbrr 0x12033296 has op9 0x24), so a
+         * runtime-generated stub carrying a branch hint decoded to UNKNOWN,
+         * the microstep bailed, and the SPU fell into branch-to-0. */
+        if (op11 == 0x1AC || op7 == 0x08 || op7 == 0x09) { pc += 4; continue; } /* hbr/hbra/hbrr */
 
         { static int _n = 0;
           if (_n++ < 8)
