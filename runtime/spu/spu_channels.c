@@ -194,35 +194,91 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 
 /* ===========================================================================
  * Per-context MFC engine registry
+ *
+ * One MFC engine per live SPU context, in a small table. A thread group starts
+ * all of its threads at once and each one arrives here on its first DMA, so the
+ * table is written concurrently by as many host threads as the group has.
+ *
+ * Two rules keep that safe without putting a lock on the lookup, which every
+ * MFC channel access goes through:
+ *
+ *   - A slot's owner field is written only by the thread that owns the context
+ *     in it: the claim below, and the release when that context is done. Every
+ *     reader is comparing the field against ITS OWN context pointer, so a read
+ *     that races a claim either matches (its own slot, which only it can have
+ *     written) or does not, and can never be handed another context's engine.
+ *   - Choosing which free slot to claim is done under a lock. It used to be a
+ *     scan followed by a store, and two threads that scanned before either
+ *     stored both took the same slot and then shared one engine's queue and tag
+ *     state -- one SPU's tag wait satisfied by the other SPU's transfer.
  * ===========================================================================*/
 #define SPU_MAX_CONTEXTS 8
 
 typedef struct {
-    spu_context* ctx;
+    spu_context* volatile ctx;
     mfc_engine   mfc;
 } spu_mfc_slot;
 
 static spu_mfc_slot s_mfc_slots[SPU_MAX_CONTEXTS];
+static SRWLOCK      s_mfc_claim_lock = SRWLOCK_INIT;
 
 static mfc_engine* mfc_for(spu_context* ctx)
 {
-    spu_mfc_slot* free_slot = NULL;
-    for (int i = 0; i < SPU_MAX_CONTEXTS; i++) {
+    for (int i = 0; i < SPU_MAX_CONTEXTS; i++)
         if (s_mfc_slots[i].ctx == ctx)
             return &s_mfc_slots[i].mfc;
-        if (!free_slot && s_mfc_slots[i].ctx == NULL)
-            free_slot = &s_mfc_slots[i];
+
+    /* No slot yet: take one. The engine is initialized before the slot is
+     * published, so it is never visible to anyone in a half-reset state. */
+    mfc_engine* e = NULL;
+    AcquireSRWLockExclusive(&s_mfc_claim_lock);
+    for (int i = 0; i < SPU_MAX_CONTEXTS && !e; i++) {
+        if (s_mfc_slots[i].ctx != NULL) continue;
+        mfc_engine_init(&s_mfc_slots[i].mfc);
+        s_mfc_slots[i].ctx = ctx;
+        e = &s_mfc_slots[i].mfc;
     }
-    if (free_slot) {
-        free_slot->ctx = ctx;
-        mfc_engine_init(&free_slot->mfc);
-        return &free_slot->mfc;
+    if (!e) {
+        /* Out of slots: fall back to a shared engine (correct for single-SPU).
+         * Reachable only with more than SPU_MAX_CONTEXTS contexts running at
+         * the same time, which is more SPUs than the machine has -- and the
+         * sharing is silent, so say it once. Its one-time init is inside the
+         * lock as well, or two threads arriving together would each memset an
+         * engine the other is already using. */
+        static mfc_engine fallback;
+        static int fallback_init = 0;
+        if (!fallback_init) {
+            mfc_engine_init(&fallback);
+            fallback_init = 1;
+            fprintf(stderr, "[SPU] more than %d contexts hold an MFC engine at "
+                    "once; the rest share one\n", SPU_MAX_CONTEXTS);
+            fflush(stderr);
+        }
+        e = &fallback;
     }
-    /* Out of slots: fall back to a shared engine (correct for single-SPU). */
-    static mfc_engine fallback;
-    static int fallback_init = 0;
-    if (!fallback_init) { mfc_engine_init(&fallback); fallback_init = 1; }
-    return &fallback;
+    ReleaseSRWLockExclusive(&s_mfc_claim_lock);
+    return e;
+}
+
+/* Give the slot `ctx` holds back to the table, called when its context is done.
+ * Slots used to be claimed and never released, so a title with more SPU
+ * contexts over its life than there are slots ran the rest of them on the
+ * shared fallback engine -- and by then it is not a fresh engine but whatever
+ * tag and queue state the previous owners left in it.
+ *
+ * Only the owner calls this, and only after its SPU has stopped, so the engine
+ * is idle. The next claimant re-initializes it. A context that never issued a
+ * DMA holds no slot and this is a scan that finds nothing. */
+void spu_mfc_release(spu_context* ctx)
+{
+    if (!ctx) return;
+    AcquireSRWLockExclusive(&s_mfc_claim_lock);
+    for (int i = 0; i < SPU_MAX_CONTEXTS; i++) {
+        if (s_mfc_slots[i].ctx != ctx) continue;
+        s_mfc_slots[i].ctx = NULL;
+        break;
+    }
+    ReleaseSRWLockExclusive(&s_mfc_claim_lock);
 }
 
 /* ===========================================================================
