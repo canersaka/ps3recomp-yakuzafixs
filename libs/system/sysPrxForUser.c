@@ -282,6 +282,30 @@ s32 _sys_printf(const char* fmt, ...)
     return ret;
 }
 
+/* The abort half of the Cell SDK's internal assertion macro. Every one of its
+ * 80 call sites in libsre is the same two-instruction pair: _sys_printf with
+ * the "PS3 SDK INTERNAL ASSERTION FAILURE" format, then this with a short
+ * message -- "Aborted.", or "The SPURS is aborted." when SPURS is the one
+ * giving up. One argument, a guest pointer to that message.
+ *
+ * It is not noreturn. The compiler emits an ordinary return sequence after
+ * each call, because on retail hardware with no debugger attached the trap is
+ * taken, ignored, and the caller unwinds itself -- which is why a title whose
+ * SPURS has aborted goes on to walk its own call chain, print it, and exit the
+ * thread rather than stopping here.
+ *
+ * So printing the message and returning is the faithful behaviour, not a stub
+ * standing in for something better. What it changes is that the abort is
+ * legible: without it the call is an unresolved NID answering CELL_ENOSYS in a
+ * trace, three lines after the assertion text that explains it, with nothing
+ * connecting the two. */
+s32 _sys_trap_process(const char* msg)
+{
+    const char* m = (const char*)yz_g2h(msg);
+    printf("[PS3] %s", m ? m : "(trap)\n");
+    return CELL_OK;
+}
+
 s32 _sys_sprintf(char* buf, const char* fmt, ...)
 {
     va_list ap; va_start(ap, fmt);
