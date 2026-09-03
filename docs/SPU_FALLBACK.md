@@ -1,21 +1,140 @@
-# SPU PPU Fallback API
+# Running SPU threads
 
-ps3recomp does not execute SPU code (no SPU ISA JIT, no SPU local-store
-model). For most games this is fine — many SPU jobs produce side effects
-that nothing actually depends on, or the PPU code is happy when the
-group reports "all threads exited cleanly".
+`sys_spu_thread_group_start` has three ways to run an SPU thread, and it
+tries them in this order:
 
-Some games need real SPU output: PhyreEngine asset decompressors, audio
-mixers, particle simulations, physics. Stubbing those silently leaves
-PPU code reading garbage.
+1. **Lifted SPU code** -- the image's own program, recompiled to C by the
+   SPU lifter and registered with `spu_register_function`. This is the
+   faithful path and the one a title with a SPURS kernel needs. See
+   [Starting a thread on lifted code](#starting-a-thread-on-lifted-code).
+2. **A PPU fallback** -- a host-side stand-in registered for the image's
+   entry point, for a job whose *output* you can produce without running
+   its code. See [PPU fallback API](#ppu-fallback-api).
+3. **The interpreter** -- `RD_SPU_INTERP=1` interprets an image that has
+   neither of the above, straight out of local store.
+
+A thread whose image matches none of the three completes instantly with
+status 0. For many games that is fine: a lot of SPU work produces side
+effects nothing depends on, and the PPU code is happy once the group
+reports "all threads exited cleanly". It is not fine for a game that needs
+real SPU output -- PhyreEngine asset decompressors, audio mixers, particle
+simulations, physics, and anything downstream of a SPURS kernel -- because
+stubbing those leaves PPU code reading garbage, or waiting forever.
+
+In all three cases the thread runs on a host thread of its own, so a group
+has real concurrency, and `sys_spu_thread_group_join` blocks until every
+one of them is done.
+
+## Starting a thread on lifted code
+
+`sys_spu_thread_group_start` asks the lifted-code registry whether it has a
+function at the thread's entry point (the entry the `sys_spu_image` at
+`img_ea+4` declares, which `_sys_spu_image_import` filled in from the ELF).
+If it does, that thread runs the real program.
+
+### Registering an image
+
+The lifter emits a `spu_recomp_register()` per image. A title calls
+`spu_begin_image(id)` first, so every function that image registers is
+keyed on `(LS address, image id)` rather than the address alone:
+
+```c
+spu_begin_image(16);  spu_recomp_register_kernel();   /* SPURS kernel */
+spu_begin_image(2);   spu_recomp_register_policy();   /* taskset policy module */
+spu_begin_image(3);   spu_recomp_register_gstask();   /* a geometry task */
+spu_begin_image(0);                                   /* back to the wildcard */
+```
+
+The ids matter because SPURS loads its kernel, its policy modules and its
+job binaries at **overlapping local-store addresses** at different times.
+Image 0 is a wildcard that matches anything, which is right for a title
+with one image and wrong for a title with several: a lookup that falls back
+to it can serve another image's function at the same address, and the job
+then runs the wrong program end to end and returns cleanly.
+`spu_lookup` reports that substitution on stderr as `CROSS-IMAGE dispatch`.
+
+A thread therefore **starts in the image its entry point belongs to**, which
+the runtime asks the registry for (`spu_image_of_function`). Nothing in the
+lv2 layer knows any image ids.
+
+For code that is streamed into local store at run time -- SPURS job binaries,
+codec overlays -- the image is selected by **where the code came from**
+rather than by where it landed. A title registers each overlay's source
+effective address:
+
+```c
+spu_overlay_register_source(0x02023680, /* image */ 2);
+```
+
+and the MFC GET path recognises that EA, records the overlay as resident in
+that context, and dispatch resolves a missed lookup against it
+(`spu_context.resident_ovl`). `spu_overlay_register_sig` does the same by
+content signature for a binary whose source EA is not stable.
+
+### What the thread is handed
+
+```
+spu_context (heap-allocated per thread, freed at group_destroy)
+  ls[256 KB]   the image's segments, deployed from the sys_spu_image:
+               COPY segments memcpy'd from their source EA, FILL segments
+               memset to their value, INFO not loaded
+  pc           the image's entry point
+  image_id     the image the registry says owns that entry point
+  gpr[3..6]    sys_spu_thread_argument's four u64s, one per register, each
+               in the register's PREFERRED DOUBLEWORD (lanes 0 and 1)
+  spu_id       the tid from sys_spu_thread_initialize
+  spu_group_id the parent group
+```
+
+The arguments are **copied when the thread is initialized**, not read when
+the group starts. lv2 copies them at initialize, and a title reuses one
+guest argument block for every thread in a group, rewriting it between
+calls; reading it lazily hands every thread the last thread's values.
+`sys_spu_thread_set_argument` re-copies them.
+
+`r1` is deliberately left at zero. An SPU image's own crt sets its stack up
+and lv2 does not. (The job helpers in `spu_lifted_job.h` do seed `r1`,
+because they enter a lifted function directly rather than starting a
+thread -- a different ABI, see below.)
+
+### How the thread ends
+
+The SPU-side `sys_spu_thread_exit` ABI writes the status to `SPU_WrOutMbox`
+and then executes `stop 0x102`. The stop code is the selector, not the
+status (CBEA p97, `SPU_Status.StopCode`):
+
+| stop code | meaning | where the mailbox value goes |
+|---|---|---|
+| `0x102` | `THREAD_EXIT` | this thread's exit status |
+| `0x101` | `GROUP_EXIT` | the group's exit status, cause `GROUP_EXIT` |
+| anything else, or a halt | a fault | thread exits 0, caller is told |
+
+`sys_spu_thread_group_join` collects the worst (most negative) thread status
+into the group's, unless a thread reported `GROUP_EXIT` or a terminate set
+`TERMINATED`, in which case that cause and its status stand.
+
+### Local store
+
+A thread running lifted code owns its local store inside its `spu_context`,
+and `sys_spu_thread_read_ls` / `_write_ls` and `spu_thread_get_local_store`
+all reach that same 256 KB -- so the PPU reads what the SPU actually wrote.
+A thread on the fallback or interpreter paths gets the separate lazily
+allocated buffer described under [Local store](#local-store-1) below.
+
+### Where it lives
+
+| File | What |
+|---|---|
+| `runtime/spu/spu_lifted_thread.c` | image deploy, argument registers, image selection, run, exit classification |
+| `runtime/syscalls/lv2_register.c` | the group state machine, the host threads, the completion events |
+| `runtime/spu/spu_channels.c` | the function registry, `spu_indirect_branch`, `spu_run_with_halt` |
+| `runtime/spu/tests/test_spu_lifted_start.c` | a two-thread group on a synthetic image, with no guest |
+
+## PPU fallback API
 
 The SPU PPU-fallback registry lets a per-game shim provide a PPU-side
-implementation for any SPU job, keyed on the SPU image's entry point.
-When the game starts a thread group, threads with a matching fallback
-run on a host thread (real concurrency); `sys_spu_thread_group_join`
-blocks until they're all done.
-
-## API
+implementation for any SPU job, keyed on the SPU image's entry point, for
+images that have no lifted code.
 
 `#include "ps3emu/spu_fallback.h"`
 
@@ -84,12 +203,18 @@ Find the entry point via the `[SPU] image_open` log:
 
 - Synchronous registration; not thread-safe. Call all
   `spu_register_ppu_fallback()` once at startup.
+- A fallback is only consulted for an image with **no lifted code**. If
+  the registry has a function at the entry point, that runs instead; a
+  fallback registered for the same entry point is not reached.
 - Asynchronous execution. `sys_spu_thread_group_start` spawns one host
   thread per registered fallback (Win32 `CreateThread`, POSIX
-  `pthread_create`). Threads without a fallback complete instantly with
+  `pthread_create`), with the same reserved stack a lifted thread gets.
+  Threads with neither a fallback nor lifted code complete instantly with
   status 0.
 - `sys_spu_thread_group_join` blocks on each running thread's completion
-  event, then collects the worst exit status into the group state.
+  event, then collects the worst exit status into the group state -- unless
+  a thread reported `GROUP_EXIT`, or a terminate set `TERMINATED`, in
+  which case that cause and its status stand.
 - `sys_spu_thread_get_exit_status` returns CELL_ESTAT (0x80010003) if the
   thread is still in flight — match Sony's documented behaviour.
 
@@ -99,6 +224,11 @@ Each SPU thread has a virtual 256 KB local store, allocated lazily on
 first `sys_spu_thread_write_ls` / `_read_ls` syscall (or on first
 `spu_thread_get_local_store` call). PPU code uses the syscalls; the
 fallback handler reaches the same buffer via `spu_thread_get_local_store(tid)`.
+
+A thread running lifted code is the exception: its local store is the one
+inside its `spu_context`, because that is what the SPU code reads and
+writes, and all three of those entry points hand that back instead. The
+buffer is freed at `sys_spu_thread_group_destroy` either way.
 
 Typical pattern:
 
@@ -146,3 +276,9 @@ The buffer is freed when `sys_spu_thread_group_destroy` runs.
   the dispatch site in `sys_spu_thread_group_start_handler`.
 - `include/ps3emu/spu_fallback.h` — public header.
 - `runtime/syscalls/spu_fallback.c` — registry implementation.
+- `runtime/spu/spu_lifted_thread.{c,h}` -- starting a thread on lifted code.
+- `runtime/spu/spu_lifted_job.h` -- a different ABI for a different job:
+  running one lifted function as a SPURS *task* or job body, which takes a
+  descriptor EA in `r3` and seeds `r1`, rather than starting a thread.
+- `docs/SPU_LIFTER.md` -- how the lifted C is generated, and what
+  `spu_register_function` is called with.
