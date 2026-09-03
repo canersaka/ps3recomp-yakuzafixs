@@ -159,6 +159,12 @@ jobs:
           # plausible and still fails here. Exercises rsx_texture_layout and
           # rsx_texture_decode end to end with no GPU involved.
           ./build/ps3recomp_host --tex
+          # A polygon and a quad strip, neither of which any host API draws:
+          # both have to be expanded into triangles first. The pentagon is
+          # green and the strip red over it, and the centre pixel belongs to
+          # the strip's second quad, so a dropped or half-expanded strip is
+          # green and fails.
+          ./build/ps3recomp_host --quads
           # No graphics: create a guest PPU thread through the lv2 path and
           # check the host stack it got. A recompiled call chain nests on the
           # host stack one frame per guest call, so the default stack is not

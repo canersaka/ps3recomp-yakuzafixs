@@ -259,7 +259,9 @@ u64  rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash);
 
 /* How many indices the topology expansion produces for `source_refs`
  * references cut at `cuts`, and the indices themselves. `indices` must have
- * room for the count. Triangle strips alternate winding per segment. */
+ * room for the count. Triangle strips alternate winding per segment; a quad
+ * strip pairs its vertices from each segment's own start, and a polygon is a
+ * fan around each segment's own first vertex. */
 u32  rsx_draw_engine_topology_index_count(u32 primitive, u32 source_refs,
                                           const u32* cuts, u32 cut_count);
 void rsx_draw_engine_write_topology_indices(u32 primitive, u32 source_refs,

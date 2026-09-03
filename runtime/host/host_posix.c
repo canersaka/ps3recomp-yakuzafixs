@@ -320,6 +320,50 @@ static void upload_depth_triangles(void)
             guest_f32(IO_ADDR + ZVTX_OFFSET + (uint32_t)(i * 32 + k * 4), v[i][k]);
 }
 
+/* --quads: the two primitives that have no host equivalent and are not simply
+ * a list of quads -- a POLYGON and a QUAD_STRIP -- one drawn over the other.
+ *
+ * The polygon is a convex pentagon large enough to contain the whole viewport
+ * and it is GREEN; the quad strip covers the viewport in RED and is drawn
+ * after it, so the centre pixel is red only if the strip was expanded and
+ * rasterised. Its seam sits left of centre on purpose: the centre belongs to
+ * the SECOND quad, so an expansion that emitted the first one and stopped
+ * leaves the pentagon's green there rather than passing by accident.
+ *
+ * The pixel proves the strip. The polygon is what a renderer that drops it
+ * shows nothing of, and its own expansion -- vertex by vertex, restart cuts
+ * included -- is asserted in libs/video/tests/test_rsx_draw_engine.c.
+ *
+ * Layout as upload_triangle's: float4 position, float4 colour, stride 32, and
+ * no vertex program, so the coordinates land in NDC unchanged. */
+#define QVTX_OFFSET  (VTX_OFFSET + 0x4000u)
+#define QSTRIP_OFFSET (QVTX_OFFSET + 0x100u)
+static void upload_quad_geometry(void)
+{
+    static const float poly[5][8] = {
+        {  0.0f,  3.0f, 0.0f, 1.0f,   0.0f, 1.0f, 0.0f, 1.0f },
+        { -3.0f,  1.0f, 0.0f, 1.0f,   0.0f, 1.0f, 0.0f, 1.0f },
+        { -2.0f, -3.0f, 0.0f, 1.0f,   0.0f, 1.0f, 0.0f, 1.0f },
+        {  2.0f, -3.0f, 0.0f, 1.0f,   0.0f, 1.0f, 0.0f, 1.0f },
+        {  3.0f,  1.0f, 0.0f, 1.0f,   0.0f, 1.0f, 0.0f, 1.0f },
+    };
+    /* Three pairs of vertices, so two quads: x in [-1,-0.5] and [-0.5,1]. */
+    static const float strip[6][8] = {
+        { -1.0f, -1.0f, 0.0f, 1.0f,   1.0f, 0.0f, 0.0f, 1.0f },
+        { -1.0f,  1.0f, 0.0f, 1.0f,   1.0f, 0.0f, 0.0f, 1.0f },
+        { -0.5f, -1.0f, 0.0f, 1.0f,   1.0f, 0.0f, 0.0f, 1.0f },
+        { -0.5f,  1.0f, 0.0f, 1.0f,   1.0f, 0.0f, 0.0f, 1.0f },
+        {  1.0f, -1.0f, 0.0f, 1.0f,   1.0f, 0.0f, 0.0f, 1.0f },
+        {  1.0f,  1.0f, 0.0f, 1.0f,   1.0f, 0.0f, 0.0f, 1.0f },
+    };
+    for (int i = 0; i < 5; i++)
+        for (int k = 0; k < 8; k++)
+            guest_f32(IO_ADDR + QVTX_OFFSET + (uint32_t)(i * 32 + k * 4), poly[i][k]);
+    for (int i = 0; i < 6; i++)
+        for (int k = 0; k < 8; k++)
+            guest_f32(IO_ADDR + QSTRIP_OFFSET + (uint32_t)(i * 32 + k * 4), strip[i][k]);
+}
+
 /* The fragment programs live in guest memory, where SET_SHADER_PROGRAM points
  * the RSX at them, stored the way rsx_fp_read_word expects (big-endian,
  * half-words swapped). Each is one instruction, 16 bytes:
@@ -554,6 +598,27 @@ static void emit_depth_draw(void)
     emit(NV4097_SET_BEGIN_END, 0u);
 }
 
+/* The pentagon, then the quad strip over it. Both are fixed-function, so
+ * every backend can run this mode. */
+static void emit_quad_draws(void)
+{
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, VTX_MAIN(QVTX_OFFSET +  0));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0 * 4, VFMT(4, 32));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4, VTX_MAIN(QVTX_OFFSET + 16));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 3 * 4, VFMT(4, 32));
+    emit(NV4097_SET_BEGIN_END, RSX_PRIMITIVE_POLYGON);
+    emit(NV4097_DRAW_ARRAYS,   0u | ((5u - 1u) << 24));   /* first=0 count=5 */
+    emit(NV4097_SET_BEGIN_END, 0u);
+
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, VTX_MAIN(QSTRIP_OFFSET +  0));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0 * 4, VFMT(4, 32));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4, VTX_MAIN(QSTRIP_OFFSET + 16));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 3 * 4, VFMT(4, 32));
+    emit(NV4097_SET_BEGIN_END, RSX_PRIMITIVE_QUAD_STRIP);
+    emit(NV4097_DRAW_ARRAYS,   0u | ((6u - 1u) << 24));   /* first=0 count=6 */
+    emit(NV4097_SET_BEGIN_END, 0u);
+}
+
 /* Append this frame's commands to the ring and advance `put`, exactly as a
  * title does. The RSX's `get` pointer lives inside cellGcmSys and chases `put`;
  * it is never rewound, so each frame must occupy fresh ring space rather than
@@ -571,7 +636,8 @@ static void submit_frame(int with_draw)
     } else {
         emit(NV4097_CLEAR_SURFACE,            0xF0u);
     }
-    if (with_draw == 6)      emit_rtt_draws();
+    if (with_draw == 7)      emit_quad_draws();
+    else if (with_draw == 6) emit_rtt_draws();
     else if (with_draw == 5) emit_mip_draw();
     else if (with_draw == 4) emit_depth_draw();
     else if (with_draw == 3) emit_shader_draw();
@@ -771,6 +837,31 @@ static int run_audio_pad_check(void)
     return rc;
 }
 
+/* Which modes need a backend that translates the guest's own programs. --tex
+ * is not one of them: the null backend samples the texture in its own
+ * software path, which is why Linux runs that mode and not these. */
+static int mode_needs_translator(int mode)
+{
+    return mode == 3 || mode == 5 || mode == 6;
+}
+
+/* ...and which ones must, on a backend that has a translator, have run the
+ * guest's programs rather than the built-in pair. */
+static int mode_runs_guest_programs(int mode)
+{
+    return mode == 2 || mode_needs_translator(mode);
+}
+
+static const char* mode_flag_name(int mode)
+{
+    switch (mode) {
+    case 3:  return "--shader";
+    case 5:  return "--mip";
+    case 6:  return "--rtt";
+    default: return "(mode)";
+    }
+}
+
 int main(int argc, char** argv)
 {
     /* frames = 0 runs until the window is closed, which is what the .app
@@ -818,13 +909,17 @@ int main(int argc, char** argv)
          * sample it, which is what a title does for every reflection, shadow
          * map and post-processing pass. Needs the guest-program path. */
         else if (strcmp(argv[i], "--rtt") == 0)    do_draw = 6;
+        /* --quads: a POLYGON and a QUAD_STRIP, the two primitives a host API
+         * has no equivalent of that are not simply a list of quads. Both have
+         * to be expanded into triangles before they can be drawn at all.
+         * Fixed-function, so every backend can run it. */
+        else if (strcmp(argv[i], "--quads") == 0)  do_draw = 7;
     }
     /* The guest-program modes, which a backend without a translator cannot
-     * run. --depth sits between them and is not one: it is fixed-function. */
-    if ((do_draw == 3 || do_draw >= 5) && !HOST_BACKEND_GUEST_SHADERS) {
+     * run. --depth and --quads are not among them: both are fixed-function. */
+    if (mode_needs_translator(do_draw) && !HOST_BACKEND_GUEST_SHADERS) {
         printf("[host] %s: the %s backend runs no guest programs; nothing to check\n",
-               do_draw == 6 ? "--rtt" : do_draw == 5 ? "--mip" : "--shader",
-               HOST_BACKEND_NAME);
+               mode_flag_name(do_draw), HOST_BACKEND_NAME);
         return 0;
     }
 
@@ -853,7 +948,8 @@ int main(int argc, char** argv)
     if (do_draw == 5) { upload_mip_texture(); upload_mip_quad(); }
     /* --rtt draws both: the triangle into the surface, the quad out of it. */
     if (do_draw == 6) { upload_triangle(); upload_textured_quad(); upload_rtt_backing(); }
-    if (do_draw == 2 || do_draw == 3 || do_draw >= 5) upload_fragment_programs();
+    if (do_draw == 7) upload_quad_geometry();
+    if (mode_runs_guest_programs(do_draw)) upload_fragment_programs();
     submit_frame(do_draw);
 
     u32 got = host_backend_color();
@@ -892,9 +988,13 @@ int main(int argc, char** argv)
          * red exists nowhere but in the offscreen surface the first draw
          * rendered into: the quad's own vertices are green, and so are the
          * guest bytes behind the surface, so anything that skips the
-         * render-to-texture path shows green.
+         * render-to-texture path shows green. With --quads it is the quad
+         * strip's red over the pentagon's green, and the centre belongs to
+         * the strip's second quad, so a dropped or half-expanded strip is
+         * green.
          */
-        u32 want = (do_draw == 6) ? 0xFFFF0000u   /* only the surface holds red  */
+        u32 want = (do_draw == 7) ? 0xFFFF0000u   /* the quad strip over the polygon */
+                 : (do_draw == 6) ? 0xFFFF0000u   /* only the surface holds red  */
                  : (do_draw == 5) ? MIP_L1_ARGB
                  : (do_draw == 4) ? 0xFFFF0000u   /* near red beats far green    */
                  : (do_draw == 3) ? 0xFFFF0000u   /* blue vertices, FP swaps r/b */
@@ -905,7 +1005,7 @@ int main(int argc, char** argv)
                back, want, (back & 0x00FFFFFFu) == (want & 0x00FFFFFFu) ? "OK" : "MISMATCH");
         if ((back & 0x00FFFFFFu) != (want & 0x00FFFFFFu)) rc = 3;
     }
-    if ((do_draw == 2 || do_draw == 3 || do_draw >= 5) && HOST_BACKEND_GUEST_SHADERS) {
+    if (mode_runs_guest_programs(do_draw) && HOST_BACKEND_GUEST_SHADERS) {
         /* The pixel alone cannot prove the programs ran: a backend that
          * ignored them would draw the triangle blue, which the check above
          * catches, but one that ran the vertex program and dropped the
