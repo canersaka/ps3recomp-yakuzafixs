@@ -270,6 +270,34 @@ The buffer is freed when `sys_spu_thread_group_destroy` runs.
 - The args_size parameter is currently always 0. If your job needs to
   know the descriptor size, encode it in the descriptor itself.
 
+## Lock-line coherence
+
+A thread running lifted code shares 128-byte lines with the PPU and with the
+other SPUs, and `GETLLAR` / `PUTLLC` is how the SPURS kernel arbitrates them. A
+store by any other processor into a reserved line has to break that reservation
+and raise `SPU_EVENT_LR` on the SPU holding it, or the SPU sleeps through the
+write and a pending `PUTLLC` commits against a line that has already moved.
+
+Both writers do it. The PPU store paths consult the reserved-line bitmap and
+notify under the lock-line lock. On the SPU side a committing `PUTLLC`, a
+`PUTLLUC` and a plain DMA `PUT` into a reserved line notify the same way, from
+inside the same lock: five SPURS kernel threads share one management line, so
+another SPU is usually the processor doing the writing. A fallback needs
+nothing for any of this, because its guest writes go through `vm_write*` and
+those are already the coherent paths.
+
+Three parts of the reference implementation are deliberately left out: the
+per-line write generation counter, the `GETLLAR` path that serves a cached copy
+of the line instead of re-reading it, and the backoff ladder on a repeated
+same-line `GETLLAR`. They are one mechanism in three parts, and only the
+backoff motivates the other two. `GETLLAR` here always re-reads the line under
+the lock, which is what the first macOS boot measured SPURS dispatch working
+on, so it already observes a write that landed while no reservation was live
+and there is no dropped edge for a generation counter to recover. If a backoff
+is ever added, all three come back together.
+
+Described in full under "Lock-Line Coherence" in `docs/RUNTIME.md`.
+
 ## Related
 
 - `runtime/syscalls/lv2_register.c` — SPU group/thread state machine and

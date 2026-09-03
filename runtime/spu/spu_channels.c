@@ -473,6 +473,20 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         if (ctx->resv_valid && ctx->resv_ea == ea &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
+            /* A committing PUTLLC is a line write like any other, so every
+             * PEER reservation on it is lost and its SPU takes SPU_EVENT_LR.
+             * Silent, this is the same lost update the PPU half was added to
+             * close, with an SPU on the writing side: a peer is never told to
+             * re-read, so it goes on polling a line it believes it still owns,
+             * and a peer parked on RdEventStat sleeps through the commit it
+             * was waiting for.
+             *
+             * Our own reservation is dropped FIRST so the notify does not
+             * raise a self-LR: hardware CONSUMES the reservation on a
+             * successful PUTLLC, it does not report it lost. Already under the
+             * lock-line lock, which is what spu_coh_notify_write expects. */
+            ctx->resv_valid = 0;
+            spu_coh_notify_write(ea);
             ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
         } else {
             ctx->atomic_stat = 1;                      /* PUTLLC_FAILURE -> retry */
@@ -500,6 +514,12 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     case MFC_PUTQLLUC_CMD:
         spu_lockline_lock();
         memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
+        /* Unconditional, so it invalidates EVERY reservation on the line --
+         * this SPU's included, which is why the notify runs before the
+         * bookkeeping below rather than after it. A peer left holding a
+         * reservation here would commit a PUTLLC against a snapshot this store
+         * has already overwritten. */
+        spu_coh_notify_write(ea);
         ctx->resv_valid = 0; ctx->atomic_stat = 0;
         spu_lockline_unlock();
         return 1;

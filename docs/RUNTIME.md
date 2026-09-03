@@ -378,11 +378,11 @@ spu_channel_has_data(&ch)       // Check if channel has data
 | 29 | `SPU_RdInMbox` | Read | Read inbound mailbox (PPU → SPU) |
 | 30 | `SPU_WrOutIntrMbox` | Write | Write outbound interrupt mailbox |
 
-### Lock-Line Coherence (PPU ↔ SPU)
+### Lock-Line Coherence
 
-**Files:** `runtime/spu/spu_coherency.c`, `runtime/spu/spu_channels.c`, `runtime/ppu/ppu_memory.h`, `runtime/ppu/ppu_loader.cpp`
+**Files:** `runtime/spu/spu_coherency.c`, `runtime/spu/spu_channels.c`, `runtime/spu/spu_dma.h`, `runtime/ppu/ppu_memory.h`, `runtime/ppu/ppu_loader.cpp`
 
-An SPU takes a reservation on a 128-byte line with the MFC command `GETLLAR`, and commits it with `PUTLLC`, which succeeds only if the line has not changed meanwhile. The SPU half of that is local bookkeeping (`resv_ea`, `resv_valid`, `resv_line` on the context, compared under a lock). The half that needs the PPU is the other side of the contract: on real hardware a store by any other processor to a reserved line kills the reservation and raises `SPU_EVENT_LR` (0x400) on the reserving SPU. That event is how a SPURS idle service parked in `rdch SPU_RdEventStat` learns the PPU has posted work. Without it the SPU stays asleep and the workload is never dispatched.
+An SPU takes a reservation on a 128-byte line with the MFC command `GETLLAR`, and commits it with `PUTLLC`, which succeeds only if the line has not changed meanwhile. The SPU half of that is local bookkeeping (`resv_ea`, `resv_valid`, `resv_line` on the context, compared under a lock). The other side of the contract is what every other processor owes it: on real hardware a store by anyone else to a reserved line kills the reservation and raises `SPU_EVENT_LR` (0x400) on the reserving SPU. That event is how a SPURS idle service parked in `rdch SPU_RdEventStat` learns work has been posted. Without it the SPU stays asleep and the workload is never dispatched. Both writers owe it: the PPU, and any other SPU.
 
 Two things make that work:
 
@@ -404,11 +404,17 @@ if (spu_coh_is_reserved(addr)) {
 
 This sits in four places, covering every guest store: the inline `vm_write8/16/32/64` in `ppu_memory.h` (HLE modules, including the SPURS ones that write the management structures), the out-of-line `vm_write8/16/32/64` in `ppu_loader.cpp` (recompiled guest code), and the successful commit inside `ppu_stwcx`/`ppu_stdcx` and `ppu_stwcx32`/`ppu_stdcx64`. The lifter emission is unchanged: it already routes stores and store-conditionals through those functions.
 
+An SPU is the other writer, and it reaches the same `spu_coh_notify_write`. This matters more than it sounds: five SPURS kernel threads share one management line, so an SPU is usually the processor on the writing side. A committing `PUTLLC` and a `PUTLLUC` in `spu_channels.c` are already inside the lock-line lock and notify from where they are. A plain DMA `PUT` in `spu_dma.h`'s `mfc_do_transfer` scans the 128-byte lines its span covers, and when any of them is reserved it takes the lock for the copy and the notify together, which is also what stops the copy landing inside a peer's compare-and-commit window. Spans that touch no reserved line keep the lock-free copy, because bulk asset PUTs are large and hot.
+
+The two atomic writers differ in what they do about the writer's own reservation. `PUTLLC` drops it before notifying, so the committer takes no event: hardware consumes a reservation on a successful commit rather than reporting it lost. `PUTLLUC` is unconditional and made no compare, so it invalidates every reservation on the line including its own and the issuer is told along with everyone else.
+
 `spu_coh_is_reserved` reads a global that stays zero until an SPU reserves its first line, so a title that runs no SPU code pays one predictable branch per store and never touches the bitmap.
 
 `g_spu_lr_raise` counts the events delivered. A SPURS service that never wakes with that counter at zero is a coherence miss; nonzero moves the question downstream to selection and dispatch.
 
-Covered by `runtime/spu/tests/test_spu_coherency.c`, which drives the real PPU store path and asserts the event both fires and stays quiet in the not-reserved and different-line cases.
+Three pieces of the reference implementation this was mirrored from are deliberately absent: the per-line write generation counter, the `GETLLAR` path that serves a cached copy of the line instead of re-reading it, and the backoff ladder on a repeated same-line `GETLLAR`. They are one mechanism in three parts. The backoff exists to get a spinning SPU off the lock-line lock; skipping the re-read is what makes the backoff cheap; and the generation counter exists so a `GETLLAR` that skipped the re-read can still tell that the line moved while nobody held a reservation. Here `GETLLAR` always re-reads memory under the lock, which is what the first macOS boot measured SPURS dispatch working on, so that re-read already carries the edge and there is nothing for a generation to recover. If a backoff is ever added, all three come back together.
+
+Covered by `runtime/spu/tests/test_spu_coherency.c`, which drives the real PPU store path, and `runtime/spu/tests/test_spu_lockline_peer.c`, which drives the real SPU command path for the commit, the unconditional store and the plain PUT. Both assert the event fires and both assert it stays quiet in the not-reserved and different-line cases, because a notify that fires too eagerly is a livelock rather than a safe over-approximation.
 
 ---
 
