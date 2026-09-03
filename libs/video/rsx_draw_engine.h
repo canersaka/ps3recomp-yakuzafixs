@@ -29,6 +29,7 @@
 #define PS3RECOMP_RSX_DRAW_ENGINE_H
 
 #include "rsx_dispatch.h"
+#include "rsx_primitives.h"
 #include "rsx_texture_layout.h"
 #include "rsx_vertex_compact.h"
 
@@ -169,9 +170,13 @@ typedef struct rsx_draw_backend {
     void (*set_viewport)(void* user, float x, float y, float w, float h);
     void (*set_scissor)(void* user, u32 x, u32 y, u32 w, u32 h);
     void (*set_stencil_ref)(void* user, u32 ref);
-    /* One triangle-list draw. `indices` is NULL for a non-indexed draw. */
-    void (*draw)(void* user, const void* vertices, u32 vertex_count,
-                 u32 stride, const u32* indices, u32 index_count);
+    /* One draw. `indices` is NULL for a non-indexed one. Everything the
+     * hardware has and the host does not -- quads, quad strips, fans,
+     * polygons -- has already been expanded into a triangle list by the time
+     * it gets here, so the topology is only ever one a host API has. */
+    void (*draw)(void* user, rsx_topology topology, const void* vertices,
+                 u32 vertex_count, u32 stride, const u32* indices,
+                 u32 index_count);
 
     /* Clears, which are ordered against draws rather than folded into a pass:
      * a title draws the world, clears depth, and draws the weapon over it. */
