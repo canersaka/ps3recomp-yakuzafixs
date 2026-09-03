@@ -265,6 +265,11 @@ if(PS3RECOMP_BUILD_TESTS)
     # the suite runs everywhere -- and is the arm64 memory-model regression
     # net for the lv2 sync primitives.
     add_subdirectory(tests/sync_stress)
+    # cellFiber switches contexts with Windows fibers on Windows and ucontext
+    # everywhere else. Apple deprecated the ucontext routines and gates both
+    # them and the shape of ucontext_t on _XOPEN_SOURCE, so whether that path
+    # works on arm64 is a question to answer rather than assume.
+    add_subdirectory(tests/fiber_switch)
 endif()
 
 # ---------------------------------------------------------------------------

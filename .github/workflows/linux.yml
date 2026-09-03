@@ -192,3 +192,12 @@ jobs:
           cmake -S tests/sync_stress -B build-sync-stress -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           cmake --build build-sync-stress
           ./build-sync-stress/sync_stress
+
+      # cellFiber's cooperative switching on ucontext. glibc's ucontext_t is
+      # not the one that bites, but running the suite on both hosts is what
+      # tells a Darwin header problem from a logic error in the switch.
+      - name: Build and run fiber_switch
+        run: |
+          cmake -S tests/fiber_switch -B build-fiber -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          cmake --build build-fiber
+          ./build-fiber/fiber_switch
