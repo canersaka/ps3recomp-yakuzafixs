@@ -108,3 +108,9 @@ void ps3_ww_report_inline(unsigned int addr, unsigned long long val, int width)
 {
     (void)addr; (void)val; (void)width;
 }
+
+/* ppu_loader.cpp - the link register of the guest context the calling host
+ * thread is running, for the env-gated lwmutex trace in sysPrxForUser.c. A
+ * host with no guest has no such register; zero is what the trace prints for
+ * a caller it cannot name. */
+unsigned int ppu_active_lr(void) { return 0; }
