@@ -21,9 +21,16 @@
  *   RtlCaptureStackBackTrace -> backtrace(3)
  *   GetModuleHandleA(NULL)   -> dladdr(3) on this image, giving its load base
  *   GetModuleHandleExA(..FROM_ADDRESS..) -> dladdr(3) on the queried address
+ *   GetModuleFileNameA       -> the path dladdr(3) reports for that image
  *
  * A returned HMODULE is therefore a load base, not a Win32 module handle, and
  * is only ever valid to subtract. That is all the scaffold does with it.
+ *
+ * The W forms of those four are here as well, resolving through exactly the
+ * same calls. A runner reaches for them not because it has wide strings but
+ * because the W name is the one Win32 documents; the only place the character
+ * type matters at all is GetModuleFileNameW's output, and the note on it says
+ * what that conversion does and does not promise.
  *
  * The dbghelp names -- SymInitialize, SymFromAddr, SymCleanup -- are here too,
  * over the same dladdr, because a crash report that prints a raw RVA is worth
@@ -100,6 +107,8 @@ typedef const char* LPCSTR;
 typedef const char* PCSTR;
 typedef char*       LPSTR;
 typedef char        CHAR;
+typedef wchar_t*       LPWSTR;
+typedef const wchar_t* LPCWSTR;
 typedef int         BOOL;
 typedef uint32_t    DWORD;
 typedef uint32_t    ULONG;
@@ -137,6 +146,26 @@ static inline int GetModuleHandleExA(unsigned long flags, LPCSTR addr,
     if (!out) return 0;
     *out = (HMODULE)ps3__image_base_of((const void*)addr);
     return *out != NULL;   /* nonzero == success, as on Win32 */
+}
+
+/* The W forms answer the same questions. Nothing here reads the name argument,
+ * for the reason the A form does not, and the address the Ex form is given is
+ * an address whichever character type it was declared with -- a runner spells
+ * it LPCWSTR because that is the parameter Win32 declares, not because there
+ * is a string at the other end. */
+static inline HMODULE GetModuleHandleW(LPCWSTR name)
+{
+    (void)name;
+    return (HMODULE)ps3__image_base_of((const void*)(uintptr_t)&ps3__image_base_of);
+}
+
+static inline int GetModuleHandleExW(unsigned long flags, LPCWSTR addr,
+                                     HMODULE* out)
+{
+    (void)flags;
+    if (!out) return 0;
+    *out = (HMODULE)ps3__image_base_of((const void*)addr);
+    return *out != NULL;
 }
 
 /* Win32 counts `skip` from the CALLER of RtlCaptureStackBackTrace; backtrace(3)
@@ -246,6 +275,29 @@ static inline DWORD GetModuleFileNameA(HMODULE module, LPSTR buffer, DWORD size)
     if (n > (size_t)(size - 1)) n = (size_t)(size - 1);
     memcpy(buffer, info.dli_fname, n);
     buffer[n] = '\0';
+    return (DWORD)n;
+}
+
+/* Widened one byte to one wchar_t, which is the simple conversion and not the
+ * correct one: a UTF-8 path arrives as one wide character per BYTE, so a
+ * non-ASCII component prints as mojibake. Doing it properly means mbstowcs
+ * against a locale the process has usually not set, and the whole audience for
+ * this string is a crash-time "which module was that" line where a build path
+ * is ASCII in practice. Truncation matches the A form: what fits is written,
+ * terminated, and its length returned. */
+static inline DWORD GetModuleFileNameW(HMODULE module, LPWSTR buffer, DWORD size)
+{
+    if (!buffer || size == 0) return 0;
+    buffer[0] = L'\0';
+    const void* probe = module ? (const void*)module
+                              : (const void*)(uintptr_t)&ps3__image_base_of;
+    Dl_info info;
+    if (!dladdr(probe, &info) || !info.dli_fname) return 0;
+    size_t n = strlen(info.dli_fname);
+    if (n > (size_t)(size - 1)) n = (size_t)(size - 1);
+    for (size_t i = 0; i < n; i++)
+        buffer[i] = (wchar_t)(unsigned char)info.dli_fname[i];
+    buffer[n] = L'\0';
     return (DWORD)n;
 }
 
