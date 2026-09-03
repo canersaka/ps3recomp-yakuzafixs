@@ -37,7 +37,7 @@ extern u32 ppu_vm_size;
 
 #define ENG_MAX_SURFACES   64
 #define ENG_MAX_ZDEPTHS    64
-#define ENG_MAX_TEXTURES   1024
+#define ENG_MAX_TEXTURES   RSX_DRAW_ENGINE_TEXTURE_CACHE
 #define ENG_MAX_VTEXTURES  64
 #define ENG_MAX_PIPELINES  8192
 #define ENG_MAX_BATCHES    256
@@ -109,7 +109,7 @@ typedef struct {
     u64 last_use_serial;
 } eng_texture;
 
-typedef struct { u64 key; u32 handle; } eng_pipeline;
+typedef struct { u64 key; u32 handle; u8 fixed; } eng_pipeline;
 
 typedef struct { u32 first, count; } eng_batch;
 
@@ -905,8 +905,9 @@ static const char* const kEngFixedPS =
  * retried on every draw of every frame. */
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
-                            rsx_be_format rt_fmt)
+                            rsx_be_format rt_fmt, int* out_fixed)
 {
+    *out_fixed = 1;
     const u8* vp_uc = NULL;
     const u8* fp_uc = NULL;
     u32 vp_instrs = 0, fp_size = 0;
@@ -945,7 +946,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     key = rsx_draw_engine_hash_render_state(rs, key);
 
     for (u32 i = 0; i < g.n_pipelines; i++)
-        if (g.pipelines[i].key == key) return g.pipelines[i].handle;
+        if (g.pipelines[i].key == key) {
+            *out_fixed = g.pipelines[i].fixed;
+            return g.pipelines[i].handle;
+        }
     if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
 
     u32 handle = 0;
@@ -977,7 +981,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
 
     g.pipelines[g.n_pipelines].key = key;
     g.pipelines[g.n_pipelines].handle = handle;
+    g.pipelines[g.n_pipelines].fixed = (u8)fixed;
     g.n_pipelines++;
+    *out_fixed = fixed;
     return handle;
 }
 
@@ -1249,8 +1255,14 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
                                                     vsamplers);
 
+    /* A guest program pair that will not translate has no fallback: the draw
+     * is dropped, as the reference engine drops it. Substituting the built-in
+     * program would draw the geometry in the wrong colours, which is harder to
+     * see than a missing object and hides the translation failure. */
+    int pipeline_is_fixed = 1;
     const u32 pipeline = eng_pipeline_get(&layout, &rs,
-                                          eng_surface_format(sf.color_format));
+                                          eng_surface_format(sf.color_format),
+                                          &pipeline_is_fixed);
     if (!pipeline) return;
 
     if (indexed) {
@@ -1343,7 +1355,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 uploaded = indexed ? dc.n_verts : n_tri;
     g.be->draw(g.be->user, dc.verts, uploaded, layout.stride,
                indexed ? g.indices : NULL, indexed ? n_tri : 0);
-    g.guest_draws++;
+    /* Counted only when the draw ran the guest's OWN programs, which is what
+     * the test hook means: a draw through the built-in pair is a draw, not
+     * evidence that the decompile-translate-compile path worked. */
+    if (!pipeline_is_fixed) g.guest_draws++;
 
     if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write)
         g.zdepths[zslot].had_write = 1;

@@ -96,6 +96,11 @@ typedef struct rsx_be_render_state {
 #define RSX_BE_MAX_TEXTURES        RSX_DSP_NUM_TEXTURES
 #define RSX_BE_MAX_VERTEX_TEXTURES RSX_DSP_NUM_VERTEX_TEXTURES
 
+/* How many distinct guest textures the engine keeps before it evicts the
+ * least recently used one. Public so the eviction test can be exact about
+ * where the boundary is rather than assuming a number. */
+#define RSX_DRAW_ENGINE_TEXTURE_CACHE 1024
+
 /* ---- the backend interface ---------------------------------------------- */
 
 typedef struct rsx_draw_backend {
