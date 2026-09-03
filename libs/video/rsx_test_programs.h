@@ -122,6 +122,10 @@ static inline void rsx_test_vp_txl_out(u8* p, u32 input, u32 swz, u32 unit,
 #define RSX_TEST_FP_OPC(x)      ((u32)(x) << 24)
 #define RSX_TEST_FP_MASK_XYZW   (0xFu << 9)
 #define RSX_TEST_FP_END         1u
+/* Destination register. Left out of the helpers below, which all write r0,
+ * because that is the first colour export; the MRT program names r2, which
+ * is the second one under 32-bit exports. */
+#define RSX_TEST_FP_OUTREG(i)   ((u32)(i) << 1)
 #define RSX_TEST_FP_INSRC(x)    ((u32)(x) << 13)
 #define RSX_TEST_FP_INSRC_COL0  RSX_TEST_FP_INSRC(1)
 #define RSX_TEST_FP_INSRC_TC0   RSX_TEST_FP_INSRC(4)
@@ -164,6 +168,25 @@ static inline void rsx_test_fp_tex_r0_tc0(u8* p, u32 unit)
     rsx_test_fp_instr(p, RSX_TEST_FP_OPC(RSX_TEST_FP_OP_TEX) | RSX_TEST_FP_MASK_XYZW |
                          RSX_TEST_FP_INSRC_TC0 | RSX_TEST_FP_TEXU(unit) | RSX_TEST_FP_END,
                          RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+}
+
+/* MOV r0, COL0.swz0 ; MOV r2, COL0.swz1 ; END -- 32 bytes, two instructions.
+ *
+ * The smallest program that writes a second colour target: with 32-bit
+ * exports r0 is target A and r2 is target B, so the two swizzles come out on
+ * two different surfaces. Anything that drops the second export leaves B
+ * holding whatever the clear or the guest bytes put there, which is what the
+ * host's --mrt mode and the MSL test both key on. */
+static inline void rsx_test_fp_mrt_col0(u8* p, u32 swz0, u32 swz1)
+{
+    rsx_test_fp_instr(p + 0,
+                      RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
+                      RSX_TEST_FP_INSRC_COL0 | RSX_TEST_FP_OUTREG(0),
+                      RSX_TEST_FP_SRC_INPUT | swz0);
+    rsx_test_fp_instr(p + 16,
+                      RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
+                      RSX_TEST_FP_INSRC_COL0 | RSX_TEST_FP_OUTREG(2) | RSX_TEST_FP_END,
+                      RSX_TEST_FP_SRC_INPUT | swz1);
 }
 
 #endif /* PS3RECOMP_RSX_TEST_PROGRAMS_H */
