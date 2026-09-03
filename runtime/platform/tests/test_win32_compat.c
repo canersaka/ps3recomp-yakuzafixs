@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 
 static int g_pass, g_fail;
 #define CHECK(cond) do { if (cond) g_pass++; else { g_fail++; \
@@ -808,12 +809,46 @@ static void test_symbols(void)
     CHECK(sym->MaxNameLen == 255);                   /* the caller's cap is not touched */
     CHECK(!SymFromAddr(GetCurrentProcess(), (DWORD64)0x10, &disp, sym));   /* unmapped */
     CHECK(!SymFromAddr(GetCurrentProcess(), (DWORD64)(uintptr_t)&test_symbols, &disp, NULL));
-
-    char path[512];
-    DWORD n = GetModuleFileNameA(NULL, path, (DWORD)sizeof path);
-    CHECK(n > 0 && strlen(path) == n);
-    CHECK(GetModuleFileNameA(NULL, path, 0) == 0);
     CHECK(SymCleanup(GetCurrentProcess()));
+}
+
+/* ---- module handles and names -------------------------------------------- */
+static void test_module_names(void)
+{
+    /* A load base, not a Win32 handle: subtracting it from a frame address is
+     * the only thing it is good for, and both spellings must give the same one. */
+    HMODULE self = GetModuleHandleA(NULL);
+    CHECK(self != NULL);
+    CHECK(GetModuleHandleW(NULL) == self);
+
+    HMODULE from_a = NULL, from_w = NULL;
+    CHECK(GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             (LPCSTR)(uintptr_t)&test_module_names, &from_a));
+    CHECK(from_a == self);
+    CHECK(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             (LPCWSTR)(uintptr_t)&test_module_names, &from_w));
+    CHECK(from_w == self);
+    CHECK(!GetModuleHandleExW(0, (LPCWSTR)(uintptr_t)0x10, &from_w) && from_w == NULL);
+    CHECK(!GetModuleHandleExA(0, (LPCSTR)(uintptr_t)&self, NULL));   /* nowhere to answer */
+
+    char    narrow[512];
+    wchar_t wide[512];
+    DWORD na = GetModuleFileNameA(NULL, narrow, (DWORD)sizeof narrow);
+    DWORD nw = GetModuleFileNameW(NULL, wide, 512);
+    CHECK(na > 0 && strlen(narrow) == na);
+    CHECK(nw == na && wcslen(wide) == nw);
+    int widened = 1;
+    for (DWORD i = 0; i < na; i++)
+        if (wide[i] != (wchar_t)(unsigned char)narrow[i]) widened = 0;
+    CHECK(widened);                                  /* one wchar_t per byte */
+    CHECK(GetModuleFileNameW(self, wide, 512) == nw);   /* by handle: same image */
+
+    wchar_t clipped[4];
+    CHECK(GetModuleFileNameW(NULL, clipped, 4) == 3 && wcslen(clipped) == 3);
+    CHECK(GetModuleFileNameW(NULL, wide, 0) == 0);
+    CHECK(GetModuleFileNameA(NULL, narrow, 0) == 0);
 }
 
 /* ---- MSVC CRT and intrinsic spellings ------------------------------------ */
@@ -886,6 +921,7 @@ int main(void)
     test_virtual_query();
     test_exceptions();
     test_symbols();
+    test_module_names();
     test_msvc_compat();
     printf("win32_compat tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail;
