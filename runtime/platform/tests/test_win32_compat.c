@@ -7,8 +7,8 @@
  * joinable threads with exit codes and the CREATE_SUSPENDED gate,
  * WaitForMultipleObjects in both modes, WaitOnAddress, waitable timers,
  * timing, virtual memory, stopping a running thread and reading its
- * registers, the address-space queries, vectored exception handlers,
- * and the MSVC CRT spellings.
+ * registers, the address-space queries, vectored exception handlers, the
+ * dbghelp symbol names, and the MSVC CRT spellings.
  *
  * Build (any POSIX host):
  *   cc -std=gnu17 -Wall -Wextra -I runtime/platform \
@@ -17,6 +17,7 @@
  * Exit status is the number of failed checks, so it works as a CI step.
  */
 #include "../win32_compat.h"
+#include "../win32_backtrace.h"
 #include "../msvc_compat.h"
 
 #include <setjmp.h>
@@ -696,6 +697,35 @@ static void test_exceptions(void)
     CHECK(VirtualFree(g_veh_page, 0, MEM_RELEASE));
 }
 
+/* ---- symbols ------------------------------------------------------------- */
+static void test_symbols(void)
+{
+    CHECK(SymInitialize(GetCurrentProcess(), NULL, TRUE));
+
+    char buf[sizeof(SYMBOL_INFO) + 256];
+    SYMBOL_INFO* sym = (SYMBOL_INFO*)buf;
+    memset(buf, 0, sizeof buf);
+    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+    sym->MaxNameLen   = 255;
+    DWORD64 disp = 0xDEAD;
+    BOOL ok = SymFromAddr(GetCurrentProcess(), (DWORD64)(uintptr_t)&test_symbols, &disp, sym);
+    /* Whether a name comes back at all is the platform's business -- dladdr on
+     * Linux sees only exported symbols -- but where one does it is this one. */
+    CHECK(!ok || strstr(sym->Name, "test_symbols") != NULL);
+    CHECK(!ok || (sym->Address != 0 && disp < 0x10000));
+    CHECK(!ok || sym->NameLen == (ULONG)strlen(sym->Name));
+    CHECK(ok || disp == 0);                          /* a miss still zeroes it */
+    CHECK(sym->MaxNameLen == 255);                   /* the caller's cap is not touched */
+    CHECK(!SymFromAddr(GetCurrentProcess(), (DWORD64)0x10, &disp, sym));   /* unmapped */
+    CHECK(!SymFromAddr(GetCurrentProcess(), (DWORD64)(uintptr_t)&test_symbols, &disp, NULL));
+
+    char path[512];
+    DWORD n = GetModuleFileNameA(NULL, path, (DWORD)sizeof path);
+    CHECK(n > 0 && strlen(path) == n);
+    CHECK(GetModuleFileNameA(NULL, path, 0) == 0);
+    CHECK(SymCleanup(GetCurrentProcess()));
+}
+
 /* ---- MSVC CRT and intrinsic spellings ------------------------------------ */
 static __declspec(thread) int t_tls_probe;
 
@@ -764,6 +794,7 @@ int main(void)
     test_thread_control();
     test_virtual_query();
     test_exceptions();
+    test_symbols();
     test_msvc_compat();
     printf("win32_compat tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail;
