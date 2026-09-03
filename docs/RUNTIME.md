@@ -251,6 +251,8 @@ ppu_xer_get_byte_count(ctx) // Read string instruction byte count
 
 The `reserve_addr`, `reserve_value`, and `reserve_valid` fields implement the PowerPC atomic compare-and-swap pattern used by `lwarx`/`stwcx.` instructions. The recompiled code sets a reservation on `lwarx` and checks/clears it on `stwcx.`.
 
+An SPU can hold a reservation on the same memory, and then the PPU store paths have obligations to it. See "Lock-Line Coherence" under SPU Execution Context.
+
 ### Stack Setup
 
 ```c
@@ -358,6 +360,38 @@ spu_channel_has_data(&ch)       // Check if channel has data
 | 28 | `SPU_WrOutMbox` | Write | Write outbound mailbox (SPU → PPU) |
 | 29 | `SPU_RdInMbox` | Read | Read inbound mailbox (PPU → SPU) |
 | 30 | `SPU_WrOutIntrMbox` | Write | Write outbound interrupt mailbox |
+
+### Lock-Line Coherence (PPU ↔ SPU)
+
+**Files:** `runtime/spu/spu_coherency.c`, `runtime/spu/spu_channels.c`, `runtime/ppu/ppu_memory.h`, `runtime/ppu/ppu_loader.cpp`
+
+An SPU takes a reservation on a 128-byte line with the MFC command `GETLLAR`, and commits it with `PUTLLC`, which succeeds only if the line has not changed meanwhile. The SPU half of that is local bookkeeping (`resv_ea`, `resv_valid`, `resv_line` on the context, compared under a lock). The half that needs the PPU is the other side of the contract: on real hardware a store by any other processor to a reserved line kills the reservation and raises `SPU_EVENT_LR` (0x400) on the reserving SPU. That event is how a SPURS idle service parked in `rdch SPU_RdEventStat` learns the PPU has posted work. Without it the SPU stays asleep and the workload is never dispatched.
+
+Two things make that work:
+
+- **The lock-line lock.** One process-wide spinlock (`spu_lockline_lock` / `spu_lockline_unlock`) serializes every lock-line transaction, SPU and PPU alike. A PPU store that lands inside a `PUTLLC`'s compare-and-commit window would otherwise be read, compared against, and written straight back over, so the update disappears with no error anywhere.
+- **The reserved-line bitmap.** `GETLLAR` calls `spu_coh_reserve`, which sets one bit for the line. Lines are marked and never unmarked: a line the SPURS kernel reserves is reserved again microseconds later, and a stale mark costs one locked store to a line the kernel owns anyway.
+
+The PPU store paths consult that bitmap:
+
+```c
+if (spu_coh_is_reserved(addr)) {
+    spu_lockline_lock();
+    /* the store */
+    spu_coh_notify_write(addr);   /* raises SPU_EVENT_LR, drops the reservation */
+    spu_lockline_unlock();
+} else {
+    /* the store */
+}
+```
+
+This sits in four places, covering every guest store: the inline `vm_write8/16/32/64` in `ppu_memory.h` (HLE modules, including the SPURS ones that write the management structures), the out-of-line `vm_write8/16/32/64` in `ppu_loader.cpp` (recompiled guest code), and the successful commit inside `ppu_stwcx`/`ppu_stdcx` and `ppu_stwcx32`/`ppu_stdcx64`. The lifter emission is unchanged: it already routes stores and store-conditionals through those functions.
+
+`spu_coh_is_reserved` reads a global that stays zero until an SPU reserves its first line, so a title that runs no SPU code pays one predictable branch per store and never touches the bitmap.
+
+`g_spu_lr_raise` counts the events delivered. A SPURS service that never wakes with that counter at zero is a coherence miss; nonzero moves the question downstream to selection and dispatch.
+
+Covered by `runtime/spu/tests/test_spu_coherency.c`, which drives the real PPU store path and asserts the event both fires and stays quiet in the not-reserved and different-line cases.
 
 ---
 
