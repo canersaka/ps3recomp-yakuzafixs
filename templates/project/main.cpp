@@ -18,7 +18,14 @@
  * profiler. Read it when a boot goes wrong; copy from it what the title
  * needs. It is deliberately not what a fresh project starts with.
  *
- * This file builds and runs on Windows, macOS and Linux as written.
+ * The one part that IS duplicated from it is the frame clock below, because a
+ * port is expected to change its pacing and a shared one would be the wrong
+ * shape for that. It was copied faithfully, comments and all. If a pacing bug
+ * is fixed in one of the two, look at the other.
+ *
+ * This builds on Windows, macOS and Linux. CI builds and runs it against the
+ * boot smoke title on the last two, and compile-checks it against clang-cl on
+ * the first (tools/check_ppu_scaffold.py).
  */
 
 /* The lifter's generated header, which declares ppu_context and the function
