@@ -535,14 +535,31 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     }
 
     /* Clean up */
-    table_lock();
 #ifdef _WIN32
+    table_lock();
     CloseHandle(t->host_thread);
     CloseHandle(t->finish_event);
     t->host_thread = NULL;
     t->finish_event = NULL;
 #else
+    /* Reap the host thread with the table lock RELEASED.
+     *
+     * pthread_join blocks until the thread procedure returns, and that
+     * procedure's epilogue takes the table lock to stamp its own state. The
+     * joiner is woken well before that epilogue runs, because a guest thread
+     * normally ends at sys_ppu_thread_exit, which signals `finished` from
+     * INSIDE the thread body and then longjmps back out to the epilogue. So a
+     * joiner that holds the lock across the join is waiting for a thread that
+     * is waiting for the lock -- and the whole title stops with no message.
+     *
+     * Windows never saw it: its half of this block is CloseHandle, which
+     * records nothing about whether the thread has finished and never waits.
+     * The two halves have to be read as one thing, and only one of them was.
+     * Take the lock again afterwards for the teardown, which is what actually
+     * needs it: nothing can claim this slot in between, because it is still
+     * FINISHED rather than FREE until the line below. */
     pthread_join(t->host_thread, NULL);
+    table_lock();
     pthread_mutex_destroy(&t->finish_mutex);
     pthread_cond_destroy(&t->finish_cond);
 #endif
