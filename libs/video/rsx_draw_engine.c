@@ -141,6 +141,7 @@ static struct {
     u32 guest_draws;
     u32 last_guest_draws;
     u32 last_present_surface;
+    u32 last_flip_buffer;
 
     /* staging: decoded texture levels, the constant blocks, the index list */
     u8* tex_staging;
@@ -1461,7 +1462,8 @@ static void eng_present(u32 buffer_id)
 static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
 {
     (void)user; (void)r;
-    eng_present(arg & 7u);
+    g.last_flip_buffer = arg & 7u;
+    eng_present(g.last_flip_buffer);
 }
 
 /* ---- public API ---------------------------------------------------------- */
@@ -1576,9 +1578,13 @@ void rsx_draw_engine_flush(void)
 
 void rsx_draw_engine_present(void)
 {
-    /* A host that drives the flip itself presents display buffer 0, which is
-     * what a title's first scanout is; the FIFO's own 0xE944 names its own. */
-    eng_present(0);
+    /* A host that drives the flip itself gets whichever buffer the guest's
+     * own last flip named, and display buffer 0 before there has been one:
+     * a runner that both consumes 0xE944 and calls here would otherwise
+     * re-present a double-buffered title's OTHER scanout. Presenting twice is
+     * harmless either way -- the engine never clears the surface, so a second
+     * present just blits the same image again. */
+    eng_present(g.last_flip_buffer);
 }
 
 u32 rsx_draw_engine_guest_draws(void)
