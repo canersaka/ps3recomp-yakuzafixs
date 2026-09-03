@@ -65,11 +65,36 @@ POW_NV30=0x26, TXL_NV40=0x2F, RFL_NV30=0x36).
 
 Branch ops (when DWORD2 bit31 IS_BRANCH set): BRK0 CAL1 IF2 LOOP3 REP4 RET5.
 
+## Colour exports
+The program's colour comes out of fixed registers, and which set of them
+depends on `SET_SHADER_CONTROL`'s `32_BITS_EXPORTS` bit (0x40): with it set
+the four targets are **r0, r2, r3, r4**, with it clear they are **h0, h4, h6,
+h8**. This is a property of the control word, not of the program: a shader
+that accumulates into r2 and writes its final colour to h0 is a single-target
+16-bit-export program, and the fp32 temps it used along the way are just
+temps.
+
+The emitter returns `float4 ... : SV_TARGET` for a program that only writes
+the first export, and a `PSOutput` struct of `SV_TARGET0..N` for one that
+reaches the second, third or fourth of the *exported* file. Each target
+carries its own NaN guard. The fixed-function alpha test tests target 0's
+alpha whichever shape is emitted, as the hardware does.
+
+`rsx_fp_structural_hash` distinguishes the two without help: it hashes the
+instruction words, and the destination register is one of them.
+
+A program may export past the set the guest has bound, and the surplus is
+discarded. Nothing has to reconcile the two counts: Metal builds a pipeline
+whose colour-attachment count is above OR below the fragment function's
+output count (checked against the API validation layer), and D3D12 drops
+outputs past `NumRenderTargets`.
+
 ## Decompiler status (MVP)
 Implemented in the HLSL emitter: NOP, MOV, MUL, ADD, MAD, DP3, DP4, MIN, MAX,
 FRC, FLR, RCP, RSQ, EX2, LG2, SLT/SGE/SLE/SGT/SNE/SEQ, COS, SIN, POW, LRP,
 TEX/TXP, KIL. Per-source swizzle, negate, abs, and the dest write-mask are
-honored. OUT_SAT wraps the result in `saturate()`.
+honored. OUT_SAT wraps the result in `saturate()`. Multiple render targets
+are emitted (see "Colour exports" above).
 
 Not yet handled (emit a `// TODO` comment, result left as the source / zero):
 pack/unpack (PK*/UP*), DDX/DDY beyond XY, DST/LIT/DP2A/TXD/TXB, branching

@@ -21,7 +21,7 @@ documents the host shim itself._
 | lv2 threads | `ps3recomp_host --threads`: a guest PPU thread created and joined through the syscalls, and the host stack it got |
 | cellFiber | `tests/fiber_switch`: 4000 scheduler round trips and 4000 direct fiber-to-fiber switches on ucontext (runs on Linux too) |
 | Audio and pad | `ps3recomp_host --audio-pad`: the SDL2 backends up and down twice with `SDL_AUDIODRIVER=dummy` and no controller |
-| RSX self-contained tests | texture layout, the primitive tables, and `test_rsx_draw_engine`: the draw engine driven through its dispatch sink against a stub backend, with no GPU -- surface keying and reallocation, render-target aliasing on a texture bind, an MRT set registered, cleared and bound whole, the texture cache's revalidation and LRU eviction, the pipeline key's stability under constant changes, restart cuts bounding topology expansion with quad strips and polygons among them (runs on Linux too) |
+| RSX self-contained tests | texture layout, the primitive tables, `test_fp_decompiler` (the fragment decoder on its own, including which register file the colour export comes from and how many `SV_TARGET`s a multi-export program gets), and `test_rsx_draw_engine`: the draw engine driven through its dispatch sink against a stub backend, with no GPU -- surface keying and reallocation, render-target aliasing on a texture bind, an MRT set registered, cleared and bound whole, the texture cache's revalidation and LRU eviction, the pipeline key's stability under constant changes, restart cuts bounding topology expansion with quad strips and polygons among them (runs on Linux too) |
 
 The scaffold check is compile-only. What links and runs it is the smoke title:
 a hand-written program in the lifter's ABI, with an image
@@ -73,14 +73,16 @@ exercised on the Mac without a game. See docs/PPU_RECOMP.md.
    vertex-texture units bound to the vertex stage so a transform program's
    `TXL` samples.
 
-   An MRT set is attached and cleared whole on both paths now, and quad
-   strips and polygons are expanded into the engine's indexed triangle list
-   the way the vtable path expands them, so those two differences are gone.
-   Depth-as-texture has a check: `--depthtex` writes a zeta and samples it.
+   An MRT set is attached, cleared and **written** whole on both paths now:
+   a fragment program that writes r2/r3/r4 (h4/h6/h8 with 16-bit exports)
+   returns that many `SV_TARGET`s, so a deferred pass fills every G-buffer
+   plane it declares. `--mrt` and `--mrt-a` check it -- one draw through an
+   MRT1 set, then each surface sampled in turn. Quad strips and polygons are
+   expanded into the engine's indexed triangle list the way the vtable path
+   expands them, so that difference is gone too, and depth-as-texture has a
+   check: `--depthtex` writes a zeta and samples it.
 
-   What the engine does **not** have. Nothing writes colour targets B, C and
-   D on either path, because the fragment decompiler emits one `SV_TARGET`;
-   they are attached and cleared, not fed. A vertex-texture unit bound at a
+   What the engine does **not** have. A vertex-texture unit bound at a
    surface's offset still uploads from guest memory. A colour target is
    seeded only when its context DMA says main memory and the IO table says
    the page is mapped; a VRAM surface is not seeded, because this tree's
@@ -148,10 +150,13 @@ implements. `rsx_live_draw.c` keeps working on Windows and keeps merging.
 
 What is left, in order:
 
-- **MRT.** Both paths now attach and clear every target the set names, so
-  half of it is done. What is left is the fragment decompiler, which emits a
-  single `SV_TARGET`: until it emits more, a deferred pass still fills its
-  first G-buffer plane and no other, over a correctly cleared one.
+- **MRT: done.** Both paths attach and clear every target the set names, and
+  the fragment decompiler returns one `SV_TARGET` per colour export the
+  program writes, so a deferred pass fills every plane it declares.
+  `--mrt`/`--mrt-a` draw an MRT1 set once and sample each member. What is
+  not modelled is a set whose members disagree about size or format: both
+  paths stop at the first member they cannot bind, as the D3D12 backend
+  stops at the first gap.
 - **The rest of texturing.** What is left is narrow: anisotropic filtering,
   the LOD bias in `SET_TEXTURE_FILTER` (Metal has no sampler-side bias, so it
   means patching the sampling call in the fragment program), 3D textures, and
@@ -275,6 +280,8 @@ PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip                # two mip
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --rtt                # render into a surface, then sample it
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --quads              # a polygon and a quad strip, expanded
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depthtex           # write a zeta, then sample it (draw engine only)
+PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mrt                # one draw fills an MRT1 set; sample target B
+PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mrt-a              # ... the same draw, sampling target A
 PS3RECOMP_RSX_ENGINE=vtable PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --rtt  # ... through the older path
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_boot_smoke build/smoke/smoke.elf   # the PPU boot path
 ./build/ps3recomp_host --threads                  # lv2 thread create/join + host stack
