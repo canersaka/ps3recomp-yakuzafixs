@@ -159,6 +159,11 @@ jobs:
           # plausible and still fails here. Exercises rsx_texture_layout and
           # rsx_texture_decode end to end with no GPU involved.
           ./build/ps3recomp_host --tex
+          # No graphics: create a guest PPU thread through the lv2 path and
+          # check the host stack it got. A recompiled call chain nests on the
+          # host stack one frame per guest call, so the default stack is not
+          # enough and nothing says so until a title dies with no diagnosis.
+          ./build/ps3recomp_host --threads
 
       # RSX texture layout -- format class, row sizes, Morton addressing. Pure
       # arithmetic with no host API in it, so it runs everywhere, and it is the
