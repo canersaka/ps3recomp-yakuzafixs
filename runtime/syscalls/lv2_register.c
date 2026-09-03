@@ -1544,6 +1544,49 @@ static int64_t sys_process_getpid_handler(ppu_context* ctx)
     return (int64_t)(int32_t)ctx->gpr[3];
 }
 
+/* sys_process_is_spu_lock_line_reservation_address (14)
+ *
+ * r3 = effective address, r4 = access-right flags (SPU_THR 0x2, RAW_SPU 0x1).
+ * Asks lv2 whether SPUs may place lock-line reservations -- GETLLAR/PUTLLC --
+ * on a range. SPURS calls it while validating its management areas during
+ * cellSpursInitialize, and treats a failure as a reason to abort init, so the
+ * unimplemented-syscall handler's CELL_ENOSYS takes a title down a path that
+ * ends in a null management pointer rather than anywhere that names this.
+ *
+ * The number has been in lv2_syscall_table.h since it was written and nothing
+ * ever registered a handler for it.
+ *
+ * Contract from RPCS3's sys_process.cpp, mapped onto this runtime's guest
+ * layout: the flags must be non-zero and contain only the two SPU bits, or
+ * EINVAL; main memory, the sys_memory window and RSX local memory are
+ * reservation-capable; PPU stacks and sys_vm regions are not, and answer
+ * EPERM; anything outside those is EINVAL. */
+static int64_t sys_process_is_spu_lock_line_reservation_address(ppu_context* ctx)
+{
+    uint32_t addr  = (uint32_t)ctx->gpr[3];
+    uint64_t flags = ctx->gpr[4];
+    int64_t  rc;
+
+    if (!flags || (flags & ~0x3ull)) {
+        rc = (int64_t)(int32_t)CELL_EINVAL;
+    } else if (addr >= VM_MAIN_MEM_BASE && addr < VM_MAIN_MEM_BASE + VM_MAIN_MEM_SIZE) {
+        rc = 0;                                   /* main memory */
+    } else if (addr >= 0x40000000u && addr < 0x50000000u) {
+        rc = 0;                                   /* sys_memory window */
+    } else if (addr >= 0xC0000000u && addr < 0xD0000000u) {
+        rc = 0;                                   /* RSX local memory */
+    } else if (addr >= 0xD0000000u && addr < 0xE0000000u) {
+        rc = (int64_t)(int32_t)CELL_EPERM;        /* PPU stack area */
+    } else if (addr >= SYS_VM_REGION_BASE && addr < SYS_VM_REGION_END) {
+        rc = (int64_t)(int32_t)CELL_EPERM;        /* sys_vm memory */
+    } else {
+        rc = (int64_t)(int32_t)CELL_EINVAL;       /* unmapped */
+    }
+
+    ctx->gpr[3] = (uint64_t)rc;
+    return rc;
+}
+
 /* Catch-all stub for SPU syscalls we don't model individually yet. */
 static int64_t sys_spu_thread_stub(ppu_context* ctx)
 {
@@ -1560,6 +1603,8 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     /* Process control */
     lv2_syscall_register(tbl, SYS_PROCESS_GETPID, sys_process_getpid_handler);
     lv2_syscall_register(tbl, SYS_PROCESS_EXIT,   sys_process_exit_handler);
+    lv2_syscall_register(tbl, SYS_PROCESS_IS_SPU_LOCK_LINE_RESERVATION_ADDRESS,
+                         sys_process_is_spu_lock_line_reservation_address);
 
     /* Thread management */
     sys_ppu_thread_init(tbl);
