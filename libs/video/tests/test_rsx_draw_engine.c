@@ -605,6 +605,55 @@ static void test_restart_expansion(void)
         RSX_PRIMITIVE_QUADS, 8, NULL, 0);
     CHECK(quads == 12, "two quads are four triangles (%u)", quads);
 
+    /* A quad strip advances two vertices per quad, so eight vertices are
+     * three quads whole and one quad per half once the strip is cut. */
+    const u32 qstrip = rsx_draw_engine_topology_index_count(
+        RSX_PRIMITIVE_QUAD_STRIP, 8, NULL, 0);
+    const u32 qstrip_cut = rsx_draw_engine_topology_index_count(
+        RSX_PRIMITIVE_QUAD_STRIP, 8, cuts, 1);
+    CHECK(qstrip == 3 * 6, "an uncut quad strip of 8 is three quads (%u)", qstrip);
+    CHECK(qstrip_cut == 2 * 6,
+          "a quad strip cut in half is one quad per half (%u)", qstrip_cut);
+
+    memset(idx, 0xFF, sizeof idx);
+    rsx_draw_engine_write_topology_indices(RSX_PRIMITIVE_QUAD_STRIP, 8,
+                                           cuts, 1, NULL, idx);
+    CHECK(idx[0] == 0 && idx[1] == 1 && idx[2] == 2 &&
+          idx[3] == 1 && idx[4] == 3 && idx[5] == 2,
+          "a quad is split along the diagonal between its pairs "
+          "(%u,%u,%u %u,%u,%u)", idx[0], idx[1], idx[2], idx[3], idx[4], idx[5]);
+    CHECK(idx[6] == 4 && idx[7] == 5 && idx[8] == 6,
+          "the segment after the cut pairs from its own first vertex "
+          "(%u,%u,%u)", idx[6], idx[7], idx[8]);
+    spans = 0;
+    for (u32 t = 0; t < qstrip_cut / 3; t++) {
+        int below = 0, above = 0;
+        for (u32 k = 0; k < 3; k++)
+            if (idx[t * 3 + k] < 4) below++; else above++;
+        if (below && above) spans = 1;
+    }
+    CHECK(!spans, "and no quad spans the cut");
+
+    /* A polygon is a fan around its own first vertex, and a cut starts a
+     * second polygon rather than joining the two. */
+    const u32 poly = rsx_draw_engine_topology_index_count(
+        RSX_PRIMITIVE_POLYGON, 5, NULL, 0);
+    const u32 poly_cut = rsx_draw_engine_topology_index_count(
+        RSX_PRIMITIVE_POLYGON, 8, cuts, 1);
+    CHECK(poly == (5 - 2) * 3, "a pentagon is three triangles (%u)", poly);
+    CHECK(poly_cut == (4 - 2) * 3 * 2,
+          "a cut polygon is two runs of 2 triangles (%u)", poly_cut);
+
+    memset(idx, 0xFF, sizeof idx);
+    rsx_draw_engine_write_topology_indices(RSX_PRIMITIVE_POLYGON, 8,
+                                           cuts, 1, NULL, idx);
+    CHECK(idx[0] == 0 && idx[1] == 1 && idx[2] == 2 &&
+          idx[3] == 0 && idx[4] == 2 && idx[5] == 3,
+          "the first polygon fans around vertex 0 (%u,%u,%u %u,%u,%u)",
+          idx[0], idx[1], idx[2], idx[3], idx[4], idx[5]);
+    CHECK(idx[6] == 4 && idx[9] == 4,
+          "the one after the cut fans around vertex 4 (%u, %u)", idx[6], idx[9]);
+
     /* An occurrence-to-unique map is applied to every emitted index, which is
      * what lets a remapped draw share one uploaded vertex per reference. */
     u32 remap[8];
@@ -653,6 +702,25 @@ static void test_indexed_draws(void)
     CHECK(stub.draw_topology == RSX_TOPOLOGY_TRIANGLES &&
           stub.draw_indices == 12,
           "two quads become twelve triangle indices (%u)", stub.draw_indices);
+
+    /* So do quad strips and polygons, the two the engine used to drop. Six
+     * quad-strip vertices are two quads, and a five-vertex polygon is a fan
+     * of three triangles. */
+    m(M_BEGIN_END, RSX_PRIMITIVE_QUAD_STRIP);
+    m(M_DRAW_ARRAYS, 0u | ((6u - 1u) << 24));
+    m(M_BEGIN_END, 0u);
+    CHECK(stub.draw_topology == RSX_TOPOLOGY_TRIANGLES &&
+          stub.draw_indices == 12 && stub.draw_vertices == 6,
+          "a quad strip of six becomes twelve indices over six vertices "
+          "(%u verts, %u indices)", stub.draw_vertices, stub.draw_indices);
+
+    m(M_BEGIN_END, RSX_PRIMITIVE_POLYGON);
+    m(M_DRAW_ARRAYS, 0u | ((5u - 1u) << 24));
+    m(M_BEGIN_END, 0u);
+    CHECK(stub.draw_topology == RSX_TOPOLOGY_TRIANGLES &&
+          stub.draw_indices == 9 && stub.draw_vertices == 5,
+          "a five-vertex polygon becomes nine indices (%u verts, %u indices)",
+          stub.draw_vertices, stub.draw_indices);
 
     /* Points and lines are drawn as they are, in the order they arrived: an
      * index buffer would be pointless and collapsing repeats would reorder

@@ -306,7 +306,8 @@ u32 rsx_draw_engine_topology_index_count(u32 primitive, u32 source_refs,
     case RSX_PRIMITIVE_TRIANGLES:
         return source_refs - source_refs % 3u;
     case RSX_PRIMITIVE_TRIANGLE_STRIP:
-    case RSX_PRIMITIVE_TRIANGLE_FAN: {
+    case RSX_PRIMITIVE_TRIANGLE_FAN:
+    case RSX_PRIMITIVE_POLYGON: {
         u32 total = 0;
         for (u32 s = 0; s < segments; s++) {
             u32 begin, count;
@@ -314,6 +315,19 @@ u32 rsx_draw_engine_topology_index_count(u32 primitive, u32 source_refs,
                                        &begin, &count);
             (void)begin;
             if (count >= 3) total += (count - 2) * 3;
+        }
+        return total;
+    }
+    case RSX_PRIMITIVE_QUAD_STRIP: {
+        /* Two vertices per quad after the first pair, so a segment of n
+         * carries (n - 2) / 2 quads and an odd trailing vertex is dropped. */
+        u32 total = 0;
+        for (u32 s = 0; s < segments; s++) {
+            u32 begin, count;
+            rsx_restart_segment_bounds(cuts, cut_count, source_refs, s,
+                                       &begin, &count);
+            (void)begin;
+            if (count >= 4) total += ((count - 2u) / 2u) * 6u;
         }
         return total;
     }
@@ -361,7 +375,10 @@ void rsx_draw_engine_write_topology_indices(u32 primitive, u32 source_refs,
             }
         }
         break;
+    /* A polygon is a convex fan around its own first vertex, which is what
+     * both of this tree's other renderers make of one. */
     case RSX_PRIMITIVE_TRIANGLE_FAN:
+    case RSX_PRIMITIVE_POLYGON:
         for (u32 s = 0; s < segments; s++) {
             u32 begin, count;
             rsx_restart_segment_bounds(cuts, cut_count, source_refs, s,
@@ -371,6 +388,27 @@ void rsx_draw_engine_write_topology_indices(u32 primitive, u32 source_refs,
                 indices[write++] = eng_topology_vertex(occurrence_to_unique, begin);
                 indices[write++] = eng_topology_vertex(occurrence_to_unique, begin + i);
                 indices[write++] = eng_topology_vertex(occurrence_to_unique, begin + i + 1u);
+            }
+        }
+        break;
+    case RSX_PRIMITIVE_QUAD_STRIP:
+        for (u32 s = 0; s < segments; s++) {
+            u32 begin, count;
+            rsx_restart_segment_bounds(cuts, cut_count, source_refs, s,
+                                       &begin, &count);
+            if (count < 4) continue;
+            /* Every quad is split along the diagonal between the two pairs,
+             * so each one keeps the strip's winding without alternating the
+             * way a triangle strip has to; a cut simply starts the pairing
+             * again from the segment's own first vertex. This is the
+             * expansion the vtable path's emit_vertices performs. */
+            for (u32 q = 0; q + 3 < count; q += 2) {
+                indices[write++] = eng_topology_vertex(occurrence_to_unique, begin + q);
+                indices[write++] = eng_topology_vertex(occurrence_to_unique, begin + q + 1u);
+                indices[write++] = eng_topology_vertex(occurrence_to_unique, begin + q + 2u);
+                indices[write++] = eng_topology_vertex(occurrence_to_unique, begin + q + 1u);
+                indices[write++] = eng_topology_vertex(occurrence_to_unique, begin + q + 3u);
+                indices[write++] = eng_topology_vertex(occurrence_to_unique, begin + q + 2u);
             }
         }
         break;
@@ -388,6 +426,22 @@ void rsx_draw_engine_write_topology_indices(u32 primitive, u32 source_refs,
     default:
         break;
     }
+}
+
+/* Does this primitive become an indexed triangle list, and is the index buffer
+ * needed at all? rsx_vertex_topology_plan answers that for the reference
+ * engine, whose own expansion stops at quads. Quad strips and polygons are
+ * this engine's, so their two cases are decided here rather than in the
+ * shared helper, which the vendored rsx_live_draw.c also calls. */
+static int eng_topology_rebuild(u32 primitive, int refs_remapped, int* indexed)
+{
+    if (primitive == RSX_PRIMITIVE_QUAD_STRIP ||
+        primitive == RSX_PRIMITIVE_POLYGON) {
+        (void)refs_remapped;
+        *indexed = 1;
+        return 1;
+    }
+    return rsx_vertex_topology_plan(primitive, refs_remapped, indexed);
 }
 
 /* ---- surfaces ------------------------------------------------------------ */
@@ -1219,16 +1273,17 @@ static void sink_end(void* user, const rsx_dispatch* r)
     if (!g.ready || !dc.n_packets) return;
 
     const u32 prim = g.rsx.current_primitive;
-    /* Triangles, strips, fans and quads are REBUILT into one triangle list
-     * through an index buffer. A host strip topology cannot express a restart
-     * cut -- that is the whole reason the reference engine rebuilds them --
-     * and rebuilding is also what lets repeated references share an uploaded
-     * vertex. Points and lines pass through as the guest issued them. Quad
-     * strips and polygons need an expansion this engine does not have, so
-     * they are dropped rather than drawn as something else. */
+    /* Everything that becomes triangles -- lists, strips, fans, quads, quad
+     * strips and polygons -- is REBUILT into one triangle list through an
+     * index buffer. A host strip topology cannot express a restart cut, which
+     * is the whole reason the reference engine rebuilds them, and rebuilding
+     * is also what lets repeated references share an uploaded vertex. Points
+     * and lines pass through as the guest issued them, and anything left that
+     * would need an expansion this engine does not have is dropped rather
+     * than drawn as something else. */
     rsx_topology topology = RSX_TOPOLOGY_TRIANGLES;
     int scratch = 0;
-    const int rebuild = rsx_vertex_topology_plan(prim, 0, &scratch) != 0;
+    const int rebuild = eng_topology_rebuild(prim, 0, &scratch) != 0;
     if (!rebuild) {
         if (rsx_primitive_needs_expansion(prim)) return;
         topology = rsx_primitive_topology(prim);
@@ -1243,7 +1298,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     int indexed = 0;
     u32 n_draw = dc.n_source_refs;
     if (rebuild) {
-        if (!rsx_vertex_topology_plan(prim, dc.refs_remapped, &indexed)) return;
+        if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) return;
         n_draw = indexed
             ? rsx_draw_engine_topology_index_count(prim, dc.n_source_refs,
                                                    dc.cuts, dc.n_cuts)

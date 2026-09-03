@@ -109,6 +109,12 @@ jobs:
           # rendered into presents green and fails.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --rtt
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --rtt --frames=60
+          # A polygon and a quad strip, the two primitives with no host
+          # equivalent that are not simply a list of quads. The pentagon is
+          # green and the quad strip red over it, and the centre pixel belongs
+          # to the strip's SECOND quad, so a renderer that drops quad strips
+          # or expands only the first quad presents green and fails.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --quads
           # A guest program pair that will not translate has no fallback in
           # the draw engine, so forcing the built-in shader leaves --shader
           # with nothing to draw: it must still fail, or the check is not
@@ -148,6 +154,7 @@ jobs:
           ./build/ps3recomp_host --mip
           ./build/ps3recomp_host --rtt
           ./build/ps3recomp_host --rtt --frames=60
+          ./build/ps3recomp_host --quads
           if PS3RECOMP_METAL_FIXED_FUNCTION=1 ./build/ps3recomp_host --shader; then
             echo "--shader passed with the built-in shader forced; the check is not checking"
             exit 1
