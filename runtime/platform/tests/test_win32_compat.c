@@ -16,6 +16,13 @@
  *
  * Exit status is the number of failed checks, so it works as a CI step.
  */
+/* win32_backtrace.h resolves symbols through dladdr, whose Dl_info glibc
+ * declares only under _GNU_SOURCE, and that has to be set before the first
+ * system header of the translation unit. A C++ translation unit gets it from
+ * the compiler; this one is C. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#  define _GNU_SOURCE
+#endif
 #include "../win32_compat.h"
 #include "../win32_backtrace.h"
 #include "../msvc_compat.h"
