@@ -11,7 +11,7 @@ documents the host shim itself._
 | Runtime library | builds, Debug and Release, verified arm64 |
 | Lifter suites | all eight, including the 1300+ conformance cases compiled and executed with Apple Clang |
 | SPU helper tests | pass |
-| `ps3recomp_host` | clear, flip, a fixed-function NV4097 draw, a draw through **guest vertex and fragment programs**, and a draw sampling a **guest texture** from a guest program -- headless through the **Metal** backend, with 60-frame runs |
+| `ps3recomp_host` | clear, flip, a fixed-function NV4097 draw, a draw through **guest vertex and fragment programs**, a draw sampling a **guest texture** from a guest program, and a pair of triangles the **depth test** has to order -- headless through the **Metal** backend, with 60-frame runs |
 | Guest shader translation | `test_shader_msl`: hand-assembled NV40 programs through the decompilers, glslang and spirv-cross, checked for the MSL binding contract the backend relies on (runs on Linux too) |
 | PPU boot scaffold | `ppu_loader.cpp`, `ppu_hle.cpp`, `ppu_fs.cpp`, `ppu_sysprx.cpp`, `boot_main.cpp` compile at a recorded baseline of **0** errors (`darwin-clang` in `tools/ppu_scaffold_baseline.json`) |
 | Win32 host shim | `runtime/platform/tests/test_win32_compat.c`, 197 checks |
@@ -33,12 +33,16 @@ because that needs a lifted game.
    mask, and it binds guest textures through the shared layout/decode path
    with the `TEXTURE_CONTROL1` crossbar as the texture's swizzle and the
    sampler registers decoded; every one of those semantics is copied field
-   for field from the D3D12 backend. It has no depth/stencil attachment,
-   no render-to-texture or MRT, no surface formats beyond the drawable's,
-   no mip levels, cube maps or vertex textures. And it is the simpler
-   engine: a title on Windows runs through `rsx_live_draw.c`, so the last
-   step is either a seam under that file or the vtable backend growing the
-   rest of that behaviour.
+   for field from the D3D12 backend. It has one depth/stencil attachment
+   shared by the frame, the NV4097 depth and stencil state per draw, and
+   clears as records in the frame's ordered stream, so a clear in the middle
+   of a frame opens a new pass rather than being lost. It has no
+   render-to-texture or MRT, no surface formats beyond the drawable's, no
+   zeta offsets or per-target depth, no stencil write mask or two-sided
+   stencil (neither register is decoded upstream), no mip levels, cube maps
+   or vertex textures. And it is the simpler engine: a title on Windows runs
+   through `rsx_live_draw.c`, so the last step is either a seam under that
+   file or the vtable backend growing the rest of that behaviour.
 
 2. **A game's host code.** The scaffold in `runtime/ppu/` is game-agnostic; a
    port adds its own runner (imports, overrides, the window, diagnostics). A
@@ -69,11 +73,10 @@ obvious shape for a Linux backend.
 
 What is left, in order:
 
-- **Depth and stencil.** A depth attachment on the drawable and the NV4097
-  depth/stencil state as pipeline state (`set_depth_stencil` is still
-  unhandled).
 - **Render targets.** `SET_SURFACE_*` beyond the clip size: colour and zeta
-  surfaces as textures, render-to-texture, MRT, surface formats.
+  surfaces as textures, render-to-texture, MRT, surface formats. The record
+  stream is the seam for it: a target change is one more record that ends the
+  open pass and opens the next one somewhere else, exactly as a clear does.
 - **The rest of texturing.** Mip levels, cube maps, vertex textures, and the
   formats `rsx_texture_layout` does not classify yet.
 - **The production engine.** A seam under `rsx_live_draw.c`, or the vtable
@@ -112,6 +115,7 @@ cmake --build build
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw --frames=60   # fixed-function draw
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader             # guest VP + FP
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --tex                # guest texture via a guest FP
+PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depth              # near-first pair, depth test
 ./build/test_shader_msl -v                        # decompilers -> MSL, sources printed
 
 for t in tools/test_*.py; do python3 "$t"; done          # lifter suites
