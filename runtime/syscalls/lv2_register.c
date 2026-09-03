@@ -1707,6 +1707,38 @@ static int64_t sys_process_getpid_handler(ppu_context* ctx)
     return (int64_t)(int32_t)ctx->gpr[3];
 }
 
+/* sys_process_get_sdk_version (25)
+ *
+ * r3 = pid, r4 = guest address to store the version at.
+ *
+ * The number is 25, not the 23 an ordering of the sys_process family would
+ * suggest, and this runtime had no name and no handler for it -- so a caller
+ * got CELL_ENOSYS and a version it never wrote.
+ *
+ * libsre asks at startup, through _cellSpursGetSdkVersion, and an SDK version
+ * is how it picks between feature sets. Failing the call does not stop it: it
+ * trips the assert at usertrace.c:123, prints the SDK internal assertion
+ * banner and carries on with no version at all, which is a worse place to be
+ * than either answer, because everything version-gated after it is decided
+ * against nothing.
+ *
+ * g_ps3_sdk_version is the value a port sets from its title's PROC_PARAM
+ * segment, which is where the number really comes from -- the loader reads
+ * sys_process_param_t.sdk_version out of the ELF. The pid in r3 is ignored:
+ * there is one process here.
+ */
+static int64_t sys_process_get_sdk_version_handler(ppu_context* ctx)
+{
+    uint32_t version_ea = (uint32_t)ctx->gpr[4];
+    if (!version_ea) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EFAULT;
+        return (int64_t)(int32_t)CELL_EFAULT;
+    }
+    vm_write_be32(version_ea, g_ps3_sdk_version);
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
 /* sys_process_is_spu_lock_line_reservation_address (14)
  *
  * r3 = effective address, r4 = access-right flags (SPU_THR 0x2, RAW_SPU 0x1).
@@ -1766,6 +1798,7 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     /* Process control */
     lv2_syscall_register(tbl, SYS_PROCESS_GETPID, sys_process_getpid_handler);
     lv2_syscall_register(tbl, SYS_PROCESS_EXIT,   sys_process_exit_handler);
+    lv2_syscall_register(tbl, SYS_PROCESS_GET_SDK_VERSION, sys_process_get_sdk_version_handler);
     lv2_syscall_register(tbl, SYS_PROCESS_IS_SPU_LOCK_LINE_RESERVATION_ADDRESS,
                          sys_process_is_spu_lock_line_reservation_address);
 
