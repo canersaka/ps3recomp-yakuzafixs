@@ -187,6 +187,16 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I runtime/platform -o /tmp/test_win32_compat runtime/platform/tests/test_win32_compat.c runtime/platform/win32_compat.c -lpthread
           /tmp/test_win32_compat
 
+      # Which signal an inaccessible guest window faults with, and whether one
+      # can be reserved at all. runtime/ppu/ppu_loader.cpp's untranslated-guest-
+      # pointer trap takes both SIGSEGV and SIGBUS because the two hosts answer
+      # that differently; this is the evidence, and it needs no game, so it is
+      # the one thing about that trap CI can actually run.
+      - name: Run the guest-pointer trap signal test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -o /tmp/test_guest_ptr_trap runtime/platform/tests/test_guest_ptr_trap.c
+          /tmp/test_guest_ptr_trap
+
       # The lv2 sync-primitive stress suite (mutex, cond, semaphore, event
       # queue) on host threads. It was Windows-only until the shim grew joinable
       # handles and multi-object waits; here it is the memory-model regression

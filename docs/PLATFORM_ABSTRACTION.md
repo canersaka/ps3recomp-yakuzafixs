@@ -504,7 +504,10 @@ Rules the shim keeps, and code using it must keep too:
   not a deadlock; and after the handlers and the unhandled filter, the signal
   goes to whatever `sigaction` was installed before the shim. That is what
   makes it compose with `runtime/ppu/ppu_loader.cpp`, which installs its own
-  `SIGSEGV` handler and chains the same way, in either installation order.
+  `SIGSEGV` and `SIGBUS` handlers and chains the same way, in either
+  installation order. Both keep one saved action per signal: they are separate
+  `sigaction` slots, and handing a `SIGBUS` to the handler that registered for
+  `SIGSEGV` runs a handler for a signal it never agreed to take.
 
 ### Where each of the game-runner calls lands
 
@@ -537,6 +540,16 @@ falls through to the unhandled filter, and four threads racing one
 the Linux and macOS workflows, and `tests/sync_stress` runs on the same shim on
 every platform.
 
+`runtime/platform/tests/test_guest_ptr_trap.c` sits beside it and pins the one
+platform fact `runtime/ppu/ppu_loader.cpp`'s untranslated-guest-pointer trap
+rests on: which signal an inaccessible guest window faults with. It rebuilds
+the trap in miniature -- the same `PROT_NONE` reservation, the same
+`SA_SIGINFO` handler on both signals, the same `si_addr` decode, the same chain
+to a predecessor -- because `ppu_loader.cpp` includes the per-game
+`ppu_recomp.h` and so cannot be linked without a game. It also prints which
+signal this host produced and whether the low window could be reserved, which
+is the pair of facts that makes the answer differ between the two.
+
 ---
 
 ## Apple Silicon Notes
@@ -549,7 +562,8 @@ validated on, and where each is handled:
 | **Weak memory model.** x86 is TSO; arm64 reorders freely. Lifted guest code carries its own fences (`sync`/`lwsync`/`eieio`/`isync` and the SPU `sync`/`dsync` lift to C11 fences), so the audit target is host runtime code that used `volatile` or a plain store to publish state. Every "data stores, then flag store" needs a release/acquire pair; the shim's Interlocked ops are sequentially consistent and `ReadAcquire`/`WriteRelease` are there for the flag case. | `runtime/platform/win32_compat.h`, per-module |
 | **16 KB pages.** `mprotect` on a 4 KB-aligned address fails with `EINVAL`, and a "4 KB" guard covers 16 KB. `VM_PAGE_SIZE` stays the guest's 4 KB; commit, protect and the stack guard use `vm_host_page_size()`. | `runtime/memory/vm.h` |
 | **No unnamed semaphores.** `sem_init` returns `ENOSYS`. | `runtime/platform/posix_sem.h` |
-| **A protection fault is `SIGBUS`, not `SIGSEGV`.** Darwin routes an access to a page that is mapped but inaccessible -- a `PROT_NONE` reservation, most of all -- to `SIGBUS`, and only an address with nothing mapped at it to `SIGSEGV`. So a handler installed for one signal and not the other misses half the faults. Worse, `si_code` there is 1, the value that spells `BUS_ADRALN`, whether the access was misaligned or merely forbidden; the direction and the real cause come from the trap frame's ESR instead. | `runtime/platform/win32_compat.c` |
+| **A protection fault is `SIGBUS`, not `SIGSEGV`.** Darwin routes an access to a page that is mapped but inaccessible -- a `PROT_NONE` reservation, most of all -- to `SIGBUS`, and only an address with nothing mapped at it to `SIGSEGV`. So a handler installed for one signal and not the other misses half the faults. Worse, `si_code` there is 1, the value that spells `BUS_ADRALN`, whether the access was misaligned or merely forbidden; the direction and the real cause come from the trap frame's ESR instead. | `runtime/platform/win32_compat.c`, `runtime/ppu/ppu_loader.cpp` |
+| **The low 4 GB cannot be mapped.** A 64-bit Mach-O carries a `__PAGEZERO` segment over `0 .. 0x100000000` with no protections, and `mmap` will not place anything inside it -- an address hint below 4 GB is ignored, not honoured or refused. The guest-pointer trap's reservation of that window therefore gets none of it on macOS, and an untranslated guest pointer faults against `__PAGEZERO`: `SIGSEGV`, `si_code` 2, because a zero-`maxprot` region reads as unmapped rather than as forbidden. The address still decodes, so the report is intact; what it is NOT is the reservation the code asks for. | `runtime/ppu/ppu_loader.cpp`, `runtime/platform/tests/test_guest_ptr_trap.c` |
 | **No thread affinity.** `SetThreadAffinityMask` is a no-op; thread priority maps to QoS classes (`USER_INTERACTIVE` for above-normal and up), which is what keeps a thread on the P-cores. | `runtime/platform/win32_compat.c` |
 | **FMA in the base ISA.** Clang contracts `a*b+c` into a fused multiply-add by default on arm64; MSVC never does and x86-64 without `-mfma` cannot. The library builds with `-ffp-contract=off` so results match the validated x86 builds and a PPC `fmadd` is fused only where the lifter spells one -- and a port's own build of the lifted code must set the same flag. | `CMakeLists.txt` |
 | **`ucontext` is deprecated**, and `_XOPEN_SOURCE` gates two things: whether `<ucontext.h>` compiles, which it says with an `#error`, and whether `ucontext_t` carries the machine state `getcontext` writes into it, which it does not say at all. Defined first, or every context operation overruns its target by 752 bytes. | `libs/spurs/cellFiber.c`, `tests/fiber_switch` |
