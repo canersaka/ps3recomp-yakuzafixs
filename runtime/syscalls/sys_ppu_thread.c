@@ -22,6 +22,15 @@ static PPU_TLS int     s_exit_armed = 0;
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>   /* getenv (else return value truncated to int on x64) */
+#ifndef _WIN32
+#include <errno.h>
+#endif
+
+/* Host stack reserved per guest thread, for pthread_attr_setstacksize. The
+ * same 256 MB the Win32 branch hands _beginthreadex a few hundred lines
+ * down; keep the two in step so a stack-depth bug reproduces on both. */
+#define PPU_HOST_STACK_BYTES  (256u * 1024u * 1024u)
+
 #ifdef _WIN32
 #include <process.h>   /* _beginthreadex: CRT-aware thread creation (raw CreateThread
                         * leaves per-thread CRT state uninit -> buffered fread() silently
@@ -422,7 +431,34 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     }
     if (_gate_this && g_gate_n < 256) g_gate_pending[g_gate_n++] = t->host_thread;
 #else
-    int rc = pthread_create(&t->host_thread, NULL, ppu_host_thread_proc, t);
+    /* Same reservation, for the same reason. This is the HOST stack the
+     * recompiled C frames run on, not the guest stack (allocated above out of
+     * guest VM), and the default is nowhere near enough: 512 KB on Darwin,
+     * where a recompiled call chain that spills a whole ppu_context per frame
+     * overflows in a few hundred frames. Like the Win32 branch it is a
+     * reservation, not a commitment -- the pages are mapped lazily. */
+    int rc;
+    {
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        if (pthread_attr_setstacksize(&attr, PPU_HOST_STACK_BYTES) == 0) {
+            rc = pthread_create(&t->host_thread, &attr, ppu_host_thread_proc, t);
+        } else {
+            rc = EINVAL;
+        }
+        pthread_attr_destroy(&attr);
+        /* A host that will not hand out that much address space (a strict
+         * overcommit policy, a low RLIMIT_AS) gets the thread anyway on the
+         * default stack. A shallow guest thread runs fine there, and a deep
+         * one crashing beats not starting at all. */
+        if (rc != 0) {
+            fprintf(stderr, "[SYS] tid=%llu: no %zu MB host stack (%d), "
+                            "falling back to the default\n",
+                    (unsigned long long)thread_id,
+                    (size_t)(PPU_HOST_STACK_BYTES / (1024 * 1024)), rc);
+            rc = pthread_create(&t->host_thread, NULL, ppu_host_thread_proc, t);
+        }
+    }
     if (rc != 0) {
         t->state = PPU_THREAD_STATE_FREE;
         pthread_mutex_destroy(&t->finish_mutex);
