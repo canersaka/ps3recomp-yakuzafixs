@@ -113,8 +113,11 @@ s32 cellSysutilCheckCallback(void);
  * games use slot 0. */
 void cellSysutilQueueEvent(int slot, u32 status, u32 param);
 
-s32 cellSysutilGetSystemParamInt(s32 id, s32* value);
-s32 cellSysutilGetSystemParamString(s32 id, char* buf, u32 bufsize);
+/* value_ea / buf_ea are GUEST addresses, not host pointers: both write into
+ * the title's own memory through vm_write*. Spelt u32 so a caller cannot
+ * translate the argument first and hand over a host address. */
+s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea);
+s32 cellSysutilGetSystemParamString(s32 id, u32 buf_ea, u32 bufsize);
 
 /* ---------------------------------------------------------------------------
  * BGM playback control
