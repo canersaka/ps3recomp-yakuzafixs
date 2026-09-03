@@ -178,6 +178,12 @@ enum {
 #define SMOKE_MARK_CAP 32
 static unsigned      g_marks[SMOKE_MARK_CAP];
 static atomic_uint   g_mark_n;
+/* Set by the creator once its thread-create marker is down. The new thread
+ * can be scheduled before sys_ppu_thread_create even returns to its caller,
+ * so without this handshake "thread-body" lands before "thread-create" on a
+ * busy host and the strict marker order below is not the scaffold's to
+ * guarantee. The body waits on it before it marks anything. */
+static atomic_uint   g_create_marked;
 
 /* Failures the guest found while running. Reported by smoke_verify, which is
  * the only thing that reads them. */
@@ -369,6 +375,9 @@ void func_00010100(ppu_context* ctx)
 {
     g_body_host_tid = (unsigned long)GetCurrentThreadId();
     g_body_arg      = (uint32_t)ctx->gpr[3];
+    /* Let the creator mark first (see g_create_marked); a sleep through the
+     * timer syscall rather than a spin, so the wait is itself guest-shaped. */
+    while (!atomic_load(&g_create_marked)) smoke_usleep(ctx, 100);
     smoke_mark(ctx, SMOKE_STEP_THREAD_BODY);
 
     smoke_check(ctx->gpr[13] != 0, "the guest thread has no thread pointer in r13");
@@ -444,6 +453,7 @@ void func_00010000(ppu_context* ctx)
     tid = vm_read64(SMOKE_SC_TID);
     smoke_check(tid != 0, "sys_ppu_thread_create returned thread id 0");
     smoke_mark(ctx, SMOKE_STEP_THREAD_CREATE);
+    atomic_store(&g_create_marked, 1u);
 
     ctx->gpr[11] = SC_PPU_THREAD_JOIN;
     ctx->gpr[3]  = tid;
