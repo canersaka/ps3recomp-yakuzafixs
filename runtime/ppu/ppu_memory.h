@@ -225,14 +225,55 @@ static inline void vm_memcpy_from(void* host_dst, uint32_t guest_src, size_t len
     memcpy(host_dst, vm_ptr8(guest_src), len);
 }
 
+/* A block store is a store to every 128-byte line it touches, so it breaks
+ * an SPU reservation on any of them the same way vm_write32 does on one:
+ * under the lock-line lock, with the lost-reservation event raised per line.
+ * Only the lines that are reserved are notified, and a block that touches
+ * none takes the plain path. */
+static inline int vm_block_reserved(uint32_t guest_dst, size_t len)
+{
+    if (len == 0) return 0;
+    uint32_t first = guest_dst & ~127u;
+    uint32_t last  = (uint32_t)(guest_dst + (len - 1)) & ~127u;
+    for (uint32_t line = first; ; line += 128u) {
+        if (spu_coh_is_reserved(line)) return 1;
+        if (line == last) break;
+    }
+    return 0;
+}
+
+static inline void vm_block_notify(uint32_t guest_dst, size_t len)
+{
+    uint32_t first = guest_dst & ~127u;
+    uint32_t last  = (uint32_t)(guest_dst + (len - 1)) & ~127u;
+    for (uint32_t line = first; ; line += 128u) {
+        if (spu_coh_is_reserved(line)) spu_coh_notify_write(line);
+        if (line == last) break;
+    }
+}
+
 static inline void vm_memcpy_to(uint32_t guest_dst, const void* host_src, size_t len)
 {
-    memcpy(vm_ptr8(guest_dst), host_src, len);
+    if (vm_block_reserved(guest_dst, len)) {
+        spu_lockline_lock();
+        memcpy(vm_ptr8(guest_dst), host_src, len);
+        vm_block_notify(guest_dst, len);
+        spu_lockline_unlock();
+    } else {
+        memcpy(vm_ptr8(guest_dst), host_src, len);
+    }
 }
 
 static inline void vm_memset(uint32_t guest_dst, int val, size_t len)
 {
-    memset(vm_ptr8(guest_dst), val, len);
+    if (vm_block_reserved(guest_dst, len)) {
+        spu_lockline_lock();
+        memset(vm_ptr8(guest_dst), val, len);
+        vm_block_notify(guest_dst, len);
+        spu_lockline_unlock();
+    } else {
+        memset(vm_ptr8(guest_dst), val, len);
+    }
 }
 
 /* ---------------------------------------------------------------------------
