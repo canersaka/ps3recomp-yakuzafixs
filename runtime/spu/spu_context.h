@@ -256,6 +256,18 @@ typedef struct spu_context {
      * overlay is now resident; dispatch retries a missed lookup against it. */
     int resident_ovl;
 
+    /* Resident SPURS-taskset TASK image id (0 = none) retires the id-0 wildcard
+     * for co-resident tasks. A taskset may hold several tasks that all lift at the
+     * SAME LS base (the shared task-code region at LS 0x3000+), so an LS address
+     * alone cannot say which one owns it. Kept as: cleared whenever the SPU runs
+     * kernel/policy code (LS < 0x3000) -- i.e. we are between tasks -- and adopted
+     * from the title-registered entry->image map (spu_taskset_register_task_entry)
+     * the moment the policy branches into a task's entry with none resident. Its
+     * functions -- and only its -- then serve the shared region until the SPU next
+     * drops back below 0x3000, so a dormant co-resident task can no longer shadow
+     * the one the policy actually launched. */
+    int      resident_task;
+
     /* --- SPU_DRAIN trampoline execution model (faithful-adopt, canersaka) ---
      * host_depth counts live lifted call frames (matched brsl/bisl). SPU_RET
      * (`bi $r0`) does a host `return` while host_depth>0 (the caller's frame is
