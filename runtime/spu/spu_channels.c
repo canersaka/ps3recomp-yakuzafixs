@@ -1018,6 +1018,35 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
     }
 }
 
+/* SPURS taskset TASK entries (see spu_context.resident_task). A taskset can hold
+ * several tasks whose lifts share the SAME LS base -- the co-resident task-code
+ * region -- so no LS address identifies which task owns it. The title registers
+ * each task's ELF ENTRY point with the image id its functions were registered
+ * under; spu_indirect_branch adopts that image the moment the policy branches
+ * into the entry from outside the region. This is what lets each such task be
+ * registered under its own real image id instead of the id-0 wildcard, so a
+ * dormant co-resident task can no longer shadow the one the policy launched. */
+#define SPU_TASK_ENTRY_MAX 16
+static struct { uint32_t entry; int image_id; } s_task_entry[SPU_TASK_ENTRY_MAX];
+static int s_task_entry_count = 0;
+void spu_taskset_register_task_entry(uint32_t entry, int image_id)
+{
+    if (s_task_entry_count < SPU_TASK_ENTRY_MAX) {
+        s_task_entry[s_task_entry_count].entry = entry & SPU_LS_MASK;
+        s_task_entry[s_task_entry_count].image_id = image_id;
+        s_task_entry_count++;
+    }
+}
+static int spu_taskset_task_image(uint32_t entry)
+{
+    for (int i = 0; i < s_task_entry_count; i++)
+        if (s_task_entry[i].entry == entry) return s_task_entry[i].image_id;
+    return 0;
+}
+/* Lowest LS address of the shared task-code region: the taskset tasks all lift
+ * at LS 0x3000 (below it is the SPURS kernel/policy/context, 0x290..0x2FFF). */
+#define SPU_TASKSET_TASK_LO 0x3000u
+
 /* Content-signature variant: FMOD COPIES codec overlays to the heap before
  * streaming them into the swap slot, so the source EA is unknowable ahead of
  * time -- match the first 16 bytes of the streamed content instead. */
@@ -1512,10 +1541,38 @@ void spu_indirect_branch(spu_context* ctx)
             fflush(stderr);
         } }
     }
-    /* Resident overlay FIRST: streamed code overwrote that LS range, so its
-     * lift is the truth there -- the base image's stale bytes at the same
-     * addresses may also be registered (historical junk lifts) and must lose. */
-    spu_fn fn = ctx->resident_ovl ? spu_lookup(ctx->pc, ctx->resident_ovl) : NULL;
+    /* SPURS taskset task residency (retires the id-0 wildcard for co-resident
+     * tasks -- gs_task, the cri codec and the wkl4 worker all lift at LS 0x3000).
+     * Below the task region the SPU is running the kernel/policy, i.e. it is
+     * BETWEEN tasks: forget any task we had adopted. On the first branch INTO the
+     * region we are being launched, so adopt the launched task's image from the
+     * title's entry->image map; an internal branch already inside the region keeps
+     * it. Before this, gs_task's id-0 wildcard served EVERY image's request in the
+     * region, so a fresh cri-codec launch at its own entry was answered by
+     * gs_task's function -- the wrong program -- and the codec never ran (the PPU,
+     * blocked on the codec's completion queue, then faulted on a callback the
+     * codec never installed). */
+    if (ctx->pc < SPU_TASKSET_TASK_LO) {
+        ctx->resident_task = 0;
+    } else if (!ctx->resident_task) {
+        int ti = spu_taskset_task_image(ctx->pc);
+        if (ti) {
+            ctx->resident_task = ti;
+            static int _n = 0; if (_n++ < 32)
+                fprintf(stderr, "[spu-task] launch: entry=0x%05X -> task image %d "
+                        "resident for LS 0x%05X+\n", ctx->pc, ti, SPU_TASKSET_TASK_LO);
+        }
+    }
+    /* The launched task owns the shared task-code region: resolve it there FIRST
+     * so a co-resident task at the same LS base cannot shadow it. (resident_task
+     * is 0 outside the region, so this only ever fires for genuine task code.) */
+    spu_fn fn = NULL;
+    if (ctx->resident_task)
+        fn = spu_lookup(ctx->pc, ctx->resident_task);
+    /* Resident overlay next: streamed code overwrote that LS range, so its lift
+     * is the truth there -- the base image's stale bytes at the same addresses
+     * may also be registered (historical junk lifts) and must lose. */
+    if (!fn && ctx->resident_ovl) fn = spu_lookup(ctx->pc, ctx->resident_ovl);
     if (!fn) fn = spu_lookup(ctx->pc, ctx->image_id);
     /* The job returned through the link register we planted: it is finished.
      * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
