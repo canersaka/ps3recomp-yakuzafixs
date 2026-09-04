@@ -101,6 +101,7 @@ static void guard_fault(int sig)
 typedef void (*test_spu_fn)(spu_context*);
 void spu_begin_image(int image_id);
 void spu_register_function(uint32_t addr, test_spu_fn fn);
+test_spu_fn spu_lookup(uint32_t addr, int image_id);
 void spu_stop(spu_context* ctx);
 
 /* ---------------------------------------------------------------------------
@@ -340,6 +341,36 @@ static void test_smc_branch_hints(void)
     free(ctx);
 }
 
+/* The registry holds one entry per lifted function across EVERY image, and a
+ * whole game's SPU workload is far more than one image: Yakuza registers ~170k.
+ * Images register in dependency order, so a too-small cap silently dropped the
+ * LAST ones -- the SPURS job-chain policy, the job binaries and the Edge
+ * geometry task -- and every indirect branch into them fell through to a
+ * branch-to-0 that read as a lifter bug. Register well past the old 65536 cap
+ * and confirm the entries above it survive and are found, so a too-small
+ * registry can never return as that silent, mislabelled failure.
+ *
+ * Runs last: its filler entries use their own image id and a key range clear of
+ * the group test's, so they cannot shadow anything the checks above relied on. */
+static void test_registry_capacity(void)
+{
+    const uint32_t OLD_CAP = 65536u;             /* the cap this fix raised */
+    const uint32_t N       = OLD_CAP + 4096u;    /* comfortably past it */
+    const uint32_t BASE    = 0x00080000u;        /* unique keys, clear of LS and IMG_ENTRY */
+    const int      IMG     = 77;                 /* its own image id */
+
+    spu_begin_image(IMG);
+    for (uint32_t i = 0; i < N; i++)
+        spu_register_function(BASE + i * 4u, tiny_spu_entry);
+
+    check(spu_lookup(BASE + 100u * 4u, IMG) == tiny_spu_entry,
+          "an early registry entry is found");
+    check(spu_lookup(BASE + OLD_CAP * 4u, IMG) == tiny_spu_entry,
+          "an entry at the old 65536 cap is retained (it used to be dropped)");
+    check(spu_lookup(BASE + (N - 1u) * 4u, IMG) == tiny_spu_entry,
+          "the last entry, well past the old cap, is retained");
+}
+
 int main(void)
 {
     printf("SPU lifted thread-group start\n");
@@ -471,6 +502,10 @@ int main(void)
 
     /* An image with no lifted code must still take the old path. */
     CHECK(!spu_lifted_thread_available(IMG_ENTRY + 4));
+
+    /* The registry is sized for a whole game's SPU workload. Last, so its
+     * filler registrations cannot affect the lookups above. */
+    test_registry_capacity();
 
     printf("SPU lifted thread-group start: %d passed, %d failed\n",
            g_pass, g_fail);

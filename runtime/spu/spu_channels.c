@@ -837,7 +837,15 @@ typedef struct {
     int      image_id;   /* which recompiled image this function belongs to */
 } spu_reg_entry;
 
-#define SPU_FN_REGISTRY_MAX 65536
+/* One entry per lifted SPU function across EVERY registered image, and a game
+ * that lifts its whole SPU workload set has a lot of them: Yakuza: Dead Souls
+ * registers ~170k (cri_audio alone is ~35k, gs_task ~9k, the job binaries ~11k).
+ * At 65536 the registry silently truncated every image registered past the cap
+ * -- and the SPURS job-chain policy, the job binaries and the Edge geometry
+ * task (gs_task) register LAST, so their functions were dropped wholesale and
+ * every indirect branch into them fell through to a branch-to-0. Size it for
+ * the real workload; the overflow is now loud (see spu_register_function). */
+#define SPU_FN_REGISTRY_MAX 262144
 static spu_reg_entry s_registry[SPU_FN_REGISTRY_MAX];
 static uint32_t s_registry_count = 0;
 
@@ -850,7 +858,7 @@ static uint32_t s_registry_count = 0;
  * walk, which is 1-3 entries (same LS addr across overlapping images).
  * Registration is startup-single-threaded; lookups treat the index as
  * read-only. Chain links store index+1 so zero-init means "empty". */
-#define SPU_FN_HASH_SIZE 32768   /* power of two, ~2x max load factor 2 */
+#define SPU_FN_HASH_SIZE 131072   /* power of two, ~= MAX/2 -> load factor ~2 */
 static uint32_t s_hash_head[SPU_FN_HASH_SIZE];
 static uint32_t s_hash_tail[SPU_FN_HASH_SIZE];
 static uint32_t s_hash_next[SPU_FN_REGISTRY_MAX];
@@ -868,20 +876,36 @@ void spu_begin_image(int image_id) { s_reg_image = image_id; }
 
 void spu_register_function(uint32_t addr, spu_fn fn)
 {
-    if (s_registry_count < SPU_FN_REGISTRY_MAX) {
-        uint32_t i = s_registry_count;
-        s_registry[i].addr = addr;
-        s_registry[i].fn = fn;
-        s_registry[i].image_id = s_reg_image;
-        s_registry_count = i + 1;
-        uint32_t h = spu_fn_hash(addr);
-        s_hash_next[i] = 0;
-        if (s_hash_head[h] == 0)
-            s_hash_head[h] = i + 1;
-        else
-            s_hash_next[s_hash_tail[h] - 1] = i + 1;
-        s_hash_tail[h] = i + 1;
+    if (s_registry_count >= SPU_FN_REGISTRY_MAX) {
+        /* Silent truncation here dropped whole late-registered SPU images and
+         * cost a multi-round hunt (the branch-to-0 looked like a lifter/overlay
+         * bug). Never again: say so, once, loudly, with the number to raise the
+         * cap to. */
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr,
+                    "[spu] FATAL: SPU function registry full at %u entries "
+                    "(SPU_FN_REGISTRY_MAX=%u) -- image %d function 0x%05X and all "
+                    "later registrations DROPPED. Raise SPU_FN_REGISTRY_MAX.\n",
+                    s_registry_count, (unsigned)SPU_FN_REGISTRY_MAX,
+                    s_reg_image, addr);
+            fflush(stderr);
+        }
+        return;
     }
+    uint32_t i = s_registry_count;
+    s_registry[i].addr = addr;
+    s_registry[i].fn = fn;
+    s_registry[i].image_id = s_reg_image;
+    s_registry_count = i + 1;
+    uint32_t h = spu_fn_hash(addr);
+    s_hash_next[i] = 0;
+    if (s_hash_head[h] == 0)
+        s_hash_head[h] = i + 1;
+    else
+        s_hash_next[s_hash_tail[h] - 1] = i + 1;
+    s_hash_tail[h] = i + 1;
 }
 
 /* Report a CROSS-IMAGE match: the registry served a function some other image
