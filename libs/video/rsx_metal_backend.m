@@ -459,7 +459,7 @@ static int create_offscreen(void)
 }
 
 #if !TARGET_OS_IPHONE
-static int create_window(const char* title)
+static int create_window_impl(const char* title)
 {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
@@ -489,6 +489,18 @@ static int create_window(const char* title)
     [s_window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
     return 0;
+}
+
+static int create_window(const char* title)
+{
+    if ([NSThread isMainThread])
+        return create_window_impl(title);
+    __block int result = 0;
+    NSString* t = title ? [NSString stringWithUTF8String:title] : nil;
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        result = create_window_impl(t ? [t UTF8String] : NULL);
+    });
+    return result;
 }
 #endif
 
@@ -3235,7 +3247,7 @@ void rsx_metal_backend_shutdown(void)
     }
 }
 
-int rsx_metal_backend_pump_messages(void)
+static int pump_messages_impl(void)
 {
 #if !TARGET_OS_IPHONE
     if (s_headless || !s_ready) return 0;
@@ -3252,6 +3264,22 @@ int rsx_metal_backend_pump_messages(void)
     }
 #endif
     return s_closed ? -1 : 0;
+}
+
+int rsx_metal_backend_pump_messages(void)
+{
+    if (s_headless || !s_ready) return s_closed ? -1 : 0;
+#if !TARGET_OS_IPHONE
+    if ([NSThread isMainThread])
+        return pump_messages_impl();
+    __block int result = 0;
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        result = pump_messages_impl();
+    });
+    return result;
+#else
+    return pump_messages_impl();
+#endif
 }
 
 void rsx_metal_backend_present(void)
