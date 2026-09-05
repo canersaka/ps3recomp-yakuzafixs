@@ -273,6 +273,7 @@ typedef struct {
      * to connected_queue so PPU code blocked in sys_event_queue_receive wakes. */
     uint32_t            connected_queue;
     uint32_t            connect_spup;
+    uint32_t            spu_cfg;
 } spu_thread_t;
 
 typedef struct {
@@ -1782,6 +1783,99 @@ static int64_t sys_process_is_spu_lock_line_reservation_address(ppu_context* ctx
     return rc;
 }
 
+/* sys_spu_thread_write_snr (sc-184): write an SPU Signal Notification Register.
+ * In OR mode (spu_cfg bit 0/1) the value is ORed into the pending register;
+ * in overwrite mode (default) it replaces it. The SPU reads via RdSigNotify1/2
+ * (read-and-clear; channel count = 1 while a value is pending). */
+static int64_t sys_spu_thread_write_snr_handler(ppu_context* ctx)
+{
+    uint32_t tid = (uint32_t)ctx->gpr[3];
+    uint32_t num = (uint32_t)ctx->gpr[4];
+    uint32_t val = (uint32_t)ctx->gpr[5];
+    if (num > 1) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002;
+        return -1;
+    }
+    spu_thread_t* t = spu_find_thread(tid);
+    if (!t) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005;
+        return -1;
+    }
+    if (t->sctx) {
+        spu_channel* ch = &t->sctx->ch_sig_notify[num];
+        int or_mode = (t->spu_cfg >> num) & 1;
+        if (or_mode && ch->count)
+            ch->value |= val;
+        else
+            spu_channel_write(ch, val);
+        extern void spu_ch_wake(spu_context*);
+        spu_ch_wake(t->sctx);
+        { static int n = 0; if (n < 12) { n++;
+            fprintf(stderr, "[SPU] write_snr tid=0x%X snr%u <- 0x%08X (%s)\n",
+                    tid, num + 1, val, or_mode ? "OR" : "overwrite");
+            fflush(stderr); } }
+    }
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
+/* sys_spu_thread_write_spu_mb (sc-190): PPU pushes a value into the SPU's
+ * inbound mailbox (channel 0 / SPU_RdInMbox). The SPURS kernel's scheduling
+ * loop reads this channel for workload-dispatch commands from the PPU. */
+static int64_t sys_spu_thread_write_spu_mb_handler(ppu_context* ctx)
+{
+    uint32_t tid = (uint32_t)ctx->gpr[3];
+    uint32_t val = (uint32_t)ctx->gpr[4];
+    spu_thread_t* t = spu_find_thread(tid);
+    if (!t) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005;
+        return -1;
+    }
+    if (t->sctx) {
+        spu_channel_write(&t->sctx->ch_in_mbox, val);
+        extern void spu_ch_wake(spu_context*);
+        spu_ch_wake(t->sctx);
+        { static int n = 0; if (n < 24) { n++;
+            fprintf(stderr, "[SPU] write_spu_mb tid=0x%X <- 0x%08X\n", tid, val);
+            fflush(stderr); } }
+    }
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
+/* sys_spu_thread_set_spu_cfg (sc-187): bits 0-1 = SNR1/SNR2 OR mode. */
+static int64_t sys_spu_thread_set_spu_cfg_handler(ppu_context* ctx)
+{
+    uint32_t tid = (uint32_t)ctx->gpr[3];
+    uint64_t val = (uint64_t)ctx->gpr[4];
+    if (val & ~3ull) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002;
+        return -1;
+    }
+    spu_thread_t* t = spu_find_thread(tid);
+    if (!t) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005;
+        return -1;
+    }
+    t->spu_cfg = (uint32_t)val;
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
+/* sys_spu_thread_get_spu_cfg (sc-188): read back the cfg word. */
+static int64_t sys_spu_thread_get_spu_cfg_handler(ppu_context* ctx)
+{
+    uint32_t tid = (uint32_t)ctx->gpr[3];
+    spu_thread_t* t = spu_find_thread(tid);
+    if (!t) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005;
+        return -1;
+    }
+    ctx->gpr[4] = (uint64_t)t->spu_cfg;
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
 /* Catch-all stub for SPU syscalls we don't model individually yet. */
 static int64_t sys_spu_thread_stub(ppu_context* ctx)
 {
@@ -1864,7 +1958,10 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_DISCONNECT_EVENT, sys_spu_thread_group_disconnect_event_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_LS,        sys_spu_thread_write_ls_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_READ_LS,         sys_spu_thread_read_ls_handler);
-    lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_SNR,       sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_SNR,       sys_spu_thread_write_snr_handler);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_SET_SPU_CFG,    sys_spu_thread_set_spu_cfg_handler);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_GET_SPU_CFG,    sys_spu_thread_get_spu_cfg_handler);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_SPU_MB,  sys_spu_thread_write_spu_mb_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_BIND_QUEUE,      sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_connect_event_handler);
