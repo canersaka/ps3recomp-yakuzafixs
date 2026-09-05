@@ -560,7 +560,7 @@ u32 cellGcmGetFlipStatus(void)
  * -----------------------------------------------------------------------*/
 #ifdef _WIN32
 #include <windows.h>
-static volatile LONG s_gcm_pending = 0;    /* bit0 = vblank, bit1 = flip */
+static volatile LONG s_gcm_pending = 0;    /* bit0 = vblank, bit1 = flip, bit2 = user cmd */
 #define GCM_PENDING_SET(bits)  InterlockedOr(&s_gcm_pending, (bits))
 #define GCM_PENDING_TAKE()     InterlockedExchange(&s_gcm_pending, 0)
 #else
@@ -626,6 +626,11 @@ void ppu_gcm_pump(void)
             ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
         }
+    }
+    if (p & 4) {
+        u32 cmd = s_user_command;
+        if (s_user_handler_opd && g_ps3_guest_caller)
+            g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
     }
     in = 0;
 }
@@ -1407,7 +1412,17 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                  n_be, n_va, n_ia), fflush(stdout);
                   } }
 
-                if (subch == 0 || (subch == 1 && !s1_2d)) {
+                /* Driver methods (0xE9xx, 0xEBxx) occupy bits 2-15 of the
+                 * FIFO word; the standard 11-bit extraction (w & 0x1FFC)
+                 * truncates them.  Reconstruct the full address the same way
+                 * the draw-engine call above does. */
+                { const u32 mfull = (subch << 13) | m;
+                if (mfull == 0xEB00u || mfull == 0xEB04u) {
+                    s_user_command = vm_read32(dea);
+                    GCM_PENDING_SET(4);
+                } else if (mfull == 0xE920u || mfull == 0xE924u) {
+                    cellGcmSetFlipCommand(vm_read32(dea) & 7u);
+                } else if (subch == 0 || (subch == 1 && !s1_2d)) {
                     rsx_process_method(&s_state, m, vm_read32(dea));
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a
@@ -1415,6 +1430,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
                 } else
                     gcm_2d_method(subch, m, vm_read32(dea));
+                }
             }
             s_fifo_getoff += 4 + count * 4;
             continue;

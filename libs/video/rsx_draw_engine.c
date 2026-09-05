@@ -1662,9 +1662,12 @@ void rsx_draw_engine_method(u32 method, u32 arg)
     if (!g.ready) return;
     /* The subchannel is a binding slot, not an engine selector, and a title
      * whose SPU-built command lists bind NV4097 elsewhere would otherwise
-     * store its state in the wrong register bank. rsx_dispatch_method masks
-     * the method itself; this is where that contract is documented. */
-    rsx_dispatch_method(&g.rsx, method & 0x1FFCu, arg);
+     * store its state in the wrong register bank.  Standard NV4097 methods
+     * (< 0x2000) strip the subchannel with & 0x1FFC.  Driver methods
+     * (0xE9xx, 0xEBxx) encode the subchannel bits as part of the address;
+     * preserve them with the wider mask. */
+    u32 m = (method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu);
+    rsx_dispatch_method(&g.rsx, m, arg);
 }
 
 void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
