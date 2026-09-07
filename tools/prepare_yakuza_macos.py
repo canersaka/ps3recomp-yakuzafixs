@@ -65,6 +65,56 @@ def main():
     }
     pthread_join(game_thr, NULL);''', 'main-thread event loop')
 
+    # This legacy runner owns its own import dispatcher, so it never calls
+    # the toolkit scaffold's HLE-boundary pump. With no libgcm LLE interrupt
+    # thread, deliver HLE events on its dedicated ticker instead.
+    imports = replace_once(imports, '      cellGcmTickFlip();',
+        """      cellGcmTickFlip();
+#ifndef YZ_LLE_LIBGCM_SYS
+      extern void ppu_gcm_pump(void);
+      ppu_gcm_pump();
+#endif""", 'HLE interrupt delivery')
+    main_cpp = replace_once(main_cpp, '#include <atomic>',
+        '#include <atomic>\n#include <mutex>', 'callback allocator include')
+    main_cpp = replace_once(main_cpp,
+        '        cb_stack = vm_stack_allocate(&g_stacks, 256 * 1024);',
+        """        static std::mutex stack_lock;
+        {
+            std::lock_guard<std::mutex> guard(stack_lock);
+            cb_stack = vm_stack_allocate(&g_stacks, 256 * 1024);
+        }""", 'callback stack allocation')
+    main_cpp = replace_once(main_cpp,
+        '    cb_ctx.thread_id = yz_thread_current_id();',
+        """    cb_ctx.thread_id = yz_thread_current_id();
+    if (!g_yz_cur_ctx || !cb_ctx.thread_id) {
+        static std::atomic<uint32_t> next_id{0x70000000u};
+        static thread_local uint32_t interrupt_id = next_id.fetch_add(1);
+        cb_ctx.thread_id = interrupt_id;
+    }""", 'interrupt callback identity')
+    main_cpp = replace_once(main_cpp,
+        '    CreateThread(NULL, 0, yz_vblank_thread, NULL, 0, NULL);',
+        '    CreateThread(NULL, 256ull * 1024 * 1024, yz_vblank_thread, NULL, 0, NULL);',
+        'interrupt host stack')
+    main_cpp = replace_once(main_cpp,
+        '    pthread_create(&game_thr, NULL, +[](void*) -> void* {',
+        """    pthread_attr_t guest_attr;
+    pthread_attr_init(&guest_attr);
+    if (pthread_attr_setstacksize(&guest_attr, 256ull * 1024 * 1024) != 0) {
+        pthread_attr_destroy(&guest_attr);
+        fprintf(stderr, "[boot] could not reserve guest host stack\\n");
+        return 1;
+    }
+    int guest_rc = pthread_create(&game_thr, &guest_attr, +[](void*) -> void* {""",
+        'guest host stack')
+    main_cpp = replace_once(main_cpp, '    }, NULL);\n    while (!game_done.load',
+        """    }, NULL);
+    pthread_attr_destroy(&guest_attr);
+    if (guest_rc != 0) {
+        fprintf(stderr, "[boot] could not start guest thread\\n");
+        return 1;
+    }
+    while (!game_done.load""", 'guest thread startup result')
+
     adapter.mkdir(parents=True, exist_ok=True)
     write_changed(adapter / 'main.cpp', main_cpp)
     write_changed(adapter / 'import_overrides.cpp', imports)
@@ -85,7 +135,8 @@ cmake_language(DEFER CALL ps3recomp_adapt_yakuza)
         'game_dir': str(game), 'toolkit_dir': str(toolkit),
         'main_sha256': hashlib.sha256(original_main.encode()).hexdigest(),
         'imports_sha256': hashlib.sha256(original_imports.encode()).hexdigest(),
-        'adaptations': ['tiled-pitch guest ABI', 'main run loop until guest completion'],
+        'adaptations': ['tiled-pitch guest ABI', 'main run loop until guest completion',
+                        'HLE interrupt delivery', 'guest and interrupt host stacks'],
     }, indent=2) + '\n')
     subprocess.run(['cmake', '-S', str(source), '-B', str(build), '-G', 'Ninja',
         '-DCMAKE_BUILD_TYPE=RelWithDebInfo', f'-DPS3RECOMP_DIR={toolkit}',
