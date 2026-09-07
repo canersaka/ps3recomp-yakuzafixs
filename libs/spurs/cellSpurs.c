@@ -827,7 +827,19 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
             s_tasks[i].exitCode = 0;
             s_tasks[i].entryPoint = elf;
 
-            if (taskId_h) *taskId_h = s_tasks[i].id;
+            /* The guest reads this out-param BIG-ENDIAN, and a native store
+             * put it in host order: task 1 came back to the game as 0x01000000,
+             * which it then handed to _cellSpursSendSignal. No task by that id
+             * exists, the signal was dropped, and the SPU task sat in
+             * WAIT_SIGNAL while the PPU waited on the event flag it would have
+             * set -- a two-sided deadlock from one missing byte swap.
+             *
+             * Hand back the SLOT INDEX, not the global counter: `i` is what
+             * spurs_taskset_add_task() sets as the taskset's bitset bit and
+             * what spu_taskset_signal_task() looks up, so the id the guest
+             * signals with has to be the same number. */
+            if (taskId) vm_write32((u32)(uintptr_t)taskId, i);
+            (void)taskId_h;
             taskset->taskCount++;
 
             /* Register the task in the REAL BE taskset: writes task_info[slot]
@@ -970,6 +982,37 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
           attr->lsPattern_ea = 0;                  /* r9 was a leftover */
           printf("[cellSpurs] TaskAttr R8-form: argument_ea=0x%08X (was 0x%08X)\n",
                  attr->argument_ea, (u32)(uintptr_t)argument);
+      } }
+    /* SPURS_TASKATTR_DESC: a THIRD caller shape, found in Saints Row 2. Its
+     * taskset builder (func_009F56E0) does not pass eaContext/sizeContext/
+     * lsPattern as separate arguments at all -- r7 points at a 3-word
+     * DESCRIPTOR it fills immediately before the call, and r8 is the argument:
+     *
+     *   009F58D0  addi r7, r1, 128     ; r7 = sp+0x80  -> the descriptor
+     *   009F58D4  addi r8, r1, 176     ; r8 = sp+0xB0  -> CellSpursTaskArgument
+     *   009F58E8  stw  r9,  0x80(r1)   ;   [0] context EA
+     *   009F58EC  stw  r11, 0x84(r1)   ;   [1] context size, straight out of
+     *                                  ;       cellSpursTaskGetContextSaveAreaSize
+     *   009F58F0  stw  r25, 0x88(r1)   ;   [2] CellSpursTaskLsPattern*
+     *
+     * Read the 8-argument way, sizeContext comes out as r8 -- a STACK ADDRESS,
+     * not a size (the log shows szctx=267382952 = 0x0FEFF0A8) -- and lsPattern
+     * comes out of r9, which this caller never sets, so it is 0. Those are
+     * exactly the conditions the SPU task library refuses to run a blocking
+     * task under, and the tasks then park in WAIT_SIGNAL forever doing 0 ms of
+     * work apiece, which is the symptom this title shows. Off by default: the
+     * R8-form above is right for YDKJ and Jackbox and they are unaffected. */
+    { static int s_desc = -1;
+      if (s_desc < 0) s_desc = getenv("SPURS_TASKATTR_DESC") ? 1 : 0;
+      if (s_desc) {
+          uint32_t d = (uint32_t)eaContext;          /* r7 */
+          attr->eaContext    = vm_read32(d + 0);
+          attr->sizeContext  = vm_read32(d + 4);
+          attr->lsPattern_ea = vm_read32(d + 8);
+          attr->argument_ea  = (u32)sizeContext;     /* r8 */
+          printf("[cellSpurs] TaskAttr DESC-form: desc=0x%08X -> ctx=0x%08X size=%u lsp=0x%08X arg=0x%08X\n",
+                 d, (u32)attr->eaContext, attr->sizeContext,
+                 attr->lsPattern_ea, attr->argument_ea);
       } }
     printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X szctx=%u lsp=0x%08X arg=0x%08X)\n",
            (u32)eaElf, (u32)eaContext, sizeContext,
@@ -2552,9 +2595,40 @@ s32 _cellSpursQueueInitialize(u64 spurs_ea, u64 taskset_ea, u64 queue_ea,
                               u64 buffer_ea, u32 size, u32 depth, u32 direction)
 {
     (void)spurs_ea;
+    if (!queue_ea || !buffer_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (!size || !depth)         return CELL_SPURS_TASK_ERROR_INVAL;
+
+    /* Same 128-byte big-endian line as the LF variant below, and the title's
+     * own call says so: it passes q=0x032B2980 with buffer=0x032B2A00, exactly
+     * 0x80 apart, just as its LFQueue passes 0x4059FD00/0x4059FD80. The
+     * consumer is task 5 (image 1), whose CellSpursTaskArgument points into
+     * this same 0x032B2xxx block and which reads the line with GETLLAR/PUTLLC,
+     * so leaving it uninitialised handed recompiled SPU code a zero-depth
+     * queue to reason about. */
+    uint32_t q = (uint32_t)queue_ea;
+    for (uint32_t o = 0; o < 128; o += 4) vm_write32(q + o, 0);
+    /* W3 at +0x0C is the ring modulus the consumer reduces indices by: the
+     * empty test is (W1-W0) mod 2*W3 and the buffer slot is index mod W3
+     * (derived at 0x12914..0x129B8). Leaving it zero degenerated both and made
+     * the queue look permanently empty no matter what a producer wrote. */
+    vm_write32(q + 0x0C, depth);
+    vm_write32(q + 0x10, size);
+    vm_write32(q + 0x14, depth);
+    vm_write64(q + 0x18, (u64)(uint32_t)buffer_ea);
+    /* NOT direction at +0x24 and NOT init at +0x2C. Both sit inside the
+     * 16-byte group at +0x20..+0x2F that the consumer owns and shifts wholesale
+     * (shlqbyi <group>,1 at 0x12A0C). The trace shows the two values we used to
+     * write there marching through it one byte per dequeue --
+     *   +0x24: 00000002 -> 00000200 -> 00020000 -> 02000000
+     *   +0x2C: 00000001 -> 00000100 -> 00010000 -> 01000000
+     * -- i.e. we were feeding garbage into the SPU's own state every cycle.
+     * Whatever holds direction/init, it is not these offsets. */
+    vm_write64(q + 0x70, (u64)(uint32_t)taskset_ea);
+    memset(vm_base + (uint32_t)buffer_ea, 0, (size_t)size * depth);
+
     static int _n = 0;
     if (_n++ < 8)
-        printf("[cellSpurs] _QueueInitialize(taskset=0x%08X q=0x%08X buf=0x%08X size=%u depth=%u dir=%u)\n",
+        printf("[cellSpurs] _QueueInitialize(taskset=0x%08X q=0x%08X buf=0x%08X size=%u depth=%u dir=%u) -> BE line written\n",
                (u32)taskset_ea, (u32)queue_ea, (u32)buffer_ea, size, depth, direction);
     return CELL_OK;
 }
@@ -2569,13 +2643,108 @@ s32 cellSpursQueueClear(u64 queue_ea)
 /* SDK ABI: cellSpursQueuePushBody(CellSpursQueue*, const void* buffer, bool isBlocking) */
 s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
 {
+    /* SPURS_QUEUE_PUSH=1 -- EXPERIMENT, off by default.
+     *
+     * A deliberately self-revealing probe rather than a finished push. The
+     * waiter half of the protocol is known (see PROGRESS.md phase 19): the
+     * 16-byte group at queue+0x20 is a ring of blocked task ids, byte[0] the
+     * count and byte[13] the cursor. The DATA half is not: which ring slot an
+     * element belongs in has never been observed, because nothing has ever
+     * pushed and so the consumer has never taken its non-empty path.
+     *
+     * So push into a CANDIDATE slot (a counter kept in the push1 half of the
+     * line at +0x0C), wake the registered waiter, and let the consumer's own
+     * DMA say where it actually looks. Its read address names the correct slot
+     * whether or not the guess was right, which turns one run into the answer.
+     * Everything is logged for that reason. */
+    static int s_exp = -1;
+    if (s_exp < 0) s_exp = getenv("SPURS_QUEUE_PUSH") ? 1 : 0;
+
     static int _n = 0;
-    if (_n < 8)
-        printf("[cellSpurs] QueuePushBody(q=0x%08X data=0x%08X blocking=%u)\n",
-               (u32)queue_ea, (u32)data_ea, isBlocking);
-    else if (_n == 8)
-        printf("[cellSpurs] QueuePushBody further logs suppressed\n");
-    _n++;
+    if (!s_exp) {
+        if (_n < 8)
+            printf("[cellSpurs] QueuePushBody(q=0x%08X data=0x%08X blocking=%u)\n",
+                   (u32)queue_ea, (u32)data_ea, isBlocking);
+        else if (_n == 8)
+            printf("[cellSpurs] QueuePushBody further logs suppressed\n");
+        _n++;
+        return CELL_OK;
+    }
+
+    if (!queue_ea || !data_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+
+    uint32_t q   = (uint32_t)queue_ea;
+    uint32_t sz  = vm_read32(q + 0x10);
+    uint32_t dep = vm_read32(q + 0x14);
+    uint32_t buf = (uint32_t)vm_read64(q + 0x18);
+    uint32_t tsp = (uint32_t)vm_read64(q + 0x70);      /* eaSignal: taskset */
+    if (!sz || !dep || !buf) return CELL_SPURS_TASK_ERROR_INVAL;
+
+    /* Derived ring model (see PROGRESS.md phase 22). Working the dataflow of
+     * the consumer's decision at 0x12914..0x129D0 backwards:
+     *
+     *   r11 = normalise(W0)        W0 = queue+0x00
+     *   r2  = normalise(W1)        W1 = queue+0x04
+     *   r60 = W3                   W3 = queue+0x0C
+     *     where normalise(v) is  cgti/nor/selb  ==  (v >= 0 ? v : ~v)
+     *
+     *   r81 = r2 - r11
+     *   r79 = (r2 + r60) - (r11 - r60)  =  r2 - r11 + 2*r60
+     *   r68 = (r11 > r2) ? r79 : r81    =  (r2 - r11) mod 2*r60
+     *   ceqi r77, r68, 0                -> the EMPTY test
+     *
+     * and, separately at 0x129A8..0x129B8,
+     *
+     *   r14 = (r60 > r11) ? r11 : r11 - r60   =  index mod r60
+     *
+     * which is the buffer slot. So this is an ordinary ring: W0 is the pop
+     * index, W1 the push index, indices run modulo 2*W3, and the slot is the
+     * index modulo W3 -- the standard scheme that keeps "full" distinguishable
+     * from "empty". W3 is therefore the depth.
+     *
+     * And that is the bug: the initialiser left queue+0x0C at ZERO, so r60 = 0
+     * and the whole computation degenerates -- occupancy is (W1-W0) mod 0 and
+     * the slot is index mod 0. With both indices at 0 the empty test is
+     * trivially true, which is precisely why the consumer parked every time and
+     * never once read the element buffer, whatever the producer wrote. */
+    uint8_t* qp = vm_base + q;
+
+    int32_t  sync  = (int32_t)vm_read32(q + 0x00);          /* W0, pop  */
+    int32_t  tail  = (int32_t)vm_read32(q + 0x04);          /* W1, push */
+    int32_t  mod   = (int32_t)vm_read32(q + 0x0C);          /* W3       */
+    if (mod <= 0) mod = (int32_t)dep;                       /* pre-fix queues */
+
+    int32_t  nsync = (sync < 0) ? ~sync : sync;             /* normalise */
+    int32_t  cur   = (tail < 0) ? ~tail : tail;
+    uint32_t slot  = (uint32_t)(cur % mod);
+
+    memcpy(vm_base + buf + (size_t)slot * sz, vm_base + (uint32_t)data_ea, sz);
+
+    int32_t  nxt   = (cur + 1) % (2 * mod);
+    int32_t  ntail = nxt;
+    vm_write32(q + 0x04, (uint32_t)ntail);
+
+    /* Waiter ring at +0x20: byte[0] = count, byte[1..12] = task ids. */
+    uint32_t waiters = qp[0x20];
+    int woke = -1;
+    if (waiters > 0 && waiters <= 3 && tsp) {
+        /* The entry area is m_bs[1..3] ONLY -- bytes 0x21..0x23. Shifting the
+         * whole 16-byte group (as a first cut of this did) walks straight over
+         * direction at +0x24 and init at +0x2C and corrupts the header; the
+         * trace caught it as direction turning from 00000002 into 00020000. */
+        woke = qp[0x21];
+        qp[0x21] = qp[0x22];
+        qp[0x22] = qp[0x23];
+        qp[0x23] = 0;
+        qp[0x20] = (uint8_t)(waiters - 1);
+        extern void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);
+        spu_taskset_signal_task(tsp, (uint32_t)woke);
+    }
+
+    if (_n++ < 16)
+        printf("[cellSpurs] QueuePush#%d q=0x%08X slot=%u (cur=%u->%u) buf=0x%08X+0x%X "
+               "size=%u depth=%u waiters=%u woke=%d sync=%d/%d tail=%d->%d taskset=0x%08X\n",
+               _n, q, slot, cur, nxt, buf, slot * sz, sz, dep, waiters, woke, sync, nsync, tail, ntail, tsp);
     return CELL_OK;
 }
 
@@ -2660,5 +2829,221 @@ s32 cellSpursWaitForWorkloadShutdown(u64 spurs_ea, u32 wid)
 {
     static int _n = 0;
     if (_n++ < 8) printf("[cellSpurs] WaitForWorkloadShutdown(wid=%u)\n", wid);
+    return CELL_OK;
+}
+
+/* =========================================================================
+ * Task LS patterns and context save area sizing.
+ *
+ * Saints Row 2 builds every taskset through this sequence (func_009F56E0):
+ *
+ *   _cellSpursTasksetAttributeInitialize(attr, ...)
+ *   cellSpursTasksetAttributeSetName(attr, name)
+ *   cellSpursTasksetAttributeSetTasksetSize(attr, size)
+ *   cellSpursCreateTasksetWithAttribute(spurs, taskset, attr)
+ *   ...
+ *   _cellSpursQueueInitialize(...) / cellSpursQueueAttachLv2EventQueue(q)
+ *   cellSpursTaskGetReadOnlyAreaPattern(&ro,   elf)
+ *   cellSpursTaskGetContextSaveAreaSize (&size, &ls)   ls = default & ~ro
+ *   _cellSpursTaskAttributeInitialize(attr2, .., size, &ls, ..)
+ *
+ * The ABI of the last two is not guesswork -- it is readable straight off the
+ * call site. At 0x009F5878 the caller sets r3 = sp+0x70 and r4 = r25, where
+ * r25 = sp+0x90 (set at 0x009F5744) is exactly the 16-byte pattern the two
+ * `andc`+`std` pairs at 0x009F5888..0x009F5894 had just built. After the call
+ * it does `lwz r11, 0x70(r1)` -- reading a u32 back out of r3 -- checks it
+ * against 0x2D400 and bails if it does not fit, then stores the size and the
+ * pattern pointer side by side at sp+0x84/sp+0x88 for the task attribute. So:
+ *
+ *   s32 cellSpursTaskGetContextSaveAreaSize(u32* size_out,
+ *                                           const CellSpursTaskLsPattern* ls);
+ *
+ * A task's context save area holds the SPU register file plus every 2 KB local
+ * store block the task may dirty; the read-only blocks (its code/rodata, which
+ * can simply be reloaded from the ELF) are masked out by the caller first.
+ * Local store is 256 KB and the pattern is 128 bits, so one bit == 2 KB.
+ * =====================================================================*/
+
+#define SPURS_LS_BLOCK      2048u    /* 256 KB local store / 128 pattern bits */
+#define SPURS_CTX_HDR       2048u    /* 128 SPU registers x 16 bytes          */
+#define SPURS_CTX_ALIGN     128u     /* CELL_SPURS_TASK_CONTEXT_SAVE_AREA_ALIGN */
+
+/* cellSpursTaskGetReadOnlyAreaPattern(CellSpursTaskLsPattern* pattern,
+ *                                     const void* elf)
+ *
+ * Mark the local-store blocks covered by the image's NON-writable PT_LOAD
+ * segments. The caller clears these out of its default pattern, so anything we
+ * fail to report simply ends up saved as well -- costing context space, never
+ * correctness. Bit numbering is PPC-style (bit 0 = MSB of the first word), and
+ * the size path below only ever popcounts the result, so a bit-order mistake
+ * here cannot change the computed size.
+ */
+s32 cellSpursTaskGetReadOnlyAreaPattern(u64 pattern_ea, u64 elf_ea)
+{
+    if (!pattern_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+
+    u64 word[2] = { 0, 0 };
+
+    if (elf_ea) {
+        const uint8_t* img = vm_base + (uint32_t)elf_ea;
+        if (img[0] == 0x7F && img[1] == 'E' && img[2] == 'L' && img[3] == 'F' &&
+            img[4] == 1 /*ELFCLASS32*/ && img[5] == 2 /*ELFDATA2MSB*/) {
+            uint32_t e_phoff = ((uint32_t)img[0x1C] << 24) | ((uint32_t)img[0x1D] << 16) |
+                               ((uint32_t)img[0x1E] << 8)  |  (uint32_t)img[0x1F];
+            uint16_t e_phentsize = (uint16_t)((img[0x2A] << 8) | img[0x2B]);
+            uint16_t e_phnum     = (uint16_t)((img[0x2C] << 8) | img[0x2D]);
+            if (e_phentsize < 0x20) e_phentsize = 0x20;
+
+            for (uint16_t i = 0; i < e_phnum; i++) {
+                const uint8_t* ph = img + e_phoff + (size_t)i * e_phentsize;
+                #define BE32(p) (((uint32_t)(p)[0] << 24) | ((uint32_t)(p)[1] << 16) | \
+                                 ((uint32_t)(p)[2] << 8)  |  (uint32_t)(p)[3])
+                uint32_t p_type  = BE32(ph + 0x00);
+                uint32_t p_vaddr = BE32(ph + 0x08);
+                uint32_t p_memsz = BE32(ph + 0x14);
+                uint32_t p_flags = BE32(ph + 0x18);
+                #undef BE32
+                if (p_type != 1 /*PT_LOAD*/ || !p_memsz) continue;
+                if (p_flags & 2 /*PF_W*/)                continue;   /* writable: must be saved */
+                if ((uint64_t)p_vaddr + p_memsz > SPU_LS_SIZE) continue;
+
+                uint32_t first = p_vaddr / SPURS_LS_BLOCK;
+                uint32_t last  = (p_vaddr + p_memsz - 1) / SPURS_LS_BLOCK;
+                for (uint32_t b = first; b <= last && b < 128; b++)
+                    word[b >> 6] |= (u64)1 << (63 - (b & 63));
+            }
+        }
+    }
+
+    vm_write64((uint32_t)pattern_ea,     word[0]);
+    vm_write64((uint32_t)pattern_ea + 8, word[1]);
+
+    static int _n = 0;
+    if (_n++ < 8)
+        printf("[cellSpurs] TaskGetReadOnlyAreaPattern(elf=0x%08X) -> %016llX %016llX\n",
+               (u32)elf_ea, (unsigned long long)word[0], (unsigned long long)word[1]);
+    return CELL_OK;
+}
+
+/* cellSpursTaskGetContextSaveAreaSize(u32* size_out,
+ *                                     const CellSpursTaskLsPattern* lsPattern) */
+s32 cellSpursTaskGetContextSaveAreaSize(u64 size_out_ea, u64 pattern_ea)
+{
+    if (!size_out_ea || !pattern_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+
+    u64 hi = vm_read64((uint32_t)pattern_ea);
+    u64 lo = vm_read64((uint32_t)pattern_ea + 8);
+
+    uint32_t blocks = 0;
+    for (int i = 0; i < 64; i++) {
+        if (hi & ((u64)1 << i)) blocks++;
+        if (lo & ((u64)1 << i)) blocks++;
+    }
+
+    uint32_t size = SPURS_CTX_HDR + blocks * SPURS_LS_BLOCK;
+    size = (size + (SPURS_CTX_ALIGN - 1)) & ~(SPURS_CTX_ALIGN - 1);
+
+    vm_write32((uint32_t)size_out_ea, size);
+
+    static int _n = 0;
+    if (_n++ < 8)
+        printf("[cellSpurs] TaskGetContextSaveAreaSize(ls=%016llX %016llX, %u blocks) -> %u (0x%X)\n",
+               (unsigned long long)hi, (unsigned long long)lo, blocks, size, size);
+    return CELL_OK;
+}
+
+/* cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute*, u32 size)
+ * CreateTaskset ignores the attribute entirely (it builds the real BE layout
+ * itself), so record the request and accept it. */
+s32 cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute* attr, u32 size)
+{
+    if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    static int _n = 0;
+    if (_n++ < 8) printf("[cellSpurs] TasksetAttributeSetTasksetSize(size=%u)\n", size);
+    return CELL_OK;
+}
+
+/* cellSpursQueueAttachLv2EventQueue(CellSpursQueue*)
+ * The queue's completion signalling runs through our own event-flag path, so
+ * there is no lv2 queue to bind; accept and log. */
+s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea)
+{
+    static int _n = 0;
+    if (_n++ < 8) printf("[cellSpurs] QueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
+    return CELL_OK;
+}
+
+/* _cellSpursLFQueueInitialize(void* pTasksetOrSpurs, CellSpursLFQueue* pQueue,
+ *      const void* buffer, u32 size, u32 depth, u32 direction)
+ *
+ * This one CANNOT be a stub, because the consumer is recompiled SPU code that
+ * reads the queue out of main memory itself. Disassembling image 1 around the
+ * task's WAIT_SIGNAL call site (LS 0x12B80) shows the real protocol: it builds
+ * a 128-byte line at LS 0x80 and commits it with
+ *
+ *   wrch MFC_LSA,0x80 / MFC_EAH / MFC_EAL / MFC_Size,128 / MFC_Cmd,0xB4 (PUTLLC)
+ *   rdch MFC_RdAtomicStat ; brnz -> retry
+ *
+ * i.e. a GETLLAR/PUTLLC lock-line atomic on the queue's own cache line. So the
+ * bytes in guest memory ARE the interface, and they have to be the real
+ * big-endian CellSyncLFQueue: one 128-byte, 128-aligned line.
+ *
+ *   0x00 pop1     0x10 size     0x18 buffer(u64)  0x24 direction  0x2C init
+ *   0x08 push1    0x14 depth    0x20 bs[4]        0x28 v1         0x70 eaSignal
+ *
+ * The title's own call corroborates the size: it passes q=0x4059FD00 with
+ * buffer=0x4059FD80, exactly 128 bytes later.
+ *
+ * NOTE: libs/sync/cellSync.c has a CellSyncLFQueue too, but that one is a
+ * HOST-native struct (atomic_uint, a 64-bit host buffer pointer). It is fine
+ * for a queue both of whose ends are HLE, and completely wrong here -- writing
+ * it into guest memory would hand the SPU a host pointer where a 32-bit big-
+ * endian EA belongs. Hence a separate, guest-accurate initializer rather than
+ * delegating to it.
+ *
+ * What is set here is only what the arguments determine outright: size, depth,
+ * buffer, direction, and the init flag, over a zeroed line (the documented
+ * empty state). The bs[]/v1 slot state machine is left zero -- see PROGRESS.md;
+ * it is not guessed at. */
+s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
+                                u32 size, u32 depth, u32 direction)
+{
+    if (!queue_ea || !buffer_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (!size || !depth)         return CELL_SPURS_TASK_ERROR_INVAL;
+
+    uint32_t q = (uint32_t)queue_ea;
+    for (uint32_t o = 0; o < 128; o += 4) vm_write32(q + o, 0);
+
+    /* W3 at +0x0C is the ring modulus the consumer reduces indices by: the
+     * empty test is (W1-W0) mod 2*W3 and the buffer slot is index mod W3
+     * (derived at 0x12914..0x129B8). Leaving it zero degenerated both and made
+     * the queue look permanently empty no matter what a producer wrote. */
+    vm_write32(q + 0x0C, depth);
+    vm_write32(q + 0x10, size);
+    vm_write32(q + 0x14, depth);
+    vm_write64(q + 0x18, (u64)(uint32_t)buffer_ea);   /* bcptr<void,u64> */
+    /* NOT direction at +0x24 and NOT init at +0x2C. Both sit inside the
+     * 16-byte group at +0x20..+0x2F that the consumer owns and shifts wholesale
+     * (shlqbyi <group>,1 at 0x12A0C). The trace shows the two values we used to
+     * write there marching through it one byte per dequeue --
+     *   +0x24: 00000002 -> 00000200 -> 00020000 -> 02000000
+     *   +0x2C: 00000001 -> 00000100 -> 00010000 -> 01000000
+     * -- i.e. we were feeding garbage into the SPU's own state every cycle.
+     * Whatever holds direction/init, it is not these offsets. */                          /* init: constructed */
+    vm_write64(q + 0x70, (u64)(uint32_t)owner_ea);    /* eaSignal <- taskset/spurs */
+
+    memset(vm_base + (uint32_t)buffer_ea, 0, (size_t)size * depth);
+
+    static int _n = 0;
+    if (_n++ < 8)
+        printf("[cellSpurs] _LFQueueInitialize(owner=0x%08X q=0x%08X buf=0x%08X size=%u depth=%u dir=%u) -> BE line written\n",
+               (u32)owner_ea, (u32)queue_ea, (u32)buffer_ea, size, depth, direction);
+    return CELL_OK;
+}
+
+s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
+{
+    static int _n = 0;
+    if (_n++ < 8) printf("[cellSpurs] LFQueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
     return CELL_OK;
 }

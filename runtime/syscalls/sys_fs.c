@@ -3,6 +3,7 @@
  */
 
 #include "sys_fs.h"
+#include "../../libs/filesystem/edat.h"
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdio.h>
@@ -128,6 +129,21 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
         }
     }
 
+    /* /dev_flash is FIRMWARE, not game data. ppu_fs.cpp serves it from a real
+     * dev_flash tree ($PS3_DEV_FLASH); this layer was missing the same branch, so
+     * a firmware path opened through the raw syscall resolved to <root>/... and
+     * missed. ps1_netemu loads its PS1 BIOS as /dev_flash/ps1emu/ps1_rom.bin and
+     * refuses to boot without it. Keep both halves of the split filesystem agreed. */
+    {
+        static const char* fw = NULL; static int fw_init = 0;
+        if (!fw_init) { fw = getenv("PS3_DEV_FLASH"); fw_init = 1; }
+        if (fw && *fw && strncmp(ps3_path, "/dev_flash/", 11) == 0) {
+            snprintf(host_path, (size_t)host_path_size, "%s/%s", fw, ps3_path + 11);
+            fs_normalize_sep(host_path);
+            return;
+        }
+    }
+
     /* Strip a known mount prefix so this sys_fs layer resolves to the SAME host
      * tree as the cellFs layer (ppu_fs.cpp host_path). Previously /dev_bdvd/X
      * mapped to <root>/dev_bdvd/X -- a directory that doesn't exist -- so a title
@@ -150,6 +166,18 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
      * not, so they fall through to sagemono's mount-prefix stripping below. */
     const char* usrp = strstr(ps3_path, "USRDIR/");
     if (usrp) {
+        /* PS3_USRDIR_BASE: a title installed as a full /dev_hdd0/game/<ID> tree
+         * keeps its USRDIR there, not at the vfs root, so the flattening above
+         * sends it to a directory that does not exist. ps1_netemu writes its
+         * settings with a bare "/USRDIR/CONFIG" and read them back the same way;
+         * both missed, and it printed "save config file: /USRDIR/CONFIG" /
+         * "failed" on every boot. Opt-in so flattened trees keep the old path. */
+        const char* ub = getenv("PS3_USRDIR_BASE");
+        if (ub && *ub) {
+            snprintf(host_path, (size_t)host_path_size, "%s/%s", ub, usrp);
+            fs_normalize_sep(host_path);
+            return;
+        }
         rel = usrp;                        /* "USRDIR/..." */
     } else {
         /* Otherwise strip a known mount prefix so this sys_fs layer resolves to the
@@ -241,7 +269,6 @@ int64_t sys_fs_open(ppu_context* ctx)
     const char* ps3_path = (const char*)vm_to_host(path_addr);
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
-    { extern char* getenv(const char*); static int _fl=-1; if(_fl<0){ const char* e=getenv("TJ_FSLOG"); _fl=(e&&*e&&*e!='0')?1:0; } if(_fl) fprintf(stderr, "[FSOPEN] %s%c", ps3_path?ps3_path:"<null>", 10); }
 
     { extern char* getenv(const char*); if (getenv("FLOW_TITLEOPEN") && ps3_path && strstr(ps3_path, "Titles")) {
         size_t _l = strlen(ps3_path);
@@ -265,6 +292,14 @@ int64_t sys_fs_open(ppu_context* ctx)
                 fprintf(stderr, "[TITLEFIX] redirected empty-filename title open -> %s\n", host_path); fflush(stderr); }
         }
     } }
+
+    /* NPDRM: a file that begins "NPD\0" is an EDAT, and on hardware the guest never
+     * sees its ciphertext -- sceNpDrmIsAvailable primes the kernel and cellFsOpen
+     * returns plaintext. Decrypt once into a cache file and open that instead, so
+     * every read/seek/stat path below stays unchanged. (libs/filesystem/edat.c) */
+    { char dec_path[1200];
+      const char* use = edat_resolve(host_path, dec_path, sizeof dec_path);
+      if (use != host_path) snprintf(host_path, sizeof host_path, "%s", use); }
 
     /* Find free fd slot */
     int slot = -1;
@@ -411,12 +446,29 @@ int64_t sys_fs_read(ppu_context* ctx)
     long pos_before = ftell(f->fp);
     size_t nread = fread(buf, 1, (size_t)size, f->fp);
 
+    /* PS3_FSTRACE=<n>: every nth read, the fd and the file offset it came from.
+     *
+     * The PS1 title under test streams its intro movie off the disc image and
+     * never stops -- 560 s undriven and the blit counter is still climbing. If
+     * the offsets here keep advancing, the stream is progressing and the movie
+     * genuinely has not reached its end; if they repeat, the disc read is stuck
+     * and the movie is looping over the same sectors forever. Those need
+     * opposite fixes and nothing else distinguishes them. */
+    { static int s_ft = -1;
+      if (s_ft < 0) { const char* e = getenv("PS3_FSTRACE");
+                      s_ft = e ? (atoi(e) > 0 ? atoi(e) : 200) : 0; }
+      if (s_ft) { static unsigned long fn;
+          if ((++fn % (unsigned long)s_ft) == 0)
+              fprintf(stderr, "[fs] n=%lu fd=%d off=%ld size=%llu -> %llu\n",
+                      fn, fd, pos_before, (unsigned long long)size,
+                      (unsigned long long)nread); } }
+
     if (nread_addr != 0) {
         write_be64(nread_addr, (uint64_t)nread);
     }
 
     /* FLOW_FSDBG: the lv2 path is what PhyreEngine titles actually use (they do
-     * not go through the cellFs HLE), so YDKJ_FSDBG in ppu_fs.cpp never fires. */
+     * not go through the cellFs HLE), so PS3_FSLOG in ppu_fs.cpp never fires. */
     { extern char* getenv(const char*);
       if (getenv("FLOW_FSDBG")) {
         const unsigned char* b = (const unsigned char*)buf;
