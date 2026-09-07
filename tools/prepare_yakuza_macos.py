@@ -9,6 +9,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import sys
 
 
 def replace_once(text, old, new, label):
@@ -20,6 +21,25 @@ def replace_once(text, old, new, label):
 def write_changed(path, text):
     if not path.exists() or path.read_text() != text:
         path.write_text(text)
+
+
+def prepare_shader(toolkit, game, build):
+    """Lift the already relocated module; never copy game assets into source."""
+    module = game / 'recomp_prx' / 'ogrez_shader_ps3.ppu'
+    image = Path(str(module) + '_image.bin')
+    functions = Path(str(module) + '_functions.json')
+    output = build / 'shader-module'
+    inputs = [image, functions, toolkit / 'tools/ppu_lifter.py']
+    fingerprint = hashlib.sha256(b''.join(p.read_bytes() for p in inputs)).hexdigest()
+    stamp = output / 'inputs.sha256'
+    if not stamp.exists() or stamp.read_text() != fingerprint:
+        subprocess.run([sys.executable, str(toolkit / 'tools/ppu_lifter.py'),
+            str(image), '--raw', '--base', '0x02200000', '--toc', '0x02673020',
+            '--functions', str(functions), '--output', str(output),
+            '--header-name', 'pxd_shader_recomp.h', '--source-name', 'pxd_shader_recomp.c',
+            '--symbol-prefix', 'pxd_shader_', '--jobs', '3'], check=True)
+        stamp.write_text(fingerprint)
+    return fingerprint
 
 
 def main():
@@ -34,6 +54,8 @@ def main():
     adapter = build / 'runner-adapter'
     original_main = (source / 'main.cpp').read_text()
     original_imports = (source / 'import_overrides.cpp').read_text()
+    original_dispatch = (source / 'dispatch.cpp').read_text()
+    shader_hash = prepare_shader(toolkit, game, build)
 
     # The legacy wrapper uses the obsolete (size, out-pointer) host signature.
     # The actual guest ABI returns the pitch in r3; r4 must never be touched.
@@ -115,17 +137,32 @@ def main():
     }
     while (!game_done.load""", 'guest thread startup result')
 
+    dispatch = replace_once(original_dispatch,
+        'extern "C" yz_ppu_fn yz_lookup_func(uint32_t guest_addr)\n{',
+        '''extern "C" const func_entry pxd_shader_function_table[];
+extern "C" const uint64_t pxd_shader_function_table_count;
+extern "C" yz_ppu_fn yz_lookup_func(uint32_t guest_addr)
+{
+    if (guest_addr >= 0x02200000u && guest_addr < 0x02600000u) {
+        for (uint64_t i = 0; i < pxd_shader_function_table_count; ++i)
+            if (pxd_shader_function_table[i].addr == guest_addr)
+                return pxd_shader_function_table[i].func;
+    }''', 'shader module dispatch')
     adapter.mkdir(parents=True, exist_ok=True)
+    write_changed(adapter / 'dispatch.cpp', dispatch)
     write_changed(adapter / 'main.cpp', main_cpp)
     write_changed(adapter / 'import_overrides.cpp', imports)
     # Defer until the external project's add_executable has defined its target.
     injection = '''function(ps3recomp_adapt_yakuza)
   get_target_property(runner_sources yakuza_recomp SOURCES)
-  list(REMOVE_ITEM runner_sources main.cpp import_overrides.cpp)
+  list(REMOVE_ITEM runner_sources main.cpp import_overrides.cpp dispatch.cpp)
   set_property(TARGET yakuza_recomp PROPERTY SOURCES "${runner_sources}")
   target_sources(yakuza_recomp PRIVATE
     "${CMAKE_BINARY_DIR}/runner-adapter/main.cpp"
-    "${CMAKE_BINARY_DIR}/runner-adapter/import_overrides.cpp")
+    "${CMAKE_BINARY_DIR}/runner-adapter/import_overrides.cpp"
+    "${CMAKE_BINARY_DIR}/runner-adapter/dispatch.cpp")
+  file(GLOB shader_sources "${CMAKE_BINARY_DIR}/shader-module/pxd_shader_recomp_*.cpp")
+  target_sources(ppu_recomp_objs PRIVATE ${shader_sources})
   target_include_directories(yakuza_recomp PRIVATE "${CMAKE_SOURCE_DIR}")
 endfunction()
 cmake_language(DEFER CALL ps3recomp_adapt_yakuza)
@@ -135,8 +172,11 @@ cmake_language(DEFER CALL ps3recomp_adapt_yakuza)
         'game_dir': str(game), 'toolkit_dir': str(toolkit),
         'main_sha256': hashlib.sha256(original_main.encode()).hexdigest(),
         'imports_sha256': hashlib.sha256(original_imports.encode()).hexdigest(),
+        'dispatch_sha256': hashlib.sha256(original_dispatch.encode()).hexdigest(),
+        'shader_inputs_sha256': shader_hash,
         'adaptations': ['tiled-pitch guest ABI', 'main run loop until guest completion',
-                        'HLE interrupt delivery', 'guest and interrupt host stacks'],
+                        'HLE interrupt delivery', 'guest and interrupt host stacks',
+                        'translated shader module and dispatch'],
     }, indent=2) + '\n')
     subprocess.run(['cmake', '-S', str(source), '-B', str(build), '-G', 'Ninja',
         '-DCMAKE_BUILD_TYPE=RelWithDebInfo', f'-DPS3RECOMP_DIR={toolkit}',
