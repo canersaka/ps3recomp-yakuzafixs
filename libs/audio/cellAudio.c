@@ -460,16 +460,12 @@ static void audio_mix_one_block(void)
          * cleared block is an observable consumption signal for producers. */
         memset(src, 0, CELL_AUDIO_BLOCK_SAMPLES * nch * sizeof(float));
 
-        /* Advance read index and publish it to the guest-visible counter so the
-         * game can tell how far playback has consumed. The counter is a 64-bit
-         * big-endian value: LBP's audio watchdog reads it with `ld` and compares
-         * the LOW word (`ld r0,0(r11)` / `cmpw r9,r0` at 0x484144), so the live
-         * bits are bytes [4..7]. A 32-bit store here only ever wrote bytes
-         * [0..3] -- the half the game never looks at -- so it saw a frozen index
-         * and tripped "LIBAUDIO DROPOUT - POSITION NO LONGER INCREMENTING". */
+        /* Keep the monotonic counter for tags/timestamps, but publish the
+         * ring slot to the guest. SurMixer multiplies this value by the block
+         * size directly; an unbounded counter walks beyond the audio buffer. */
         port->read_index++;
         if (port->read_idx_addr)
-            vm_write64((u32)port->read_idx_addr, port->read_index);
+            vm_write64((u32)port->read_idx_addr, port->read_index % nblock);
     }
 
     mutex_unlock(&s_audio_mutex);
@@ -708,23 +704,16 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     u32 buf_samples = (u32)(nblk * CELL_AUDIO_BLOCK_SAMPLES * nch);
     port->buf_size = buf_samples * (u32)sizeof(float);
 
-    /* Audio buffers live in GUEST memory, but the base must be a window NOTHING
-     * else claims. It used to be 0x01000000, commented "free window" -- it is not:
-     * that is where ports put their HLE OPD arena (Tokyo Jungle's HLE_OPD_BASE is
-     * exactly 0x01000000), and the memset below wiped 128 KB of it. Every import
-     * whose OPD lived there began dispatching to a NULL address the moment the
-     * game opened an audio port -- and a null bctr returns with r3 untouched, so
-     * the guest reads its own first argument back as a status code. That is why
-     * Tokyo Jungle reported "failed to set notify queue (23A0)": 0x23A0 was the
-     * key it had just passed in, echoed back by a call that never happened. */
-#define CELL_AUDIO_GUEST_BASE 0x60000000u   /* clear of HLE, heaps, RSX and libsre */
-    static u32 s_audio_guest = CELL_AUDIO_GUEST_BASE;
-    u32 guest_buf  = s_audio_guest;
-    s_audio_guest += (port->buf_size + 0xFFFFFu) & ~0xFFFFFu;
-    u32 guest_ridx = s_audio_guest;
-    s_audio_guest += 0x100000u;
-    /* Not part of the pre-committed main-memory map: commit before touching. */
-    vm_commit(guest_buf, (guest_ridx + 0x100000u) - guest_buf);
+    /* Keep audio outside sys_memory (0x40000000..0x50000000), the HLE heap
+     * (0x50000000..0x58000000), and sys_vm (0x60000000..0x70000000).
+     * Reserve two 1-MB pages per port so reopening reuses its own storage. */
+    u32 guest_buf = 0x58000000u + (u32)found * 0x200000u;
+    u32 guest_ridx = guest_buf + 0x100000u;
+    if (vm_commit(guest_buf, 0x200000u) != CELL_OK) {
+        port->in_use = 0;
+        mutex_unlock(&s_audio_mutex);
+        return CELL_AUDIO_ERROR_AUDIOSYSTEM;
+    }
 
     port->buffer = (float*)(vm_base + guest_buf);     /* host view of guest buffer */
     memset(port->buffer, 0, port->buf_size);
@@ -756,7 +745,7 @@ s32 cellAudioPortClose(u32 portNum)
         return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
     }
 
-    /* buffer points INTO the guest vm_base arena (bump-allocated in PortOpen),
+    /* buffer points INTO the guest vm_base arena (reserved per port in PortOpen),
      * not a host malloc -- do NOT free() it (that corrupts the host heap).
      * The guest window is reclaimed wholesale when vm_base is released. */
     s_ports[portNum].buffer = NULL;
