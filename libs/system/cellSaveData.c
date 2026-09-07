@@ -397,6 +397,22 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
     return count;
 }
 
+/* System metadata belongs to the service, not the guest file list. */
+static int savedata_system_file(const char* name)
+{
+    return !strcmp(name, "PARAM.SFO") || !strcmp(name, "PARAM.PFD");
+}
+
+static u32 savedata_content_type(const char* name)
+{
+    if (!strcmp(name, "ICON0.PNG")) return CELL_SAVEDATA_FILETYPE_CONTENT_ICON0;
+    if (!strcmp(name, "ICON1.PAM")) return CELL_SAVEDATA_FILETYPE_CONTENT_ICON1;
+    if (!strcmp(name, "PIC1.PNG")) return CELL_SAVEDATA_FILETYPE_CONTENT_PIC1;
+    if (!strcmp(name, "SND0.AT3")) return CELL_SAVEDATA_FILETYPE_CONTENT_SND0;
+    /* Secure-file metadata is not persisted by this simplified backend yet. */
+    return CELL_SAVEDATA_FILETYPE_NORMALFILE;
+}
+
 /* Enumerate files in a save directory. Returns count, fills fileList up to max. */
 static u32 enumerate_save_files(const char* save_path,
                                  CellSaveDataFileStat* fileList, u32 max)
@@ -413,11 +429,11 @@ static u32 enumerate_save_files(const char* save_path,
             return 0;
 
         do {
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || savedata_system_file(fd.cFileName))
                 continue;
             if (count < max && fileList) {
                 memset(&fileList[count], 0, sizeof(CellSaveDataFileStat));
-                fileList[count].fileType = CELL_SAVEDATA_FILETYPE_NORMALFILE;
+                fileList[count].fileType = savedata_content_type(fd.cFileName);
                 strncpy(fileList[count].fileName, fd.cFileName,
                         CELL_SAVEDATA_FILENAME_SIZE - 1);
                 ULARGE_INTEGER sz;
@@ -438,7 +454,7 @@ static u32 enumerate_save_files(const char* save_path,
 
         struct dirent* de;
         while ((de = readdir(dp)) != NULL) {
-            if (de->d_name[0] == '.')
+            if (de->d_name[0] == '.' || savedata_system_file(de->d_name))
                 continue;
             char full[1024];
             snprintf(full, sizeof(full), "%s/%s", save_path, de->d_name);
@@ -454,7 +470,7 @@ static u32 enumerate_save_files(const char* save_path,
 #endif
             if (count < max && fileList) {
                 memset(&fileList[count], 0, sizeof(CellSaveDataFileStat));
-                fileList[count].fileType = CELL_SAVEDATA_FILETYPE_NORMALFILE;
+                fileList[count].fileType = savedata_content_type(de->d_name);
                 strncpy(fileList[count].fileName, de->d_name,
                         CELL_SAVEDATA_FILENAME_SIZE - 1);
                 fileList[count].st_size = (u64)st.st_size;
