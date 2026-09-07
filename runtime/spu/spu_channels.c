@@ -1063,6 +1063,30 @@ static int spu_taskset_task_image(uint32_t entry)
         if (s_task_entry[i].entry == entry) return s_task_entry[i].image_id;
     return 0;
 }
+/* Resume PCs and even fresh entry PCs overlap between task ELFs. The
+ * taskset policy's TaskInfo identifies which ELF it has actually loaded. */
+static struct { uint32_t elf_ea; int image_id, policy_image_id; }
+    s_task_elf[SPU_TASK_ENTRY_MAX];
+static int s_task_elf_count;
+void spu_taskset_register_task_elf(uint32_t elf_ea, int image_id, int policy_image_id)
+{
+    if (s_task_elf_count < SPU_TASK_ENTRY_MAX) {
+        s_task_elf[s_task_elf_count].elf_ea = elf_ea & ~7u;
+        s_task_elf[s_task_elf_count].image_id = image_id;
+        s_task_elf[s_task_elf_count++].policy_image_id = policy_image_id;
+    }
+}
+static int spu_taskset_resident_image(const spu_context* ctx)
+{
+    const uint8_t* p = ctx->ls + 0x2794; /* SpursTasksetContext.taskInfo.elf */
+    uint32_t elf = (((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                    ((uint32_t)p[2] << 8) | p[3]) & ~7u;
+    for (int i = 0; i < s_task_elf_count; ++i)
+        if (s_task_elf[i].elf_ea == elf &&
+            s_task_elf[i].policy_image_id == ctx->resident_ovl)
+            return s_task_elf[i].image_id;
+    return 0;
+}
 /* Lowest LS address of the shared task-code region: the taskset tasks all lift
  * at LS 0x3000 (below it is the SPURS kernel/policy/context, 0x290..0x2FFF). */
 #define SPU_TASKSET_TASK_LO 0x3000u
@@ -1588,27 +1612,17 @@ void spu_indirect_branch(spu_context* ctx)
             fflush(stderr);
         } }
     }
-    /* SPURS taskset task residency (retires the id-0 wildcard for co-resident
-     * tasks -- gs_task, the cri codec and the wkl4 worker all lift at LS 0x3000).
-     * Below the task region the SPU is running the kernel/policy, i.e. it is
-     * BETWEEN tasks: forget any task we had adopted. On the first branch INTO the
-     * region we are being launched, so adopt the launched task's image from the
-     * title's entry->image map; an internal branch already inside the region keeps
-     * it. Before this, gs_task's id-0 wildcard served EVERY image's request in the
-     * region, so a fresh cri-codec launch at its own entry was answered by
-     * gs_task's function -- the wrong program -- and the codec never ran (the PPU,
-     * blocked on the codec's completion queue, then faulted on a callback the
-     * codec never installed). */
+    /* Resolve both fresh launches and mid-function resumes from TaskInfo.
+     * A scheduler call temporarily leaves the task region, but its return PC
+     * is usually not an ELF entry. Prefer the policy's selected ELF so tasks
+     * sharing an entry address cannot shadow one another. Keep the legacy
+     * entry-only mapping for runners that have not registered ELF metadata. */
     if (ctx->pc < SPU_TASKSET_TASK_LO) {
         ctx->resident_task = 0;
-    } else if (!ctx->resident_task) {
-        int ti = spu_taskset_task_image(ctx->pc);
-        if (ti) {
-            ctx->resident_task = ti;
-            static int _n = 0; if (_n++ < 32)
-                fprintf(stderr, "[spu-task] launch: entry=0x%05X -> task image %d "
-                        "resident for LS 0x%05X+\n", ctx->pc, ti, SPU_TASKSET_TASK_LO);
-        }
+    } else {
+        int ti = spu_taskset_resident_image(ctx);
+        if (!ti && !ctx->resident_task) ti = spu_taskset_task_image(ctx->pc);
+        if (ti) ctx->resident_task = ti;
     }
     /* The launched task owns the shared task-code region: resolve it there FIRST
      * so a co-resident task at the same LS base cannot shadow it. (resident_task

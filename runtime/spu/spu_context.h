@@ -265,13 +265,10 @@ typedef struct spu_context {
     /* Resident SPURS-taskset TASK image id (0 = none) retires the id-0 wildcard
      * for co-resident tasks. A taskset may hold several tasks that all lift at the
      * SAME LS base (the shared task-code region at LS 0x3000+), so an LS address
-     * alone cannot say which one owns it. Kept as: cleared whenever the SPU runs
-     * kernel/policy code (LS < 0x3000) -- i.e. we are between tasks -- and adopted
-     * from the title-registered entry->image map (spu_taskset_register_task_entry)
-     * the moment the policy branches into a task's entry with none resident. Its
-     * functions -- and only its -- then serve the shared region until the SPU next
-     * drops back below 0x3000, so a dormant co-resident task can no longer shadow
-     * the one the policy actually launched. */
+     * alone cannot say which one owns it. Outside the region it is cleared;
+     * on entry/resume it is resolved from the resident policy's TaskInfo ELF
+     * registration, or the legacy entry map if no ELF metadata is available.
+     * This also handles returns to internal PCs after scheduler calls. */
     int      resident_task;
 
     /* --- SPU_DRAIN trampoline execution model (faithful-adopt, canersaka) ---

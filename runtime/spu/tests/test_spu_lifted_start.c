@@ -427,6 +427,31 @@ static void test_lle_taskset_syscall(void)
     free(ctx);
 }
 
+extern void spu_taskset_register_task_elf(uint32_t, int, int);
+static void test_taskset_resume_identity(void)
+{
+    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
+    if (!ctx) { check(0, "allocate task resume context"); return; }
+    spu_begin_image(85); spu_register_function(0x7BD4, code_a);
+    spu_begin_image(86); spu_register_function(0x7BD4, code_b);
+    spu_begin_image(84); spu_register_function(0xA70, code_stale);
+    spu_begin_image(0);
+    spu_taskset_register_task_elf(0x500000, 85, 84);
+    spu_taskset_register_task_elf(0x600000, 86, 84);
+    ctx->image_id = 16; ctx->resident_ovl = 84;
+    ctx->ls[0x2795] = 0x50; ctx->ls[0x2797] = 3; /* ELF flag bits */
+    ctx->resident_task = 85;
+    ctx->pc = 0xA70; spu_indirect_branch(ctx);
+    ctx->pc = 0x7BD4; spu_indirect_branch(ctx);
+    check(ctx->gpr[3]._u32[0] == 81, "scheduler return resolves the original task's internal PC");
+    ctx->pc = 0xA70; spu_indirect_branch(ctx);
+    ctx->ls[0x2795] = 0x60;
+    ctx->pc = 0x7BD4; spu_indirect_branch(ctx);
+    check(ctx->gpr[3]._u32[0] == 82, "resuming another ELF switches ownership of the same PC");
+    g_spu_trampoline_fn = 0;
+    free(ctx);
+}
+
 static uint32_t captured_queue;
 static uint64_t captured_event[4];
 static int push_result;
@@ -520,6 +545,7 @@ int main(void)
     test_smc_xori();
     test_resident_code_regions();
     test_lle_taskset_syscall();
+    test_taskset_resume_identity();
 
     signal(SIGSEGV, guard_fault);
     signal(SIGBUS,  guard_fault);
