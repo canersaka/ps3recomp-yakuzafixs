@@ -6,6 +6,7 @@
  */
 
 #include "cellFs.h"
+#include "../../runtime/platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #include "ps3emu/endian.h"
 #include <stdio.h>
 #include <string.h>

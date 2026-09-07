@@ -8,7 +8,9 @@
  * track, and the guest stores still have to be big-endian.
  */
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
+#include "../ppu/ppu_context.h"   /* ppu_context, PPU_THREAD_LOCAL */
 
 extern uint8_t* vm_base;
 
@@ -114,3 +116,10 @@ void ps3_ww_report_inline(unsigned int addr, unsigned long long val, int width)
  * host with no guest has no such register; zero is what the trace prints for
  * a caller it cannot name. */
 unsigned int ppu_active_lr(void) { return 0; }
+
+PPU_THREAD_LOCAL ppu_context* g_active_ctx = 0;
+uint32_t g_spu_image_src_ea = 0;
+uint32_t g_spu_image_ls_start = 0;
+uint32_t g_spu_image_span = 0;
+void ppu_dump_bctrl_ring(uint32_t a, const char* tag) { (void)a; (void)tag; }
+uint32_t ps3_spu_image_source_ea(uint32_t img_ea) { return img_ea; }

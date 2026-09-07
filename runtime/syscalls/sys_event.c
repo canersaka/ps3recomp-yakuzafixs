@@ -323,6 +323,26 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
 #else
         sched_yield();
 #endif
+    /* WAITBT_EVERY=<n>: the same dump, but every nth wait per (tid,queue)
+     * instead of once. The one-shot above names where a thread FIRST parks,
+     * which is a boot-time answer; when a title runs for a while and then stops
+     * doing something, the question is where it is parked at the END, and the
+     * last dump in the log answers that. */
+    { static int every = -1;
+      if (every < 0) { const char* e = getenv("WAITBT_EVERY"); every = e ? atoi(e) : 0; }
+      if (every > 0) {
+          static unsigned n[8][8] = {{0}};
+          unsigned t = (unsigned)ctx->thread_id & 7, qk = queue_id & 7;
+          if ((n[t][qk]++ % (unsigned)every) == 0) {
+              extern void ppu_dump_guest_stack(ppu_context*, const char*);
+              char tag[64];
+              snprintf(tag, sizeof tag, "wait#%u tid=%u q=%u",
+                       n[t][qk] - 1u, t, queue_id);
+              ppu_dump_guest_stack(ctx, tag);
+          }
+      } }
+
+    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
@@ -679,6 +699,30 @@ int64_t sys_event_queue_drain(ppu_context* ctx)
 /* Helper to enqueue an event into a queue */
 static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
 {
+    /* PS3_EVQSTAT=<n>: every n pushes, report each live queue's push count and
+     * how many events are sitting in it unread.
+     *
+     * For a deadlock the pending count is the whole answer. The R3000 spins
+     * waiting for spu4; spu4 waits for SigNotify2 from the guest thread that
+     * services an event queue; that thread sits in sys_event_queue_receive.
+     * pending > 0 means the receiver is not waking (our bug); pending == 0
+     * means nothing produced the event (the guest's, or a missing HLE
+     * producer). Those need opposite fixes, and nothing else distinguishes
+     * them. */
+    { static int s_es = -1;
+      if (s_es < 0) { const char* e = getenv("PS3_EVQSTAT");
+                      s_es = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
+      if (s_es) { static unsigned long long np[SYS_EVENT_QUEUE_MAX + 1], n;
+          const unsigned qi = (unsigned)(q - g_sys_event_queues) + 1u;
+          if (qi <= SYS_EVENT_QUEUE_MAX) np[qi]++;
+          if ((++n % (unsigned long long)s_es) == 0) {
+              fprintf(stderr, "[evqstat] %llu pushes;", n);
+              for (unsigned k = 1; k <= SYS_EVENT_QUEUE_MAX; k++)
+                  if (np[k] || g_sys_event_queues[k - 1].count)
+                      fprintf(stderr, " q%u[pushed=%llu pending=%u]", k, np[k],
+                              (unsigned)g_sys_event_queues[k - 1].count);
+              fprintf(stderr, "\n"); fflush(stderr);
+          } } }
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
 #else
@@ -785,6 +829,7 @@ int64_t sys_event_port_connect_local(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
+    fprintf(stderr, "[evt] port_connect(port=%u -> queue=%u)\n", port_id, queue_id);
 
     evt_table_lock();
 

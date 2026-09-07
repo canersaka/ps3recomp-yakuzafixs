@@ -948,7 +948,12 @@ def main():
     # else use the system compiler directly, so CI runs the same 1300+ checks
     # on macOS and Linux rather than only on a developer's Windows box.
     if os.name == "nt":
-        vcvars = r"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
+        # Located rather than hardcoded: a literal version here silently reduced
+        # this suite to compiling nothing on any machine with a different Visual
+        # Studio installed, which is exactly the green-tick-meaning-nothing this
+        # file's own comments warn about.
+        from msvc_env import find_vcvars
+        vcvars = find_vcvars() or ""
         bat = os.path.join(ROOT, "scratch", "ppu_conformance_run.bat")
         with open(bat, "w") as f:
             f.write("@echo off\n")
