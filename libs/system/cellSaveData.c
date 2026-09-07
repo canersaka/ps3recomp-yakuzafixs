@@ -210,43 +210,32 @@ static s32 marshal_cbresult_read_result(uint32_t addr)
 #define SAVEDATA_FILEGET_SIZE   0x44u
 #define SAVEDATA_FILESET_SIZE   0x30u
 
-/* Dispatch the game's funcFile the same way funcStat is dispatched.
- *
- * It used to be called as a HOST function pointer with HOST stack addresses:
- *
- *     funcFile(&cbResult, &fileGet, &fileSet);
- *
- * funcFile is a GUEST OPD, so that jumped straight into guest memory as if it
- * were host code -- "ACCESS VIOLATION: execute at host 0x34C250" the moment
- * Tokyo Jungle autosaved. Marshal the three structs into guest memory and go
- * through g_ps3_guest_caller, exactly as dispatch_func_stat does.
- *
- * ponytail: the callback's fileSet is not read back yet, so the game's chosen
- * file is not written -- the callback runs and the title advances instead of
- * crashing. Read fileName/fileBuf/fileSize out of set_ea and feed
- * process_file_op when a title actually needs its save contents. */
-static s32 dispatch_func_file(uint32_t func_opd, uint32_t userdata_ea)
+/* Preserve callback-updated userdata and read the requested operation back
+ * before scratch is reused. FileGet reports the previous operation's byte count. */
+static s32 dispatch_func_file(uint32_t func_opd, uint32_t* userdata_ea,
+                              u32 exc_size, CellSaveDataFileSet* out)
 {
     if (!g_ps3_guest_caller) return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
-
     scratch_reset();
-    uint32_t cb_ea  = scratch_alloc(SAVEDATA_CBRESULT_SIZE);
-    uint32_t get_ea = scratch_alloc(SAVEDATA_FILEGET_SIZE);
-    uint32_t set_ea = scratch_alloc(SAVEDATA_FILESET_SIZE);
-    if (!cb_ea || !get_ea || !set_ea) {
-        printf("[cellSaveData] funcFile scratch alloc failed\n");
-        return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
-    }
-
-    marshal_cbresult_init(cb_ea, CELL_SAVEDATA_CBRESULT_OK_NEXT, userdata_ea);
-
-    printf("[cellSaveData] dispatching funcFile OPD=0x%08X (cb=0x%X get=0x%X set=0x%X)\n",
-           func_opd, cb_ea, get_ea, set_ea);
+    u32 cb_ea = scratch_alloc(SAVEDATA_CBRESULT_SIZE);
+    u32 get_ea = scratch_alloc(SAVEDATA_FILEGET_SIZE);
+    u32 set_ea = scratch_alloc(SAVEDATA_FILESET_SIZE);
+    if (!cb_ea || !get_ea || !set_ea) return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
+    marshal_cbresult_init(cb_ea, CELL_SAVEDATA_CBRESULT_OK_NEXT, *userdata_ea);
+    vm_write32(get_ea, exc_size);
     g_ps3_guest_caller(func_opd, cb_ea, get_ea, set_ea, 0, 0, 0, 0, 0);
-
-    s32 result = marshal_cbresult_read_result(cb_ea);
-    printf("[cellSaveData] funcFile returned cbResult.result=%d\n", result);
-    return result;
+    *userdata_ea = vm_read32(cb_ea + 16);
+    memset(out, 0, sizeof(*out));
+    out->fileOperation = vm_read32(set_ea);
+    out->fileType = vm_read32(set_ea + 8);
+    memcpy(out->secureFileId, vm_base + set_ea + 12, 16);
+    u32 name = vm_read32(set_ea + 28), buffer = vm_read32(set_ea + 44);
+    out->fileName = name ? (char*)vm_base + name : NULL;
+    out->fileOffset = vm_read32(set_ea + 32);
+    out->fileSize = vm_read32(set_ea + 36);
+    out->fileBufSize = vm_read32(set_ea + 40);
+    out->fileBuf = buffer ? vm_base + buffer : NULL;
+    return marshal_cbresult_read_result(cb_ea);
 }
 
 static void marshal_statget_init(uint32_t addr, int is_new, const char* dirName,
@@ -274,8 +263,9 @@ static void marshal_statget_init(uint32_t addr, int is_new, const char* dirName,
 /* Dispatch funcStat callback via the guest-caller hook.
  * Returns the cbResult.result value the callback wrote, or
  * CELL_SAVEDATA_CBRESULT_ERR_FAILURE if no dispatcher is installed. */
-static s32 dispatch_func_stat(uint32_t func_opd, int is_new, const char* dirName,
-                              uint32_t userdata_ea)
+static s32 dispatch_func_stat_full(uint32_t func_opd, int is_new, const char* dirName,
+                                   uint32_t* userdata_ea, const CellSaveDataStatGet* input,
+                                   CellSaveDataStatSet* output)
 {
     if (!g_ps3_guest_caller) return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
 
@@ -288,17 +278,55 @@ static s32 dispatch_func_stat(uint32_t func_opd, int is_new, const char* dirName
         return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
     }
 
-    marshal_cbresult_init(cb_ea, CELL_SAVEDATA_CBRESULT_OK_NEXT, userdata_ea);
+    marshal_cbresult_init(cb_ea, CELL_SAVEDATA_CBRESULT_OK_NEXT, *userdata_ea);
     marshal_statget_init(get_ea, is_new, dirName, 0, 0);
+    if (input) {
+        vm_write32(get_ea, (u32)input->hddFreeSizeKB);
+        vm_write64(get_ea + 8, (u64)input->dir.st_atime);
+        vm_write64(get_ea + 16, (u64)input->dir.st_mtime);
+        vm_write64(get_ea + 24, (u64)input->dir.st_ctime);
+        memcpy(vm_base + get_ea + 64, &input->getParam, 1552);
+        vm_write32(get_ea + 64 + 1280, input->getParam.attribute);
+        vm_write32(get_ea + 1616, input->bind);
+        vm_write32(get_ea + 1620, (u32)input->sizeKB);
+        vm_write32(get_ea + 1624, (u32)input->sysSizeKB);
+        vm_write32(get_ea + 1628, input->fileNum);
+        vm_write32(get_ea + 1632, input->fileListNum);
+        u32 files = input->fileListNum ? scratch_alloc(input->fileListNum * 56) : 0;
+        if (input->fileListNum && !files) return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
+        vm_write32(get_ea + 1636, files);
+        for (u32 i = 0; i < input->fileListNum; i++) {
+            const CellSaveDataFileStat* f = input->fileList + i;
+            u32 dst = files + i * 56;
+            vm_write32(dst, f->fileType); vm_write64(dst + 8, f->st_size);
+            vm_write64(dst + 16, (u64)f->st_atime);
+            vm_write64(dst + 24, (u64)f->st_mtime);
+            vm_write64(dst + 32, (u64)f->st_ctime);
+            memcpy(vm_base + dst + 40, f->fileName, CELL_SAVEDATA_FILENAME_SIZE);
+        }
+    }
     /* StatSet zero-init by scratch_alloc */
 
     printf("[cellSaveData] dispatching funcStat OPD=0x%08X (cb=0x%X get=0x%X set=0x%X, isNew=%d, userdata=0x%08X)\n",
-           func_opd, cb_ea, get_ea, set_ea, is_new, userdata_ea);
+           func_opd, cb_ea, get_ea, set_ea, is_new, *userdata_ea);
     g_ps3_guest_caller(func_opd, cb_ea, get_ea, set_ea, 0, 0, 0, 0, 0);
 
+    *userdata_ea = vm_read32(cb_ea + 16);
+    if (output) {
+        u32 params = vm_read32(set_ea);
+        output->setParam = params ? (CellSaveDataSystemFileParam*)(vm_base + params) : NULL;
+        output->reCreateMode = vm_read32(set_ea + 4);
+        output->indicator = NULL;
+    }
     s32 result = marshal_cbresult_read_result(cb_ea);
     printf("[cellSaveData] funcStat returned cbResult.result=%d\n", result);
     return result;
+}
+
+static s32 dispatch_func_stat(uint32_t func_opd, int is_new, const char* dirName,
+                              uint32_t userdata_ea)
+{
+    return dispatch_func_stat_full(func_opd, is_new, dirName, &userdata_ea, NULL, NULL);
 }
 
 /* Enumerate save directories matching a prefix. Returns count, fills dirList up to max. */
@@ -457,11 +485,23 @@ static u32 enumerate_save_files(const char* save_path,
 /* Execute file callback: read/write/delete files in the save directory */
 static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
 {
-    if (!set || !set->fileName)
-        return CELL_OK;
-
+    if (!set) return CELL_SAVEDATA_ERROR_PARAM;
+    const char* name = set->fileName;
+    switch (set->fileType) {
+    case CELL_SAVEDATA_FILETYPE_CONTENT_ICON0: name = "ICON0.PNG"; break;
+    case CELL_SAVEDATA_FILETYPE_CONTENT_ICON1: name = "ICON1.PAM"; break;
+    case CELL_SAVEDATA_FILETYPE_CONTENT_PIC1: name = "PIC1.PNG"; break;
+    case CELL_SAVEDATA_FILETYPE_CONTENT_SND0: name = "SND0.AT3"; break;
+    case CELL_SAVEDATA_FILETYPE_SECUREFILE:
+    case CELL_SAVEDATA_FILETYPE_NORMALFILE: break;
+    default: return CELL_SAVEDATA_ERROR_PARAM;
+    }
+    if (!name || !name[0] || strnlen(name, CELL_SAVEDATA_FILENAME_SIZE) == CELL_SAVEDATA_FILENAME_SIZE ||
+        strchr(name, '/') || strchr(name, '\\') || !strcmp(name, ".") || !strcmp(name, "..") ||
+        (set->fileOperation != CELL_SAVEDATA_FILEOP_DELETE && !set->fileBuf))
+        return CELL_SAVEDATA_ERROR_PARAM;
     char file_path[1024];
-    snprintf(file_path, sizeof(file_path), "%s/%s", save_path, set->fileName);
+    snprintf(file_path, sizeof(file_path), "%s/%s", save_path, name);
 #ifdef _WIN32
     for (char* p = file_path; *p; p++) {
         if (*p == '/') *p = '\\';
@@ -473,7 +513,7 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
         FILE* fp = fopen(file_path, "rb");
         if (!fp) {
             printf("[cellSaveData] file read: cannot open '%s'\n", file_path);
-            return 0; /* excSize = 0 */
+            return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
         }
         if (set->fileOffset > 0) {
 #ifdef _MSC_VER
@@ -485,8 +525,9 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
         size_t read_size = (size_t)set->fileSize;
         if (read_size > set->fileBufSize) read_size = set->fileBufSize;
         size_t got = fread(set->fileBuf, 1, read_size, fp);
-        fclose(fp);
-        return (s32)got;
+        int failed = ferror(fp);
+        if (fclose(fp) != 0) failed = 1;
+        return failed ? CELL_SAVEDATA_ERROR_ACCESS_ERROR : (s32)got;
     }
 
     case CELL_SAVEDATA_FILEOP_WRITE:
@@ -504,7 +545,7 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
         }
         if (!fp) {
             printf("[cellSaveData] file write: cannot open '%s'\n", file_path);
-            return 0;
+            return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
         }
         if (set->fileOffset > 0) {
 #ifdef _MSC_VER
@@ -516,8 +557,9 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
         size_t write_size = (size_t)set->fileSize;
         if (write_size > set->fileBufSize) write_size = set->fileBufSize;
         size_t wrote = fwrite(set->fileBuf, 1, write_size, fp);
-        fclose(fp);
-        return (s32)wrote;
+        int failed = wrote != write_size;
+        if (fclose(fp) != 0) failed = 1;
+        return failed ? CELL_SAVEDATA_ERROR_ACCESS_ERROR : (s32)wrote;
     }
 
     case CELL_SAVEDATA_FILEOP_DELETE:
@@ -621,11 +663,13 @@ static s32 savedata_execute(const char* dirName, int is_save,
      * violation (0xD00DCF84 = r1+0x90). Read it out of guest memory, the way
      * the dirListMax read below already does. fileListMax is at +4. */
     u32 file_list_max = setBuf ? vm_read32((u32)(uintptr_t)setBuf + 4) : 64;
+    if (file_list_max > CELL_SAVEDATA_LISTITEM_MAX) return CELL_SAVEDATA_ERROR_PARAM;
     CellSaveDataFileStat* fileList = NULL;
     u32 fileNum = 0;
 
     if (file_list_max > 0) {
         fileList = (CellSaveDataFileStat*)calloc(file_list_max, sizeof(CellSaveDataFileStat));
+        if (!fileList) return CELL_SAVEDATA_ERROR_INTERNAL;
         if (!is_new) {
             fileNum = enumerate_save_files(save_path, fileList, file_list_max);
         }
@@ -677,8 +721,9 @@ static s32 savedata_execute(const char* dirName, int is_save,
      * guest memory as host code -- ACCESS VIOLATION: execute at host 0x34C250
      * -- the moment Tokyo Jungle autosaved. Route it through the marshalling
      * dispatcher, which builds StatGet/StatSet in guest memory. */
-    cbResult.result = dispatch_func_stat((uint32_t)(uintptr_t)funcStat, is_new,
-                                         dirName, (uint32_t)(uintptr_t)userdata);
+    u32 callback_userdata = (u32)(uintptr_t)userdata;
+    cbResult.result = dispatch_func_stat_full((uint32_t)(uintptr_t)funcStat, is_new,
+                         dirName, &callback_userdata, &statGet, &statSet);
 
     if (cbResult.result < 0) {
         printf("[cellSaveData] stat callback returned error %d\n", cbResult.result);
@@ -691,39 +736,24 @@ static s32 savedata_execute(const char* dirName, int is_save,
     /* Write PARAM.SFO if stat set provided params and we're saving */
     if (is_save && statSet.setParam) {
         ensure_dirs(save_path);
-        write_param_sfo(save_path, statSet.setParam);
+        CellSaveDataSystemFileParam params;
+        memcpy(&params, statSet.setParam, sizeof(params));
+        params.attribute = ps3_bswap32(params.attribute);
+        write_param_sfo(save_path, &params);
     }
 
-    /* Call file callback repeatedly */
+    /* Each NEXT callback requests one operation. LAST ends the sequence;
+     * its zero-initialized FileSet is not an implicit read request. */
     if (funcFile && cbResult.result == CELL_SAVEDATA_CBRESULT_OK_NEXT) {
+        u32 exc_size = 0;
         while (1) {
-            CellSaveDataFileGet fileGet;
-            memset(&fileGet, 0, sizeof(fileGet));
-
             CellSaveDataFileSet fileSet;
-            memset(&fileSet, 0, sizeof(fileSet));
-
-            cbResult.result = CELL_SAVEDATA_CBRESULT_OK_NEXT;
-
-            cbResult.result = dispatch_func_file((uint32_t)(uintptr_t)funcFile, (uint32_t)(uintptr_t)userdata);
-
-            if (cbResult.result == CELL_SAVEDATA_CBRESULT_OK_LAST ||
-                cbResult.result < 0) {
-                /* Process last operation if set */
-                if (fileSet.fileName && fileSet.fileBuf) {
-                    s32 exc = process_file_op(save_path, &fileSet);
-                    (void)exc;
-                }
-                break;
-            }
-
-            if (fileSet.fileName && fileSet.fileBuf) {
-                s32 exc = process_file_op(save_path, &fileSet);
-                (void)exc;
-            } else {
-                /* No file operation requested, done */
-                break;
-            }
+            cbResult.result = dispatch_func_file((u32)(uintptr_t)funcFile,
+                                                 &callback_userdata, exc_size, &fileSet);
+            if (cbResult.result != CELL_SAVEDATA_CBRESULT_OK_NEXT) break;
+            s32 exc = process_file_op(save_path, &fileSet);
+            if (exc < 0) { free(fileList); return exc; }
+            exc_size = (u32)exc;
         }
     }
 
@@ -919,7 +949,8 @@ static s32 savedata_fixed(int is_save, CellSaveDataSetList* setList,
     /* The selected string may be inside callback scratch, reused by funcStat. */
     char directory[CELL_SAVEDATA_DIRNAME_SIZE];
     memcpy(directory, name, len + 1);
-    return savedata_execute(directory, is_save, setBuf, funcStat, funcFile, userdata);
+    return savedata_execute(directory, is_save, setBuf, funcStat, funcFile,
+                            (void*)(uintptr_t)vm_read32(cb + 16));
 }
 
 s32 cellSaveDataFixedSave2(u32 version, CellSaveDataSetList* setList,
