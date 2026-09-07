@@ -334,7 +334,7 @@ jobs:
         run: |
           cmake -S tests/sync_stress -B build-sync-stress -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           cmake --build build-sync-stress
-          ./build-sync-stress/sync_stress
+          ctest --test-dir build-sync-stress --output-on-failure
 
       # cellFiber's cooperative switching on ucontext. glibc's ucontext_t is
       # not the one that bites, but running the suite on both hosts is what

@@ -112,7 +112,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           cmake --build build-sync-stress
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          .\build-sync-stress\sync_stress.exe
+          ctest --test-dir build-sync-stress --output-on-failure
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Run self-contained RSX tests
