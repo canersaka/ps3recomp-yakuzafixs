@@ -14,6 +14,7 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
+#include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
 
 /* Guest EA of the GCM context (begin/end/current/callback) the title writes its
  * command stream into; recorded by cellGcmSetupContext, drained by the RSX. */
@@ -152,6 +153,19 @@ static int s_io_mapping_count = 0;
 /* Callback handlers — these are GUEST OPD addresses passed by the
  * recompiled game, not host function pointers. Stored as uint32_t and
  * invoked through g_ps3_guest_caller (see ps3emu/guest_call.h). */
+
+/* Handler mask exported for the RSX event delivery path. Bit layout matches
+ * the RPCS3 SYS_RSX_EVENT enum (vblank=0x02, flip=0x04, user_cmd=0x80).
+ * The runner's vblank tick reads this to decide which events to send to
+ * the libgcm interrupt thread. Updated by Set*Handler below.
+ *
+ * If g_gcm_driver_info_ea is non-zero, the mask is also written to
+ * driver_info + 0x12C0 so the game's own libgcm interrupt path can read it
+ * directly from guest memory. The runner sets g_gcm_driver_info_ea during
+ * RSX context allocation. */
+uint32_t g_gcm_handler_mask = 0;
+uint32_t g_gcm_driver_info_ea = 0;
+
 static u32 s_flip_handler_opd     = 0;
 
 /* GCM_FLIPCB_ONTICK=1: fire the guest flip handler only when the flip
@@ -182,6 +196,17 @@ static void ydkj_restore_handler_opd(u32 opd, u32 code) {
         static int _n=0; if(_n++<6) fprintf(stderr,"[HANDLERFIX] restored clobbered OPD 0x%08X code=0x%08X\n",opd,code);
     }
 }
+static void gcm_update_handler_mask(void)
+{
+    uint32_t m = 0;
+    if (s_vblank_handler_opd) m |= 0x02;
+    if (s_flip_handler_opd)   m |= 0x04;
+    if (s_user_handler_opd)   m |= 0x80;
+    g_gcm_handler_mask = m;
+    if (g_gcm_driver_info_ea)
+        vm_write32(g_gcm_driver_info_ea + 0x12C0, m);
+}
+
 /* Legacy host-typed slots kept around for any caller still treating
  * these as host pointers. New code should use the _opd slots. */
 static CellGcmFlipHandler    s_flip_handler    = NULL;
@@ -1728,6 +1753,7 @@ void cellGcmSetFlipHandler(CellGcmFlipHandler handler)
     s_flip_handler_opd = (u32)(size_t)handler;
     s_flip_handler = handler;
     { u32 c = s_flip_handler_opd ? vm_read32(s_flip_handler_opd) : 0; if (c) s_flip_handler_code = c; }
+    gcm_update_handler_mask();
 }
 
 /* NID: 0xA547ADDE */
@@ -1737,6 +1763,7 @@ void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler)
     s_vblank_handler_opd = (u32)(size_t)handler;
     s_vblank_handler = handler;
     { u32 c = s_vblank_handler_opd ? vm_read32(s_vblank_handler_opd) : 0; if (c) s_vblank_handler_code = c; }
+    gcm_update_handler_mask();
 }
 
 /* NID: 0xF9BFCDA3 */
@@ -1753,6 +1780,7 @@ void cellGcmSetUserHandler(CellGcmUserHandler handler)
     printf("[cellGcmSys] SetUserHandler(opd=0x%08X)\n", (unsigned)(size_t)handler);
     s_user_handler_opd = (u32)(size_t)handler;
     s_user_handler = handler;
+    gcm_update_handler_mask();
 }
 
 /* NID: 0x21AC3697 */
