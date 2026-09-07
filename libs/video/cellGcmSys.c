@@ -235,7 +235,16 @@ static u32 s_second_v_frequency = 0;
 static u32 s_vblank_frequency   = 0;
 
 /* User command */
-static u32 s_user_command = 0;
+#ifdef _WIN32
+static volatile LONG s_user_command = 0;
+#define GCM_USER_STORE(cmd) InterlockedExchange(&s_user_command, (LONG)(cmd))
+#define GCM_USER_LOAD() ((u32)InterlockedCompareExchange(&s_user_command, 0, 0))
+#else
+#include <stdatomic.h>
+static atomic_uint s_user_command = 0;
+#define GCM_USER_STORE(cmd) atomic_store(&s_user_command, (cmd))
+#define GCM_USER_LOAD() atomic_load(&s_user_command)
+#endif
 
 /* Tile configuration (up to 15 tiles, 8 commonly used) */
 static CellGcmTileInfo s_tiles[CELL_GCM_MAX_TILE_COUNT];
@@ -416,7 +425,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     s_queue_handler = NULL;
     s_second_v_frequency = 0;
     s_vblank_frequency = 0;
-    s_user_command = 0;
+    GCM_USER_STORE(0);
 
     /* Set up the initial IO mapping for the command buffer region */
     if (ioAddress != 0 && ioSize > 0) {
@@ -652,7 +661,7 @@ void ppu_gcm_pump(void)
         }
     }
     if (p & 4) {
-        u32 cmd = s_user_command;
+        u32 cmd = GCM_USER_LOAD();
         if (s_user_handler_opd && g_ps3_guest_caller)
             g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
     }
@@ -1487,8 +1496,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * the draw-engine call above does. */
                 { const u32 mfull = (subch << 13) | m;
                 if (mfull == 0xEB00u || mfull == 0xEB04u) {
-                    s_user_command = vm_read32(dea);
-                    GCM_PENDING_SET(4);
+                    cellGcmQueueUserCommand(vm_read32(dea));
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
@@ -2375,7 +2383,7 @@ void cellGcmTerminate(void)
     s_vblank_count = 0;
     s_io_map_reserved = 0;
     s_default_fifo_mode = 0;
-    s_user_command = 0;
+    GCM_USER_STORE(0);
 
     memset(s_display_buffers, 0, sizeof(s_display_buffers));
     memset(s_display_buffer_set, 0, sizeof(s_display_buffer_set));
@@ -2557,7 +2565,16 @@ void cellGcmSetVBlankFrequency(u32 freq)
 /* Store user command value */
 void cellGcmSetUserCommand(u32 cmd)
 {
-    s_user_command = cmd;
+    GCM_USER_STORE(cmd);
+}
+
+/* Called when a FIFO consumer retires a user-interrupt method. Publishing
+ * the cause precedes the pending bit; guest code runs later in the pump.
+ * Like the driver cause register, multiple pending commands coalesce. */
+void cellGcmQueueUserCommand(u32 cmd)
+{
+    GCM_USER_STORE(cmd);
+    GCM_PENDING_SET(4);
 }
 
 /* Invalidate a tile region (unbind + clear) */
