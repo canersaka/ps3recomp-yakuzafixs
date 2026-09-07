@@ -225,7 +225,8 @@ static void stub_clear_color(void* u, u32 s, const float rgba[4])
 static void stub_clear_ds(void* u, u32 d, u32 f, float z, u8 s)
 { (void)u; (void)d; (void)f; (void)z; (void)s; stub.n_clear_ds++; }
 
-static void stub_present(void* u, u32 s) { (void)u; (void)s; stub.n_present++; }
+static u32 presented_surface;
+static void stub_present(void* u, u32 s) { (void)u; presented_surface = s; stub.n_present++; }
 
 /* One pixel of a surface, in the R,G,B,A order rsx_texture_decode produces:
  * the readback hook has to put those back into the guest's A8R8G8B8. */
@@ -872,6 +873,25 @@ static void test_readback(void)
     engine_down();
 }
 
+static void test_queued_flip_buffer(void)
+{
+    engine_up();
+    draw_triangle();
+    u32 first = stub.bound_rt[0];
+    rsx_draw_engine_set_display_buffer(0, RSX_LOCATION_LOCAL, 0x40000, 1024, 256, 256);
+    m(M_COLOR_A_OFFSET, 0x60000);
+    draw_triangle();
+    u32 second = stub.bound_rt[0];
+    rsx_draw_engine_set_display_buffer(1, RSX_LOCATION_LOCAL, 0x60000, 1024, 256, 256);
+    rsx_draw_engine_present_buffer(0);
+    CHECK(presented_surface == first, "queued flip selects first buffer over current target");
+    rsx_draw_engine_present_buffer(1);
+    CHECK(presented_surface == second && first != second, "queued flip selects second buffer");
+    rsx_draw_engine_present();
+    CHECK(presented_surface == second, "host present retains last queued buffer");
+    engine_down();
+}
+
 static unsigned custom_reads;
 static const u8* custom_guest_read(void* user, u32 location, u32 offset, u32 bytes)
 {
@@ -918,6 +938,7 @@ int main(void)
     test_scissor();
     test_readback();
     test_custom_guest_mapping();
+    test_queued_flip_buffer();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",

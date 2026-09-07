@@ -77,7 +77,8 @@ def main():
     imports = replace_once(imports, '    rsx_live_draw_method(method, arg);',
         '''    rsx_live_draw_method(method, arg);
 #ifdef __APPLE__
-    if (rsx_draw_engine_enabled()) rsx_draw_engine_method(method, arg);
+    if (rsx_draw_engine_enabled() && method != 0xE944u)
+        rsx_draw_engine_method(method, arg);
 #endif''', 'Metal FIFO feed')
     imports = replace_once(imports,
         '    if (YZ_RSX_BACKEND_INIT(1280, 720, "Yakuza: Dead Souls (ps3recomp)") != 0) {',
@@ -93,6 +94,29 @@ def main():
             rsx_draw_engine_set_display_buffer(id, 0, g_rsx_dispbuf[id].offset,
                 g_rsx_dispbuf[id].pitch, g_rsx_dispbuf[id].width, g_rsx_dispbuf[id].height);
 #endif''', 'Metal display buffer registration')
+
+    imports = replace_once(imports, 'static void yz_rsx_present(uint32_t buffer_id)\n{',
+        '''extern "C" void yz_rsx_fifo_acquire(void);
+extern "C" void yz_rsx_fifo_release(void);
+static void yz_rsx_present(uint32_t buffer_id)
+{
+#ifdef __APPLE__
+    if (rsx_draw_engine_enabled()) {
+        yz_rsx_fifo_acquire();
+        rsx_draw_engine_present_buffer(buffer_id);
+        yz_rsx_fifo_release();
+        return;
+    }
+#endif''', 'Metal queued flip presentation')
+
+    imports = replace_once(imports,
+        '    uint32_t ea = (uint32_t)ctx->gpr[3], out = (uint32_t)ctx->gpr[4];',
+        '''    uint32_t ea = (uint32_t)ctx->gpr[3], out = (uint32_t)ctx->gpr[4];
+    if (ea >= YZ_GCM_LOCAL_BASE && ea - YZ_GCM_LOCAL_BASE < YZ_GCM_LOCAL_SIZE) {
+        if (out) vm_write32(out, ea - YZ_GCM_LOCAL_BASE);
+        ctx->gpr[3] = 0;
+        return;
+    }''', 'local VRAM address translation')
 
     # A single CFRunLoopRun may return when AppKit's nested event handling
     # stops it or when no sources remain. Do not join a still-running guest:

@@ -3061,12 +3061,45 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
     }
 }
 
+/* Opt-in readback of the game surface, useful on a locked Mac or in CI.
+ * Headless submits have completed before this runs; no compositor access. */
+static void eng_dump_frame(id<MTLTexture> src)
+{
+    if (!s_headless) return;
+    const char* path = getenv("PS3RECOMP_METAL_FRAME_DUMP");
+    if (!path || !*path) return;
+    static unsigned frame;
+    if ((++frame % 120) != 0) return;
+    if ([src pixelFormat] != MTLPixelFormatRGBA8Unorm &&
+        [src pixelFormat] != MTLPixelFormatBGRA8Unorm) return;
+    size_t w = [src width], h = [src height];
+    if (!w || !h || w > 16384 || h > 16384) return;
+    unsigned char* rgba = malloc(w * h * 4);
+    if (!rgba) return;
+    [src getBytes:rgba bytesPerRow:w * 4
+      fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+    FILE* f = fopen(path, "wb");
+    if (f) {
+        fprintf(f, "P6\n%zu %zu\n255\n", w, h);
+        int bgra = [src pixelFormat] == MTLPixelFormatBGRA8Unorm;
+        for (size_t p = 0; p < w * h; ++p) {
+            unsigned char rgb[3] = {rgba[p*4 + (bgra ? 2 : 0)], rgba[p*4+1],
+                                    rgba[p*4 + (bgra ? 0 : 2)]};
+            fwrite(rgb, 1, 3, f);
+        }
+        fclose(f);
+        fprintf(stderr, "[rsx engine/metal] captured frame %u to %s\n", frame, path);
+    }
+    free(rgba);
+}
+
 static void eng_present(void* user, u32 surface)
 {
     (void)user;
     id<MTLTexture> src = eng_obj(surface);
     if (!src) { eng_encode_and_commit(nil); return; }
     eng_encode_and_commit(src);
+    eng_dump_frame(src);
 }
 
 static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,

@@ -1574,6 +1574,15 @@ static void eng_present(u32 buffer_id)
     if (!g.ready) return;
     const u32 target = eng_present_surface(buffer_id);
     if (target == ENG_INVALID) return;
+    if (getenv("PS3RECOMP_METAL_FRAME_DUMP") && g.frames % 120 == 0) {
+        u32 current = eng_current_surface();
+        fprintf(stderr, "[rsx capture] frame=%u buffer=%u selected=%u current=%u draws=%u surfaces=%u\n",
+                g.frames, buffer_id, target, current, g.guest_draws, g.n_surfaces);
+        for (u32 i = 0; i < g.n_surfaces; ++i)
+            fprintf(stderr, "[rsx capture] surface %u loc=%u offset=%08X size=%ux%u handle=%u\n",
+                    i, g.surfaces[i].location, g.surfaces[i].offset,
+                    g.surfaces[i].w, g.surfaces[i].h, g.surfaces[i].handle);
+    }
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);
     g.frames++;
@@ -1710,6 +1719,12 @@ void rsx_draw_engine_present(void)
      * re-present a double-buffered title's OTHER scanout. Presenting twice is
      * harmless either way -- the engine never clears the surface, so a second
      * present just blits the same image again. */
+    eng_present(g.last_flip_buffer);
+}
+
+void rsx_draw_engine_present_buffer(u32 buffer_id)
+{
+    g.last_flip_buffer = buffer_id & 7u;
     eng_present(g.last_flip_buffer);
 }
 
