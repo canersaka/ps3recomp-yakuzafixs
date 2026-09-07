@@ -239,12 +239,18 @@ static u32 s_vblank_frequency   = 0;
 #ifdef _WIN32
 static volatile LONG s_user_command = 0;
 #define GCM_USER_STORE(cmd) InterlockedExchange(&s_user_command, (LONG)(cmd))
-#define GCM_USER_LOAD() ((u32)InterlockedCompareExchange(&s_user_command, 0, 0))
+/* Pair the pending marker with its cause so a later producer cannot
+ * overwrite a cause already claimed by the callback pump. */
+static volatile LONG64 s_user_pending = 0;
+#define GCM_USER_PENDING_STORE(value) InterlockedExchange64(&s_user_pending, (LONG64)(value))
+#define GCM_USER_PENDING_TAKE() ((u64)InterlockedExchange64(&s_user_pending, 0))
 #else
 #include <stdatomic.h>
 static atomic_uint s_user_command = 0;
 #define GCM_USER_STORE(cmd) atomic_store(&s_user_command, (cmd))
-#define GCM_USER_LOAD() atomic_load(&s_user_command)
+static _Atomic(u64) s_user_pending = 0;
+#define GCM_USER_PENDING_STORE(value) atomic_store(&s_user_pending, (value))
+#define GCM_USER_PENDING_TAKE() atomic_exchange(&s_user_pending, 0)
 #endif
 
 /* Tile configuration (up to 15 tiles, 8 commonly used) */
@@ -427,6 +433,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     s_second_v_frequency = 0;
     s_vblank_frequency = 0;
     GCM_USER_STORE(0);
+    GCM_USER_PENDING_STORE(0);
 
     /* Set up the initial IO mapping for the command buffer region */
     if (ioAddress != 0 && ioSize > 0) {
@@ -594,7 +601,7 @@ u32 cellGcmGetFlipStatus(void)
  * -----------------------------------------------------------------------*/
 #ifdef _WIN32
 #include <windows.h>
-static volatile LONG s_gcm_pending = 0;    /* bit0 = vblank, bit1 = flip, bit2 = user cmd */
+static volatile LONG s_gcm_pending = 0;    /* bit0 = vblank, bit1 = flip */
 #define GCM_PENDING_SET(bits)  InterlockedOr(&s_gcm_pending, (bits))
 #define GCM_PENDING_TAKE()     InterlockedExchange(&s_gcm_pending, 0)
 #else
@@ -647,7 +654,8 @@ void ppu_gcm_pump(void)
 #endif
     if (in) return;
     long p = (long)GCM_PENDING_TAKE();
-    if (!p) return;
+    u64 user = GCM_USER_PENDING_TAKE();
+    if (!p && !user) return;
     in = 1;
     if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
         ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
@@ -661,8 +669,8 @@ void ppu_gcm_pump(void)
             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
         }
     }
-    if (p & 4) {
-        u32 cmd = GCM_USER_LOAD();
+    if (user) {
+        u32 cmd = (u32)user;
         if (s_user_handler_opd && g_ps3_guest_caller)
             g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
     }
@@ -2395,6 +2403,7 @@ void cellGcmTerminate(void)
     s_io_map_reserved = 0;
     s_default_fifo_mode = 0;
     GCM_USER_STORE(0);
+    GCM_USER_PENDING_STORE(0);
 
     memset(s_display_buffers, 0, sizeof(s_display_buffers));
     memset(s_display_buffer_set, 0, sizeof(s_display_buffer_set));
@@ -2580,12 +2589,12 @@ void cellGcmSetUserCommand(u32 cmd)
 }
 
 /* Called when a FIFO consumer retires a user-interrupt method. Publishing
- * the cause precedes the pending bit; guest code runs later in the pump.
+ * the cause and pending marker is atomic; guest code runs later in the pump.
  * Like the driver cause register, multiple pending commands coalesce. */
 void cellGcmQueueUserCommand(u32 cmd)
 {
     GCM_USER_STORE(cmd);
-    GCM_PENDING_SET(4);
+    GCM_USER_PENDING_STORE((1ULL << 32) | cmd);
 }
 
 /* Invalidate a tile region (unbind + clear) */
