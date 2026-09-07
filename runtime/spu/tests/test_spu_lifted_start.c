@@ -483,6 +483,29 @@ static void test_guest_stack_reset(void)
     free(ctx);
 }
 
+static void nested_task_resume(spu_context* ctx)
+{
+    ctx->host_depth = 5;
+    ctx->pc = 0x7BD4;
+    spu_indirect_branch(ctx);
+    stale_caller_ran = 1;
+}
+static void test_taskset_resume_stack(void)
+{
+    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
+    if (!ctx) { check(0, "allocate task resume stack"); return; }
+    spu_begin_image(88); spu_register_function(0x7BD4, reset_target);
+    spu_begin_image(0);
+    spu_taskset_register_task_elf(0x700000, 88, 84);
+    ctx->image_id = 16; ctx->resident_ovl = 84;
+    ctx->ls[0x2795] = 0x70;
+    stack_reset_depth = -1; stale_caller_ran = 0;
+    spu_run_with_halt(nested_task_resume, ctx);
+    check(stack_reset_depth == 0, "restored task runs without the scheduler's host frames");
+    check(!stale_caller_ran, "task resume discards the old scheduler continuation");
+    free(ctx);
+}
+
 static uint32_t captured_queue;
 static uint64_t captured_event[4];
 static int push_result;
@@ -578,6 +601,7 @@ int main(void)
     test_lle_taskset_syscall();
     test_taskset_resume_identity();
     test_guest_stack_reset();
+    test_taskset_resume_stack();
 
     signal(SIGSEGV, guard_fault);
     signal(SIGBUS,  guard_fault);
