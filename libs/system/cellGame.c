@@ -559,22 +559,18 @@ s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPat
     snprintf(usrdir, sizeof(usrdir), "%s/USRDIR", path);
     ensure_dirs(usrdir);
 
+    /* Host paths are only for host filesystem access. Guest code feeds these
+     * results back to cellFs, which resolves PS3 virtual paths through VFS. */
     uint32_t cip_ea = (uint32_t)(uintptr_t)tmp_contentInfoPath;
     uint32_t usr_ea = (uint32_t)(uintptr_t)tmp_usrdirPath;
+    char guest_path[CELL_GAME_PATH_MAX];
     if (cip_ea) {
-        size_t len = strlen(path);
-#ifdef _WIN32
-        if (len == 3 && path[1] == ':' && (path[2] == '/' || path[2] == '\\')) break;
-#endif
-        if (len > CELL_GAME_PATH_MAX - 1) len = CELL_GAME_PATH_MAX - 1;
-        memcpy(vm_base + cip_ea, path, len);
-        vm_base[cip_ea + len] = '\0';
+        snprintf(guest_path, sizeof(guest_path), "/dev_hdd0/game/%s", create_dir);
+        memcpy(vm_base + cip_ea, guest_path, strlen(guest_path) + 1);
     }
     if (usr_ea) {
-        size_t len = strlen(usrdir);
-        if (len > CELL_GAME_PATH_MAX - 1) len = CELL_GAME_PATH_MAX - 1;
-        memcpy(vm_base + usr_ea, usrdir, len);
-        vm_base[usr_ea + len] = '\0';
+        snprintf(guest_path, sizeof(guest_path), "/dev_hdd0/game/%s/USRDIR", create_dir);
+        memcpy(vm_base + usr_ea, guest_path, strlen(guest_path) + 1);
     }
 
     return CELL_OK;
