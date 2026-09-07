@@ -588,26 +588,28 @@ u32 cellGcmGetFlipStatus(void)
 #include "ps3emu/guest_call.h"
 
 /* ---------------------------------------------------------------------------
- * Serialized vblank/flip handler delivery.
+ * Serialized vblank/flip/user handler delivery.
  *
- * The vblank ticker runs on its own host thread. Invoking the guest vblank/flip
- * handlers directly from it executes GUEST CODE concurrently with the main guest
- * thread -- a data race on guest memory that made the demo nondeterministic (Cg
- * shader loader aborting run-to-run). Instead the ticker only marks a tick
- * PENDING (no guest code), and the handlers run on the MAIN guest thread, at HLE
- * call boundaries (ppu_gcm_pump from ps3_hle_call). Guest handler execution is
- * therefore serialized with the main thread -- no race.
+ * Tick producers publish pending work. The runner pumps it at HLE boundaries
+ * or on a dedicated callback thread. The pump serializes guest handlers with
+ * one another; it does not stop unrelated guest execution on other threads.
  * -----------------------------------------------------------------------*/
 #ifdef _WIN32
 #include <windows.h>
 static volatile LONG s_gcm_pending = 0;    /* bit0 = vblank, bit1 = flip */
 #define GCM_PENDING_SET(bits)  InterlockedOr(&s_gcm_pending, (bits))
 #define GCM_PENDING_TAKE()     InterlockedExchange(&s_gcm_pending, 0)
+static volatile LONG s_gcm_pumping = 0;
+#define GCM_PUMP_TRY_ENTER() (InterlockedCompareExchange(&s_gcm_pumping, 1, 0) == 0)
+#define GCM_PUMP_LEAVE()     InterlockedExchange(&s_gcm_pumping, 0)
 #else
 #include <stdatomic.h>
 static atomic_int s_gcm_pending = 0;
 #define GCM_PENDING_SET(bits)  atomic_fetch_or(&s_gcm_pending, (bits))
 #define GCM_PENDING_TAKE()     atomic_exchange(&s_gcm_pending, 0)
+static atomic_flag s_gcm_pumping = ATOMIC_FLAG_INIT;
+#define GCM_PUMP_TRY_ENTER() (!atomic_flag_test_and_set_explicit(&s_gcm_pumping, memory_order_acquire))
+#define GCM_PUMP_LEAVE()     atomic_flag_clear_explicit(&s_gcm_pumping, memory_order_release)
 #endif
 
 /* Called by the vblank ticker thread. NO guest code -- advance the vblank count
@@ -637,25 +639,16 @@ void cellGcm_request_tick(void)
     GCM_PENDING_SET(3);
 }
 
-/* Run the pending vblank/flip handlers on the CURRENT (main guest) thread.
- * Called from ps3_hle_call at each HLE boundary. Re-entrancy-guarded, and skipped
- * while already inside a guest callback (shared scratch stack). */
+/* Deliver pending handlers on the calling host thread. Serialize the entire
+ * claim-and-deliver sequence across threads: an HLE boundary and a host ticker
+ * may both pump, and newer causes must not overtake already claimed callbacks.
+ * A nonblocking guard also prevents nested callbacks from reentering. Leave
+ * pending notifications untouched when another pump is active. */
 void ppu_gcm_pump(void)
 {
-    /* (faithful-adopt-caner fold: dropped the ydkj ppu_in_guest_callback() guard
-     * -- sagemono's runtime has no guest-call-depth counter; the local `in`
-     * re-entrancy guard below still holds. Re-add depth tracking if a nested-
-     * callback flip regression appears in flow.) */
-#ifdef _WIN32
-    static __declspec(thread) int in = 0;
-#else
-    static __thread int in = 0;
-#endif
-    if (in) return;
+    if (!GCM_PUMP_TRY_ENTER()) return;
     long p = (long)GCM_PENDING_TAKE();
     u64 user = GCM_USER_PENDING_TAKE();
-    if (!p && !user) return;
-    in = 1;
     if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
         ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
         g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,
@@ -673,7 +666,7 @@ void ppu_gcm_pump(void)
         if (s_user_handler_opd && g_ps3_guest_caller)
             g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
     }
-    in = 0;
+    GCM_PUMP_LEAVE();
 }
 
 /* Back-compat: the old direct entry points now just mark a tick pending (so any
