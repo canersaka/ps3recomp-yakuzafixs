@@ -1275,7 +1275,25 @@ static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_contex
 static int spu_deliver_user_event(spu_context* spu, uint32_t value)
 {
     unsigned code = value >> 24;
-    if (!spu->spu_group_id || code >= 128) return 0;
+    if (!spu->spu_group_id) return 0;
+    /* Task-exit handlers signal an LV2 flag, not an SPU user-event queue.
+     * 128 acknowledges the result; 192 is the impatient, no-ack form. */
+    if (code == 128 || code == 192) {
+        uint32_t result = CELL_EINVAL;
+        if (spu->ch_out_mbox.count) {
+            uint32_t flag_id = spu_channel_read(&spu->ch_out_mbox);
+            uint32_t bit = value & 0xFFFFFFu;
+            if (bit < 64) {
+                ppu_context call = {0};
+                call.gpr[3] = flag_id;
+                call.gpr[4] = 1ull << bit;
+                result = (uint32_t)sys_event_flag_set(&call);
+            }
+        }
+        if (code == 128) spu_channel_write(&spu->ch_in_mbox, result);
+        return 1;
+    }
+    if (code >= 128) return 0;
     uint32_t result = CELL_EINVAL;
     if (spu->ch_out_mbox.count) {
         uint32_t data = spu_channel_read(&spu->ch_out_mbox);
