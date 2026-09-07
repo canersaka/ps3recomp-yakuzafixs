@@ -1644,6 +1644,16 @@ void spu_indirect_branch(spu_context* ctx)
         ctx->resident_task = 0;
     } else {
         int ti = spu_taskset_resident_image(ctx);
+        if (ti && !ctx->resident_task && ctx->host_depth &&
+            s_spu_halt_armed && !ctx->policy_mode) {
+            /* The policy restored a task's guest registers and branches to
+             * its saved PC. Its host frames still belong to the scheduler or
+             * an earlier task invocation; none can satisfy this task's return.
+             * Resume at depth zero so SPU_RET follows the restored guest link. */
+            ctx->resident_task = ti;
+            g_spu_trampoline_fn = 0;
+            longjmp(s_spu_halt_env, 2);
+        }
         if (!ti && !ctx->resident_task) ti = spu_taskset_task_image(ctx->pc);
         if (ti) ctx->resident_task = ti;
     }
