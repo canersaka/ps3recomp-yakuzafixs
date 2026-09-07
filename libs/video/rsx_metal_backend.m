@@ -2378,7 +2378,7 @@ static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
             return s_eng_view[i].view;
     if (s_eng_view_count >= ENG_MAX_VIEWS) return 0;
     u8 sel[4];
-    rsx_texture_component_remap(remap, (rsx_format >> 8) & 0x9Fu, sel);
+    rsx_texture_component_remap(remap, rsx_format & 0x9Fu, sel);
     id<MTLTexture> v =
         [t newTextureViewWithPixelFormat:[t pixelFormat]
                              textureType:MTLTextureType2D
