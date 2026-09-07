@@ -71,6 +71,16 @@ static uint64_t spu_host_ns(void)
 static SPU_TLS jmp_buf s_spu_halt_env;
 static SPU_TLS int     s_spu_halt_armed = 0;
 
+/* A non-local return replaces the old host call chain without changing
+ * any architectural registers, local store, or pending guest work. */
+void spu_restart_dispatch(spu_context* ctx)
+{
+    g_spu_trampoline_fn = 0;
+    if (s_spu_halt_armed) longjmp(s_spu_halt_env, 2);
+    fprintf(stderr, "[spu] non-local return outside execution driver at 0x%05X\n", ctx->pc);
+    ctx->status = SPU_STATUS_STOPPED_BY_HALT;
+}
+
 /* SPU->PPU outbound-mailbox delivery hook. The SPU writing WrOutMbox /
  * WrOutIntrMbox must wake PPU code blocked on the SPURS event queue bound to
  * the SPU thread group (e.g. cellSpursInitialize). lv2_register.c installs a
@@ -1568,6 +1578,7 @@ void spu_indirect_branch(spu_context* ctx)
                 fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
                         n, ctx->gpr[3]._u32[0]);
             ctx->gpr[3] = spu_make_preferred_u32(0);
+            ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
         }
     }
@@ -1580,7 +1591,9 @@ void spu_indirect_branch(spu_context* ctx)
         uint32_t sc = ((uint32_t)ctx->ls[0x27C4] << 24) | ((uint32_t)ctx->ls[0x27C5] << 16)
                     | ((uint32_t)ctx->ls[0x27C6] << 8)  | ctx->ls[0x27C7];
         if (ctx->image_id == 22 || (ctx->policy_mode && sc == YDKJ_TASKSET_PM_SYSCALL_ADDR)) {
-            spu_spurs_taskset_syscall(ctx); return;
+            spu_spurs_taskset_syscall(ctx);
+            ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+            return;
         }
     }
     /* YDKJ_CRI_R4: the taskset policy entry (LS 0xA00, image 23) writes r4 into

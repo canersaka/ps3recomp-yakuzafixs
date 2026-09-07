@@ -7,6 +7,7 @@ the PS3RECOMP_DIR split and macOS host support; no game assets are copied.
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -188,10 +189,35 @@ extern "C" yz_ppu_fn yz_lookup_func(uint32_t guest_addr)
     write_changed(adapter / 'dispatch.cpp', dispatch)
     write_changed(adapter / 'main.cpp', main_cpp)
     write_changed(adapter / 'import_overrides.cpp', imports)
+    # Keep legacy lifts read-only; upgrade their explicit call brackets in the
+    # build tree. The captured link is the return PC even when RA is not r0.
+    spu_adapter = adapter / 'spu'
+    spu_adapter.mkdir(exist_ok=True)
+    spu_adapted = {}
+    call = re.compile(r'(spu_link\((0x[0-9A-Fa-f]+)\);[^\n]*?)SPU_DRAIN\(ctx\);(?= ctx->host_depth--;)')
+    for original in sorted((game / 'recomp_prx').glob('*.c')):
+        content = original.read_text()
+        adapted, count = call.subn(lambda m: m[1] + 'spu_drain_call(ctx, ' + m[2] + ');', content)
+        if count:
+            if 'SPU_DRAIN(ctx); ctx->host_depth--;' in adapted:
+                raise SystemExit(f'Unsupported SPU call bracket: {original}')
+            write_changed(spu_adapter / original.name, adapted)
+            spu_adapted[str(original.resolve())] = {
+                'sha256': hashlib.sha256(content.encode()).hexdigest(), 'calls': count}
     # Defer until the external project's add_executable has defined its target.
     injection = '''function(ps3recomp_adapt_yakuza)
   get_target_property(runner_sources yakuza_recomp SOURCES)
   list(REMOVE_ITEM runner_sources main.cpp import_overrides.cpp dispatch.cpp)
+  set(adapted_sources)
+  foreach(source IN LISTS runner_sources)
+    get_filename_component(source_name "${source}" NAME)
+    if(EXISTS "${CMAKE_BINARY_DIR}/runner-adapter/spu/${source_name}")
+      list(APPEND adapted_sources "${CMAKE_BINARY_DIR}/runner-adapter/spu/${source_name}")
+    else()
+      list(APPEND adapted_sources "${source}")
+    endif()
+  endforeach()
+  set(runner_sources "${adapted_sources}")
   set_property(TARGET yakuza_recomp PROPERTY SOURCES "${runner_sources}")
   target_sources(yakuza_recomp PRIVATE
     "${CMAKE_BINARY_DIR}/runner-adapter/main.cpp"
@@ -210,6 +236,7 @@ cmake_language(DEFER CALL ps3recomp_adapt_yakuza)
         'imports_sha256': hashlib.sha256(original_imports.encode()).hexdigest(),
         'dispatch_sha256': hashlib.sha256(original_dispatch.encode()).hexdigest(),
         'shader_inputs_sha256': shader_hash,
+        'spu_call_adapters': spu_adapted,
         'adaptations': ['tiled-pitch guest ABI', 'main run loop until guest completion',
                         'HLE interrupt delivery', 'guest and interrupt host stacks',
                         'translated shader module and dispatch'],
