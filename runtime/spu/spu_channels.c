@@ -1061,6 +1061,19 @@ void spu_register_stack_reset_entry(uint32_t entry, int image_id)
     }
 }
 
+/* Also called before direct trampoline transfers: generated calls can enter
+ * a stack-switching routine without going through spu_indirect_branch. */
+void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
+{
+    if (!ctx->host_depth || !s_spu_halt_armed || ctx->policy_mode) return;
+    for (unsigned i = 0; i < s_stack_reset_count; ++i)
+        if (ctx->pc == s_stack_reset[i].entry &&
+            fn == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {
+            g_spu_trampoline_fn = 0;
+            longjmp(s_spu_halt_env, 2);
+        }
+}
+
 /* SPURS taskset TASK entries (see spu_context.resident_task). A taskset can hold
  * several tasks whose lifts share the SAME LS base -- the co-resident task-code
  * region -- so no LS address identifies which task owns it. The title registers
@@ -1891,14 +1904,7 @@ void spu_indirect_branch(spu_context* ctx)
                   s_dumped = 1; } } }
     }
     if (fn) {
-        if (ctx->host_depth && s_spu_halt_armed && !ctx->policy_mode) {
-            for (unsigned i = 0; i < s_stack_reset_count; ++i)
-                if (ctx->pc == s_stack_reset[i].entry &&
-                    fn == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {
-                    g_spu_trampoline_fn = 0;
-                    longjmp(s_spu_halt_env, 2);
-                }
-        }
+        spu_check_stack_reset(ctx, fn);
         /* MUSTTAIL: a guest loop that iterates through an indirect branch (the
          * Bink decoder's per-command dispatch does) must not grow the host
          * stack -- a plain call here leaked a resolver+callee frame per

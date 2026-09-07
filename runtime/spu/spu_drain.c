@@ -37,7 +37,8 @@ void* volatile    g_pm_flow_ctx = 0;
 extern void spu_halt(spu_context*);
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
-    (void)fn;
+    extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
+    spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
     /* A SPURS job returning to LS 0 is finished -- its crt tail-jumps to the
      * resident job manager, and with the job loaded at 0 that lands on its own
      * entry. Planting a return address in r0 catches the jobs that get there

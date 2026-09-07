@@ -164,7 +164,14 @@ def main():
         'kernel stack reset declaration')
     main_cpp = replace_once(main_cpp,
         '    spu_begin_image(16); spu_recomp_register();',
-        '    spu_register_stack_reset_entry(0x838u, 16);\n    spu_begin_image(16); spu_recomp_register();',
+        '''    spu_register_stack_reset_entry(0x838u, 16);
+    /* Sony's policy changes or restores its stack in these blocks. Register
+     * reachable trampoline PCs as well as the indirect kernel exit above. */
+    spu_register_stack_reset_entry(0xA14u, 2);
+    spu_register_stack_reset_entry(0xB48u, 2);
+    spu_register_stack_reset_entry(0xB64u, 2);
+    spu_register_stack_reset_entry(0x177Cu, 2);
+    spu_begin_image(16); spu_recomp_register();''',
         'kernel module-exit stack reset')
     dispatch = replace_once(original_dispatch,
         'extern "C" yz_ppu_fn yz_lookup_func(uint32_t guest_addr)\n{',
