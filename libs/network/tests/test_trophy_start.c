@@ -23,18 +23,22 @@ int main(void)
     assert(sceNpTrophyInit(NULL, 0, 0, 0) == CELL_OK);
     assert(sceNpTrophyCreateContext(NULL, (void*)0x100, NULL, 0) ==
            SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < SCE_NP_TROPHY_MAX_CONTEXTS; i++) {
         assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, NULL, 0) == CELL_OK);
-        assert(vm_read32(0x200) == (u32)i);
+        assert(vm_read32(0x200) == (u32)(i + 1));
         assert(sceNpTrophyCreateHandle((void*)0x204) == CELL_OK);
-        assert(vm_read32(0x204) == (u32)i);
+        assert(vm_read32(0x204) == (u32)(i + 1));
     }
+    assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, NULL, 0) == SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY);
+    assert(sceNpTrophyCreateHandle((void*)0x204) == SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY);
+    assert(sceNpTrophyDestroyContext(0) == SCE_NP_TROPHY_ERROR_INVALID_CONTEXT);
+    assert(sceNpTrophyDestroyHandle(0) == SCE_NP_TROPHY_ERROR_INVALID_HANDLE);
     assert(sceNpTrophyInit(NULL, 0, 0, 0) == SCE_NP_TROPHY_ERROR_ALREADY_INITIALIZED);
     assert(sceNpTrophyGetRequiredDiskSpace(1, 1, (void*)0x208, 0) == CELL_OK);
     assert(vm_read64(0x208) == 1024 * 1024);
-    assert(sceNpTrophyDestroyContext(1) == CELL_OK);
-    assert(sceNpTrophyDestroyHandle(1) == CELL_OK);
-    assert(s_contexts[0].in_use && s_handles[0].in_use);
+    assert(sceNpTrophyDestroyContext(SCE_NP_TROPHY_MAX_CONTEXTS) == CELL_OK);
+    assert(sceNpTrophyDestroyHandle(SCE_NP_TROPHY_MAX_HANDLES) == CELL_OK);
+    assert(s_contexts[1].in_use && s_handles[1].in_use);
     assert(sceNpTrophyTerm() == CELL_OK);
     free(vm_base);
     puts("Trophy initialization and guest-endian checks passed");

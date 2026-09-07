@@ -38,8 +38,8 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Constants
  * -----------------------------------------------------------------------*/
-#define SCE_NP_TROPHY_INVALID_CONTEXT       ((SceNpTrophyContext)-1)
-#define SCE_NP_TROPHY_INVALID_HANDLE        ((SceNpTrophyHandle)-1)
+#define SCE_NP_TROPHY_INVALID_CONTEXT       ((SceNpTrophyContext)0)
+#define SCE_NP_TROPHY_INVALID_HANDLE        ((SceNpTrophyHandle)0)
 #define SCE_NP_TROPHY_INVALID_TROPHY_ID     ((SceNpTrophyId)-1)
 
 #define SCE_NP_TROPHY_MAX_NUM_TROPHIES      128
