@@ -76,6 +76,7 @@ static SPU_TLS int     s_spu_halt_armed = 0;
  * the SPU thread group (e.g. cellSpursInitialize). lv2_register.c installs a
  * handler that maps spu_group_id -> connected event queue and pushes an event.
  * NULL until installed (plain SPU jobs with no PPU listener stay a no-op). */
+int (*g_spu_user_event_hook)(spu_context*, uint32_t) = NULL;
 void (*g_spu_out_mbox_hook)(uint32_t group_id, uint32_t spu_id,
                             int is_intr, uint32_t value) = 0;
 
@@ -596,9 +597,10 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         { static int s_t = -1; if (s_t < 0) s_t = getenv("YDKJ_MBOXTRACE") ? 1 : 0;
           if (s_t) fprintf(stderr, "[spu-mbox] OUT  grp=0x%X spu=0x%X val=0x%08X\n",
                            ctx->spu_group_id, ctx->spu_id, v); }
-        if (g_spu_out_mbox_hook) g_spu_out_mbox_hook(ctx->spu_group_id, ctx->spu_id, 0, v);
+        /* Plain mailbox data is consumed by the following interrupt request. */
         break;
     case SPU_WrOutIntrMbox:
+        if (g_spu_user_event_hook && g_spu_user_event_hook(ctx, v)) break;
         spu_channel_write(&ctx->ch_out_intr_mbox, v);
         { static int s_t = -1; if (s_t < 0) s_t = getenv("YDKJ_MBOXTRACE") ? 1 : 0;
           if (s_t) fprintf(stderr, "[spu-mbox] INTR grp=0x%X spu=0x%X val=0x%08X\n",

@@ -290,6 +290,7 @@ typedef struct {
      * into this queue with source = SYS_SPU_THREAD_GROUP_EVENT (0x100..) so
      * PPU code blocked on sys_event_queue_receive wakes up. */
     uint32_t event_queue_id;
+    uint32_t user_event_ports[64];
 } spu_group_t;
 
 static spu_group_t  s_spu_groups[MAX_SPU_GROUPS];
@@ -1218,9 +1219,8 @@ static int64_t sys_spu_thread_set_argument_handler(ppu_context* ctx)
 }
 
 /* sys_spu_thread_group_connect_event(group_id, queue_id, event_type)
- * sys_spu_thread_group_connect_event_all_threads(group_id, queue_id, name, port)
  *
- * Both bind a SYS_EVENT queue to the group; we record queue_id so
+ * Bind a lifecycle SYS_EVENT queue to the group; we record queue_id so
  * group_join can push a completion event. Sony's docs distinguish event
  * types (group state changes vs SPU-emitted user events) but we collapse
  * them into "the queue gets notified when the group transitions to
@@ -1240,6 +1240,60 @@ static int64_t sys_spu_thread_group_connect_event_handler(ppu_context* ctx)
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
+}
+
+/* User-event ports are independent of group lifecycle event connections. */
+static SRWLOCK s_spu_port_lock = SRWLOCK_INIT;
+static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_context* ctx)
+{
+    spu_group_t* g = spu_find_group((uint32_t)ctx->gpr[3]);
+    uint64_t requested = ctx->gpr[5];
+    uint32_t output = (uint32_t)ctx->gpr[6];
+    uint32_t result = CELL_OK;
+    if (!g) result = CELL_ESRCH;
+    else if (!requested) result = CELL_EINVAL;
+    else if (!output) result = CELL_EFAULT;
+    else {
+        result = CELL_EISCONN;
+        AcquireSRWLockExclusive(&s_spu_port_lock);
+        for (unsigned port = 0; port < 64; ++port) {
+            if ((requested & (1ull << port)) && !g->user_event_ports[port]) {
+                g->user_event_ports[port] = (uint32_t)ctx->gpr[4];
+                vm_base[output] = (uint8_t)port;
+                result = CELL_OK;
+                break;
+            }
+        }
+        ReleaseSRWLockExclusive(&s_spu_port_lock);
+    }
+    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)result;
+    return (int64_t)(int32_t)result;
+}
+
+/* The interrupt mailbox encodes send_event (0..63) or throw_event (64..127).
+ * The preceding ordinary mailbox word is data, not a separate PPU event. */
+static int spu_deliver_user_event(spu_context* spu, uint32_t value)
+{
+    unsigned code = value >> 24;
+    if (!spu->spu_group_id || code >= 128) return 0;
+    uint32_t result = CELL_EINVAL;
+    if (spu->ch_out_mbox.count) {
+        uint32_t data = spu_channel_read(&spu->ch_out_mbox);
+        unsigned port = code & 63;
+        uint32_t queue = 0;
+        AcquireSRWLockShared(&s_spu_port_lock);
+        spu_group_t* group = spu_find_group(spu->spu_group_id);
+        if (group) queue = group->user_event_ports[port];
+        ReleaseSRWLockShared(&s_spu_port_lock);
+        result = CELL_ENOTCONN;
+        if (queue) {
+            int rc = sys_event_queue_push_by_id(queue, 0xFFFFFFFF53505501ull,
+                spu->spu_id, ((uint64_t)port << 32) | (value & 0xFFFFFFu), data);
+            result = rc == 0 ? CELL_OK : CELL_EBUSY;
+        }
+    }
+    if (code < 64) spu_channel_write(&spu->ch_in_mbox, result);
+    return 1;
 }
 
 static int64_t sys_spu_thread_group_disconnect_event_handler(ppu_context* ctx)
@@ -1953,6 +2007,8 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_THREAD_CONNECT_EVENT,   sys_spu_thread_connect_event_handler);
     { extern void (*g_spu_out_mbox_hook)(uint32_t,uint32_t,int,uint32_t);
       g_spu_out_mbox_hook = ydkj_spu_out_mbox_deliver; }
+    { extern int (*g_spu_user_event_hook)(spu_context*, uint32_t);
+      g_spu_user_event_hook = spu_deliver_user_event; }
     lv2_syscall_register(tbl, SYS_SPU_THREAD_DISCONNECT_EVENT,sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT, sys_spu_thread_group_connect_event_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_DISCONNECT_EVENT, sys_spu_thread_group_disconnect_event_handler);
@@ -1964,7 +2020,7 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_SPU_MB,  sys_spu_thread_write_spu_mb_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_BIND_QUEUE,      sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_stub);
-    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_connect_event_handler);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_connect_event_all_threads_handler);
 }
 
 /* ---------------------------------------------------------------------------

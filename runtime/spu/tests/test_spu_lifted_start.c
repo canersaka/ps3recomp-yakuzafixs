@@ -97,6 +97,8 @@ static void guard_fault(int sig)
  * linked so the test can call the static syscall handlers directly and read
  * the group and thread tables to check what they did. */
 #include "../../syscalls/lv2_register.c"
+#include "../spu_helpers.h"
+void spu_wrch(spu_context*, uint32_t, u128);
 
 /* The lifted-code registry (spu_channels.c), which the test registers into. */
 typedef void (*test_spu_fn)(spu_context*);
@@ -369,6 +371,59 @@ static void test_smc_xori(void)
     free(ctx);
 }
 
+static uint32_t captured_queue;
+static uint64_t captured_event[4];
+static int push_result;
+
+static void test_user_event_ports(uint32_t gid, uint32_t tid)
+{
+    check(call(sys_spu_thread_group_connect_event_all_threads_handler,
+        gid, 77, 0xFFFFFFFFFFFF0000ull, OUT_EA, 0, 0) == 0,
+        "allocate a requested SPU user-event port");
+    check(vm_base[OUT_EA] == 16, "return the allocated port through the byte out-param");
+    check(call(sys_spu_thread_group_connect_event_all_threads_handler,
+        gid, 78, 1ull << 16, OUT_EA, 0, 0) == (int32_t)CELL_EISCONN,
+        "refuse an already connected requested port");
+    check(call(sys_spu_thread_group_connect_event_all_threads_handler,
+        gid, 78, 3ull << 16, OUT_EA, 0, 0) == 0 && vm_base[OUT_EA] == 17,
+        "allocate another port without replacing the first");
+    check(call(sys_spu_thread_group_connect_event_all_threads_handler,
+        gid, 78, 0, OUT_EA, 0, 0) == (int32_t)CELL_EINVAL,
+        "reject an empty port mask");
+    spu_context* spu = (spu_context*)calloc(1, sizeof *spu);
+    if (!spu) { check(0, "allocate event context"); return; }
+    spu->spu_group_id = gid;
+    spu->spu_id = tid;
+    extern int (*g_spu_user_event_hook)(spu_context*, uint32_t);
+    g_spu_user_event_hook = spu_deliver_user_event;
+    captured_queue = 0;
+    spu_wrch(spu, SPU_WrOutMbox, spu_splat_u32(0x12345678));
+    check(captured_queue == 0, "ordinary mailbox data does not emit a PPU event");
+    spu_wrch(spu, SPU_WrOutIntrMbox, spu_splat_u32(0x1000ABCD));
+    check(captured_queue == 77 && captured_event[0] == 0xFFFFFFFF53505501ull &&
+          captured_event[1] == tid && captured_event[2] == 0x100000ABCDull &&
+          captured_event[3] == 0x12345678,
+          "send_event routes the port, source and payload correctly");
+    check(spu->ch_out_mbox.count == 0 && spu->ch_in_mbox.count == 1 &&
+          spu_channel_read(&spu->ch_in_mbox) == 0, "send_event consumes data and acknowledges success");
+    push_result = -1;
+    spu_wrch(spu, SPU_WrOutMbox, spu_splat_u32(1));
+    spu_wrch(spu, SPU_WrOutIntrMbox, spu_splat_u32(0x10000000));
+    check(spu_channel_read(&spu->ch_in_mbox) == CELL_EBUSY,
+          "send_event reports a full queue to the SPU");
+    push_result = 0;
+    spu_wrch(spu, SPU_WrOutMbox, spu_splat_u32(2));
+    spu_wrch(spu, SPU_WrOutIntrMbox, spu_splat_u32(0x51000000));
+    check(captured_queue == 78 && spu->ch_in_mbox.count == 0,
+          "throw_event uses its own port and produces no acknowledgement");
+    spu_wrch(spu, SPU_WrOutMbox, spu_splat_u32(3));
+    spu_wrch(spu, SPU_WrOutIntrMbox, spu_splat_u32(0x12000000));
+    check(spu_channel_read(&spu->ch_in_mbox) == CELL_ENOTCONN,
+          "send_event reports an unbound port");
+    g_spu_user_event_hook = NULL;
+    free(spu);
+}
+
 /* The registry holds one entry per lifted function across EVERY image, and a
  * whole game's SPU workload is far more than one image: Yakuza registers ~170k.
  * Images register in dependency order, so a too-small cap silently dropped the
@@ -464,6 +519,8 @@ int main(void)
     /* Slot selection below keys on the low bit of the tid; if lv2 ever hands
      * out two ids of the same parity the two threads would share a slot. */
     CHECK(((tid0 ^ tid1) & 1u) == 1u);
+
+    test_user_event_ports(gid, tid0);
 
     /* --- start and join ----------------------------------------------- */
     CHECK(call(sys_spu_thread_group_start_handler, gid, 0, 0, 0, 0, 0) == 0);
@@ -563,8 +620,10 @@ void sys_fs_init(lv2_syscall_table* t)         { (void)t; }
 int sys_event_queue_push_by_id(uint32_t q, uint64_t d0, uint64_t d1,
                                uint64_t d2, uint64_t d3)
 {
-    (void)q; (void)d0; (void)d1; (void)d2; (void)d3;
-    return 0;
+    captured_queue = q;
+    captured_event[0] = d0; captured_event[1] = d1;
+    captured_event[2] = d2; captured_event[3] = d3;
+    return push_result;
 }
 void sys_fs_translate_path(const char* ps3_path, char* host, int size)
 {
