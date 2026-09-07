@@ -8,7 +8,9 @@
  * track, and the guest stores still have to be big-endian.
  */
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
+#include "../ppu/ppu_context.h"   /* ppu_context, PPU_THREAD_LOCAL */
 
 extern uint8_t* vm_base;
 
@@ -46,4 +48,60 @@ unsigned int g_ww_lo = 0, g_ww_hi = 0;
 void ps3_ww_report_inline(unsigned int addr, unsigned long long val, int width)
 {
     (void)addr; (void)val; (void)width;
+}
+
+/* ---------------------------------------------------------------------------
+ * Diagnostics that live in the PPU boot scaffold.
+ *
+ * runtime/ppu/ is compiled per-game against the lifter's generated header, not
+ * into this library, so an HLE module or syscall that calls one of its
+ * diagnostic helpers has nothing to link against in a library-only build. These
+ * are the do-nothing versions: the host harness has no guest context, no guest
+ * stack and no lifted function table, so there is nothing for them to report.
+ * -----------------------------------------------------------------------*/
+
+PPU_THREAD_LOCAL ppu_context* g_active_ctx = 0;
+
+uint32_t ppu_vm_size          = 0;
+uint32_t g_barrier_sync_watch = 0;
+uint32_t g_spu_image_src_ea   = 0;
+uint32_t g_spu_image_ls_start = 0;
+uint32_t g_spu_image_span     = 0;
+
+uint32_t vm_read32(uint64_t a)
+{
+    uint32_t v;
+    if (!vm_base) return 0;
+    memcpy(&v, vm_base + (uint32_t)a, 4);
+    return __builtin_bswap32(v);
+}
+
+void vm_write64(uint64_t a, uint64_t v)
+{
+    if (!vm_base) return;
+    v = __builtin_bswap64(v);
+    memcpy(vm_base + (uint32_t)a, &v, 8);
+}
+
+void ppu_resv_register(ppu_context* c)        { (void)c; }
+void ppu_guard_page(uint32_t ea)              { (void)ea; }
+void ppu_dump_guest_stack(ppu_context* c, const char* tag) { (void)c; (void)tag; }
+void ppu_dump_bctrl_ring(uint32_t a, const char* tag)      { (void)a; (void)tag; }
+void ppu_guest_callstack(const char* tag)     { (void)tag; }
+void ppu_log_host_chain(const char* tag)      { (void)tag; }
+void lbp_breadcrumb_dump(const char* tag)     { (void)tag; }
+
+/* Names the guest function that called in. No lifted function table here, so
+ * say so rather than leaving the caller's buffer undefined. */
+void ppu_guest_caller(char* out, size_t n)
+{
+    if (out && n) snprintf(out, n, "<no guest context>");
+}
+
+uint32_t ps3_spu_image_source_ea(uint32_t img_ea) { return img_ea; }
+
+/* The context-aware HLE table lives in ppu_hle.cpp, which is also per-game. */
+void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*))
+{
+    (void)nid; (void)name; (void)fn;
 }

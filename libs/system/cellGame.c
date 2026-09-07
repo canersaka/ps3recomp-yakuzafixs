@@ -103,6 +103,14 @@ void cellGame_set_title(const char* title)
     s_title[sizeof(s_title) - 1] = '\0';
 }
 
+/* The game's display name, straight from PARAM.SFO's TITLE. The boot harness
+ * uses this for the window caption -- it used to hardcode another title's name,
+ * which is confusing the moment you run two ports side by side. */
+const char* cellGame_get_title(void)
+{
+    return s_title;
+}
+
 void cellGame_set_content_path(const char* path)
 {
     if (!path) return;
@@ -362,20 +370,25 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
 #define CELL_GAMEDATA_CBRESULT_OK_CANCEL  1
 #define CELL_GAMEDATA_CBRESULT_OK         0
 
-s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
-                             void* funcStat, u32 container)
+/* Shared body for the two firmware entry points that hand a title a
+ * (CBResult, StatGet, StatSet) triple and run its funcStat callback:
+ * cellGameDataCheckCreate2 and cellHddGameCheck. RPCS3 defines
+ * CellHddGameStatGet / StatSet / CBResult as plain aliases of the CellGameData
+ * ones, so the single layout below is correct for both entry points; only the
+ * log tag, the isNewData we report, and the error mapping on a failed callback
+ * differ, and those stay with the callers.
+ *
+ * Returns the callback's cbResult->result (0 when there is no guest caller to
+ * run, which both callers treat as success). */
+static s32 gamedata_stat_callback(const char* tag, u32 version, uint32_t dir_ea,
+                                  uint32_t func_opd, uint32_t is_new_data)
 {
-    (void)errDialog; (void)container;
-    uint32_t dir_ea  = (uint32_t)(uintptr_t)dirName;
-    uint32_t func_opd = (uint32_t)(uintptr_t)funcStat;
     const char* dir = dir_ea ? (const char*)(vm_base + dir_ea) : "";
-    printf("[cellGame] DataCheckCreate2(version=%u dir='%s' errDialog=%u funcStat=0x%08X)\n",
-           version, dir, errDialog, func_opd);
+    printf("[cellGame] %s(version=%u dir='%s' funcStat=0x%08X)\n",
+           tag, version, dir, func_opd);
 
-    if (version != 0 || !dir_ea || !func_opd)
-        return CELL_GAME_ERROR_PARAM;
     if (!g_ps3_guest_caller)
-        return CELL_OK;
+        return CELL_GAMEDATA_CBRESULT_OK;
 
     /* Guest scratch for the 3 callback structs: CBResult(0x18)/StatGet(0xBE8)/StatSet(0x0C). */
     uint32_t cb  = GAMEDATA_CB_BASE;
@@ -385,7 +398,7 @@ s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
 
     /* CellGameDataStatGet (offsets per SDK, RPCS3-verified). */
     vm_write32(get + 0x000, 40u * 1024u * 1024u - 256u);  /* hddFreeSizeKB (~40 GB) */
-    vm_write32(get + 0x004, 0);                            /* isNewData = 0 (data exists) */
+    vm_write32(get + 0x004, is_new_data);                  /* isNewData */
     snprintf((char*)(vm_base + get + 0x008), 96, "/dev_hdd0/game/%s", dir);          /* contentInfoPath */
     snprintf((char*)(vm_base + get + 0x427), 96, "/dev_hdd0/game/%s/USRDIR", dir);   /* gameDataPath */
     vm_write32(get + 0xB9C, 0xFFFFFFFFu);                  /* sizeKB = NOTCALC (-1) */
@@ -402,11 +415,73 @@ s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
     g_ps3_guest_caller(func_opd, cb, get, set, 0, 0, 0, 0, 0);
 
     s32 result = (s32)vm_read32(cb + 0x000);
-    printf("[cellGame] DataCheckCreate2: funcStat returned result=%d\n", result);
+    printf("[cellGame] %s: funcStat returned result=%d\n", tag, result);
+    return result;
+}
+
+s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
+                             void* funcStat, u32 container)
+{
+    (void)errDialog; (void)container;
+    uint32_t dir_ea   = (uint32_t)(uintptr_t)dirName;
+    uint32_t func_opd = (uint32_t)(uintptr_t)funcStat;
+
+    if (version != 0 || !dir_ea || !func_opd)
+        return CELL_GAME_ERROR_PARAM;
+
+    /* We report existing data (isNewData=0) + ample space; DeS's callback
+     * returns CELL_GAMEDATA_CBRESULT_OK_CANCEL (check-only) -> CELL_OK. */
+    s32 result = gamedata_stat_callback("DataCheckCreate2", version, dir_ea,
+                                        func_opd, 0);
     if (result < 0)
         return CELL_GAME_ERROR_PARAM;   /* callback reported an error */
     /* OK / OK_CANCEL: succeed (our HLE doesn't create/modify the on-disk data). */
     return CELL_OK;
+}
+
+/* cellGameDataCheckCreate -- the pre-3.00 entry point. Same arguments and same
+ * behaviour as Create2 (RPCS3 forwards it the same way); the only difference is
+ * the size of CellGameDataStatGet in older SDKs, and a title that asks for the
+ * smaller one simply ignores the tail of ours.
+ *
+ * Registering only Create2 meant a title on the older API got the unresolved-NID
+ * default, its funcStat callback never fired, and its game-data check never
+ * completed. Virtua Fighter 5 calls this once during its load and stops there. */
+s32 cellGameDataCheckCreate(u32 version, const char* dirName, u32 errDialog,
+                            void* funcStat, u32 container)
+{
+    printf("[cellGame] DataCheckCreate -> Create2%c", 10);
+    return cellGameDataCheckCreate2(version, dirName, errDialog, funcStat, container);
+}
+
+/* cellHddGameCheck (exported from cellSysutil, not cellGame) -- the HDD-game
+ * counterpart of cellGameDataCheckCreate2. Same five arguments, and RPCS3
+ * aliases all three callback structs to the CellGameData ones, so it shares
+ * gamedata_stat_callback above verbatim; only the return/error codes are the
+ * cellHddGame set.
+ *
+ * This is asynchronous from the title's point of view: firmware runs funcStat
+ * and the boot state machine waits on it. An unregistered NID here returns the
+ * fake CELL_OK default WITHOUT ever running the callback, so the title waits
+ * forever. Rampage World Tour calls this once, loads its entire front-end, then
+ * spins in its wait loop polling cellSysutilGetSystemParamInt. */
+s32 cellHddGameCheck(u32 version, const char* dirName, u32 errDialog,
+                     void* funcStat, u32 container)
+{
+    (void)errDialog; (void)container;
+    uint32_t dir_ea   = (uint32_t)(uintptr_t)dirName;
+    uint32_t func_opd = (uint32_t)(uintptr_t)funcStat;
+
+    /* Deliberately not rejecting version != 0 the way Create2 does: the HDD-game
+     * API predates that check and launch-window titles pass their own value. */
+    if (!dir_ea || !func_opd)
+        return CELL_HDDGAME_ERROR_PARAM;
+
+    s32 result = gamedata_stat_callback("HddGameCheck", version, dir_ea,
+                                        func_opd, CELL_HDDGAME_ISNEWDATA_EXIST);
+    if (result < 0)
+        return CELL_HDDGAME_ERROR_CBRESULT;
+    return CELL_HDDGAME_RET_OK;
 }
 
 s32 cellGameGetParamInt(s32 id, s32* value)
