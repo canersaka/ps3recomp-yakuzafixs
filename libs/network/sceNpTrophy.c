@@ -215,12 +215,14 @@ s32 sceNpTrophyCreateContext(SceNpTrophyContext* context,
 {
     (void)commSign; (void)options;
 
-    if (!s_trophy_initialized)
-        return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
-
     if (!context || !commId)
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
-    SceNpTrophyContext* context_h = GUEST_PTR(context, SceNpTrophyContext*);
+    /* Match the Windows runner's first-use initialization. Its module loader
+     * does not execute the firmware trophy initialization chain before this API.
+     * Only a valid first request initializes; later calls preserve live contexts. */
+    if (!s_trophy_initialized)
+        sceNpTrophyInit(NULL, 0, 0, 0);
+
     const SceNpCommunicationId* commId_h = GUEST_PTR(commId, const SceNpCommunicationId*);
 
     for (s32 i = 0; i < SCE_NP_TROPHY_MAX_CONTEXTS; i++) {
@@ -229,7 +231,7 @@ s32 sceNpTrophyCreateContext(SceNpTrophyContext* context,
             s_contexts[i].in_use = 1;
             s_contexts[i].commId = *commId_h;
             s_contexts[i].total_trophies = SCE_NP_TROPHY_MAX_NUM_TROPHIES;
-            *context_h = i;
+            vm_write32(GUEST_EA(context), (u32)i);
             printf("[sceNpTrophy] CreateContext(commId=\"%s\") -> ctx=%d\n",
                    commId_h->data, i);
             return CELL_OK;
@@ -263,12 +265,11 @@ s32 sceNpTrophyCreateHandle(SceNpTrophyHandle* handle)
 
     if (!handle)
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
-    handle = GUEST_PTR(handle, SceNpTrophyHandle*);
 
     for (s32 i = 0; i < SCE_NP_TROPHY_MAX_HANDLES; i++) {
         if (!s_handles[i].in_use) {
             s_handles[i].in_use = 1;
-            *handle = i;
+            vm_write32(GUEST_EA(handle), (u32)i);
             printf("[sceNpTrophy] CreateHandle() -> handle=%d\n", i);
             return CELL_OK;
         }
