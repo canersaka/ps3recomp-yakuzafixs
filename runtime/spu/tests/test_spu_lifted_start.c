@@ -452,6 +452,37 @@ static void test_taskset_resume_identity(void)
     free(ctx);
 }
 
+extern void spu_register_stack_reset_entry(uint32_t, int);
+extern void spu_halt(spu_context*);
+extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
+static int stack_reset_depth, stale_caller_ran;
+static void reset_target(spu_context* ctx)
+{
+    stack_reset_depth = (int)ctx->host_depth;
+    spu_halt(ctx);
+}
+static void nested_reset(spu_context* ctx)
+{
+    ctx->host_depth += 4;
+    ctx->pc = 0x838;
+    spu_indirect_branch(ctx);
+    stale_caller_ran = 1;
+}
+static void test_guest_stack_reset(void)
+{
+    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
+    if (!ctx) { check(0, "allocate stack reset context"); return; }
+    spu_begin_image(87); spu_register_function(0x838, reset_target);
+    spu_begin_image(0);
+    spu_register_stack_reset_entry(0x838, 87);
+    ctx->image_id = 87;
+    stack_reset_depth = -1; stale_caller_ran = 0;
+    spu_run_with_halt(nested_reset, ctx);
+    check(stack_reset_depth == 0, "one-way kernel entry discards nested host call frames");
+    check(!stale_caller_ran, "exited workload cannot resume its obsolete caller");
+    free(ctx);
+}
+
 static uint32_t captured_queue;
 static uint64_t captured_event[4];
 static int push_result;
@@ -546,6 +577,7 @@ int main(void)
     test_resident_code_regions();
     test_lle_taskset_syscall();
     test_taskset_resume_identity();
+    test_guest_stack_reset();
 
     signal(SIGSEGV, guard_fault);
     signal(SIGBUS,  guard_fault);

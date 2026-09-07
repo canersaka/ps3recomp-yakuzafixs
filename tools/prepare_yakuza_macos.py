@@ -158,6 +158,14 @@ def main():
         spu_taskset_register_task_elf(task.elf_ea, task.image_id == 0 ? 17 : task.image_id, 2);
     }
     spu_taskset_register_task_entry(0x3070u, 3);''', 'task ELF registration')
+    main_cpp = replace_once(main_cpp,
+        'extern "C" void spu_taskset_register_task_elf(uint32_t, int, int);',
+        'extern "C" void spu_taskset_register_task_elf(uint32_t, int, int);\nextern "C" void spu_register_stack_reset_entry(uint32_t, int);',
+        'kernel stack reset declaration')
+    main_cpp = replace_once(main_cpp,
+        '    spu_begin_image(16); spu_recomp_register();',
+        '    spu_register_stack_reset_entry(0x838u, 16);\n    spu_begin_image(16); spu_recomp_register();',
+        'kernel module-exit stack reset')
     dispatch = replace_once(original_dispatch,
         'extern "C" yz_ppu_fn yz_lookup_func(uint32_t guest_addr)\n{',
         '''extern "C" const func_entry pxd_shader_function_table[];
