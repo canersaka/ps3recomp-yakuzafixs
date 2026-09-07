@@ -255,6 +255,12 @@ typedef struct spu_context {
      * path recognizes a registered overlay's source EA and records which
      * overlay is now resident; dispatch retries a missed lookup against it. */
     int resident_ovl;
+    /* Independently streamed code buffers can coexist with the policy overlay.
+     * Each mapping records which translated image owns that local-store span. */
+    struct {
+        uint32_t lsa, size, source_ea;
+        int image_id;
+    } resident_code[4];
 
     /* Resident SPURS-taskset TASK image id (0 = none) retires the id-0 wildcard
      * for co-resident tasks. A taskset may hold several tasks that all lift at the

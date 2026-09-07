@@ -99,6 +99,8 @@ static void guard_fault(int sig)
 #include "../../syscalls/lv2_register.c"
 #include "../spu_helpers.h"
 void spu_wrch(spu_context*, uint32_t, u128);
+void spu_overlay_register_region(uint32_t, uint32_t, int);
+void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
 
 /* The lifted-code registry (spu_channels.c), which the test registers into. */
 typedef void (*test_spu_fn)(spu_context*);
@@ -371,6 +373,38 @@ static void test_smc_xori(void)
     free(ctx);
 }
 
+static void code_a(spu_context* ctx) { ctx->gpr[3]._u32[0] = 81; }
+static void code_b(spu_context* ctx) { ctx->gpr[3]._u32[0] = 82; }
+static void code_stale(spu_context* ctx) { ctx->gpr[3]._u32[0] = 83; }
+static void test_resident_code_regions(void)
+{
+    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
+    if (!ctx) { check(0, "allocate streamed code context"); return; }
+    const uint32_t a = 0x11000, b = 0x12000;
+    spu_begin_image(81); spu_register_function(a, code_a);
+    spu_begin_image(82); spu_register_function(b, code_b);
+    spu_begin_image(83); spu_register_function(a, code_stale);
+    spu_register_function(b, code_stale);
+    spu_begin_image(0);
+    spu_overlay_register_region(0x500000, 0x400, 81);
+    spu_overlay_register_region(0x600000, 0x400, 82);
+    ctx->image_id = 83;
+    spu_overlay_note_get(ctx, 0x500000, ctx->ls + a, 0x100);
+    spu_overlay_note_get(ctx, 0x600000, ctx->ls + b, 0x100);
+    spu_overlay_note_get(ctx, 0x500100, ctx->ls + a + 0x100, 0x100);
+    ctx->pc = a; spu_indirect_branch(ctx);
+    check(ctx->gpr[3]._u32[0] == 81, "first streamed job survives second job and continuation DMA");
+    ctx->pc = b; spu_indirect_branch(ctx);
+    check(ctx->gpr[3]._u32[0] == 82, "second streamed job overrides stale base-image code");
+    spu_overlay_note_get(ctx, 0x700000, ctx->ls + a, 0x100);
+    ctx->pc = a; spu_indirect_branch(ctx);
+    check(ctx->gpr[3]._u32[0] != 81, "overwriting a code buffer invalidates its old image");
+    ctx->pc = b; spu_indirect_branch(ctx);
+    check(ctx->gpr[3]._u32[0] == 82, "overwriting one buffer preserves the other");
+    g_spu_trampoline_fn = 0;
+    free(ctx);
+}
+
 static uint32_t captured_queue;
 static uint64_t captured_event[4];
 static int push_result;
@@ -462,6 +496,7 @@ int main(void)
      * so the micro-interpreter path is the one that runs. */
     test_smc_branch_hints();
     test_smc_xori();
+    test_resident_code_regions();
 
     signal(SIGSEGV, guard_fault);
     signal(SIGBUS,  guard_fault);
