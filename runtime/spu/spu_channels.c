@@ -168,10 +168,20 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * executes at a time. No-op when unarmed. The thread-local halt env above
      * makes a token pause/resume mid-run safe. */
     yz_lockstep_register(ctx);
-    if (setjmp(s_spu_halt_env) != 0) {
-        halted = 1;                                /* came back via longjmp     */
-        g_spu_trampoline_fn = 0;                   /* unwound mid-drain: discard */
-    } else {
+    switch (setjmp(s_spu_halt_env)) {
+    case 1:
+        halted = 1;
+        g_spu_trampoline_fn = 0;
+        break;
+    case 2:
+        /* A one-way guest stack reset invalidates every lifted host caller.
+         * Re-enter its target with the same guest state on the driver stack. */
+        ctx->host_depth = 0;
+        g_spu_trampoline_fn = 0;
+        spu_indirect_branch(ctx);
+        SPU_DRAIN(ctx);
+        break;
+    default:
         /* SPU_DRAIN trampoline model: the top-level entry runs until its first
          * cross-function tail transfer, which sets g_spu_trampoline_fn and
          * returns; the drain loop re-enters each queued target until the SPU
@@ -1038,6 +1048,19 @@ void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_i
     s_ovl_src[s_ovl_src_count - 1].span = span;
 }
 
+/* Register one-way runtime entries that replace the guest call stack.
+ * Matching the resolved function, not just its LS address, avoids affecting
+ * unrelated overlays using the same address. Registration precedes execution. */
+static struct { uint32_t entry; int image_id; } s_stack_reset[16];
+static unsigned s_stack_reset_count;
+void spu_register_stack_reset_entry(uint32_t entry, int image_id)
+{
+    if (s_stack_reset_count < 16) {
+        s_stack_reset[s_stack_reset_count].entry = entry & SPU_LS_MASK;
+        s_stack_reset[s_stack_reset_count++].image_id = image_id;
+    }
+}
+
 /* SPURS taskset TASK entries (see spu_context.resident_task). A taskset can hold
  * several tasks whose lifts share the SAME LS base -- the co-resident task-code
  * region -- so no LS address identifies which task owns it. The title registers
@@ -1858,6 +1881,14 @@ void spu_indirect_branch(spu_context* ctx)
                   s_dumped = 1; } } }
     }
     if (fn) {
+        if (ctx->host_depth && s_spu_halt_armed && !ctx->policy_mode) {
+            for (unsigned i = 0; i < s_stack_reset_count; ++i)
+                if (ctx->pc == s_stack_reset[i].entry &&
+                    fn == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {
+                    g_spu_trampoline_fn = 0;
+                    longjmp(s_spu_halt_env, 2);
+                }
+        }
         /* MUSTTAIL: a guest loop that iterates through an indirect branch (the
          * Bink decoder's per-command dispatch does) must not grow the host
          * stack -- a plain call here leaked a resolver+callee frame per
