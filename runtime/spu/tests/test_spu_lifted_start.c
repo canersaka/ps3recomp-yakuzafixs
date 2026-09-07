@@ -658,6 +658,55 @@ static void test_registry_capacity(void)
           "the last entry, well past the old cap, is retained");
 }
 
+/* Short list elements occupy separate quadwords in LS. The effective
+ * address supplies the byte offset within each quadword. Chroma rows in
+ * movie decoding use eight-byte elements, making packed advancement corrupt
+ * every other block even though ordinary sixteen-byte transfers work. */
+static void submit_short_dma_list(spu_context* ctx, uint32_t cmd)
+{
+    spu_wrch(ctx, MFC_LSA, spu_pref_u32(0x207)); /* low bits ignored for lists */
+    spu_wrch(ctx, MFC_EAH, spu_zero());
+    spu_wrch(ctx, MFC_EAL, spu_pref_u32(0x100));
+    spu_wrch(ctx, MFC_Size, spu_pref_u32(24));
+    spu_wrch(ctx, MFC_TagID, spu_pref_u32(2));
+    spu_wrch(ctx, MFC_Cmd, spu_pref_u32(cmd));
+}
+
+static void test_short_dma_lists(void)
+{
+    static spu_context ctx;
+    spu_context_init(&ctx, 0);
+    /* This arena was already committed with mprotect above. */
+    extern uint8_t g_vm_page_bitmap[];
+    g_vm_page_bitmap[1] |= 1;
+    const uint32_t ea[] = {0x80000, 0x80028, 0x80040};
+    const uint32_t ls[] = {0x200, 0x218, 0x220};
+    memset(ctx.ls + 0x200, 0xCC, 48);
+    for (unsigned i = 0; i < 3; ++i) {
+        spu_ls_write32(&ctx, 0x100 + i * 8, 8);
+        spu_ls_write32(&ctx, 0x104 + i * 8, ea[i]);
+        memset(ctx.ls + ls[i], 0x31 + i, 8);
+        memset(vm_base + ea[i], 0, 8);
+    }
+    submit_short_dma_list(&ctx, MFC_PUTL_CMD);
+    for (unsigned i = 0; i < 3; ++i)
+        check(vm_base[ea[i]] == 0x31 + i && vm_base[ea[i] + 7] == 0x31 + i,
+              "short PUT list reads the correct LS quadword and byte offset");
+
+    /* The second GET stalls; resuming must retain the rounded cursor. */
+    spu_ls_write32(&ctx, 0x108, 0x80000008u);
+    memset(ctx.ls + 0x200, 0xCC, 48);
+    submit_short_dma_list(&ctx, MFC_GETL_CMD);
+    check(ctx.list_stall_dest_lsa[2] == 0x220 && ctx.ls[0x220] == 0xCC,
+          "short GET list parks after its second quadword");
+    spu_wrch(&ctx, MFC_WrListStallAck, spu_pref_u32(2));
+    for (unsigned i = 0; i < 3; ++i)
+        check(ctx.ls[ls[i]] == 0x31 + i && ctx.ls[ls[i] + 7] == 0x31 + i,
+              "short GET list preserves alignment across stall acknowledgement");
+    check(ctx.ls[0x208] == 0xCC && ctx.ls[0x210] == 0xCC && ctx.ls[0x228] == 0xCC,
+          "short GET list leaves quadword padding untouched");
+}
+
 int main(void)
 {
     printf("SPU lifted thread-group start\n");
@@ -690,6 +739,7 @@ int main(void)
         return 1;
     }
     vm_base = g_guest_mem;
+    test_short_dma_lists();
 
     /* Ask for the group-start diagnostic that reads one title's SPURS instance
      * at a fixed 0x40009D00, a thousand times past the end of this arena, so
