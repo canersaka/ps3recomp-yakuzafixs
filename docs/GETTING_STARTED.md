@@ -120,16 +120,51 @@ python tools/post_lift.py --recomp-dir src/recomp/
 ```
 This renames `.c` → `.cpp`, patches the header, and applies the split-function fallthrough fix.
 
-### Step 6: Build the Recompiled Game
+### Step 6: Generate the HLE handler table
+
+Lifting produces the game's own code. It does **not** produce the bridge from
+the game's firmware imports to this runtime's HLE implementations — that is a
+separate generated file, and a port without it builds and starts and then fails
+in a way that does not name the cause:
+
+```
+[ppu] unresolved indirect call -> 0x39800000 (tid=1 lr=0x000103C0)
+```
+
+`0x39800000` is not an address, it is the PowerPC instruction `li r12,0` — the
+first word of an import stub. With no handlers registered, every firmware import
+falls through and the first call through one lands there.
+
+```bash
+python ../tools/gen_hle_nids.py --all --out src/gen/ppu_hle_nids.cpp
+```
+
+Compile the result into the port along with the lifted sources. It defines
+`ppu_hle_register_all()`, which `ppu_hle_init()` calls at startup;
+`runtime/ppu/ppu_hle.cpp` carries a weak do-nothing version so that a build
+without it still links, which is why the omission is not a build error.
+
+The runtime says so at startup if it ends up with no handlers, so if you see
+that warning this is the step you are missing.
+
+### Step 7: Build the Recompiled Game
 
 ```bash
 cmake -B build -G Ninja -DPS3RECOMP_DIR=/path/to/ps3recomp
 cmake --build build
 ```
 
-Lifted output produces very large translation units. On MSVC (and `clang-cl`)
-add `/bigobj` to the target that compiles them, or the object files overflow
-their section limit:
+Use **clang-cl** on Windows, not `cl`. The runtime uses `__atomic_*` builtins,
+`__int128` and `__builtin_bswap*`, and the lifted output uses `__int128` for the
+PPC 64x64 multiplies; `cl` has none of them. clang-cl consumes the same MSVC
+headers and libraries, so nothing else about the build changes:
+
+```bash
+cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
+```
+
+Lifted output also produces very large translation units, so add `/bigobj` to the
+target that compiles them or the object files overflow their section limit:
 
 ```cmake
 if(MSVC)
@@ -140,7 +175,7 @@ endif()
 `lbp/CMakeLists.txt` in this repository does exactly that and is the working
 reference; the starter template does not set it for you.
 
-### Step 7: Run
+### Step 8: Run
 
 The game executable takes the path to the decrypted ELF as its first argument
 -- it is loaded into the guest address space at startup, not baked into the

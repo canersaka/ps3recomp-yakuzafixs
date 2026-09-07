@@ -768,23 +768,93 @@ s32 sys_heap_destroy_heap(sys_heap_t heap)
     return CELL_ESRCH;
 }
 
-/* Guest-address bump allocator for the _sys_heap_* API. These return a GUEST
+/* Guest-address allocator for the _sys_heap_* API. These return a GUEST
  * effective address (the caller writes to it through the VM), so a host malloc
  * pointer is wrong -- the guest would treat it as a 32-bit EA and fault. Hand
- * out addresses from a dedicated guest window above the sys_memory window. */
+ * out addresses from a dedicated guest window above the sys_memory window.
+ *
+ * This was a pure bump allocator with a no-op free, which is fine for a title
+ * that allocates a few blocks at startup and fine for getting past an
+ * out-of-memory path -- and not fine for a title whose middleware allocates and
+ * frees working buffers continuously. Virtua Fighter 5's CRI ADXM threads do
+ * exactly that and walked the window until they were reading each other's
+ * blocks.
+ *
+ * ponytail: size-binned free lists, not a general heap. The traffic here is a
+ * small number of repeated sizes, so returning a freed block to a bin keyed by
+ * its rounded size reuses memory perfectly for that pattern and costs one
+ * array. No coalescing: a title that allocates thousands of DISTINCT sizes will
+ * still exhaust the window, and the fix then is a real first-fit heap, not a
+ * bigger window.
+ *
+ * Block layout, all relative to the address handed to the guest:
+ *   user-4   offset back to the raw block start
+ *   user-8   bin index
+ *   user-12  magic (so free() can tell our blocks from a foreign pointer)
+ * The free-list link lives at the raw block start, which is dead space while
+ * the block is free. */
 #define YZ_HEAP_BASE 0x50000000u
 #define YZ_HEAP_END  0x58000000u
+#define YZ_HEAP_MAGIC 0x595A4850u        /* 'YZHP' */
+#define YZ_BINS 32
 static u32 s_heap_bump = 0;
+static u32 s_heap_bin[YZ_BINS];          /* guest EA of each free list head */
+
+static u32 yz_bin_for(u32 need)
+{
+    u32 b = 4;                            /* 16 bytes minimum */
+    while (b < YZ_BINS - 1 && (1u << b) < need) b++;
+    return b;
+}
 
 static u32 yz_heap_alloc(u32 size, u32 align)
 {
-    if (s_heap_bump == 0) s_heap_bump = YZ_HEAP_BASE;
     if (align < 16) align = 16;
-    s_heap_bump = (s_heap_bump + align - 1) & ~(align - 1);
-    u32 ea = s_heap_bump;
-    s_heap_bump += (size + 15) & ~15u;
-    if (s_heap_bump > YZ_HEAP_END) return 0;
-    return ea;   /* guest EA; flat VM commits pages on first access */
+    u32 need = size + align + 16;         /* header + worst-case alignment pad */
+    u32 b = yz_bin_for(need);
+    u32 raw;
+
+    slot_lock();
+    if (s_heap_bin[b]) {
+        raw = s_heap_bin[b];
+        s_heap_bin[b] = vm_read32(raw);
+    } else {
+        if (s_heap_bump == 0) s_heap_bump = YZ_HEAP_BASE;
+        raw = s_heap_bump;
+        s_heap_bump += (1u << b);
+        if (s_heap_bump > YZ_HEAP_END) { slot_unlock(); return 0; }
+    }
+    slot_unlock();
+
+    u32 user = (raw + 16 + align - 1) & ~(align - 1);
+    { static int dbg = -1;
+      if (dbg < 0) dbg = getenv("SYS_HEAP_DBG") ? 1 : 0;
+      if (dbg) { static int n = 0; if (n++ < 400)
+          fprintf(stderr, "[heap] alloc size=%u align=%u -> 0x%08X (raw 0x%08X, bin %u)%c",
+                  size, align, user, raw, b, 10); } }
+    vm_write32(user - 4,  user - raw);
+    vm_write32(user - 8,  b);
+    vm_write32(user - 12, YZ_HEAP_MAGIC);
+    return user;                          /* guest EA; the flat VM is already backed */
+}
+
+static void yz_heap_free(u32 user)
+{
+    if (!user || user < YZ_HEAP_BASE || user >= YZ_HEAP_END) return;
+    if (vm_read32(user - 12) != YZ_HEAP_MAGIC) return;   /* not one of ours */
+    u32 b   = vm_read32(user - 8);
+    u32 off = vm_read32(user - 4);
+    if (b >= YZ_BINS || off > (1u << b)) return;         /* corrupt header */
+    u32 raw = user - off;
+    { static int dbg = -1;
+      if (dbg < 0) dbg = getenv("SYS_HEAP_DBG") ? 1 : 0;
+      if (dbg) { static int n = 0; if (n++ < 400)
+          fprintf(stderr, "[heap] free  0x%08X (bin %u)%c", user, b, 10); } }
+    vm_write32(user - 12, 0);                            /* poison: catch double free */
+    slot_lock();
+    vm_write32(raw, s_heap_bin[b]);
+    s_heap_bin[b] = raw;
+    slot_unlock();
 }
 
 void* sys_heap_malloc(sys_heap_t heap, u32 size)
@@ -795,7 +865,8 @@ void* sys_heap_malloc(sys_heap_t heap, u32 size)
 
 s32 sys_heap_free(sys_heap_t heap, void* ptr)
 {
-    (void)heap; (void)ptr;   /* bump allocator: no per-alloc free */
+    (void)heap;
+    yz_heap_free((u32)(uintptr_t)ptr);
     return CELL_OK;
 }
 
@@ -803,16 +874,6 @@ void* sys_heap_memalign(sys_heap_t heap, u32 align, u32 size)
 {
     (void)heap;
     return (void*)(uintptr_t)yz_heap_alloc(size, align);
-#if 0
-#ifdef _WIN32
-    return _aligned_malloc(size, align);
-#else
-    void* ptr = NULL;
-    if (posix_memalign(&ptr, align, size) != 0)
-        return NULL;
-    return ptr;
-#endif
-#endif
 }
 
 /* _sys_heap_create_heap (libdbgfont / dinkum ABI): RETURNS a non-zero heap id
@@ -823,6 +884,85 @@ u32 sys_heap_create_heap_ret(u32 name, u32 type, u32 blocksize, u32 flags)
     (void)name; (void)type; (void)blocksize; (void)flags;
     static u32 s_hid = 0x100;
     return s_hid++;
+}
+
+/* The names titles actually import. Every one of these existed above under a
+ * name without the leading underscore, so gen_hle_nids.py hashed a NID nothing
+ * imports and the whole family fell through to the unresolved-NID default --
+ * create_heap handed back 0, every allocation off it returned 0, and the title
+ * took its out-of-memory path. Virtua Fighter 5's boot ends in exactly that:
+ * _sys_heap_create_heap unresolved, then _sys_heap_memalign unresolved, then
+ * cellMsgDialogOpen and a permanent wait.
+ *
+ * ponytail: forwarders, not a second implementation. The allocator stays the
+ * one bump allocator above. */
+u32 _sys_heap_create_heap(u32 name, u32 type, u32 blocksize, u32 flags)
+{
+    return sys_heap_create_heap_ret(name, type, blocksize, flags);
+}
+
+s32 _sys_heap_delete_heap(sys_heap_t heap)
+{
+    return sys_heap_destroy_heap(heap);
+}
+
+/* The plain libc allocator sysPrxForUser exports, as opposed to the sys_heap_*
+ * family above. It was missing entirely, so every caller got the generic
+ * unresolved-NID stub: CELL_OK with r3 left holding whatever was there, i.e. a
+ * garbage pointer that the caller then wrote through. ps1_netemu hits it in
+ * cellUsbdInit (which fails), and RPCS3's NID table names it _sys_malloc.
+ *
+ * Same one bump allocator as everything else here -- forwarders, not a second
+ * implementation. */
+void* _sys_malloc(u32 size)
+{
+    return (void*)(uintptr_t)yz_heap_alloc(size, 16);
+}
+
+void* _sys_memalign(u32 align, u32 size)
+{
+    return (void*)(uintptr_t)yz_heap_alloc(size, align);
+}
+
+s32 _sys_free(void* ptr)
+{
+    yz_heap_free((u32)(uintptr_t)ptr);
+    return CELL_OK;
+}
+
+void* _sys_realloc(void* ptr, u32 size)
+{
+    /* Bump-allocated blocks carry their bin in the header, so an in-place grow is
+     * only safe within the same power-of-two bin. Anything larger moves, and the
+     * old block goes back on its free list. The copy length is the SMALLER of the
+     * two sizes -- reading the full new size off a short block would walk past it. */
+    if (!ptr) return (void*)(uintptr_t)yz_heap_alloc(size, 16);
+    u32 old = (u32)(uintptr_t)ptr;
+    if (!size) { yz_heap_free(old); return NULL; }
+    u32 b_old = (old >= YZ_HEAP_BASE && old < YZ_HEAP_END &&
+                 vm_read32(old - 12) == YZ_HEAP_MAGIC) ? vm_read32(old - 8) : 0;
+    u32 fresh = yz_heap_alloc(size, 16);
+    if (!fresh) return NULL;
+    u32 copy = size;
+    if (b_old && b_old < YZ_BINS && (1u << b_old) < copy) copy = (1u << b_old);
+    for (u32 i = 0; i + 4 <= copy; i += 4) vm_write32(fresh + i, vm_read32(old + i));
+    yz_heap_free(old);
+    return (void*)(uintptr_t)fresh;
+}
+
+void* _sys_heap_malloc(sys_heap_t heap, u32 size)
+{
+    return sys_heap_malloc(heap, size);
+}
+
+void* _sys_heap_memalign(sys_heap_t heap, u32 align, u32 size)
+{
+    return sys_heap_memalign(heap, align, size);
+}
+
+s32 _sys_heap_free(sys_heap_t heap, void* ptr)
+{
+    return sys_heap_free(heap, ptr);
 }
 
 /* ---------------------------------------------------------------------------

@@ -250,6 +250,16 @@ static u32 s_labels[CELL_GCM_MAX_LABEL_COUNT];
  * just-written commands are lost). Updated in cellGcm_rsx_process_fifo. */
 volatile u32 g_gcm_fifo_drained_ea = 0;
 
+/* The guest variable cellGcmInit's ctx_out pointed at -- the title's own
+ * gCellGcmCurrentContext. A title that switches to a command buffer of its own
+ * does it by repointing this, and until something reads it back the runtime has
+ * no way to notice. GCM_CTXDBG=1 reports it. */
+static u32 s_gcm_ctx_out_ea = 0;
+
+/* Set by cellGcm_syscall_bringup: this run reaches RSX through the lv2 sys_rsx_*
+ * syscalls (libs/video/sys_rsx.c) rather than through the HLE cellGcm* imports. */
+static int s_gcm_syscall_mode = 0;
+
 /* ---------------------------------------------------------------------------
  * Internal helpers
  * -----------------------------------------------------------------------*/
@@ -453,6 +463,7 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
         }
         if (ctx_out_addr)
             gwrite32(ctx_out_addr, cdata);          /* *context = &ctxdata */
+        s_gcm_ctx_out_ea = ctx_out_addr;   /* the title's gCellGcmCurrentContext */
         s_gcm_context_ea = cdata;                   /* RSX drains commands from here */
     }
     return cdata;
@@ -525,6 +536,9 @@ void cellGcmSetWaitFlip(void)
 /* NID: 0x51C9D62B */
 void cellGcmResetFlipStatus(void)
 {
+    { static int n = 0;
+      if (getenv("FLIP_DBG") && n++ < 12)
+          fprintf(stderr, "[FLIP] ResetFlipStatus%c", 10); }
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
 }
 
@@ -538,6 +552,10 @@ u32 cellGcmGetFlipStatus(void)
      * beat) completes pending flips. The old self-completing version made
      * every wait-for-flip loop exit on its first poll, so titles ran
      * completely unpaced (wave: 95 fps with a fixed-dt simulation). */
+    { static int n = 0;
+      if (getenv("FLIP_DBG") && n++ < 24)
+          fprintf(stderr, "[FLIP] GetFlipStatus -> %u (0=DONE 1=WAITING)%c",
+                  s_flip_status, 10); }
     return s_flip_status;
 }
 
@@ -680,6 +698,19 @@ unsigned long long ps3_ms_now(void)
 }
 
 static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
+/* Backlog past which the drain stops honouring one-flip-per-tick and
+ * catches up instead. Sized well above a frame's command list so a
+ * title that keeps up never sees this path. */
+#define GCM_FIFO_CATCHUP_BYTES 0x10000u
+/* How close `current` must get to `end` before the runtime will recycle a ring
+ * on the title's behalf. One gcmReserve is 8 bytes; a page of slack keeps a
+ * title that is merely near the end from being touched. */
+#define GCM_RECYCLE_SLACK 0x1000u
+/* How far past the ring's start the walker must have read before the runtime
+ * will recycle on the title's behalf. The guest resumes writing at `begin`, so
+ * this is the amount of already-consumed head room it gets. */
+#define GCM_RECYCLE_MARGIN 0x20000u
+static u32 gcm_ea2io(u32 ea);   /* defined with the wrap callback below */
 static u32 s_fifo_getoff  = 0;
 static u32 s_last_ring_off = 0;   /* last offset the walker actually consumed */
 static u32 s_fifo_calloff = 0;
@@ -1103,11 +1134,29 @@ static void gcm_ref_push_at(u32 v, u32 getoff)
  * long lock hold with the number of paced fence publications inside it (the
  * 200us pacing x hundreds of one-ahead fences = the ~156ms holds). */
 volatile long long g_gcm_ref_pub_count = 0;
+/* Absolute microseconds from the QPC hardware counter -- the SAME origin in every
+ * translation unit, so two probes in different files can be compared directly.
+ * That is the whole point: every wrong conclusion about this stall came from
+ * comparing orderings instead of times. */
+unsigned long long ps3_qpc_us(void)
+{
+    static LARGE_INTEGER f; if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    LARGE_INTEGER n; QueryPerformanceCounter(&n);
+    return (unsigned long long)(n.QuadPart / (f.QuadPart / 1000000));
+}
+
 static void gcm_ref_publish_one(void)
 {
     u32 h = s_ref_qhead;
     if (h == s_ref_qtail) return;
     vm_write32(GCM_CONTROL_GUEST_ADDR + 8, s_ref_q[h % GCM_REF_QLEN]);
+    /* stderr, deliberately: [DRAIN] uses printf and stdout is block-buffered
+     * when redirected, so its interleaving with an stderr probe is not a
+     * timeline. Same stream = same ordering. */
+    { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_REFPUB") ? 1 : 0;
+      if (_rd) { static unsigned long _n = 0; if (++_n <= 24)
+        fprintf(stderr, "[refpub] t=%lluus #%lu wrote 0x%08X -> readback 0x%08X\n", ps3_qpc_us(), _n,
+                s_ref_q[h % GCM_REF_QLEN], vm_read32(GCM_CONTROL_GUEST_ADDR + 8)); } }
     s_ref_qhead = h + 1;
     g_gcm_ref_pub_count++;
 }
@@ -1196,7 +1245,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
     static int  s_inited = 0;
     extern u32 g_rsx_last_reference;
 
-    if (!s_gcm_context_ea) return;
+    /* A statically-linked libgcm (PS3 firmware modules -- ps1_netemu) never calls
+     * cellGcmSetupContext, so there is no CellGcmContextData EA to gate on: it gets
+     * its ring through sys_rsx_context_allocate instead. The walk below only needs
+     * `put` and the IO table, both of which the syscall layer fills; the one part
+     * that does read the context (the ring-recycle heuristic) is separately guarded
+     * by s_gcm_ctx_out_ea, which stays 0 on that path. */
+    if (!s_gcm_context_ea && !s_gcm_syscall_mode) return;
     if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
 
     /* Walk the FIFO exactly like the RSX: chase the guest-written `put` (an IO
@@ -1208,6 +1263,26 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * writes its waits spin on) silently never executed. */
     u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
 
+    /* GCM_CTXDBG=1: which context the title is actually driving. Ours is written
+     * once at init; if the title repoints gCellGcmCurrentContext at a buffer of
+     * its own, every field below moves with it and the FIFO the runtime walks
+     * stops being the one the title fills. Reported on change, not per tick. */
+    if (getenv("GCM_CTXDBG") && s_gcm_ctx_out_ea) {
+        static u32 last_ptr = 0xFFFFFFFFu, last_cur = 0xFFFFFFFFu;
+        u32 ptr = vm_read32(s_gcm_ctx_out_ea);
+        u32 cur = ptr ? vm_read32(ptr + 0x8) : 0;
+        if (ptr != last_ptr || cur != last_cur) {
+            last_ptr = ptr; last_cur = cur;
+            fprintf(stderr, "[CTX] gCellGcmCurrentContext@0x%08X -> 0x%08X  "
+                    "begin=%08X end=%08X current=%08X callback=%08X  (ours=0x%08X)\n",
+                    s_gcm_ctx_out_ea, ptr,
+                    ptr ? vm_read32(ptr + 0x0) : 0, ptr ? vm_read32(ptr + 0x4) : 0,
+                    cur, ptr ? vm_read32(ptr + 0xC) : 0, s_gcm_context_ea);
+            fflush(stderr);
+        }
+    }
+
+    u32 start_off = s_fifo_getoff;
     if (getenv("GCM_DRAINDBG")) {
         static int n = 0;
         if (n++ % 60 == 0)
@@ -1235,7 +1310,33 @@ static void gcm_rsx_process_fifo_unlocked(void)
         }
         fprintf(stderr, "[SCANREF] %u SET_REFERENCE in 0..%08X\n", found, put);
       } }
+
+    /* GCM_FIFO_SNAP=N: dump N snapshots of the raw words at both ends of the
+     * ring -- what `get` is about to decode, and what the title just wrote at
+     * `put`. When get and put drift apart, the two windows say immediately
+     * whether get is grinding through NOPs/garbage or the title is writing
+     * somewhere get can never reach. The [FIFOSTEP] trace only ever fired on a
+     * bad branch, which is exactly the case where the drift is silent. */
+    { static int snap = -1;
+      if (snap < 0) { const char* e = getenv("GCM_FIFO_SNAP"); snap = e ? atoi(e) : 0; }
+      if (snap > 0 && put) {
+          snap--;
+          fprintf(stderr, "[SNAP] get=%08X put=%08X\n", s_fifo_getoff, put);
+          for (int k = 0; k < 16; k++) {
+              u32 gio = s_fifo_getoff + (u32)(k * 4), pio = put + (u32)(k * 4);
+              u32 gea = gcm_io2ea(gio), pea = gcm_io2ea(pio);
+              fprintf(stderr, "[SNAP]  get+%-3d io=%08X w=%08X   put+%-3d io=%08X w=%08X\n",
+                      k * 4, gio, gea ? vm_read32(gea) : 0xDEADDEADu,
+                      k * 4, pio, pea ? vm_read32(pea) : 0xDEADDEADu);
+          }
+          fflush(stderr);
+      } }
+
     int budget = 0x100000;                    /* words per tick cap */
+    /* GCM_DRAINDBG also reports WHY each pass stopped. A drain that ends far
+     * short of `put` every tick is the signature of a FIFO that can never
+     * catch up, and the reason is the whole diagnosis. */
+    const char* why = "caught-up";
     while (s_fifo_getoff != put && budget-- > 0) {
         u32 ea = gcm_io2ea(s_fifo_getoff);
         if (!ea) {
@@ -1256,6 +1357,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                             s_fifo_getoff, put);
             }
             s_fifo_getoff = put;
+            why = "no-io-mapping";
             break;
         }
         u32 w = vm_read32(ea);
@@ -1277,8 +1379,31 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * frame split across 4 presents, layout flashing/zooming). */
             extern s32 cellGcmSetFlipCommand(u32 bufferId);
             s_fifo_getoff += 4;
+            /* Count the flip WORDS the title actually writes into the FIFO,
+             * separately from the presents that result. When a title stops
+             * appearing on screen the first question is which side stopped:
+             * this counter still climbing while presents do not is a runtime
+             * problem, both stopping together is the guest's. */
+            { static unsigned long long flips = 0; static int dbg = -1;
+              if (dbg < 0) dbg = getenv("GCM_FLIPCOUNT") ? 1 : 0;
+              ++flips;
+              if (dbg && (flips <= 8ull || (flips % 200ull) == 0))
+                  fprintf(stderr, "[flipword] %llu FIFO flip words decoded%c",
+                          flips, 10); }
             cellGcmSetFlipCommand(w & 0xFFu);
-            break;
+            /* ...unless the FIFO is badly backlogged. One flip per drain is
+             * right while `get` is keeping up with `put`; when it is megabytes
+             * behind it is a deadlock, because the title's ring can only be
+             * reclaimed as `get` advances. VF5 submits ~5x faster than one
+             * flip per drain consumes, so its 4 MB ring fills, its own
+             * buffer-full callback can never free space, and AMGL prints
+             * "Command Buffer Overflow" forever. Past the threshold keep
+             * draining -- the intermediate presents are frames we are too far
+             * behind to show anyway. No-op for a title that is keeping up. */
+            if (put < s_fifo_getoff ||
+                put - s_fifo_getoff < GCM_FIFO_CATCHUP_BYTES)
+                { why = "flip"; break; }
+            continue;
         }
 
         if (type == 1) {                       /* JUMP: 0x20000000 | offset */
@@ -1384,6 +1509,22 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
                 u32 m = (type == 0) ? method + i * 4 : method;
+                /* GCM_SET_USER_COMMAND is method 0xEB00, which this decode
+                 * splits into subchannel 7 / method 0x0B00 -- so it was landing
+                 * in the 2D engine path and being dropped as unrecognised. It
+                 * is not a 2D method at all: it tells the RSX to raise a
+                 * USER_CMD interrupt, which is what ps1_netemu's flip path
+                 * blocks on. */
+                { static int sd = -1; static unsigned long s7 = 0;
+                  if (sd < 0) sd = getenv("GCM_SUBCH7") ? 1 : 0;
+                  if (sd && subch == 7 && (s7++ < 16))
+                      fprintf(stderr, "[subch7] method=0x%04X data=0x%08X\n",
+                              m, vm_read32(dea)); }
+                if (subch == 7 && m == 0x0B00u) {
+                    extern void rsx_raise_user_cmd(u32 arg);
+                    rsx_raise_user_cmd(vm_read32(dea));
+                    continue;
+                }
                 /* GCM_SUBCH1_3D=1: treat subchannel 1 as the 3D object too.
                  * The title issues NV4097 methods on it -- 0x1A80..0x1AC0 is
                  * SET_TEXTURE_OFFSET for units 4-6 -- and the 2D path silently
@@ -1469,18 +1610,135 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * passes while `put` is somewhere else, there is work the walker will
      * never reach: resynchronise to the write head. Same trade as the
      * unmapped-get path -- commands are lost, the FIFO lives. */
+    /* The stuck-detector above only fires when `get` stops MOVING. A walker
+     * going in circles moves plenty -- it just never arrives. Twisted Metal
+     * and flOw both write one ring and their JUMPs lead to `put`; VF5 does
+     * not. AMGL leaves libgcm's default ring at IO 0 parked on its own JUMP
+     * loop and drives the RSX from a second buffer it mapped at IO 0xA00000,
+     * so the walker circulates the default ring forever, `get` never reaches
+     * `put`, the title's ring is never reclaimed, and AMGL prints "Command
+     * Buffer Overflow" until it runs off the end of its own mapping.
+     *
+     * A drain that burns its ENTIRE word budget without arriving is that
+     * signature: no legitimate frame leaves a million words pending, and a
+     * genuine burst clears within a tick or two. Circling does not, so
+     * require several passes in a row before following the write head.
+     *
+     * ponytail: consecutive-budget-burn is a heuristic, not a proof. The real
+     * fix is knowing which buffer the RSX is bound to -- that needs the
+     * SetQueueHandler / context-switch path modelled, not a walker rule. */
+    { static int burned = 0, passes = -1;
+      if (passes < 0) { const char* e = getenv("GCM_FIFO_CIRCLE_PASSES");
+                        passes = e ? atoi(e) : 4; }
+      if (passes && budget <= 0 && s_fifo_getoff != put) {
+          if (++burned >= passes) {
+              static int n = 0;
+              if (n++ < 8)
+                  fprintf(stderr, "[cellGcmSys] FIFO walker circling (get=0x%08X, "
+                          "put=0x%08X, full budget burned x%d) -- following the "
+                          "write head\n", s_fifo_getoff, put, burned);
+              gcm_fifo_resync_why("circling", &s_fifo_getoff, put);
+              burned = 0;
+          }
+      } else burned = 0; }
+
     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
       if (s_fifo_getoff == last && s_fifo_getoff != put) {
           if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
-                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
+                             gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
       } else { stuck = 0; last = s_fifo_getoff; } }
 
     /* Publish progress: get chases put; ref advances at most ONE queued fence
      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
      * value stays observable to equality-waiters. The wrap recycle path polls
      * the drained EA. */
+    if (getenv("GCM_DRAINDBG")) {
+        static int n2 = 0;
+        if (n2++ % 60 == 0)
+            fprintf(stderr, "[DRAINEND] %s: %08X -> %08X (%u bytes), put=%08X\n",
+                    why, start_off, s_fifo_getoff, s_fifo_getoff - start_off, put);
+    }
+    /* Recycle the TITLE'S OWN command buffer when its callback will not.
+     *
+     * gCellGcmCurrentContext points at the title's context, not the one
+     * cellGcmInit handed back: Virtua Fighter 5's is a 512 KB ring at EA
+     * 0x4AE00000, and the buffer-full callback AMGL installs (0x006A8030) only
+     * prints "[AMGL]:[ERROR] Command Buffer Overflow!" and returns 0 -- which
+     * libgcm's gcmReserve reads as "retry", so the title writes straight past
+     * `end` into unmapped memory and never renders again.
+     *
+     * Hardware never reaches that state because the ring is recycled once the
+     * RSX has consumed it. Do the same here, on the title's context, and only
+     * when it is provably safe: the walker has drained everything the title
+     * submitted (get == put) and `current` is within one reserve of `end`.
+     * A title whose own callback recycles never reaches that state, so this is
+     * inert for every port that works today.
+     *
+     * ponytail: append the JUMP at `current` the way the SDK's own callback
+     * does, rather than tracking a second copy of the ring's geometry. */
+    if (s_gcm_ctx_out_ea) {
+        u32 ctx = vm_read32(s_gcm_ctx_out_ea);
+        u32 begin = ctx ? vm_read32(ctx + 0x0) : 0;
+        u32 end   = ctx ? vm_read32(ctx + 0x4) : 0;
+        u32 cur   = ctx ? vm_read32(ctx + 0x8) : 0;
+        /* `get == put` -- a fully drained FIFO -- was too strict. It holds
+         * while a title is only clearing, and stops holding the moment its SPU
+         * work starts producing real command volume: the walker then always has
+         * a backlog, the recycle never fires, and the ring overflows again.
+         * That is exactly where Virtua Fighter 5 stalls once its "SPU Delegate"
+         * group starts feeding the renderer.
+         *
+         * Hardware does not need a drained FIFO either -- only that the bytes
+         * about to be overwritten have already been read. So require the walker
+         * to be a margin PAST `begin` instead: the head of the ring is consumed,
+         * which is the region the guest is about to write. */
+        u32 io_begin_chk = begin ? gcm_ea2io(begin) : 0xFFFFFFFFu;
+        int head_consumed =
+            (io_begin_chk != 0xFFFFFFFFu) &&
+            (s_fifo_getoff == put ||
+             (s_fifo_getoff > io_begin_chk &&
+              s_fifo_getoff - io_begin_chk >= GCM_RECYCLE_MARGIN));
+        /* Already overrun. gcmReserve writes past `end` when its callback
+         * declines to recycle (AMGL's only prints), and once the guest is out
+         * there the walker follows into memory that is not the ring: `get`
+         * stops advancing, head_consumed can never become true again, and the
+         * title is wedged for good -- which is exactly where Virtua Fighter 5
+         * stops, at the same flip every run however long it is left.
+         *
+         * There is nothing left to protect at that point. Recycling loses
+         * whatever was written past the end; not recycling loses the rest of
+         * the run. */
+        if (begin && end > begin && cur >= end) head_consumed = 1;
+        if (begin && end > begin && cur >= begin && cur + GCM_RECYCLE_SLACK >= end
+                && head_consumed) {
+            u32 io_begin = gcm_ea2io(begin);
+            if (io_begin != 0xFFFFFFFFu) {
+                u32 jmp_at = (cur + 4 <= end) ? cur : end - 4;
+                vm_write32(jmp_at, 0x20000000u | io_begin);   /* JUMP -> begin */
+                vm_write32(ctx + 0x8, begin);                 /* current = begin */
+                vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);  /* put */
+                s_fifo_getoff = io_begin;                          /* get */
+                put = io_begin;
+                static int n = 0;
+                if (n++ < 8)
+                    fprintf(stderr, "[cellGcmSys] recycled the title's own ring "
+                            "(ctx=0x%08X begin=0x%08X end=0x%08X) -- its callback "
+                            "does not%c", ctx, begin, end, 10);
+            }
+        }
+    }
+
     g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
-    vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff);              /* get */
+    /* GCM_GET_EQ_PUT=1: publish `get` as having reached `put` rather than where
+     * the walker actually is. A probe, not a fix -- it removes the back-pressure
+     * a title uses to avoid overwriting commands the GPU has not read. It exists
+     * to answer one question for a title that reports its ring full while the
+     * walker says it is drained: is the title reading `get`, or something else?
+     * If the overflow survives this, `get` is not what it consults. */
+    { static int eq = -1;
+      if (eq < 0) { const char* e = getenv("GCM_GET_EQ_PUT"); eq = e ? atoi(e) : 0; }
+      vm_write32(GCM_CONTROL_GUEST_ADDR + 4, eq ? put : s_fifo_getoff); }
+
     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
     gcm_ref_publish_one();
     ReleaseSRWLockExclusive(&s_ref_pub_lock);
@@ -1591,8 +1849,60 @@ int cellGcmOffsetIsDisplay(u32 offset)
 }
 
 /* NID: 0xEAA52F23 */
+/* How many display buffers the title has actually registered. cellResc needs
+ * it to know how far to rotate its flip target; nothing else about the set is
+ * anyone else's business, so this stays a count rather than exposing the array. */
+u32 cellGcm_display_buffer_count(void)
+{
+    u32 n = 0;
+    for (u32 i = 0; i < CELL_GCM_MAX_DISPLAY_BUFFER_NUM; i++)
+        if (s_display_buffer_set[i]) n++;
+    return n;
+}
+
 s32 cellGcmSetFlipCommand(u32 bufferId)
 {
+    /* GCM_FLIPCOUNT=1: every flip, with a timestamp. FLIP_DBG caps at 20 lines,
+     * which answers "did it ever flip?" and not "is it still flipping, and how
+     * fast?" -- the question that matters when a title stops appearing on
+     * screen. Virtua Fighter 5 does not use the in-FIFO 0xFEADxxxx flip word at
+     * all (that counter stays at zero for the whole run); it flips through
+     * cellGcmSetFlip, so this is where its frame rate actually is. */
+    { static int dbg = -1;
+      if (dbg < 0) dbg = getenv("GCM_FLIPCOUNT") ? 1 : 0;
+      if (dbg) {
+          extern unsigned long long ps3_ms_now(void);
+          static unsigned long long n = 0, t0 = 0;
+          unsigned long long now = ps3_ms_now();
+          if (!t0) t0 = now;
+          ++n;
+          if (n <= 400ull || (n % 10ull) == 0)
+              fprintf(stderr, "[flip] %llu at %llu ms%c", n, now - t0, 10);
+      } }
+
+    /* GCM_FLIP_BT=<n>: dump the flipping thread's guest stack for the flips
+     * around n. When a title renders correctly for a while and then stops
+     * submitting -- no error, no unresolved import, no overflow -- the only
+     * thing separating the last good frame from the first missing one is what
+     * the render path was doing on each. This is the window onto that. */
+    { static long long at = -2;
+      if (at == -2) { const char* e = getenv("GCM_FLIP_BT"); at = e ? atoll(e) : -1; }
+      if (at >= 0) {
+          static unsigned long long m = 0;
+          ++m;
+          if ((long long)m >= at - 5 && (long long)m <= at + 5) {
+              extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+              extern void ppu_dump_guest_stack(ppu_context*, const char*);
+              if (g_active_ctx) {
+                  char tag[48];
+                  snprintf(tag, sizeof tag, "flip#%llu", m);
+                  ppu_dump_guest_stack(g_active_ctx, tag);
+                  { extern void ppu_dump_bctrl_ring(uint32_t, const char*);
+                    ppu_dump_bctrl_ring((uint32_t)g_active_ctx->thread_id, tag); }
+              }
+          }
+      } }
+
     { static int _n=0; if (getenv("FLIP_DBG") && _n++ < 20)
         fprintf(stderr, "[FLIP] SetFlipCommand(buf=%u) set=%d\n",
                 bufferId, bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM ? s_display_buffer_set[bufferId] : -1); }
@@ -2426,6 +2736,24 @@ void cellGcmSetDefaultCommandBuffer(void)
     s_control.put = 0;
     s_control.get = 0;
     s_control.ref = 0;
+
+    /* On hardware this re-points gCellGcmCurrentContext at the default context
+     * cellGcmInit built. Zeroing a host-side struct is not that: a title that
+     * calls it to go back to the big default buffer stays on whatever smaller
+     * segment it had switched to.
+     *
+     * GCM_DEFAULT_CTX_REPOINT=1 does the real thing -- write our context's EA
+     * into the guest variable cellGcmInit's ctx_out pointed at, and rewind that
+     * context. Off by default because a title managing its own segment chain
+     * may hold pointers into the old one; this exists to be measured, not
+     * assumed. */
+    if (getenv("GCM_DEFAULT_CTX_REPOINT") && s_gcm_ctx_out_ea && s_gcm_context_ea) {
+        vm_write32(s_gcm_context_ea + 0x8, vm_read32(s_gcm_context_ea + 0x0));
+        vm_write32(s_gcm_ctx_out_ea, s_gcm_context_ea);
+        printf("[cellGcmSys] SetDefaultCommandBuffer: repointed "
+               "gCellGcmCurrentContext@0x%08X -> 0x%08X\n",
+               s_gcm_ctx_out_ea, s_gcm_context_ea);
+    }
 }
 
 /* Debug dump — no-op in recomp */
@@ -2579,4 +2907,68 @@ u32 rsx_find_vram_upload(u32 want)
 void rsx_reset_upload_claims(void)
 {
     for (u32 i = 0; i < RSX_UPLOAD_LOG; i++) s_uploads[i].claimed = 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_rsx_* bridge (libs/video/sys_rsx.c)
+ *
+ * A PS3 firmware module links libgcm statically and drives RSX through the lv2
+ * syscalls instead of importing cellGcmSys, so none of the HLE entry points above
+ * ever run. Everything the FIFO walker needs is still here -- it just has to be
+ * reachable from the syscall layer. These four accessors are that surface; the
+ * walker, the method decoder and rsx_live_draw are untouched.
+ * -----------------------------------------------------------------------*/
+
+/* Bring the GCM state up the way cellGcmInit would, minus the IO window (the
+ * driver maps that itself with sys_rsx_context_iomap). Returns the guest base of
+ * RSX local memory, which is what sys_rsx_memory_allocate hands back. */
+u32 cellGcm_syscall_bringup(u32 local_size)
+{
+    if (!s_gcm_initialized)
+        cellGcmInit(0x10000, 0, 0);
+    if (local_size)
+        s_config.localSize = local_size;
+    s_gcm_syscall_mode = 1;
+    return s_config.localAddress;
+}
+
+/* Guest EA of the put/get/ref triple. The driver gets this as
+ * sys_rsx_context_allocate's lpar_dma_control + 0x40 (verified in the image:
+ * `lwz r3,0x18(r9)` / `addi r3,r3,64`), so the syscall returns this minus 0x40
+ * and the driver's own flushes land exactly where the walker reads. */
+u32 cellGcm_control_guest_addr(void) { return GCM_CONTROL_GUEST_ADDR; }
+
+/* sys_rsx_context_iomap / iounmap: the same 1MB-page offset table
+ * cellGcmMapEaIoAddress fills, which is what gcm_io2ea() and every offset
+ * resolution read. */
+void cellGcm_syscall_iomap(u32 ea, u32 io, u32 size)
+{
+    populate_offset_table(ea, io, size);
+    if (s_io_mapping_count < CELL_GCM_MAX_IO_MAPPINGS) {
+        s_io_mappings[s_io_mapping_count].ea     = ea;
+        s_io_mappings[s_io_mapping_count].io     = io;
+        s_io_mappings[s_io_mapping_count].size   = size;
+        s_io_mappings[s_io_mapping_count].active = 1;
+        s_io_mapping_count++;
+    }
+    if (!s_config.ioSize) { s_config.ioAddress = ea; s_config.ioSize = size; }
+}
+
+void cellGcm_syscall_iounmap(u32 io, u32 size)
+{
+    u32 page = io >> 20;
+    u32 ea = (page < 65536 && s_ea_address_table[page] != 0xFFFF)
+             ? ((u32)s_ea_address_table[page] << 20) : 0;
+    if (ea) clear_offset_table(ea, io, size);
+}
+
+/* sys_rsx_context_attribute(0x001): the driver's explicit FIFO reset. Move the
+ * walker with it -- leaving s_fifo_getoff where it was makes the next drain walk
+ * from a stale offset through whatever the driver has since overwritten. */
+void cellGcm_syscall_set_fifo(u32 put, u32 get)
+{
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 0, put);
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 4, get);
+    s_fifo_getoff  = get;
+    s_fifo_calloff = 0;
 }

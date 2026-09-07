@@ -15,10 +15,11 @@
  */
 
 #include "rsx_commands.h"
+#include "ps3emu/milestone.h"   /* ps3_ms -- boot milestone log */
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
-#include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
+#include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 
 /* ---------------------------------------------------------------------------
  * Global backend
@@ -288,10 +289,10 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
 
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
-    /* YDKJ_RSXTRACE=<N>: trace the first N methods (bare "1" keeps the old 250).
+    /* RSX_TRACE=<N>: trace the first N methods (bare "1" keeps the old 250).
      * The fixed 250 was spent entirely on boot-time setup, so the methods around
      * the first real draw -- exactly the ones worth seeing -- were never traced. */
-    { static int _rt=-1; if(_rt<0){ const char* e=getenv("YDKJ_RSXTRACE");
+    { static int _rt=-1; if(_rt<0){ const char* e=getenv("RSX_TRACE");
         _rt = e ? (atoi(e) > 1 ? atoi(e) : 250) : 0; }
       if(_rt){ static int _m=0; if(_m++<_rt) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
     /* Back-end write label / semaphore (cellGcmSetWriteBackEndLabel): the RSX
@@ -690,6 +691,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
                 }
             }
         }
+        ps3_ms("rsx:draw_arrays");
         if (s_backend && s_backend->draw_arrays)
             s_backend->draw_arrays(s_backend->userdata, state->primitive_type, first, count);
         return 0;
@@ -715,6 +717,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
         { static int _d=0; if (_d++ < 8) fprintf(stderr, "[RSX] DRAW_INDEX_ARRAY prim=%u first=%u count=%u idxoff=0x%X dma=0x%X\n", state->primitive_type, first, count, state->index_array_offset, state->index_array_dma); }
+        ps3_ms("rsx:draw_indexed");
         if (s_backend && s_backend->draw_indexed)
             s_backend->draw_indexed(s_backend->userdata, state->primitive_type,
                                     first, count);

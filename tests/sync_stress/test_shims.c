@@ -40,7 +40,7 @@ uint32_t vm_read32(uint64_t addr)
 /* Diagnostic/port hooks sys_semaphore.c calls; real definitions live in the
  * per-title host code (lbp/main.cpp, runtime/ppu/ppu_loader.cpp). */
 void lbp_breadcrumb_dump(const char* tag) { (void)tag; }
-void lbp_hle_complete_pending(void) {}
+void ps3_spu_job_complete_pending(void) {}
 void ppu_log_host_chain(const char* tag) { (void)tag; }
 
 int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)

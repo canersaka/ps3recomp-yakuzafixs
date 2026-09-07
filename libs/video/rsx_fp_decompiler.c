@@ -1000,3 +1000,88 @@ u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes)
     }
     return h;
 }
+
+/* Scale texel-space coordinates to the 0..1 range HLSL sampling expects.
+ *
+ * An RSX texture whose format carries RSX_TEX_FMT_UNNORM (0x40) is addressed in
+ * TEXELS, not normalised units. ps1_netemu composites the PS1 framebuffer with
+ * exactly that: format 0xE2 (A1R5G5B5 | UNNORM | LINEAR) over a 1024x512
+ * texture, and a quad whose texture coordinates run 1..638 by 2..474 --
+ *
+ *     [uvdbg] unit=0 ps1fb 1024x512 pitch=2048 fmt=0xE2
+ *     [uvdbg]   v0 pos(-1.0 -1.0) tc(1.0000 2.0000)
+ *     [uvdbg]   v2 pos(0.8 0.8)   tc(638.0000 474.0000)
+ *
+ * The bit was only ever masked OUT of the base format so the decoder could
+ * recognise A1R5G5B5, and never honoured for addressing. So the sampler was
+ * handed coordinates hundreds of times out of range, which under clamp lands on
+ * one edge texel for the whole quad -- a flat, uniform result. That is the
+ * black screen: the PS1 renders, the composite pass runs, and it samples one
+ * corner texel.
+ *
+ * D3D12 has no unnormalised addressing mode, so the division has to happen in
+ * the shader. Doing it as a post-pass over the generated HLSL rather than
+ * inside the emitter keeps it beside rsx_fp_apply_alpha_test, which already
+ * works this way, and leaves every non-UNNORM program byte-identical.
+ *
+ * Cube units are skipped: their coordinate is a float3 direction, and
+ * RSX_TEX_FMT_UNNORM has no meaning for one.
+ */
+int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
+                              const u32 dim[][2], u32 cube_mask)
+{
+    if (!hlsl || !unnorm_mask) return 0;
+    int patched = 0;
+
+    for (u32 u = 0; u < 16; u++) {
+        if (!((unnorm_mask >> u) & 1u)) continue;
+        if ((cube_mask >> u) & 1u) continue;
+        const u32 w = dim[u][0], h = dim[u][1];
+        if (!w || !h) continue;
+
+        /* Both spellings the emitter produces for a 2D unit. */
+        char needles[2][40];
+        snprintf(needles[0], sizeof needles[0], "rsx_tex[%u].Sample(rsx_samp[%u],", u, u);
+        snprintf(needles[1], sizeof needles[1], "rsx_tex%u.Sample(rsx_samp[%u],", u, u);
+
+        for (int nidx = 0; nidx < 2; nidx++) {
+            const char* needle = needles[nidx];
+            const u32 nlen = (u32)strlen(needle);
+            for (;;) {
+                char* at = strstr(hlsl, needle);
+                if (!at) break;
+                /* The '(' of Sample(, then its matching ')'. */
+                char* open = at + nlen - 1;   /* the ',' ... step back to '(' */
+                while (open > at && *open != '(') open--;
+                if (*open != '(') break;
+                int depth = 0;
+                char* p = open;
+                for (; *p; p++) {
+                    if (*p == '(') depth++;
+                    else if (*p == ')') { depth--; if (!depth) break; }
+                }
+                if (*p != ')') break;
+
+                char scale[80];
+                snprintf(scale, sizeof scale, " * float2(%.9g, %.9g)",
+                         1.0 / (double)w, 1.0 / (double)h);
+                const u32 slen = (u32)strlen(scale);
+                const u32 used = (u32)strlen(hlsl);
+                if (used + slen + 1 > hlsl_size) return -1;
+
+                memmove(p + slen, p, used - (u32)(p - hlsl) + 1);
+                memcpy(p, scale, slen);
+                patched++;
+
+                /* Mark this call site done so the next strstr moves past it:
+                 * the inserted text is inside the call, so an unmarked scan
+                 * would find the same site forever. */
+                memcpy(at, "rsx_TEX", 7);
+            }
+        }
+        /* Restore the marker. */
+        for (char* q = hlsl; (q = strstr(q, "rsx_TEX")) != NULL; )
+            memcpy(q, "rsx_tex", 7);
+    }
+    return patched;
+}

@@ -238,6 +238,16 @@ void cellGcmResetFlipStatus(void);
 u32 cellGcmGetFlipStatus(void);
 
 /* NID: 0xDC09357E */
+/* --- sys_rsx_* bridge (libs/video/sys_rsx.c) -----------------------------
+ * A firmware module links libgcm statically and reaches RSX through the lv2
+ * syscalls, so no cellGcm* import ever runs. These let the syscall layer drive
+ * the same state the HLE path sets up. */
+u32  cellGcm_syscall_bringup(u32 local_size);   /* -> RSX local memory base */
+u32  cellGcm_control_guest_addr(void);          /* put/get/ref triple EA */
+void cellGcm_syscall_iomap(u32 ea, u32 io, u32 size);
+void cellGcm_syscall_iounmap(u32 io, u32 size);
+void cellGcm_syscall_set_fifo(u32 put, u32 get);
+
 s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
                             u32 width, u32 height);
 

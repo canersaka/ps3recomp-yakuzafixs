@@ -107,7 +107,9 @@ static void write_be64(uint32_t addr, uint64_t val)
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
-    { static int n=0; if (n++ < 60) fprintf(stderr, "[WAIT] timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n",
+    { extern unsigned long long ps3_qpc_us(void);
+      static int n=0; if (n++ < 60)
+        fprintf(stderr, "[WAIT] t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n", ps3_qpc_us(),
         (unsigned long long)usec, (unsigned long long)ctx->lr, (unsigned long long)ctx->cia); }
     /* PS3_WAIT_OBJ=<lr-hex>: when a usleep spin is reached from this return
      * address, dump the registers and the object they point at. A poll loop
