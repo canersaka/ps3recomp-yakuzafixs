@@ -350,6 +350,43 @@ int64_t sys_cond_signal_all(ppu_context* ctx)
 /* ---------------------------------------------------------------------------
  * Registration
  * -----------------------------------------------------------------------*/
+/* sys_cond_signal_to(cond_id, ppu_thread_id) -- wake ONE NAMED waiter.
+ *
+ * This was the only member of the condvar family left unregistered, so it hit
+ * the generic "lv2_syscall 110 (stub)" path and returned success without waking
+ * anyone. A missing WAIT primitive fails loudly; a missing WAKE primitive just
+ * deadlocks whoever was waiting, which is far harder to spot.
+ *
+ * ponytail: wakes ALL waiters, not the named one -- sys_cond_info holds a bare
+ * condition variable with no waiter list, so targeting a thread would mean
+ * per-waiter bookkeeping in wait/signal. Waking all can never FAIL to wake the
+ * intended thread; the cost is a spurious return for any other waiter. Add a
+ * {thread_id -> event} waiter list here if a title is ever seen mishandling
+ * that spurious wake. */
+int64_t sys_cond_signal_to(ppu_context* ctx)
+{
+    uint32_t cond_id   = LV2_ARG_U32(ctx, 0);
+    uint32_t thread_id = LV2_ARG_U32(ctx, 1);
+    { static int n=0; if(n++<80) fprintf(stderr,
+        "[SIGNAL] cond_signal_to(cond=%u target_tid=%u) tid=%llu lr=0x%08X\n",
+        cond_id, thread_id, (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr); }
+
+    if (cond_id == 0 || cond_id > SYS_COND_MAX)
+        return (int64_t)(int32_t)CELL_ESRCH;
+
+    sys_cond_info* c = &g_sys_conds[cond_id - 1];
+    if (!c->active)
+        return (int64_t)(int32_t)CELL_ESRCH;
+
+#ifdef _WIN32
+    WakeAllConditionVariable(&c->cv);
+#else
+    pthread_cond_broadcast(&c->cv);
+#endif
+
+    return CELL_OK;
+}
+
 void sys_cond_init(lv2_syscall_table* tbl)
 {
     memset(g_sys_conds, 0, sizeof(g_sys_conds));
@@ -366,4 +403,5 @@ void sys_cond_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_COND_WAIT,        sys_cond_wait);
     lv2_syscall_register(tbl, SYS_COND_SIGNAL,      sys_cond_signal);
     lv2_syscall_register(tbl, SYS_COND_SIGNAL_ALL,  sys_cond_signal_all);
+    lv2_syscall_register(tbl, SYS_COND_SIGNAL_TO,   sys_cond_signal_to);
 }

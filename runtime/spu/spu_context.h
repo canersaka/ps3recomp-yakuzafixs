@@ -156,8 +156,19 @@ typedef struct spu_context {
     /* 128 general-purpose 128-bit registers */
     SPU_ALIGN16 u128 gpr[128];
 
-    /* 256 KB local store, 16-byte aligned */
-    SPU_ALIGN16 uint8_t ls[SPU_LS_SIZE];
+    /* 256 KB local store, 16-byte aligned, addressed through `ls`.
+     *
+     * Indirect because a RAW SPU's local store is not private: lv2 maps it into
+     * the process at 0xE0000000 + n*0x100000, and the PPU writes the SPU's code
+     * and its command buffers there WHILE IT RUNS (runtime/spu/spu_raw.c). Such
+     * a context points `ls` straight at guest memory; every other context points
+     * it at ls_store, so no other path changes -- ctx->ls[i], &ctx->ls[i] and
+     * ctx->ls + n all still compile and mean the same thing.
+     *
+     * A context memset without spu_context_init would leave this NULL.
+     * spurs_policy.c memsets and calls the init immediately after; keep it so. */
+    SPU_ALIGN16 uint8_t ls_store[SPU_LS_SIZE];
+    uint8_t* ls;
 
     /* Program counter (local store address, 0-0x3FFFF) */
     uint32_t pc;
@@ -336,6 +347,7 @@ typedef struct spu_context {
 static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
 {
     memset(ctx, 0, sizeof(*ctx));
+    ctx->ls     = ctx->ls_store;   /* a raw SPU repoints this at guest memory */
     ctx->spu_id = spu_id;
     ctx->status = SPU_STATUS_STOPPED;
 }
@@ -603,6 +615,12 @@ void spu_indirect_branch(spu_context* ctx);
  * spu_context is pinned to one host thread for its lifetime. */
 extern SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
 
+/* Ring of the last PCs this SPU thread executed, for the unlifted-branch
+ * report. The dispatcher records indirect branches; SPU_DRAIN records every
+ * trampoline hop, which is the one that actually precedes a bad branch. */
+extern SPU_THREAD_LOCAL uint32_t g_spu_pch[8];
+extern SPU_THREAD_LOCAL unsigned g_spu_pch_n;
+
 /* Central per-transfer hooks (stubbed in spu_drain.c until their milestones). */
 void yz_lockstep_tick(spu_context* ctx);             /* round-robin token gate */
 void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    */
@@ -625,6 +643,53 @@ int  spu_tailret_enabled(void);
  * unchanged (interrupt not taken) if LS 0 holds no branch instruction. */
 void (*spu_take_interrupt(spu_context* ctx,
                           void (*tf)(spu_context*)))(spu_context*);
+
+/* SPU_PCHIST=1: bucket SPU execution by the GPU module's own symbols.
+ *
+ * SPU_VRAMPC showed 3.7M VRAM writes from Host2Local_Body and ZERO from
+ * DrawRect/DrawEdge, i.e. the rasteriser never writes a pixel. That leaves two
+ * possibilities -- the draw commands never arrive, or they arrive and main
+ * never dispatches them -- and the difference is whether DrawRect/DrawEdge are
+ * ENTERED at all. This counts entries rather than writes, one increment per
+ * trampoline hop, which is the cheapest place that sees every transfer of
+ * control.
+ *
+ * Extents from the .symtab embedded in ps1_netemu (firmware file offset
+ * 0x171100), so they are exact rather than guessed. */
+static inline void spu_pchist_tick(const spu_context* ctx)
+{
+    static int en = -1;
+    if (en < 0) en = getenv("SPU_PCHIST") ? 1 : 0;
+    if (!en) return;
+    static unsigned long long b[8][8], n;
+    const unsigned sp = (unsigned)(ctx->spu_id & 7u);
+    const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
+    const int k = pc < 0x00188u ? 0
+                : pc < 0x00350u ? 1     /* BlockClear */
+                : pc < 0x00758u ? 2     /* Host2Local_Body */
+                : pc < 0x00928u ? 3     /* Host2Local */
+                : pc < 0x010F8u ? 4     /* Local2Local */
+                : pc < 0x051E8u ? 5     /* main */
+                : pc < 0x08700u ? 6     /* DrawRect */
+                : pc < 0x1493Cu ? 7     /* DrawEdge */
+                : 0;
+    b[sp][k]++;
+    if ((++n % 4000000ull) == 0) {
+        static const char* nm[8] = { "other", "BlockClear", "H2L_Body",
+            "Host2Local", "Local2Local", "main", "DrawRect", "DrawEdge" };
+        fprintf(stderr, "[pchist] %llu hops\n", n);
+        for (unsigned q = 0; q < 8; q++) {
+            int any = 0;
+            for (int j = 0; j < 8; j++) if (b[q][j]) any = 1;
+            if (!any) continue;
+            fprintf(stderr, "   spu%u", q);
+            for (int j = 0; j < 8; j++)
+                if (b[q][j]) fprintf(stderr, " %s=%llu", nm[j], b[q][j]);
+            fprintf(stderr, "\n");
+        }
+        fflush(stderr);
+    }
+}
 
 /* Drain the pending trampoline chain: run each queued transfer target until
  * none remain. The one central hook site for the faithful execution model. */
@@ -651,6 +716,9 @@ void (*spu_take_interrupt(spu_context* ctx,
             if ((ctx)->int_enable &&                            \
                 ((ctx)->event_status & (ctx)->event_mask))      \
                 _tf = spu_take_interrupt((ctx), _tf);          \
+            spu_pchist_tick(ctx);                              \
+            g_spu_pch[g_spu_pch_n++ & 7u] =                    \
+                (uint32_t)((ctx)->pc & SPU_LS_MASK);           \
             _tf(ctx);                                          \
         }                                                      \
     } while (0)
