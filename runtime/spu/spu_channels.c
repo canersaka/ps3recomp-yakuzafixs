@@ -1382,6 +1382,12 @@ static int spu_smc_microstep(spu_context* ctx)
             else              ctx->gpr[rt] = spu_ls_read128(ctx, a);
             pc += 4; continue;
         }
+        if (op8 == 0x44) {                                    /* xori rt,ra,i10 */
+            /* Runtime-generated job stubs toggle their own instruction words.
+             * Use the signed RI10 immediate, just like statically lifted xori. */
+            ctx->gpr[rt] = spu_xori(ctx->gpr[ra], i10);
+            pc += 4; continue;
+        }
         if (op8 == 0x1C) {                                    /* ai rt,ra,i10 */
             u128 r = ctx->gpr[ra];
             for (int k = 0; k < 4; k++) r._u32[k] += (uint32_t)i10;
