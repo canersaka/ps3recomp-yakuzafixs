@@ -376,7 +376,7 @@ extern "C" uint32_t g_barrier_sync_watch;          /* ppu_loader.cpp; armed by t
  * Write every recorded completion word nonzero -- driven from the hot
  * sys_semaphore path the frozen worker spins on. Fakes ONLY the done-signal,
  * not the job's data DMA. Called from runtime/syscalls (extern "C"). */
-extern "C" void lbp_hle_complete_pending(void)
+extern "C" void ps3_spu_job_complete_pending(void)
 {
     static int s_on = -1;
     static int s_age_ms = -1;

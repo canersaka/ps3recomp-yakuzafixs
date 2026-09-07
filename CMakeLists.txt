@@ -151,6 +151,23 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         -fno-strict-aliasing
     )
 elseif(MSVC)
+    # Real cl.exe -- clang-cl reports its id as Clang and is handled above.
+    #
+    # This does not currently build. The runtime and the lifted output use GCC/
+    # Clang builtins that cl has no equivalent for, and the failure lands as a
+    # wall of errors in whichever file the build happens to reach first rather
+    # than as anything that names the cause. Say it here instead.
+    message(WARNING
+        "Building with cl.exe (MSVC). This is not currently supported.\n"
+        "  The runtime uses __atomic_* builtins, __int128 and __builtin_bswap*, "
+        "and the lifted output uses __int128 for the PPC 64x64 multiplies. "
+        "cl has none of them.\n"
+        "  Use clang-cl instead -- it consumes the MSVC headers and libraries, "
+        "so nothing else about a Visual Studio build changes:\n"
+        "    cmake -S . -B build -G Ninja "
+        "-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl\n"
+        "  See docs/BUILDING.md. Porting the intrinsics to cl is a welcome "
+        "contribution; nothing else stands in the way.")
     target_compile_options(ps3recomp_runtime PRIVATE
         /W3 /wd4100 /wd4244 /wd4267 /wd4996
         /Zc:__cplusplus
@@ -159,6 +176,14 @@ elseif(MSVC)
     target_compile_definitions(ps3recomp_runtime PRIVATE
         _CRT_SECURE_NO_WARNINGS
     )
+endif()
+
+if(NOT MSVC AND NOT WIN32)
+    # dladdr/Dl_info (runtime/platform/win32_backtrace.h) are GNU extensions
+    # that glibc hides unless _GNU_SOURCE is set. g++ defines it implicitly,
+    # so the C++ boot scaffold never noticed; a C file including the same
+    # shim does not get it for free.
+    target_compile_definitions(ps3recomp_runtime PRIVATE _GNU_SOURCE)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -192,6 +217,10 @@ if(UNIX)
         runtime/host/host_stubs.c
     )
     target_link_libraries(ps3recomp_host PRIVATE ps3recomp_runtime)
+    if(NOT WIN32)
+        # glibc keeps the math functions in a separate library; MSVC does not.
+        target_link_libraries(ps3recomp_host PRIVATE m)
+    endif()
     target_include_directories(ps3recomp_host PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
         "${CMAKE_CURRENT_SOURCE_DIR}/include"

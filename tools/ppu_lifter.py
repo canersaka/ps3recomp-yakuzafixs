@@ -683,6 +683,43 @@ class PPULifter:
                 _r = int(_dm.group(1))
                 if _r not in _first_def:
                     _first_def[_r] = _i
+        # Stores through a frame POINTER land on frame slots that never appear
+        # as a literal `r1 + off` store, so _write_counts misses them and the
+        # slot looks untouched. Track registers holding r1+off (through the
+        # zero-extend and register-move idioms the compiler emits) and charge
+        # `std rX, disp(rN)` to offset off+disp.
+        #
+        # ps1_netemu's Montgomery multiply (func_0015ABEC) does exactly this:
+        # `addi r5,r1,-128` -> r31 -> r30, then `std r9,0x8(r30)` writes -0x78 and
+        # `ld r25,-0x78(r1)` reads it back. Without this, -0x78 was snapshotted at
+        # entry and the reload returned the CALLER's r25 -- a pointer -- into the
+        # carry chain, so every ECDSA signature the firmware checked came out
+        # wrong and no PSOne disc would mount.
+        _fp = {}
+        for _l in func.body_lines:
+            _sm = re.search(r'vm_write\d+\(ctx->gpr\[(\d+)\] \+ (-?(?:0x)?[0-9a-fA-F]+)', _l)
+            if _sm and int(_sm.group(1)) in _fp:
+                try:
+                    _write_counts[hex(_fp[int(_sm.group(1))] + int(_sm.group(2), 0))] += 1
+                except ValueError:
+                    pass
+            _am2 = re.match(r'\s*ctx->gpr\[(\d+)\] = ctx->gpr\[1\] \+ \(int64_t\)\((-?(?:0x)?[0-9a-fA-F]+)\);', _l)
+            if _am2:
+                try:
+                    _fp[int(_am2.group(1))] = int(_am2.group(2), 0)
+                except ValueError:
+                    _fp.pop(int(_am2.group(1)), None)
+                continue
+            _cp = (re.match(r'\s*ctx->gpr\[(\d+)\] = ppc_rldicl\(ctx->gpr\[(\d+)\], 0, 32\);', _l)
+                   or re.match(r'\s*ctx->gpr\[(\d+)\] = ctx->gpr\[(\d+)\] \| ctx->gpr\[\];', _l))
+            if _cp:
+                _d, _s2 = int(_cp.group(1)), int(_cp.group(2))
+                if _s2 in _fp: _fp[_d] = _fp[_s2]
+                else: _fp.pop(_d, None)
+                continue
+            _dm2 = re.match(r'\s*ctx->gpr\[(\d+)\] = ', _l)
+            if _dm2:
+                _fp.pop(int(_dm2.group(1)), None)
         _saved_slots = set()
         for _i, _l in enumerate(func.body_lines):
             _m = _CS_SAVE_RE.search(_l)
@@ -711,6 +748,20 @@ class PPULifter:
                 return int(_off, 0) in _addr_taken
             except ValueError:
                 return False
+        # A function that saves ANY register into its own r1-relative frame owns
+        # that frame, even with no stdu: a PPC64 leaf may keep its locals in the
+        # 288-byte protected zone below r1 (`addi rN,r1,-224`) and never adjust
+        # the stack pointer. Such a function is NOT a tail entry, so a
+        # `ld rN,off(r1)` at an offset it never saved is a genuine data load.
+        #
+        # ps1_netemu's Montgomery multiply (func_0015ABEC) is exactly this: it
+        # spills r25 to -0x38(r1), builds a 2-word product temp at -0x80(r1) via
+        # `addi r5,r1,-128`, writes the high word as `std r9,0x8(r30)` and reads
+        # it back with `ld r25,-0x78(r1)`. The store is through r30, so
+        # _write_counts never sees -0x78 written; the address taken was -0x80, so
+        # _off_escapes misses it too -- and the reload got rewritten to the
+        # CALLER's r25, a pointer, which then flowed into the carry chain. Every
+        # ECDSA signature the firmware checked failed on that one word.
         _reg_snap = set()        # regs to snapshot from the register at entry
         _mem_snap = {}           # reg -> offset, snapshot from memory at entry
         for _i, _l in enumerate(func.body_lines):
@@ -3284,6 +3335,12 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             continue
         _dbg(all_insns[i].addr, "bctr found")
         win = all_insns[max(0, i - 30):i]
+        _clo = 0
+        for _k in range(i - 1, -1, -1):
+            if all_insns[_k].mnemonic == 'blr':
+                _clo = _k + 1
+                break
+        win_cand = all_insns[_clo:i]
         # the ctr source register (last mtctr before the bctr)
         rC = None
         for w in reversed(win):
@@ -3369,7 +3426,20 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             # dispatcher (every dense switch in newlib dtoa fell through -> the
             # guest's printf("%f") spun forever). gcc (PSL1GHT/newlib) loads the
             # base with `ld` (64-bit ELFv1 TOC entry); SN uses `lwz`. Accept both.
-            for w in reversed(win):
+            #
+            # Scanned over the ENCLOSING FUNCTION, not the 30-instruction window:
+            # the base load can sit far ahead of the dispatch arithmetic. In
+            # ps1_netemu's R3000 interpreter `lwz r19,-0x79CC(r2)` is 36
+            # instructions before its `bctr`, so the window found the mtctr and
+            # the lwzx but no base, dropped the 127-entry opcode table, and every
+            # guest instruction dispatched to an unlifted address -- the PS1 BIOS
+            # executed exactly one instruction and the emulator quit. Bounded by
+            # the nearest preceding blr (same guard the two-level path below
+            # uses) so it cannot latch a stale base from the previous function.
+            # Widening is safe for the cases that already worked: the walk stops
+            # at the NEAREST definition of `cand`, so when one exists inside the
+            # window the result is unchanged.
+            for w in reversed(win_cand):
                 a = [x.strip() for x in w.operands.split(',')]
                 if not a or a[0] != cand:
                     continue                    # not a definition of cand
@@ -3531,7 +3601,15 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                     _dbg(all_insns[i].addr, f"  entry[{k}] raw=0x{v:X} -> target=0x{t:X} valid={text_lo <= t < text_hi and t % 4 == 0}")
                 if text_lo <= t < text_hi and t % 4 == 0:
                     targets.append(t)
-                else:
+                elif targets or k >= 4:
+                    # First hole AFTER real entries ends the table. LEADING holes
+                    # do not: a dense opcode table has null slots for the codes it
+                    # never dispatches, and ps1_netemu's 128-entry R3000 table
+                    # starts with exactly one (index 0 is unused, entries 1..127
+                    # are the handlers). Breaking on it decoded 0 targets and
+                    # dropped the whole dispatcher. Bounded at 4 so a table_base
+                    # that is simply wrong still fails fast instead of scanning
+                    # into unrelated data.
                     break
             _dbg(all_insns[i].addr, f"decoded {len(targets)} targets")
             if len(targets) > len(best):
@@ -4016,7 +4094,17 @@ def main() -> None:
                 fs = _enclosing(disp)
                 if fs is None:
                     continue
-                maxc = max(cases)
+                # A real switch's cases sit inside the dispatcher's own body.
+                # A case target megabytes away is a misread table entry, and
+                # extending to it swallows every function in between: on Saints
+                # Row 2 one bogus table absorbed 8.6 MB and 21,812 function
+                # starts into a single 2.3M-line emission that clang then
+                # dead-stripped to a 34 KB object. Bound the extension by the
+                # same span cap the mid-function tail pass uses.
+                near = [c for c in cases if abs(c - disp) <= _MAX_MID_TAIL]
+                if not near:
+                    continue
+                maxc = max(near)
                 kk = bisect.bisect_right(_starts0, maxc)
                 new_end = _starts0[kk] if kk < len(_starts0) else text_hi
                 if new_end > fb[fs]:

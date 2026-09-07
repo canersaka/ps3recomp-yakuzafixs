@@ -1102,6 +1102,19 @@ def main() -> None:
     else:
         with open(args.input, "rb") as f:
             data = f.read()
+        # An ELF handed in as the positional input is read as a RAW image: the
+        # ELF header becomes the first instructions and every address is a file
+        # offset, so a lifted "func_00000100" is really the code at LS
+        # (0x100 - p_vaddr + p_offset). It compiles, links and runs -- straight
+        # into the wrong instructions -- which is an expensive way to find a
+        # missing flag. Use --auto-functions for an ELF, or say --offset/--base
+        # explicitly if the raw read is deliberate.
+        if data[:4] == b"ELF" and args.offset == 0 and args.base == 0:
+            p.error("input is an ELF but no --auto-functions/--offset/--base was "
+                    "given: it would be lifted as a raw image at base 0, placing "
+                    "every function at its FILE OFFSET instead of its local-store "
+                    "address. Pass --auto-functions <same elf> to lift it as an "
+                    "ELF, or --offset/--base to confirm a raw read.")
         data = data[args.offset:]
         if args.length:
             data = data[:args.length]
