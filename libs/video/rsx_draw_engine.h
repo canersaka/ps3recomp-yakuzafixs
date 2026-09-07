@@ -221,6 +221,10 @@ int  rsx_draw_engine_enabled(void);
  * environment set. PS3RECOMP_RSX_ENGINE=vtable still turns it off. */
 void rsx_draw_engine_set_default(int on);
 
+/* A runner with its own RSX IO map supplies its address resolver before init.
+ * NULL restores the toolkit's cellGcm mapping. */
+void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user);
+
 int  rsx_draw_engine_init(u32 width, u32 height);
 void rsx_draw_engine_shutdown(void);
 

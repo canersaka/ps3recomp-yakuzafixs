@@ -189,11 +189,22 @@ static struct {
 /* rsx_dsp_* locations are RSX_LOCATION_LOCAL = 0 / _MAIN = 1;
  * cellGcmResolveLocated's argument is the opposite sense (1 = local), and
  * getting that backwards resolves every VRAM object through the IO table. */
+static rsx_vertex_guest_ptr_fn s_guest_reader;
+static void* s_guest_user;
+
+void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user)
+{
+    s_guest_reader = reader;
+    s_guest_user = user;
+}
+
 static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
                                u32 min_bytes)
 {
     (void)user;
-    if (!vm_base || !min_bytes || min_bytes > (256u << 20)) return NULL;
+    if (!min_bytes || min_bytes > (256u << 20)) return NULL;
+    if (s_guest_reader) return s_guest_reader(s_guest_user, location, offset, min_bytes);
+    if (!vm_base) return NULL;
     const u32 ea = cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset);
     if (!ea) return NULL;
     if (ppu_vm_size && (u64)ea + min_bytes > ppu_vm_size) return NULL;
@@ -472,7 +483,8 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
      * surface's backing would fault long before it could help. Both halves are
      * checked: the DMA context says which space the offset is in, and the IO
      * table says the page is really mapped. */
-    if (location != RSX_LOCATION_MAIN || !cellGcmResolveIO(offset)) return NULL;
+    if (location != RSX_LOCATION_MAIN ||
+        (!s_guest_reader && !cellGcmResolveIO(offset))) return NULL;
     rsx_tex_layout tl;
     /* A8R8G8B8 with the LN bit: a surface is linear, never swizzled. */
     rsx_texture_layout(0x85u | 0x20u, w, h, &tl);
@@ -1648,6 +1660,7 @@ void rsx_draw_engine_shutdown(void)
         if (g.zdepths[i].handle) g.be->depth_target_release(g.be->user, g.zdepths[i].handle);
     if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
 
+    rsx_draw_engine_set_guest_memory(NULL, NULL);
     free(dc.refs); free(dc.cuts); free(dc.verts);
     rsx_vertex_remap_destroy(&dc.ref_remap);
     memset(&dc, 0, sizeof dc);

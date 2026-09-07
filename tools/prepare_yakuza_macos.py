@@ -72,6 +72,28 @@ def main():
         'uint32_t cellGcmGetTiledPitchSize(uint32_t size);',
         'legacy tiled-pitch declaration')
 
+    imports = replace_once(imports, '#include "rsx_live_draw.h"',
+        '#include "rsx_draw_engine.h"\n#include "rsx_live_draw.h"', 'Metal draw engine include')
+    imports = replace_once(imports, '    rsx_live_draw_method(method, arg);',
+        '''    rsx_live_draw_method(method, arg);
+#ifdef __APPLE__
+    if (rsx_draw_engine_enabled()) rsx_draw_engine_method(method, arg);
+#endif''', 'Metal FIFO feed')
+    imports = replace_once(imports,
+        '    if (YZ_RSX_BACKEND_INIT(1280, 720, "Yakuza: Dead Souls (ps3recomp)") != 0) {',
+        '''#ifdef __APPLE__
+    rsx_draw_engine_set_guest_memory(yz_rsx_live_guest_ptr, nullptr);
+#endif
+    if (YZ_RSX_BACKEND_INIT(1280, 720, "Yakuza: Dead Souls (ps3recomp)") != 0) {''',
+        'Metal guest memory mapping')
+    imports = replace_once(imports,
+        '            if (id + 1 > g_rsx_dispbuf_count) g_rsx_dispbuf_count = id + 1;',
+        '''            if (id + 1 > g_rsx_dispbuf_count) g_rsx_dispbuf_count = id + 1;
+#ifdef __APPLE__
+            rsx_draw_engine_set_display_buffer(id, 0, g_rsx_dispbuf[id].offset,
+                g_rsx_dispbuf[id].pitch, g_rsx_dispbuf[id].width, g_rsx_dispbuf[id].height);
+#endif''', 'Metal display buffer registration')
+
     # A single CFRunLoopRun may return when AppKit's nested event handling
     # stops it or when no sources remain. Do not join a still-running guest:
     # that starves Metal's dispatch_sync and CoreAudio's main-queue work.
