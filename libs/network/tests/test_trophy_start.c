@@ -18,9 +18,11 @@ int main(void)
     vm_base = calloc(1, 65536);
     assert(vm_base);
     memcpy(vm_base + 0x100, "NPWR00000", 9);
+    assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, NULL, 0) ==
+           SCE_NP_TROPHY_ERROR_NOT_INITIALIZED);
+    assert(sceNpTrophyInit(NULL, 0, 0, 0) == CELL_OK);
     assert(sceNpTrophyCreateContext(NULL, (void*)0x100, NULL, 0) ==
            SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
-    assert(!s_trophy_initialized);
     for (int i = 0; i < 2; i++) {
         assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, NULL, 0) == CELL_OK);
         assert(vm_read32(0x200) == (u32)i);
@@ -35,5 +37,5 @@ int main(void)
     assert(s_contexts[0].in_use && s_handles[0].in_use);
     assert(sceNpTrophyTerm() == CELL_OK);
     free(vm_base);
-    puts("Trophy first-use and guest-endian checks passed");
+    puts("Trophy initialization and guest-endian checks passed");
 }
