@@ -468,6 +468,14 @@ static void nested_reset(spu_context* ctx)
     spu_indirect_branch(ctx);
     stale_caller_ran = 1;
 }
+static void direct_reset(spu_context* ctx)
+{
+    ctx->host_depth = 3;
+    ctx->pc = 0x838;
+    g_spu_trampoline_fn = reset_target;
+    SPU_DRAIN(ctx);
+    stale_caller_ran = 1;
+}
 static void test_guest_stack_reset(void)
 {
     spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
@@ -480,6 +488,10 @@ static void test_guest_stack_reset(void)
     spu_run_with_halt(nested_reset, ctx);
     check(stack_reset_depth == 0, "one-way kernel entry discards nested host call frames");
     check(!stale_caller_ran, "exited workload cannot resume its obsolete caller");
+    stack_reset_depth = -1; stale_caller_ran = 0;
+    spu_run_with_halt(direct_reset, ctx);
+    check(stack_reset_depth == 0 && !stale_caller_ran,
+          "direct trampoline transfers honor registered stack resets");
     free(ctx);
 }
 
