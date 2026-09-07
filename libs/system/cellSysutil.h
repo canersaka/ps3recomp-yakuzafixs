@@ -104,6 +104,9 @@ s32 cellSysutilRegisterCallback(s32 slot, CellSysutilCallback func, void* userda
 s32 cellSysutilUnregisterCallback(s32 slot);
 s32 cellSysutilCheckCallback(void);
 
+/* Internal HLE completion queue, delivered by the guest's next callback poll. */
+s32 cellSysutilQueueGuestCallback(u32 opd, u64 arg0, u64 arg1);
+
 /* Host-side helper: queue a sysutil event to be delivered to the game's
  * registered callback at the next cellSysutilCheckCallback poll. status
  * is one of the CELL_SYSUTIL_* event codes (REQUEST_EXITGAME,

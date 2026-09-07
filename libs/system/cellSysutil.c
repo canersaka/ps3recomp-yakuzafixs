@@ -73,6 +73,63 @@ void cellSysutilQueueEvent(int slot, uint32_t status, uint32_t param)
     s_event_tail = next;
 }
 
+/* Dialog and other one-shot completions carry their own OPD, rather than a
+ * registered sysutil slot. Detach one batch before invoking guest code so a
+ * callback may safely enqueue another completion for the next poll. */
+#ifdef _WIN32
+#include <windows.h>
+static SRWLOCK s_completion_lock = SRWLOCK_INIT;
+#define COMPLETION_LOCK() AcquireSRWLockExclusive(&s_completion_lock)
+#define COMPLETION_UNLOCK() ReleaseSRWLockExclusive(&s_completion_lock)
+#define COMPLETION_TLS __declspec(thread)
+#else
+#include <pthread.h>
+static pthread_mutex_t s_completion_lock = PTHREAD_MUTEX_INITIALIZER;
+#define COMPLETION_LOCK() pthread_mutex_lock(&s_completion_lock)
+#define COMPLETION_UNLOCK() pthread_mutex_unlock(&s_completion_lock)
+#define COMPLETION_TLS _Thread_local
+#endif
+
+typedef struct GuestCompletion {
+    struct GuestCompletion* next;
+    u32 opd;
+    u64 arg0, arg1;
+} GuestCompletion;
+static GuestCompletion* s_completion_head;
+static GuestCompletion* s_completion_tail;
+
+s32 cellSysutilQueueGuestCallback(u32 opd, u64 arg0, u64 arg1)
+{
+    if (!opd) return CELL_OK;
+    GuestCompletion* item = malloc(sizeof(*item));
+    if (!item) return (s32)CELL_ENOMEM;
+    item->next = NULL; item->opd = opd; item->arg0 = arg0; item->arg1 = arg1;
+    COMPLETION_LOCK();
+    if (s_completion_tail) s_completion_tail->next = item;
+    else s_completion_head = item;
+    s_completion_tail = item;
+    COMPLETION_UNLOCK();
+    return CELL_OK;
+}
+
+static void drain_guest_completions(void)
+{
+    static COMPLETION_TLS int draining;
+    if (draining || !g_ps3_guest_caller) return;
+    draining = 1;
+    COMPLETION_LOCK();
+    GuestCompletion* item = s_completion_head;
+    s_completion_head = s_completion_tail = NULL;
+    COMPLETION_UNLOCK();
+    while (item) {
+        GuestCompletion* next = item->next;
+        g_ps3_guest_caller(item->opd, item->arg0, item->arg1, 0, 0, 0, 0, 0, 0);
+        free(item);
+        item = next;
+    }
+    draining = 0;
+}
+
 static s32 s_bgm_enabled = 1;
 static s32 s_bgm_status = CELL_SYSUTIL_BGMPLAYBACK_STATUS_STOP;
 static char s_cache_path[CELL_SYSCACHE_PATH_MAX];
@@ -130,6 +187,7 @@ s32 cellSysutilUnregisterCallback(s32 slot)
 
 s32 cellSysutilCheckCallback(void)
 {
+    drain_guest_completions();
     /* Drain the event queue, dispatching each event into guest code via
      * the registered ps3_guest_caller hook. Standard PS3 sysutil callback
      * signature is:
