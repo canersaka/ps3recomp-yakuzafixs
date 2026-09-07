@@ -246,6 +246,8 @@ void rsx_draw_engine_flush(void);
 /* Present whatever the frame has recorded, for a host that drives the flip
  * itself rather than through the FIFO's 0xE944. */
 void rsx_draw_engine_present(void);
+/* A runner retiring a queued flip names the buffer explicitly. */
+void rsx_draw_engine_present_buffer(u32 buffer_id);
 
 /* --- test hooks ---------------------------------------------------------- */
 
