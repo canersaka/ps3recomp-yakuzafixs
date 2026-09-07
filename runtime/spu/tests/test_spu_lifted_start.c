@@ -321,6 +321,7 @@ static void test_smc_branch_hints(void)
 {
     spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
     if (!ctx) { check(0, "calloc spu_context for the SMC hint test"); return; }
+    spu_context_init(ctx, 0);
 
     const uint32_t PC = 0x400, TARGET = 0x2000;
     ls_put_be32(&ctx->ls[PC + 0x00], 0x40800282u);   /* il   $2, 5            */
@@ -352,6 +353,7 @@ static void test_smc_xori(void)
 {
     spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
     if (!ctx) { check(0, "allocate SMC XOR context"); return; }
+    spu_context_init(ctx, 0);
     const uint32_t pc = 0x500, target = 0x2000;
     ls_put_be32(&ctx->ls[pc], 0x44012850u); /* xori $80,$80,4 */
     ls_put_be32(&ctx->ls[pc + 4], 0x44FFE851u); /* xori $81,$80,-1 */
@@ -380,6 +382,7 @@ static void test_resident_code_regions(void)
 {
     spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
     if (!ctx) { check(0, "allocate streamed code context"); return; }
+    spu_context_init(ctx, 0);
     const uint32_t a = 0x11000, b = 0x12000;
     spu_begin_image(81); spu_register_function(a, code_a);
     spu_begin_image(82); spu_register_function(b, code_b);
@@ -411,6 +414,7 @@ static void test_lle_taskset_syscall(void)
 {
     spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
     if (!ctx) { check(0, "allocate taskset context"); return; }
+    spu_context_init(ctx, 0);
     spu_begin_image(84); spu_register_function(0xA70, code_a);
     spu_begin_image(0);
     ctx->image_id = 16;
@@ -432,6 +436,7 @@ static void test_taskset_resume_identity(void)
 {
     spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
     if (!ctx) { check(0, "allocate task resume context"); return; }
+    spu_context_init(ctx, 0);
     spu_begin_image(85); spu_register_function(0x7BD4, code_a);
     spu_begin_image(86); spu_register_function(0x7BD4, code_b);
     spu_begin_image(84); spu_register_function(0xA70, code_stale);
@@ -480,6 +485,7 @@ static void test_guest_stack_reset(void)
 {
     spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
     if (!ctx) { check(0, "allocate stack reset context"); return; }
+    spu_context_init(ctx, 0);
     spu_begin_image(87); spu_register_function(0x838, reset_target);
     spu_begin_image(0);
     spu_register_stack_reset_entry(0x838, 87);
@@ -506,6 +512,7 @@ static void test_taskset_resume_stack(void)
 {
     spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
     if (!ctx) { check(0, "allocate task resume stack"); return; }
+    spu_context_init(ctx, 0);
     spu_begin_image(88); spu_register_function(0x7BD4, reset_target);
     spu_begin_image(0);
     spu_taskset_register_task_elf(0x700000, 88, 84);
@@ -528,6 +535,7 @@ static void test_alternate_link_return(void)
 {
     spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
     if (!ctx) { check(0, "allocate alternate return context"); return; }
+    spu_context_init(ctx, 0);
     spu_begin_image(89); spu_register_function(0x900, caller_continuation);
     spu_begin_image(0);
     ctx->image_id = 89; ctx->host_depth = 1;
@@ -578,6 +586,7 @@ static void test_user_event_ports(uint32_t gid, uint32_t tid)
         "reject an empty port mask");
     spu_context* spu = (spu_context*)calloc(1, sizeof *spu);
     if (!spu) { check(0, "allocate event context"); return; }
+    spu_context_init(spu, 0);
     spu->spu_group_id = gid;
     spu->spu_id = tid;
     extern int (*g_spu_user_event_hook)(spu_context*, uint32_t);
@@ -925,3 +934,12 @@ void spurs_pm_build_context(spu_context* c, uint32_t a, uint32_t b, uint32_t d)
 {
     (void)c; (void)a; (void)b; (void)d;
 }
+
+/* Upstream raw-SPU and RSX services are outside this group-start fixture. */
+uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
+uint32_t ps3_spu_image_source_ea(uint32_t ea) { return ea; }
+void sys_raw_spu_init(lv2_syscall_table* t) { (void)t; }
+void sys_rsx_init(lv2_syscall_table* t) { (void)t; }
+void spu_raw_note_image(uint32_t ea, uint32_t src) { (void)ea; (void)src; }
+int32_t spu_registry_fallback(uint32_t tid, uint32_t args, uint32_t size, void* user)
+{ (void)tid; (void)args; (void)size; (void)user; return -1; }

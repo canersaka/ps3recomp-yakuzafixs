@@ -847,6 +847,7 @@ s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag)
         return CELL_AUDIO_ERROR_PARAM;
     }
     u64 t = port->read_index + blockNo - (port->read_index % nblk);
+    if (blockNo < port->read_index % nblk) t += nblk;
     mutex_unlock(&s_audio_mutex);
 
     vm_write64(tag_ea, t);

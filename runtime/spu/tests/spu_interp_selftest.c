@@ -28,6 +28,7 @@ static const unsigned char PROG[] = {
 int main(void) {
     static spu_context ctx;
     memset(&ctx, 0, sizeof ctx);
+    spu_context_init(&ctx, 0);          /* ls points at ls_store */
     memcpy(ctx.ls, PROG, sizeof PROG);
     ctx.gpr[1]._u32[0] = 0x100;   /* stack pointer (store target base) */
 

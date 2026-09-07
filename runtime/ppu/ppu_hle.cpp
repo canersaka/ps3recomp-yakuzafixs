@@ -18,6 +18,7 @@
  */
 #include "ppu_recomp.h"   /* ppu_context */
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
+#include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
 #include <stdlib.h>       /* getenv */
 #include <stdint.h>
 #include <stdio.h>
@@ -43,13 +44,16 @@ extern "C" uint32_t ps3_hle_count(void) { return g_hle_inited ? g_hle_nids.count
  * Registered separately and dispatched before the generic table. */
 typedef void (*hle_ctx_fn)(ppu_context*);
 #define HLE_CTX_CAP 256
-static struct { uint32_t nid; hle_ctx_fn fn; } g_ctx[HLE_CTX_CAP];
+static struct { uint32_t nid; hle_ctx_fn fn; const char* name; } g_ctx[HLE_CTX_CAP];
 static uint32_t g_ctx_count = 0;
 
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn fn)
 {
-    (void)name;
-    if (g_ctx_count < HLE_CTX_CAP) { g_ctx[g_ctx_count].nid = nid; g_ctx[g_ctx_count].fn = fn; g_ctx_count++; }
+    if (g_ctx_count < HLE_CTX_CAP) {
+        g_ctx[g_ctx_count].nid = nid; g_ctx[g_ctx_count].fn = fn;
+        g_ctx[g_ctx_count].name = name ? name : "?";   /* named in the milestone log */
+        g_ctx_count++;
+    }
 }
 
 /* Is this NID implemented here? Lets a host boot harness that owns its own
@@ -177,6 +181,32 @@ extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
+    /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
+     * call it makes. WAITBT_EVERY only samples threads that are blocking on an
+     * event queue, which misses a thread that stops looping while it is BUSY --
+     * and "the title ran for a while and then quietly stopped advancing" is
+     * exactly that shape. Every guest frame goes through HLE calls, so the last
+     * dump in the log names the frame the loop was in when it stopped. */
+    { static int every = -1;
+      if (every < 0) { const char* e = getenv("HLE_BT_EVERY"); every = e ? atoi(e) : 0; }
+      if (every > 0 && ctx) {
+          static unsigned n[8] = {0};
+          unsigned t = (unsigned)ctx->thread_id & 7;
+          if ((n[t]++ % (unsigned)every) == 0) {
+              extern void ppu_dump_guest_stack(ppu_context*, const char*);
+              char tag[64];
+              /* Print the REAL thread id, not the ring index: tid&7 collides
+               * (1, 9 and 17 all land on slot 1) and a stack from a CRI worker
+               * reads exactly like one from the main thread. That collision
+               * cost a round. */
+              snprintf(tag, sizeof tag, "hle#%u tid=%llu nid=0x%08X", n[t] - 1u,
+                       (unsigned long long)ctx->thread_id, nid);
+              ppu_dump_guest_stack(ctx, tag);
+              { extern void ppu_dump_bctrl_ring(uint32_t, const char*);
+                ppu_dump_bctrl_ring((uint32_t)ctx->thread_id, tag); }
+          }
+      } }
+
     /* Preserve the caller TOC (r2) across the HLE call. ELFv1 makes r2 caller-saved
      * across a cross-module call: the glink stub does `std r2,40(r1)` before jumping and
      * the caller does `ld r2,40(r1)` after. Our HLE import stubs (`ps3_hle_call(nid);
@@ -212,19 +242,6 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     /* Guest-PC breadcrumb for the sampling profiler (see lv2_syscall). */
     ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
     g_last_hle_nid = nid;
-    /* GFX-SCAN: is the menu .gfx ever inflated into guest RAM? (magic 'GFX'=47 46 58) */
-    { static long _c=0; if(getenv("YDKJ_GFXSCAN") && (++_c % 200000)==0){ extern uint8_t* vm_base;
-        int gfx=0,cfx=0,swf=0,dds=0,png=0; for(uint32_t a=0x10000; a<0x0FF00000u; a++){
-          uint8_t m0=vm_base[a],m1=vm_base[a+1],m2=vm_base[a+2],vv=vm_base[a+3];
-          /* uncompressed GFx: 'GFX'/'GFC' ver 4..20 */
-          if(m0==0x47&&m1==0x46&&(m2==0x58||m2==0x43)&&(vv>=4&&vv<=20)){ if(gfx<3)fprintf(stderr,"[GFX-SCAN] GFX @0x%08X %c%c%c ver=%d\n",a,m0,m1,m2,vv); gfx++; }
-          /* compressed GFx: 'CFX' (zlib) */
-          else if(m0==0x43&&m1==0x46&&m2==0x58&&(vv>=4&&vv<=20)){ if(cfx<3)fprintf(stderr,"[GFX-SCAN] CFX(zlib) @0x%08X ver=%d\n",a,vv); cfx++; }
-          /* SWF: 'FWS'(raw) / 'CWS'(zlib) / 'ZWS'(lzma) */
-          else if((m0==0x46||m0==0x43||m0==0x5A)&&m1==0x57&&m2==0x53&&(vv>=4&&vv<=20)){ if(swf<3)fprintf(stderr,"[GFX-SCAN] SWF @0x%08X %c%c%c ver=%d\n",a,m0,m1,m2,vv); swf++; }
-          else if(m0==0x44&&m1==0x44&&m2==0x53&&vv==0x20){ dds++; }
-          else if(m0==0x89&&m1==0x50&&m2==0x4E&&vv==0x47){ png++; } }
-        fprintf(stderr,"[GFX-SCAN #%ld] GFX=%d CFX=%d SWF=%d DDS=%d PNG=%d\n",_c/200000,gfx,cfx,swf,dds,png); fflush(stderr); } }
 
     /* Boot trace: log the first N HLE calls (PS3_HLE_TRACE=N). Invaluable for
      * new-SDK bring-up (e.g. PSL1GHT) where the failure is "nothing happens". */
@@ -254,55 +271,12 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                   (uint32_t)ctx->gpr[9], (uint32_t)ctx->gpr[10], (uint32_t)ctx->lr);
       } }
 
-    /* Bad-lock locator (FLOW_BADLOCK): sys_lwmutex_lock (0x1573DC3F) on a garbage/null
-     * object (r3 < 0x10000 or high-bit set) in m_InitEntityHierarchy — host backtrace
-     * to find the null global it dereferences. Map RVAs via flow.map. */
-    { static int _bl=-1; if(_bl<0)_bl=getenv("FLOW_BADLOCK")?1:0;
-      if(_bl && nid==0x1573DC3Fu){ uint32_t r3=(uint32_t)ctx->gpr[3];
-        if(r3<0x00010000u || r3>=0x80000000u){ static int _n=0; if(_n++<3){
-#ifdef _WIN32
-          void* bt[44]; unsigned short fr=RtlCaptureStackBackTrace(0,44,bt,0);
-          (void)bt;(void)fr;
-          /* Guest-stack code-ptr scan (EXACT: a lifted func name IS its guest addr) —
-           * the accurate way to recover the caller chain (host-bt nearest-symbol lies). */
-          char ln[1500]; int p=snprintf(ln,sizeof ln,"[BADLOCK] r3=0x%08X guest-codeptrs:",r3);
-          uint32_t sp=(uint32_t)ctx->gpr[1]; uint32_t prev=0; int found=0;
-          for(uint32_t a=sp; a<sp+0x1800 && a<0x0FF00000u && found<40; a+=4){ uint32_t v=vm_read32(a);
-            if(((v>=0x00010000u&&v<0x00900000u)||(v>=0x30000000u&&v<0x30100000u)) && v!=0x008969A8u){
-              if(v!=prev){ p+=snprintf(ln+p,sizeof(ln)-p," %08X",v); prev=v; found++; } } }
-          fprintf(stderr,"%s\n",ln);
-          /* dump the allocator pool table: base ptr at TOC-0x315C (0x008969A8-0x315C=0x0089384C),
-           * entries table[0..4]. Tells us if pool[1] alone is null (corruption) or many (init-miss). */
-          { uint32_t tbase=vm_read32(0x0089384Cu); uint32_t cnt_ptr=vm_read32(0x00893848u);
-            fprintf(stderr,"[BADLOCK] pooltable base=0x%08X state=0x%08X count=0x%08X entries:",
-              tbase,cnt_ptr,cnt_ptr?vm_read32(cnt_ptr):0);
-            for(int i=0;i<5;i++) fprintf(stderr," [%d]=0x%08X",i,tbase?vm_read32(tbase+i*4):0);
-            fprintf(stderr,"\n"); }
-#endif
-        } } } }
-    /* Spin-loop locator: print the guest LR for any HLE call whose r3 lands in the
-     * lwmutex-spin object region (0x0275E000-0x02761000). Env FLOW_SPINLR. */
-    { static int _sl=-1; if(_sl<0)_sl=getenv("FLOW_SPINLR")?1:0;
-      if(_sl){ uint32_t r3=(uint32_t)ctx->gpr[3];
-        if(nid==0x2F85C0EFu && r3>=0x02740000u && r3<0x02780000u){ static int _n=0; if(_n++<3){
-          /* The DRAIN/fragment model leaves the standard LR slots zero, so scan the
-           * guest stack for any word in the lifted code range (game 0x10000-0x900000,
-           * libsre 0x30000000-0x30100000) — those are saved return addresses, and a
-           * lifted func name IS its guest addr (func_XXXXXXXX), so they map directly. */
-          char buf[1400]; int p=snprintf(buf,sizeof buf,"[SPINLR] lwmutex_create r3=0x%08X sp=0x%08X codeptrs:",r3,(uint32_t)ctx->gpr[1]);
-          uint32_t sp=(uint32_t)ctx->gpr[1]; uint32_t prev=0; int found=0;
-          for(uint32_t a=sp; a<sp+0x2400 && a<0x0FF00000u && found<48; a+=4){ uint32_t v=vm_read32(a);
-            if((v>=0x00010000u&&v<0x00900000u)||(v>=0x30000000u&&v<0x30100000u)){
-              if(v!=prev){ p+=snprintf(buf+p,sizeof(buf)-p," %08X",v); prev=v; found++; } } }
-          fprintf(stderr,"%s\n",buf); } } } }
-    { static int tr=-1; if(tr<0){const char*e=getenv("FLOW_HLETRACE"); tr=e?1:0;}
-      if(tr) fprintf(stderr,"[hletrace] nid=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X\n",
-          nid,(uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6]); }
     /* sys_process_exit (abort path): dump the guest back-chain so we see WHO aborted.
      * Always-on for a NONZERO exit code (error/abort) -- the rare loader-thread
-     * abort in LBP is a race we can't reliably reproduce, so capture it whenever
-     * it fires. Clean code=0 exits (normal shutdown) stay quiet. */
-    if (nid == 0xE6F2C1E7u && ((uint32_t)ctx->gpr[3] != 0 || getenv("FLOW_EXITCHAIN"))) {
+     * abort is usually a race that will not reproduce on demand, so capture it
+     * whenever it fires. Clean code=0 exits (normal shutdown) stay quiet;
+     * PS3_EXIT_CHAIN=1 dumps those too. */
+    if (nid == 0xE6F2C1E7u && ((uint32_t)ctx->gpr[3] != 0 || getenv("PS3_EXIT_CHAIN"))) {
         uint32_t sp = (uint32_t)ctx->gpr[1];
         fprintf(stderr, "[exit-chain] code=0x%X lr=0x%08X sp=0x%08X\n", (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr, sp);
         /* Scan the guest stack for words in the lifted code range — saved return
@@ -326,12 +300,6 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * lifted --hle-stubs body (ps3_hle_call) doesn't, so without this every
      * import call leaves the caller with a garbage r2 -> all later TOC-relative
      * loads (the C++ ctor list, globals, ...) read garbage -> boot corruption. */
-    { static int _h=-1; if(_h<0)_h=getenv("FLOW_HLETOC")?1:0;
-      if(_h && (uint32_t)(ctx->gpr[1]+0x28)==0x0FEFF268u){ static int _n=0; if(_n++<6){
-        char* mb=(char*)GetModuleHandleA(0); void* ra0=__builtin_return_address(0); void* ra1=__builtin_return_address(1);
-        fprintf(stderr,"[HLETOC] corrupt nid=0x%08X name=%s r1=0x%08X  host_ra0_rva=0x%llX ra1_rva=0x%llX\n",
-          nid,g_last_hle_name?g_last_hle_name:"?",(uint32_t)ctx->gpr[1],
-          (unsigned long long)((char*)ra0-mb),(unsigned long long)((char*)ra1-mb)); } } }
     /* FLOW_NOSPILL: with the lifted code using a constant main TOC (--main-toc/TOCFIX),
      * the caller no longer reads [r1+0x28] to restore r2, so this ABI TOC-spill is
      * unnecessary — and in the frameless-cascade it can clobber a caller frame slot
@@ -374,7 +342,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                         if (nid == 0x5EF96465u) {
                             const char* ce = getenv("YDKJ_CRI_EVFLAG");
                             uint32_t crif = ce ? (uint32_t)strtoul(ce, 0, 16) : 0x006B4600u;
-                            static int _cd=0; if(getenv("YDKJ_SPURSTRACE") && _cd++<4) fprintf(stderr,
+                            static int _cd=0; if(getenv("SPURS_TRACE") && _cd++<4) fprintf(stderr,
                                 "[EVFLAG] 0x5EF96465 r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X\n",
                                 (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6]);
                             /* the eventFlag EA can be r3/r4/r5 depending on the (public vs _internal)
@@ -398,9 +366,21 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         if (opd) {
             uint32_t code = vm_read32(opd);
             uint32_t toc  = vm_read32(opd + 4);
-            { static int64_t st=-2; if(st==-2){const char*e=getenv("YDKJ_SPURSTRACE"); st=e?1:0;}
+            { static int64_t st=-2; if(st==-2){const char*e=getenv("SPURS_TRACE"); st=e?1:0;}
               if (st) fprintf(stderr, "[SPURSTRACE] nid=0x%08X -> libsre code=0x%08X  r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X lr=0x%08X\n",
                   nid, code, (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6],(uint32_t)ctx->lr);
+              /* CRI task-arg trace: _cellSpursTaskAttributeInitialize (0xB8474EFF) carries the
+               * CellSpursTaskArgument (16B). Dump all 8 arg regs + the r9/r10 targets so we can
+               * find which game value becomes the task's r3 (wrong vs the RPCS3 dump). */
+              if (st && nid==0xB8474EFFu) { extern uint8_t* vm_base;
+                  fprintf(stderr,"[TASKARG] 0xB8474EFF r3..r10= %08X %08X %08X %08X %08X %08X %08X %08X (lr=0x%08X)\n",
+                      (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6],
+                      (uint32_t)ctx->gpr[7],(uint32_t)ctx->gpr[8],(uint32_t)ctx->gpr[9],(uint32_t)ctx->gpr[10],(uint32_t)ctx->lr);
+                  for (int rr=9; rr<=10; rr++){ uint32_t p=(uint32_t)ctx->gpr[rr];
+                      if (p>=0x10000 && p<0x0F000000u){ fprintf(stderr,"[TASKARG]   r%d@0x%08X:",rr,p);
+                          for(int k=0;k<0x20;k+=4) fprintf(stderr," %08X",
+                              (vm_base[p+k]<<24)|(vm_base[p+k+1]<<16)|(vm_base[p+k+2]<<8)|vm_base[p+k+3]);
+                          fprintf(stderr,"\n"); } } }
               /* Dump the struct state at the failing task-attach calls: libsre 0x300158C4
                * (nid 0x87630976) STATs unless struct+0xC==0xFF & +0xE in{1,3}; 0x30015AA4
                * (0x22AAB31D) validates the same struct. Show what our recomp left there. */
@@ -462,18 +442,10 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                         if(_g<=6) fprintf(stderr,"[GUESTINIT] after pre-init: descriptor 0x%08X +0xC=0x%02X\n", desc, vm_base[desc+0xC]); }
                 }
             }
-            /* Arm a page-guard on the CellSpurs struct at cellSpursInitializeWithAttribute2
-             * ENTRY (nid 0xAA6269A8, r3=&spurs) — before the init writes it — to catch
-             * where its struct stores actually land. Env YDKJ_GUARD_INST. */
-            if (nid == 0xAA6269A8u && getenv("YDKJ_GUARD_INST")) {
-                extern void ppu_guard_page(uint32_t);
-                fprintf(stderr, "[GUARD] arming on CellSpurs &spurs=0x%08X at init entry\n", (uint32_t)ctx->gpr[3]);
-                ppu_guard_page((uint32_t)ctx->gpr[3]);
-            }
             /* CRI_ATTR: the real task-add libsre_func_30012310 (nid 0x1D46FEDF) STATs
              * 0x80410902 unless *(u32*)(r5+0)==1 -- r5 is the task-attribute struct the
              * game builds on the stack. Dump it to see how the game left it. */
-            if (nid==0x1D46FEDFu && getenv("YDKJ_SPURSTRACE")) {
+            if (nid==0x1D46FEDFu && getenv("SPURS_TRACE")) {
                 extern uint8_t* vm_base; uint32_t a5=(uint32_t)ctx->gpr[5], a4=(uint32_t)ctx->gpr[4];
                 #define _RD(b,o) ((vm_base[(b)+(o)]<<24)|(vm_base[(b)+(o)+1]<<16)|(vm_base[(b)+(o)+2]<<8)|vm_base[(b)+(o)+3])
                 static int _a=0; if(_a++<2) fprintf(stderr,
@@ -494,7 +466,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
              * title shuts the taskset down without ever creating a task, which is
              * why no workload is ever READY and the SPU kernel has nothing to run.
              *
-             * Logged whenever YDKJ_SPURSTRACE is on. YDKJ_EVFLAG_DIR=<1|3> stamps a
+             * Logged whenever SPURS_TRACE is on. YDKJ_EVFLAG_DIR=<1|3> stamps a
              * valid direction to find the NEXT gate -- a probe, not a fix: the real
              * answer is to make the title's own event-flag init run. */
             if (nid == 0x22AAB31Du) {
@@ -503,7 +475,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 if (vm_base && ef) {
                     uint8_t dir = vm_base[ef + 0xE];
                     static int _el = 0;
-                    if (getenv("YDKJ_SPURSTRACE") && _el < 8) { _el++;
+                    if (getenv("SPURS_TRACE") && _el < 8) { _el++;
                         fprintf(stderr, "[EVFLAG] attach flag=0x%08X +0C=%02X +0D=%02X "
                                         "+0E=%02X (needs 1 or 3)\n",
                                 ef, vm_base[ef+0xC], vm_base[ef+0xD], dir);
@@ -585,7 +557,10 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
               if(_ri){ uint64_t _sr1=ctx->gpr[1]; ctx->gpr[1]=(ctx->gpr[1]-0x1000)&~0xFull;
                 ps3_indirect_call(ctx); ctx->gpr[1]=_sr1; }
               else ps3_indirect_call(ctx); }       /* -> registered lifted libsre fn; r3=ret */
-            { static int64_t st=-2; if(st==-2){const char*e=getenv("YDKJ_SPURSTRACE"); st=e?1:0;}
+            /* A real PRX serving this import is a different implementation of it,
+             * so it gets its own prefix rather than reading as the HLE stub. */
+            ps3_msf("prx:0x%08X", nid);
+            { static int64_t st=-2; if(st==-2){const char*e=getenv("SPURS_TRACE"); st=e?1:0;}
               if (st) fprintf(stderr, "[SPURSTRACE] nid=0x%08X RETURNED r3=0x%08X\n",
                   nid, (uint32_t)ctx->gpr[3]);
               /* After a create-task (0x87630976), scan the taskset TaskInfo array to see
@@ -631,10 +606,17 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     }
 
     for (uint32_t i = 0; i < g_ctx_count; i++)
-        if (g_ctx[i].nid == nid) { g_ctx[i].fn(ctx); return; }
+        if (g_ctx[i].nid == nid) {
+            ps3_msf("hle:%s", g_ctx[i].name);
+            g_ctx[i].fn(ctx); return;
+        }
 
     ps3_nid_entry* e = g_hle_inited ? ps3_nid_table_find(&g_hle_nids, nid) : nullptr;
     if (!e || !e->handler) {
+        /* Recorded before the diagnostic paths below, several of which return
+         * early. An import moving between resolved and unresolved is exactly the
+         * kind of change the gate exists to catch. */
+        ps3_msf("hle:unresolved:0x%08X", nid);
         /* YDKJ_TUNERFIX: sysPrxForUser 0xE0998DBF is the profiler-presence query called
          * by libsre _cellSpursIsLaunchedFromTuner (0x3000D318). On a normal (non-tuner)
          * run it must return 0x8001112E ("profiler not loaded"); an unresolved-NID error
@@ -699,6 +681,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         return;
     }
     g_last_hle_name = e->name;
+    ps3_msf("hle:%s", e->name);
     { unsigned t = (unsigned)ctx->thread_id;
       if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = e->name; }
     if (nid == 0xD0B1D189u /*cellGcmSetTile*/ || nid == 0xDC09357Eu /*SetDisplayBuffer*/) {
@@ -712,11 +695,12 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     uint64_t r = fn(ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6],
                     ctx->gpr[7], ctx->gpr[8], ctx->gpr[9], ctx->gpr[10]);
     ctx->gpr[3] = r;   /* PPC return value */
-    /* PTR-LEAK detector (FLOW_PTRLEAK): the game stores HLE return values as
-     * guest pointers; if an HLE returns a value out of guest RAM (>= 0x10000000)
-     * that isn't a CELL_ERROR code (0x8001xxxx), it's leaking a truncated HOST
-     * pointer -> becomes an unresolved guest call later (e.g. 0xC708C708). */
-    { static int _pl=-1; if(_pl<0)_pl=getenv("FLOW_PTRLEAK")?1:0;
+    /* PS3_HLE_PTRCHECK: the guest stores HLE return values as guest pointers, so
+     * an HLE returning a value outside guest RAM (>= 0x10000000) that is not a
+     * CELL_ERROR code (0x8001xxxx / 0x8002xxxx) is leaking a truncated HOST
+     * pointer. It surfaces much later as an unresolved indirect call with no hint
+     * of where it came from, which is why it is worth checking for directly. */
+    { static int _pl=-1; if(_pl<0)_pl=getenv("PS3_HLE_PTRCHECK")?1:0;
       if(_pl){ uint32_t rv=(uint32_t)r;
         if(rv>=0x10000000u && (rv & 0xFFFF0000u)!=0x80010000u && (rv & 0xFFFF0000u)!=0x80020000u){
           static int _n=0; if(_n++<40) fprintf(stderr,"[PTRLEAK] NID 0x%08X %s returned 0x%08X (out-of-guest-RAM host ptr?)\n",
@@ -728,4 +712,24 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 extern "C" void ppu_hle_register_all(void) __attribute__((weak));
 extern "C" void ppu_hle_register_all(void) {}
 
-extern "C" void ppu_hle_init(void) { ppu_hle_register_all(); }
+extern "C" void ppu_hle_init(void)
+{
+    ppu_hle_register_all();
+
+    /* The generated registration unit is per-game and easy to leave out: the
+     * weak stub above means a build without it links and starts, then fails
+     * later and somewhere else. Say so here, once, at the point where it is
+     * still obvious what to do about it. */
+    if (ps3_hle_count() == 0) {
+        fprintf(stderr,
+            "\n[ps3] WARNING: no HLE handlers are registered.\n"
+            "  ppu_hle_register_all() is the weak do-nothing stub, so every firmware\n"
+            "  import will return 0 and the first indirect call through one lands on\n"
+            "  the import stub's own instruction word (a bare address like 0x39800000\n"
+            "  is `li r12,0`, not a function).\n"
+            "  Generate the table and add it to the build:\n"
+            "      python tools/gen_hle_nids.py --all --out src/gen/ppu_hle_nids.cpp\n"
+            "  See docs/GETTING_STARTED.md.\n\n");
+        fflush(stderr);
+    }
+}

@@ -150,7 +150,7 @@ static int mem_is(uint32_t ea, uint8_t tag, uint32_t len)
  * two keeps the test inside the eight slots it holds. */
 static void reset_ctx(spu_context* ctx, uint32_t spu_id)
 {
-    memset(ctx, 0, sizeof(*ctx));
+    spu_context_init(ctx, 0);
     ctx->spu_id = spu_id;
 }
 
@@ -460,3 +460,7 @@ void spurs_pm_build_context(spu_context* c, uint32_t a, uint32_t b, uint32_t d)
 {
     (void)c; (void)a; (void)b; (void)d;
 }
+
+/* Loader diagnostics and worker publication are outside this fixture. */
+uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
+void spu_thread_publish_ctx(uint32_t tid, void* ctx) { (void)tid; (void)ctx; }

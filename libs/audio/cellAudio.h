@@ -109,6 +109,7 @@ s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag);
 s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp);
 
 /* NID: 0x5676F81C */
+s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag);
 s32 cellAudioSetPersonalDevice(s32 iPersonalStream, s32 iDevice);
 
 /* NID: 0x28BC1409 */

@@ -9,6 +9,7 @@
 #include "cellSysutil.h"
 #include "ps3emu/guest_call.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_read/vm_write: guest EA -> host */
@@ -91,8 +92,17 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
         s32 result = CELL_MSGDIALOG_BUTTON_OK;
 
         if (button_type == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO) {
-            result = CELL_MSGDIALOG_BUTTON_YES;
-            printf("[cellMsgDialog] Auto-responding: YES\n");
+            /* MSGDIALOG_ANSWER=no answers every yes/no prompt NO instead. The
+             * auto-answer is a guess about what the title wants, and yes is not
+             * always the boot-friendliest one: a "use game data?" prompt
+             * answered yes sends the title down an install/cache path a port may
+             * have nothing behind, where no just plays from disc. A knob costs
+             * less than a rebuild to try the other branch. */
+            static int no_ = -1;
+            if (no_ < 0) { const char* e = getenv("MSGDIALOG_ANSWER");
+                           no_ = (e && (e[0] == 'n' || e[0] == 'N')) ? 1 : 0; }
+            result = no_ ? CELL_MSGDIALOG_BUTTON_NO : CELL_MSGDIALOG_BUTTON_YES;
+            printf("[cellMsgDialog] Auto-responding: %s\n", no_ ? "NO" : "YES");
         } else if (button_type == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_OK) {
             result = CELL_MSGDIALOG_BUTTON_OK;
             printf("[cellMsgDialog] Auto-responding: OK\n");
@@ -113,6 +123,18 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
     }
 
     return CELL_OK;
+}
+
+/* cellMsgDialogOpen -- the pre-3.40 entry point, identical arguments and
+ * behaviour to Open2 (RPCS3 forwards it the same way). Registering only Open2
+ * meant a title on the older API got the unresolved-NID default and then waited
+ * forever for a callback that could never fire. Virtua Fighter 5 opens one
+ * during boot and stops dead there. */
+s32 cellMsgDialogOpen(CellMsgDialogType type, const char* msgString,
+                      CellMsgDialogCallback callback, void* userdata,
+                      void* extParam)
+{
+    return cellMsgDialogOpen2(type, msgString, callback, userdata, extParam);
 }
 
 s32 cellMsgDialogClose(float delayMs)

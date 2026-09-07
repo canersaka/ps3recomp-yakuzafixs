@@ -106,7 +106,7 @@ static void spu_getllar(spu_context* ctx, uint32_t ea)
 
 static void spu_reset(spu_context* ctx, uint32_t spu_id)
 {
-    memset(ctx, 0, sizeof(*ctx));
+    spu_context_init(ctx, 0);
     ctx->spu_id = spu_id;
 }
 

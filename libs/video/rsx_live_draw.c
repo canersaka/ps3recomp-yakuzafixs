@@ -63,6 +63,11 @@ void rsx_live_draw_shutdown(void) {}
 #include "rsx_dispatch.h"
 #include "rsx_fp_decompiler.h"
 static unsigned long long g_ld_bind_white = 0, g_ld_bind_real = 0, g_ld_bind_surf = 0;
+/* Set once PS1 VRAM actually holds a drawn frame (see the PS1_PC heartbeat).
+ * Every surface dump before this is an early-boot snapshot of a framebuffer the
+ * PS1 has not drawn into yet -- which is what made nonblack=0 look like a broken
+ * pipeline when it was the correct reading of an empty source. */
+static volatile long g_ld_ps1_vram_ready = 0;
 #include "rsx_restart_cuts.h"
 #include "rsx_vertex_compact.h"
 #include "rsx_vp_decompiler.h"
@@ -1773,6 +1778,12 @@ static void decode_texel(u32 base_fmt, const u8* p, u32 remap, u8 d[4])
 {
     u8 s[4];
     switch (base_fmt) {
+    /* B8 is one channel. Broadcasting it to alpha as well is arguably more
+     * faithful (the YUV movie combine shader samples each plane's .w), but
+     * DO NOT do it until the USM decode actually fills those planes: while
+     * they are empty it only makes the garbage VISIBLE, putting green noise
+     * behind the title screen and every other movie-backed UI. Tried
+     * 2026-09-01, reverted the same session. See ydkj-live-draw-rebuild. */
     case TEX_FMT_B8: s[0] = 255; s[1] = s[2] = s[3] = p[0]; break;
     case TEX_FMT_A4R4G4B4: {
         const u16 v = (u16)((p[0] << 8) | p[1]);
@@ -1781,7 +1792,17 @@ static void decode_texel(u32 base_fmt, const u8* p, u32 remap, u8 d[4])
     }
     case TEX_FMT_A1R5G5B5: {
         const u16 v = (u16)((p[0] << 8) | p[1]);
-        s[0] = (v & 0x8000) ? 255 : 0;
+        /* LD_FORCE_A1_OPAQUE=1: experiment, not a fix. A PS1 15-bit pixel uses
+         * the top bit as a semi-transparency FLAG, and it is clear for ordinary
+         * opaque pixels -- so decoding it as A1R5G5B5 alpha gives alpha=0 for
+         * essentially the whole framebuffer. If the pipeline then blends on
+         * source alpha, every pixel is discarded and the surface reads black,
+         * which is exactly what LD_SURF_DUMP reports for all nine surfaces.
+         * This flips alpha to opaque so that theory can be tested in one run
+         * instead of argued about. */
+        { static int fo = -1;
+          if (fo < 0) fo = getenv("LD_FORCE_A1_OPAQUE") ? 1 : 0;
+          s[0] = fo ? 255 : ((v & 0x8000) ? 255 : 0); }
         s[1] = (u8)(((v >> 10) & 0x1F) * 255 / 31);
         s[2] = (u8)(((v >> 5) & 0x1F) * 255 / 31);
         s[3] = (u8)((v & 0x1F) * 255 / 31); break;
@@ -1974,6 +1995,18 @@ static u32 texture_source_span(const rsx_dsp_texture* t)
         return 0;
     u32 n_mips = t->mipmaps ? t->mipmaps : 1;
     if (n_mips > 14) n_mips = 14;
+    /* A pitch-linear (LN) texture cannot carry a mip chain -- the RSX samples
+     * only its base level and ignores the mipmap count in SET_TEXTURE_FORMAT.
+     * Honouring that count instead walks `off += pitch * mh` through whatever
+     * guest memory follows the base image and builds every lower level out of
+     * it, and a minified draw then samples that garbage.
+     *
+     * Cherry-picked by hand from flow/live-draw 3f4bdb9, where flOw's EULA
+     * showed "banded olive stripes with a ghosted second copy of the page".
+     * Twisted Metal binds PS1 VRAM pitch-linear (fmt 0xE2/0xE1 carry
+     * TEX_FMT_LINEAR) and shows banded green/magenta stripes, which is the same
+     * symptom on the same mechanism. */
+    if (linear) n_mips = 1;
     if (t->cubemap && block_size) {
         n_mips = 1;
         for (u32 d = (t->width < t->height ? t->width : t->height) / 4;
@@ -2034,6 +2067,18 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
         return NULL;
     u32 n_mips = t->mipmaps ? t->mipmaps : 1;
     if (n_mips > 14) n_mips = 14;
+    /* A pitch-linear (LN) texture cannot carry a mip chain -- the RSX samples
+     * only its base level and ignores the mipmap count in SET_TEXTURE_FORMAT.
+     * Honouring that count instead walks `off += pitch * mh` through whatever
+     * guest memory follows the base image and builds every lower level out of
+     * it, and a minified draw then samples that garbage.
+     *
+     * Cherry-picked by hand from flow/live-draw 3f4bdb9, where flOw's EULA
+     * showed "banded olive stripes with a ghosted second copy of the page".
+     * Twisted Metal binds PS1 VRAM pitch-linear (fmt 0xE2/0xE1 carry
+     * TEX_FMT_LINEAR) and shows banded green/magenta stripes, which is the same
+     * symptom on the same mechanism. */
+    if (linear) n_mips = 1;
 
     if (base_fmt == TEX_FMT_DXT1 || base_fmt == TEX_FMT_DXT23 ||
         base_fmt == TEX_FMT_DXT45) {
@@ -2175,6 +2220,25 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
         if (!rgba[n]) { oom = 1; break; }
         const u32 lw = log2_u32(mw), lh = log2_u32(mh);
         const u8* level_src = src + off;
+        /* LD_PLANE_DUMP=1: write the first few big single-channel (B8) planes
+         * straight out as PGM, exactly as the guest laid them down. Settles
+         * "is the video decode producing an image?" without guessing from the
+         * composited frame. ponytail: one-shot debug, costs nothing when off. */
+        { static int pd = -1; static int pdn = 0;
+          if (pd < 0) { const char* e = getenv("LD_PLANE_DUMP"); pd = e ? atoi(e) : 0; }
+          if (pd && (int)g_ld_frames >= pd && m == 0 && base_fmt == TEX_FMT_B8 && mw >= 320 && pdn < 6) {
+              char fn[128];
+              snprintf(fn, sizeof fn, "scratch/plane_%02d_%ux%u_p%u.pgm", pdn, mw, mh, pitch);
+              FILE* pf = fopen(fn, "wb");
+              if (pf) {
+                  fprintf(pf, "P5\n%u %u\n255\n", mw, mh);
+                  for (u32 yy = 0; yy < mh; yy++)
+                      fwrite(level_src + (size_t)yy * pitch, 1, mw, pf);
+                  fclose(pf);
+                  fprintf(stderr, "[plane-dump] %s linear=%d\n", fn, linear);
+              }
+              pdn++;
+          } }
         for (u32 y = 0; y < mh; y++)
             for (u32 x = 0; x < mw; x++) {
                 const u8* pixel = linear
@@ -2183,6 +2247,40 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
                 decode_texel(base_fmt, pixel, remap,
                              rgba[n] + ((size_t)y * mw + x) * 4);
             }
+        /* LD_TEXRGBA_DUMP=1: the DECODED level-0 RGBA, with a non-black count
+         * and the remap that produced it.
+         *
+         * Forcing the fragment shader to green fills every surface completely
+         * (368,640 = 720x512 and 921,600 = 1280x720), so the draws reach the
+         * GPU and write every pixel -- the only thing left is that the sampled
+         * texture comes back black. The guest MEMORY has content (PS1 VRAM
+         * carries the BIOS boot screen), so the question is whether decode
+         * preserves it. remap is applied here, and a remap that zeroes channels
+         * would produce exactly this. */
+        { static int td = -1; static int tdn = 0;
+          if (td < 0) td = getenv("LD_TEXRGBA_DUMP") ? 1 : 0;
+          if (td && m == 0 && tdn < 6 && mw >= 512 && mh >= 256) {
+              u64 nb = 0;
+              for (u32 q = 0; q < mw * mh; q++) {
+                  const u8* px = rgba[n] + (size_t)q * 4;
+                  if (px[0] || px[1] || px[2]) nb++;
+              }
+              char fn[160];
+              snprintf(fn, sizeof fn, "scratch/tex_%02d_%ux%u_f%02X.ppm",
+                       tdn, mw, mh, base_fmt);
+              FILE* tf = fopen(fn, "wb");
+              if (tf) {
+                  fprintf(tf, "P6\n%u %u\n255\n", mw, mh);
+                  for (u32 q = 0; q < mw * mh; q++)
+                      fwrite(rgba[n] + (size_t)q * 4, 1, 3, tf);
+                  fclose(tf);
+              }
+              fprintf(stderr, "[tex-rgba] %s fmt=0x%02X remap=0x%04X linear=%d"
+                              " pitch=%u nonblack=%llu/%u\n",
+                      fn, base_fmt, remap, linear, pitch,
+                      (unsigned long long)nb, mw * mh);
+              tdn++;
+          } }
         levels[n].w = mw;
         levels[n].h = mh;
         levels[n].data = rgba[n];
@@ -2292,6 +2390,50 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
             entry->last_hash_frame != g_ld_frames) {
             int readable = 0;
             const u64 hash = texture_content_hash(t, &readable);
+            /* LD_TEX_RACE=1: hash the SAME source twice, back to back. The two
+             * reads are microseconds apart, so they can only disagree if a
+             * guest thread is writing this texture right now -- i.e. we are
+             * decoding a half-written image. Pure observation; it changes
+             * nothing. Counts per source so one torn texture is attributable. */
+            { static int race = -1;
+              if (race < 0) race = getenv("LD_TEX_RACE") ? 1 : 0;
+              if (race && readable) {
+                  int r2 = 0;
+                  const u64 again = texture_content_hash(t, &r2);
+                  static unsigned long long checks = 0, torn = 0;
+                  checks++;
+                  if (r2 && again != hash) torn++;
+                  if ((checks % 256) == 0)
+                      fprintf(stderr,
+                              "[tex-race] src=%u:0x%08X %ux%u  torn %llu/%llu reads"
+                              " (%.1f%%)\n",
+                              t->location, t->offset, t->width, t->height,
+                              (unsigned long long)torn,
+                              (unsigned long long)checks,
+                              100.0 * (double)torn / (double)checks);
+              } }
+            /* LD_FBDBG=1: account for the PS1 framebuffer specifically
+             * (location 1, offset 0x400000, the 1024x512 fmt 0xE2 texture the
+             * PS3 side composites). Its guest memory demonstrably fills up --
+             * PS1 VRAM goes from 0 to 75,527 non-zero words -- yet
+             * [tex-refresh] fires only 6 times in 90 seconds. Three different
+             * things produce that, and they need different fixes: the texture
+             * is rarely BOUND, the span is unreadable so `readable` is 0, or
+             * the hash genuinely does not change. Count all three. */
+            { static int fbd = -1;
+              if (fbd < 0) fbd = getenv("LD_FBDBG") ? 1 : 0;
+              if (fbd && t->location == 1u && t->offset == 0x400000u) {
+                  static unsigned long long checks = 0, unread = 0, changed = 0;
+                  checks++;
+                  if (!readable) unread++;
+                  if (readable && hash != entry->content_hash) changed++;
+                  if ((checks % 64) == 0 || checks < 4)
+                      fprintf(stderr, "[fbdbg] ps1fb checks=%llu unreadable=%llu"
+                                      " changed=%llu span=%u %ux%u pitch=%u\n",
+                              checks, unread, changed,
+                              texture_source_span(t), t->width, t->height,
+                              t->pitch);
+              } }
             entry->last_hash_frame = g_ld_frames;
             if (readable && hash != entry->content_hash) {
                 ID3D12Resource* replacement =
@@ -2602,20 +2744,41 @@ static u32 vertex_texture_srv_slot(const rsx_dsp_vertex_texture* vt)
 /* ---------------------------------------------------------------------------
  * surfaces (color RTs keyed by location/offset), rendered into then presented
  * -----------------------------------------------------------------------*/
+/* fp constants are stored as raw bits; the shader reads them as floats. */
+static float ld_c2f(u32 bits) { float f; memcpy(&f, &bits, sizeof f); return f; }
+
 static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
                        DXGI_FORMAT want_fmt)
 {
     if (!want_w) want_w = g.width;
     if (!want_h) want_h = g.height;
+    /* Key on the DIMENSIONS as well as location/offset.
+     *
+     * Keying on location/offset alone meant a redeclaration of the same offset
+     * at a different size STOLE the slot and recreated the D3D12 resource,
+     * throwing the old contents away. ps1_netemu renders two passes at two
+     * sizes -- the PS1 composite at 720x512 and the PS3 output at 1280x720 --
+     * and it alternates between them, so that path fired 9,573 times in a
+     * 90-second run:
+     *
+     *     [surfsz] live surface 0x0 redeclared 720x512 -> 1280x720 (content dropped)
+     *     [surfsz] live surface 0x1401C00 redeclared 1280x720 -> 720x512 (content dropped)
+     *
+     * Every frame of both passes was being destroyed by the other. Giving each
+     * (offset, size) its own surface lets both keep their contents.
+     *
+     * ponytail: two surfaces over the same guest memory do not alias, so a pass
+     * that renders at one size and samples at the other will not see the
+     * other's pixels. That is strictly better than the old behaviour, which saw
+     * NOBODY's pixels, and it is the smaller change. If a title ever needs true
+     * aliasing, the fix is one surface plus a copy on redeclare -- not going
+     * back to destroying content. */
     u32 slot = MAX_SURFACES;
     for (u32 i = 0; i < g.n_surfaces; i++)
-        if (g.surfaces[i].location == location && g.surfaces[i].offset == offset) {
-            if (g.surfaces[i].w == want_w && g.surfaces[i].h == want_h &&
-                g.surfaces[i].fmt == want_fmt)
-                return i;
-            slot = i;
-            break;
-        }
+        if (g.surfaces[i].location == location && g.surfaces[i].offset == offset &&
+            g.surfaces[i].w == want_w && g.surfaces[i].h == want_h &&
+            g.surfaces[i].fmt == want_fmt)
+            return i;
     /* Never destroy a usable render target because a malformed live command
      * briefly decoded a guest pointer as clip dimensions.  The known-good
      * orphanage stream never exceeds 1280x1024; D3D12 rejects the observed
@@ -2632,16 +2795,21 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
                     slot < MAX_SURFACES ? "existing" : "none");
         return slot < MAX_SURFACES ? slot : LD_INVALID_SURFACE;
     }
-    if (slot == MAX_SURFACES) {
-        if (g.n_surfaces >= MAX_SURFACES) return LD_INVALID_SURFACE;
-        slot = g.n_surfaces;
-    } else {
-        const surface_t* old = &g.surfaces[slot];
-        fprintf(stderr,
-                "[surfsz] live surface 0x%X redeclared %ux%u -> %ux%u "
-                "(content dropped)\n",
-                offset, old->w, old->h, want_w, want_h);
+    if (g.n_surfaces >= MAX_SURFACES) {
+        /* Out of slots is now the only way a surface can be lost, so say so
+         * once rather than silently returning an invalid handle. */
+        static u32 full_logs = 0;
+        if (full_logs++ < 8)
+            fprintf(stderr, "[surfsz] surface table full (%u); dropping "
+                            "%u:0x%X %ux%u\n",
+                    (unsigned)MAX_SURFACES, location, offset, want_w, want_h);
+        return LD_INVALID_SURFACE;
     }
+    slot = g.n_surfaces;
+    { static u32 new_logs = 0;
+      if (new_logs++ < 24)
+          fprintf(stderr, "[surfsz] new live surface %u:0x%X %ux%u (slot %u)\n",
+                  location, offset, want_w, want_h, slot); }
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {0};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -3642,25 +3810,80 @@ static int ld_current_vertex_layout(rsx_vertex_layout_plan* layout)
     return vp_instrs != 0;
 }
 
+/* LD_PSO_DBG=1: name the first bail-out of each kind in get_pso(). Every exit
+ * there returns NULL silently and the caller only counts drop{pso=N}, so a
+ * title whose draws ALL die in this function has no way to say which gate
+ * rejected them. One line per distinct reason, so a stuck title prints a
+ * handful of lines rather than one per draw. */
+static void ld_pso_bail(int* said, const char* reason)
+{
+    static int dbg = -1;
+    if (dbg < 0) dbg = getenv("LD_PSO_DBG") ? 1 : 0;
+    if (!dbg || *said) return;
+    *said = 1;
+    fprintf(stderr, "[pso-bail] %s\n", reason);
+    fflush(stderr);
+}
+#define LD_PSO_BAIL(reason) \
+    do { static int _said_ = 0; ld_pso_bail(&_said_, (reason)); } while (0)
+
 static ID3D12PipelineState* get_pso(
     const rsx_vertex_layout_plan* masked_layout, int packed_payload)
 {
     memset(&g_ld_current_pso, 0, sizeof(g_ld_current_pso));
     const u32 start = rsx_dsp_vp_start(&g.rsx);
-    if (start >= RSX_DSP_VP_INSTR) return NULL;
+    if (start >= RSX_DSP_VP_INSTR) { LD_PSO_BAIL("no vertex program uploaded (vp start out of range)"); return NULL; }
     const u8* vp_uc = (const u8*)(g.rsx.vp + start * 4);
     const u32 vp_instrs = rsx_vp_program_size_instrs(vp_uc, (RSX_DSP_VP_INSTR - start) * 16);
-    if (!vp_instrs) return NULL;
+    if (!vp_instrs) { LD_PSO_BAIL("vertex program has zero instructions"); return NULL; }
 
     u32 fp_loc = 0;
     const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
     const u8* fp_uc = guest_ptr(fp_loc, fp_off, 16);
-    if (!fp_uc) return NULL;
+    if (!fp_uc) { LD_PSO_BAIL("fragment program address does not resolve to guest memory"); return NULL; }
     const u32 fp_size = rsx_fp_program_size(fp_uc, 0x10000);
-    if (!fp_size) return NULL;
+    if (!fp_size) {
+        /* No END-bit instruction in 64 KB: the bytes at (location, offset) are
+         * not a fragment program. Almost always the LOCATION is wrong, not the
+         * offset -- the same class of bug caner hit in Yakuza with textures --
+         * so report the register the guest actually wrote and the head of what
+         * we read, which is what says local-vs-main. */
+        static int said = 0;
+        if (!said && getenv("LD_PSO_DBG")) {
+            said = 1;
+            fprintf(stderr,
+                    "[pso-bail] fragment program size reads as zero: "
+                    "reg=0x%08X -> loc=%u off=0x%08X, first words "
+                    "%08X %08X %08X %08X\n",
+                    rsx_dsp_reg(&g.rsx, 0x08E4 /* M_FP_ACTIVE_PROGRAM */), fp_loc, fp_off,
+                    rsx_fp_read_word(fp_uc + 0), rsx_fp_read_word(fp_uc + 4),
+                    rsx_fp_read_word(fp_uc + 8), rsx_fp_read_word(fp_uc + 12));
+            /* All-zero here has two very different causes: the offset resolved
+             * into the wrong memory, or nothing ever wrote the buffer. Scan
+             * forward for the first non-zero byte -- a hit a few hundred bytes
+             * on means the region IS populated and the offset is wrong; no hit
+             * across 64 KB means the producer never ran. */
+            {
+                const u8* q = guest_ptr(fp_loc, fp_off, 0x10000);
+                u32 i = 0;
+                if (q) { while (i < 0x10000u && !q[i]) i++; }
+                if (!q)
+                    fprintf(stderr, "[pso-bail]   (64 KB window not mapped)\n");
+                else if (i == 0x10000u)
+                    fprintf(stderr, "[pso-bail]   64 KB from here is entirely "
+                                    "zero -- nothing ever wrote this buffer\n");
+                else
+                    fprintf(stderr, "[pso-bail]   first non-zero byte at "
+                                    "+0x%X -- the region is populated, the "
+                                    "offset is wrong\n", i);
+            }
+            fflush(stderr);
+        }
+        return NULL;
+    }
     /* re-resolve with the true size to validate the whole program is mapped */
     fp_uc = guest_ptr(fp_loc, fp_off, fp_size);
-    if (!fp_uc) return NULL;
+    if (!fp_uc) { LD_PSO_BAIL("fragment program is not fully mapped in guest memory"); return NULL; }
 
     /* Fragment output register mode (fp16 h0 vs fp32 r0) is driven by the
      * SHADER_CONTROL word bit 0x40 (same fix as the replay harness — the
@@ -3708,8 +3931,10 @@ static ID3D12PipelineState* get_pso(
     render_state_t rs;
     decode_render_state(&rs);
     if (rsx_fp_collect_constants(
-            fp_uc, fp_size, &g.fp_constants) < 0)
+            fp_uc, fp_size, &g.fp_constants) < 0) {
+        LD_PSO_BAIL("fragment program constant collection failed");
         return NULL;
+    }
     g.fp_alpha_ref = rsx_fp_alpha_ref(
         rs.alpha_ref_raw, rs.alpha_ref_format);
 
@@ -3719,12 +3944,30 @@ static ID3D12PipelineState* get_pso(
         key = rsx_fp_structural_hash(fp_uc, fp_size, key);
     else
         key = fnv1a(fp_uc, fp_size, key);
-    if (!key)
+    if (!key) {
+        LD_PSO_BAIL("shader hash collapsed to zero");
         return NULL;
+    }
     const u32 fp_ctrl_key = fp_ctrl & 0x40u;
     key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
     key = fnv1a(&cube_mask, sizeof(cube_mask), key);
     key = fnv1a(&vtex_mask, sizeof(vtex_mask), key);
+    /* Texel-addressed (RSX_TEX_FMT_UNNORM) units need their coordinates divided
+     * by the texture size in the shader -- D3D12 has no unnormalised addressing
+     * mode. The divisor is baked into the HLSL, so the sizes are part of the
+     * PSO identity and must be in the key. */
+    u32 unnorm_mask = 0;
+    u32 unnorm_dim[16][2] = {{0}};
+    for (u32 uu = 0; uu < 16; uu++) {
+        rsx_dsp_texture ut; rsx_dsp_get_texture(&g.rsx, uu, &ut);
+        if (!ut.enabled || !(ut.format & TEX_FMT_UNNORM)) continue;
+        if (!ut.width || !ut.height) continue;
+        unnorm_mask |= 1u << uu;
+        unnorm_dim[uu][0] = ut.width;
+        unnorm_dim[uu][1] = ut.height;
+    }
+    key = fnv1a(&unnorm_mask, sizeof(unnorm_mask), key);
+    if (unnorm_mask) key = fnv1a(unnorm_dim, sizeof(unnorm_dim), key);
     if (masked_layout) {
         static const u32 masked_layout_tag = 0x314B534Du; /* "MSK1" */
         const u32 payload_stride =
@@ -3788,6 +4031,7 @@ static ID3D12PipelineState* get_pso(
 #if defined(YZ_PERF_PROFILE)
         g_ld_profile.total.pso_full++;
 #endif
+        LD_PSO_BAIL("PSO cache full (MAX_PSOS)");
         return NULL;
     }
 
@@ -3816,6 +4060,17 @@ static ID3D12PipelineState* get_pso(
             rsx_fp_apply_alpha_test_buffered(
                 ps_hlsl, sizeof(ps_hlsl), rs.alpha_func) < 0)
             fi = -1;
+        if (fi > 0) {
+            const int np = rsx_fp_apply_unnorm_scale(
+                ps_hlsl, sizeof(ps_hlsl), unnorm_mask, unnorm_dim, cube_mask);
+            { static int n = 0;
+              if (n++ < 8)
+                  fprintf(stderr, "[unnorm] mask=0x%X cube=0x%X dim0=%ux%u"
+                                  " patched=%d\n",
+                          unnorm_mask, cube_mask, unnorm_dim[0][0],
+                          unnorm_dim[0][1], np); }
+            if (np < 0) fi = -1;
+        }
     } else {
         fi = rsx_fp_decompile_ex(
             fp_uc, fp_size, fp_ctrl, cube_mask,
@@ -3825,11 +4080,42 @@ static ID3D12PipelineState* get_pso(
                 ps_hlsl, sizeof(ps_hlsl), rs.alpha_func,
                 g.fp_alpha_ref) < 0)
             fi = -1;
+        if (fi > 0 && rsx_fp_apply_unnorm_scale(
+                ps_hlsl, sizeof(ps_hlsl), unnorm_mask,
+                unnorm_dim, cube_mask) < 0)
+            fi = -1;
     }
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.decompile_qpc +=
         (u64)(ld_profile_qpc() - decompile_begin);
 #endif
+    /* LD_FORCE_GREEN=1: make every fragment program return solid green.
+     *
+     * The same trick as LD_CLEAR_TEST, applied one stage later. Clears are
+     * visible on these surfaces and draws are not, while the engine reports
+     * 18,452 groups executed with zero drops and the GPU state cannot discard
+     * anything (viewport 0,0 720x512, scissor full, depth test off, colour mask
+     * all channels, blend off, cull off). Two possibilities remain and they need
+     * opposite fixes: the draws reach the GPU and the SAMPLED DATA is black, or
+     * they never reach it and the accounting is wrong. Green separates them. */
+    { static int fg = -1;
+      if (fg < 0) fg = getenv("LD_FORCE_GREEN") ? 1 : 0;
+      if (fg && fi > 0) {
+          char* r = strstr(ps_hlsl, "    return ");
+          if (r) {
+              char* semi = strchr(r, ';');
+              if (semi) {
+                  const char rep[] = "    return float4(0,1,0,1);";
+                  const size_t rl = sizeof(rep) - 1;
+                  const size_t old = (size_t)(semi + 1 - r);
+                  const size_t used = strlen(ps_hlsl);
+                  if (used - old + rl + 1 <= sizeof(ps_hlsl)) {
+                      memmove(r + rl, semi + 1, used - (size_t)(semi + 1 - ps_hlsl) + 1);
+                      memcpy(r, rep, rl);
+                  }
+              }
+          }
+      } }
     if (getenv("LD_HLSL_DUMP")) {
         char fn[64]; FILE* f;
         snprintf(fn, sizeof fn, "hlsl_%02u.vs.txt", g.n_psos);
@@ -5983,15 +6269,165 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     u32 texture_mask = 0;
     for (u32 u = 0; u < SRV_TABLE_SIZE; u++) slots[u] = SRV_WHITE;
     for (u32 u = 0; u < SMP_TABLE_SIZE; u++) smp_slots[u] = SMP_DEFAULT;
+    /* LD_UNITS=1: every enabled texture unit of every draw that samples PS1
+     * VRAM, once per distinct combination.
+     *
+     * ps1_netemu's display composite is a Cg program picked from seven
+     * (CG_fp_gradient / orientation / mofix / smart / upscale / upscale_smart /
+     * sharpen) and its uniforms are texture0, texture1 and hwidth -- TWO
+     * textures. Every probe here so far has looked at unit 0 only, so "the
+     * renderer reads the right bytes" was never actually tested for the second
+     * one. This lists them. */
+    { static int lu = -1; static u32 seen[8]; static int ns;
+      if (lu < 0) lu = getenv("LD_UNITS") ? 1 : 0;
+      if (lu) {
+          u32 key = 0; int ps1 = 0;
+          for (u32 q = 0; q < SRV_TABLE_SIZE; q++) {
+              rsx_dsp_texture tq; rsx_dsp_get_texture(&g.rsx, q, &tq);
+              if (!tq.enabled) continue;
+              key = key * 31u + (tq.offset ^ (tq.format << 8) ^ (q << 24));
+              if (tq.location == 1u && tq.offset >= 0x400000u &&
+                  tq.offset < 0x480000u) ps1 = 1;
+          }
+          if (ps1) {
+              int fresh = 1;
+              for (int z = 0; z < ns; z++) if (seen[z] == key) fresh = 0;
+              if (fresh && ns < 8) {
+                  seen[ns++] = key;
+                  fprintf(stderr, "[units] draw sampling PS1 VRAM:");
+                  for (u32 q = 0; q < SRV_TABLE_SIZE; q++) {
+                      rsx_dsp_texture tq; rsx_dsp_get_texture(&g.rsx, q, &tq);
+                      if (!tq.enabled) continue;
+                      fprintf(stderr, " u%u[%u:0x%08X fmt=0x%02X %ux%u p=%u]",
+                              q, tq.location, tq.offset, tq.format,
+                              tq.width, tq.height, tq.pitch);
+                  }
+                  fprintf(stderr, "\n");
+              }
+          }
+      } }
     for (u32 u = 0; u < SRV_TABLE_SIZE; u++) {
         rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
+        /* LD_PS1_BUF0=1 -- DIAGNOSTIC, not a fix. Force a 24-bit PS1 VRAM
+         * bind at buffer 1 (offset 0x4003C0) to sample buffer 0 (0x400000).
+         *
+         * After the intro FMV both the driven and undriven paths end on a blank
+         * screen, and during it every bind is 0x4003C0 while the content that
+         * exists -- the decoded FMV frame -- sits in buffer 0. That is the shape
+         * of a display flip parked on the buffer the game is not drawing into.
+         * If forcing buffer 0 puts a picture back on screen the flip is the bug;
+         * if the screen stays blank it is not. Nothing else distinguishes those
+         * two, and the override is one line. */
+        { static int fb0 = -1;
+          if (fb0 < 0) fb0 = getenv("LD_PS1_BUF0") ? 1 : 0;
+          if (fb0 && t.location == 1u && t.offset == 0x4003C0u)
+              t.offset = 0x400000u; }
         if (!t.enabled) continue;
         texture_mask |= 1u << u;
         smp_slots[u] = sampler_slot(&t, sampler_key(&t));
+        /* Pick WHICH surface at this offset to sample.
+         *
+         * Matching on (location, offset) alone was fine when only one surface
+         * could exist per offset. Now that surfaces are keyed on size too --
+         * they have to be, or the two passes destroy each other's contents --
+         * several can, and taking the first match by offset takes an arbitrary
+         * one. ps1_netemu composites the PS1 framebuffer into a 720x512 surface
+         * at offset 0x0 and then upscales into a 1280x720 output; the upscale
+         * pass samples offset 0x0 and was getting the EMPTY 1280x720 surface
+         * that happens to sit earlier in the table.
+         *
+         * Prefer the surface whose dimensions match what the texture
+         * descriptor actually declares; failing that, the most recently drawn
+         * one, which is the only other defensible answer. */
         int sampled = -1;
-        for (u32 i = 0; i < g.n_surfaces; i++)
-            if (g.surfaces[i].location == t.location && g.surfaces[i].offset == t.offset && i != target)
-            { sampled = (int)i; break; }
+        { u32 best_gen = 0;
+          for (u32 i = 0; i < g.n_surfaces; i++) {
+              const surface_t* sf_i = &g.surfaces[i];
+              if (sf_i->location != t.location || sf_i->offset != t.offset ||
+                  i == target)
+                  continue;
+              if (sf_i->w == t.width && sf_i->h == t.height) { sampled = (int)i; break; }
+              if (sampled < 0 || sf_i->last_draw_generation > best_gen) {
+                  sampled = (int)i;
+                  best_gen = sf_i->last_draw_generation;
+              }
+          } }
+        /* LD_UVDBG=1: the texture coordinates of the draw that samples the PS1
+         * framebuffer. Placed here rather than in fetch_batches because that
+         * function is not on this draw's path -- probing it printed nothing at
+         * all, which is how that was established.
+         *
+         * This is the last unmeasured link: the PS3 side binds all 1024x512 of
+         * PS1 VRAM as ONE texture, so which part reaches the screen is decided
+         * entirely by these UVs, and every pixel the PS1 draws lives at
+         * x >= 640 while columns 0..639 are black. */
+        { static int uvd = -1;
+          if (uvd < 0) uvd = getenv("LD_UVDBG") ? 1 : 0;
+          if (uvd && t.location == 1u && t.offset == 0x400000u) {
+              static unsigned long n = 0;
+              if (n++ < 4) {
+                  const u32 vbase = rsx_dsp_vertex_data_base_offset(&g.rsx);
+                  fprintf(stderr, "[uvdbg] unit=%u ps1fb %ux%u pitch=%u fmt=0x%02X"
+                                  " base=0x%X target=%u\n",
+                          u, t.width, t.height, t.pitch, t.format,
+                          vbase, target);
+                  /* The GPU state that can silently discard a draw. Clears are
+                   * visible on these surfaces and the draws are not, so one of
+                   * these is throwing the fragments away. */
+                  { const u32 sch = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
+                    const u32 scv = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
+                    fprintf(stderr, "[uvdbg]   vp=(%u,%u %ux%u) scale=(%.2f %.2f)"
+                                    " xlate=(%.2f %.2f) scissor=(%u+%u, %u+%u)"
+                                    " depth_test=%u zwrite=%u zfunc=0x%X"
+                                    " colmask=0x%08X blend=%u cull=%u/%u"
+                                    " surf=%ux%u\n",
+                            vp.x, vp.y, vp.w, vp.h,
+                            vp.scale[0], vp.scale[1],
+                            vp.translate[0], vp.translate[1],
+                            sch & 0xFFFFu, sch >> 16, scv & 0xFFFFu, scv >> 16,
+                            rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u,
+                            rsx_dsp_reg(&g.rsx, 0x0A78) & 1u,
+                            rsx_dsp_reg(&g.rsx, 0x0A7C),
+                            rsx_dsp_reg(&g.rsx, M_COLOR_MASK),
+                            rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE) & 1u,
+                            rsx_dsp_reg(&g.rsx, 0x1918) & 1u,
+                            rsx_dsp_reg(&g.rsx, 0x090C),
+                            sf.clip_w, sf.clip_h);
+                    /* The PS1 framebuffer's fragment program unpacks the
+                     * sampled value arithmetically (NV40 has no integer ops):
+                     *
+                     *   r0 = sample(tex0, tc0 * (1/1024, 1/512))
+                     *   r0 = r0 * fp_constants[0].x + fp_constants[0].y
+                     *   r0 = floor(r0) / 8.0
+                     *   r0 = sign-preserving truncate
+                     *   r0 = r0 * fp_constants[1].x + fp_constants[1].y
+                     *
+                     * So the output depends entirely on those two constants.
+                     * Wrong or absent, it produces exactly the repeating stripe
+                     * pattern the composite currently shows. */
+                    fprintf(stderr, "[uvdbg]   fp_const count=%u mode=%c"
+                                    " c0=(%.6f %.6f %.6f %.6f)"
+                                    " c1=(%.6f %.6f %.6f %.6f)\n",
+                            g.fp_constants.count, g.fp_constant_mode,
+                            ld_c2f(g.fp_constants.count > 0u ? g.fp_constants.values[0][0] : 0u),
+                            ld_c2f(g.fp_constants.count > 0u ? g.fp_constants.values[0][1] : 0u),
+                            ld_c2f(g.fp_constants.count > 0u ? g.fp_constants.values[0][2] : 0u),
+                            ld_c2f(g.fp_constants.count > 0u ? g.fp_constants.values[0][3] : 0u),
+                            ld_c2f(g.fp_constants.count > 1u ? g.fp_constants.values[1][0] : 0u),
+                            ld_c2f(g.fp_constants.count > 1u ? g.fp_constants.values[1][1] : 0u),
+                            ld_c2f(g.fp_constants.count > 1u ? g.fp_constants.values[1][2] : 0u),
+                            ld_c2f(g.fp_constants.count > 1u ? g.fp_constants.values[1][3] : 0u));
+                  }
+                  for (u32 vi = 0; vi < 4; vi++) {
+                      float pos[4] = {0,0,0,1}, tc[4] = {0,0,0,1};
+                      const int okp = fetch_attr(0, vbase, vi, 0, pos);
+                      const int okt = fetch_attr(8, vbase, vi, 0, tc);
+                      fprintf(stderr, "[uvdbg]   v%u pos%s(%.1f %.1f) tc%s(%.4f %.4f)\n",
+                              vi, okp ? "" : "!", pos[0], pos[1],
+                              okt ? "" : "!", tc[0], tc[1]);
+                  }
+              }
+          } }
         if (sampled < 0 && getenv("LD_ALIAS_DBG")) {
             static u32 n_dbg = 0;
             if (n_dbg++ < 24) {
@@ -6370,8 +6806,19 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + target);
     if (mask & (RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G | RSX_CLEAR_COLOR_B | RSX_CLEAR_COLOR_A)) {
         const u32 c = rsx_dsp_clear_color(&g.rsx);
-        const float col[4] = { ((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f,
-                               (c & 0xFF) / 255.0f, ((c >> 24) & 0xFF) / 255.0f };
+        float col[4] = { ((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f,
+                         (c & 0xFF) / 255.0f, ((c >> 24) & 0xFF) / 255.0f };
+        /* LD_CLEAR_TEST=1: clear to magenta instead of the guest's colour.
+         *
+         * This validates the MEASUREMENT, not the renderer. LD_SURF_DUMP
+         * reports nonblack=0 for every surface, and every conclusion drawn from
+         * that depends on the readback actually being able to see a non-black
+         * pixel. If magenta clears still read back as 0, the readback is broken
+         * and those conclusions are void. Establish that X would be visible
+         * before concluding X never happens. */
+        { static int ct = -1;
+          if (ct < 0) ct = getenv("LD_CLEAR_TEST") ? 1 : 0;
+          if (ct) { col[0] = 1.0f; col[1] = 0.0f; col[2] = 1.0f; col[3] = 1.0f; } }
         g.list->lpVtbl->ClearRenderTargetView(g.list, rtv, col, 0, NULL);
         ld_surface_note_write(target, LD_SURFACE_WRITE_CLEAR);
     }
@@ -7554,6 +8001,68 @@ static void ld_vertex_diag_emit(const char* reason, int dump_surface)
 void rsx_live_draw_present(u32 buffer_id)
 {
     if (!g.ready) return;
+
+    /* LD_SURF_DUMP=<dir>: dump EVERY live surface once, with its non-black
+     * count, at LD_SURF_DUMP_FRAME (default 1200).
+     *
+     * LD_FRAME_DUMP only reads back the presented surface, which answers "is
+     * the screen black" (it is: nonblack=0 on every frame) but not WHERE the
+     * pixels stop. ps1_netemu composites PS1 VRAM into a 720x512 surface and
+     * then upscales into the presented 1280x720 one, so the interesting
+     * question is which of those is already empty. */
+    { static int done = 0; const char* sd = getenv("LD_SURF_DUMP");
+      u32 at = 1200; { const char* fe = getenv("LD_SURF_DUMP_FRAME");
+                       if (fe) at = (u32)strtoul(fe, 0, 0); }
+      /* LD_SURF_DUMP_ON_VRAM=1 waits for PS1 VRAM to hold a drawn frame instead
+       * of firing at a frame number. Needs PS1_PC=1, which is what samples it. */
+      int gate;
+      { static int onv = -1;
+        if (onv < 0) onv = getenv("LD_SURF_DUMP_ON_VRAM") ? 1 : 0;
+        gate = onv ? (g_ld_ps1_vram_ready != 0) : (g_ld_frames >= at); }
+      if (sd && sd[0] && !done && gate) {
+          done = 1;
+          for (u32 i = 0; i < g.n_surfaces; i++) {
+              char path[MAX_PATH * 2];
+              snprintf(path, sizeof(path), "%s\\surf_%02u_%08X_%ux%u.ppm",
+                       sd, i, g.surfaces[i].offset,
+                       g.surfaces[i].w, g.surfaces[i].h);
+              const u64 nb = ld_dump_surface_ppm(path, &g.surfaces[i]);
+              fprintf(stderr, "[surf-dump] slot=%u %u:0x%08X %ux%u nonblack=%llu"
+                              " draw_gen=%u clear_gen=%u\n",
+                      i, g.surfaces[i].location, g.surfaces[i].offset,
+                      g.surfaces[i].w, g.surfaces[i].h,
+                      (unsigned long long)(nb == UINT64_MAX ? 0 : nb),
+                      g.surfaces[i].last_draw_generation,
+                      g.surfaces[i].last_clear_generation);
+          }
+      } }
+    /* LD_FRAME_DUMP=<dir> [+ LD_FRAME_DUMP_EVERY=<n>, default 300]: write the
+     * PRESENTED surface to a .ppm every n flips. The engine could already dump
+     * a surface, but only at shutdown or behind the parity harness -- neither
+     * reachable when a title is simply left running, which is exactly when you
+     * want to see what is on screen. PrintWindow and CopyFromScreen both come
+     * back white for a D3D12 swapchain, so a readback here is the only way to
+     * answer "what is it actually drawing?". */
+    { static int every = -1; static const char* dir; static unsigned n;
+      if (every < 0) { dir = getenv("LD_FRAME_DUMP");
+                       const char* e = getenv("LD_FRAME_DUMP_EVERY");
+                       every = (dir && dir[0]) ? (e ? atoi(e) : 300) : 0;
+                       if (every <= 0 && dir && dir[0]) every = 300; }
+      if (every > 0 && buffer_id < 8 && g.display_buffers[buffer_id].valid &&
+          (n++ % (unsigned)every) == 0) {
+          for (u32 i = 0; i < g.n_surfaces; i++) {
+              if (g.surfaces[i].location != g.display_buffers[buffer_id].location ||
+                  g.surfaces[i].offset   != g.display_buffers[buffer_id].offset) continue;
+              char path[MAX_PATH * 2];
+              snprintf(path, sizeof(path), "%s\\frame_%06u.ppm", dir, n - 1u);
+              const u64 nb = ld_dump_surface_ppm(path, &g.surfaces[i]);
+              fprintf(stderr, "[frame-dump] %s %ux%u nonblack=%llu\n", path,
+                      g.surfaces[i].w, g.surfaces[i].h,
+                      (unsigned long long)(nb == UINT64_MAX ? 0 : nb));
+              fflush(stderr);
+              break;
+          }
+      } }
     /* A flip names a registered display buffer. The current color target may
      * be an offscreen shadow/postprocess surface at that instant; copying it
      * caused a010 to present black despite executing the scene's draws. */
@@ -7584,6 +8093,34 @@ void rsx_live_draw_present(u32 buffer_id)
     g_ld_last_present_target = target;
     const u32 current = current_surface();
     surface_t* presented_surface = &g.surfaces[target];
+    /* LD_PRESENT_DBG=1: is this surface actually finished? A surface whose last
+     * clear is NEWER than its last draw has been wiped and not redrawn -- that
+     * presents as a black frame. Counting them separates "we present the wrong
+     * buffer" from "we present the right buffer too early". */
+    { static int dbg = -1;
+      if (dbg < 0) dbg = getenv("LD_PRESENT_DBG") ? 1 : 0;
+      if (dbg) {
+          static unsigned long long n = 0, blank = 0;
+          n++;
+          if (presented_surface->last_draw_generation <
+              presented_surface->last_clear_generation) blank++;
+          if ((n % 256) == 0)
+              /* Also say WHICH surface. Surfaces are now keyed on size as well
+               * as offset, so several exist at once and "we present the wrong
+               * one" is a live possibility -- the PS1 composite is 720x512 and
+               * the PS3 output 1280x720. */
+              fprintf(stderr,
+                      "[present] %llu/%llu presents showed a surface cleared "
+                      "after its last draw (%.1f%%); target=%u %u:0x%X %ux%u"
+                      " draw_gen=%u clear_gen=%u\n",
+                      (unsigned long long)blank, (unsigned long long)n,
+                      100.0 * (double)blank / (double)n,
+                      target, presented_surface->location,
+                      presented_surface->offset,
+                      presented_surface->w, presented_surface->h,
+                      presented_surface->last_draw_generation,
+                      presented_surface->last_clear_generation);
+      } }
 #if !defined(YZ_PERF_CLEAN)
     presented_surface->last_present_copy_generation =
         ++g_ld_present_copy_generation;
@@ -8061,12 +8598,331 @@ void rsx_live_draw_present(u32 buffer_id)
       ULONGLONG now = GetTickCount64();
       if (fps_t0 == 0) { fps_t0 = now; fps_f0 = g_ld_frames; }
       else if (now - fps_t0 >= 5000) {
+          /* PS1_PC=1: the R3000 state block (0x76C080) on the same heartbeat.
+           *
+           * READ +0x124 (instructions retired), NOT +0x108. The interpreter
+           * loads PC from +0x108 on entry (lwz r26, 0x108(r23) at 0x001066CC)
+           * and writes it back only in its epilogue (stw r26, 0x108(r23) at
+           * 0x00106964) -- and it has not returned, because it is entered once
+           * and loops internally. So +0x108 is stale from boot: 280,000 reads
+           * across 14 samples gave 0xBFC00000 every time while +0x124 climbed
+           * past a billion. Reading that as "stuck at the reset vector" would
+           * be wrong twice over -- the epilogue does `ori r26, r26, 0x80`
+           * first, so a real exit there could not even write 0xBFC00000.
+           *
+           * +0x124 is updated from inside the loop and is the honest progress
+           * signal. Finding the LIVE pc needs the interpreter's register, not
+           * this field. */
+          { static int pc_on = -1;
+            if (pc_on < 0) pc_on = getenv("PS1_PC") ? 1 : 0;
+            if (pc_on) {
+                extern uint32_t vm_read32(uint64_t);
+                /* One read of +0x108 cannot tell a reset loop from a field that
+                 * is simply not live between interpreter entries -- both look
+                 * like a constant 0xBFC00000. So sample it hard: 20000 reads,
+                 * and report how many DISTINCT values appear plus the lowest
+                 * and highest. A live PC sweeps; a dead field does not. */
+                uint32_t lo = 0xFFFFFFFFu, hi = 0, prev = 0, chg = 0;
+                for (int k = 0; k < 20000; k++) {
+                    uint32_t v = vm_read32(0x76C080u + 0x108u);
+                    if (v < lo) lo = v;
+                    if (v > hi) hi = v;
+                    if (k && v != prev) chg++;
+                    prev = v;
+                }
+                /* The PS1 GPU command ring. func_0010F658 pushes one 0x100-byte
+                 * packet per GP0 batch (header 3 at +0, payload from +0x10) and
+                 * advances a write offset; the four GPU SPUs consume it. If this
+                 * offset never moves, the R3000 is not producing draw commands
+                 * at all, and no amount of SPU-side work will help.
+                 *
+                 *   ring_off_ptr = *(TOC-0x794C)   (TOC = 0x1C3D30)
+                 *   ring_base    = *(TOC-0x7918)
+                 * from func_0010F658's first two instructions. */
+                uint32_t roff_p = vm_read32(0x1BC3E4u);
+                uint32_t rbase  = vm_read32(0x1BC418u);
+                uint32_t roff   = roff_p ? vm_read32(roff_p) : 0xFFFFFFFFu;
+                /* Each GPU SPU polls its OWN local store at 0x15010 for that
+                 * offset (it reports that address to the PPU through its
+                 * outbound mailbox during init), and a raw SPU's local store is
+                 * aliased into guest memory at 0xE0000000 + n*0x100000 -- so
+                 * these four reads see exactly what the SPU sees. If they match
+                 * `off`, the kick landed and the SPUs are simply not reacting;
+                 * if they do not, the kick is being lost. Opposite problems. */
+                /* +0x15010 is the offset the PPU publishes to this SPU;
+                 * +0x15020 is how far the SPU has actually CONSUMED (its work
+                 * loop at 0x3158 advances it by 0x100 per packet under the same
+                 * 0x007FFFFF mask the PPU uses, and stores it back). The pair
+                 * separates "the SPUs are not being told" from "the SPUs are
+                 * told and not working" from "both are fine and the problem is
+                 * downstream in compositing". */
+                uint32_t ls[4], cons[4];
+                for (int n = 0; n < 4; n++) {
+                    uint32_t w = 0xE0000000u + (uint32_t)n * 0x100000u;
+                    ls[n]   = vm_read32(w + 0x15010u);
+                    cons[n] = vm_read32(w + 0x15020u);
+                }
+                /* The scheduler's own state. func_00105FA8 hands the
+                 * interpreter a budget at +0x120; when that is permanently zero
+                 * the interpreter spins without executing. These are the fields
+                 * it works from, so a frozen run says WHICH state it froze in
+                 * rather than just that it froze. */
+                fprintf(stderr, "[ps1] pc=0x%08X(chg=%u) exited=%u total=%u"
+                                " cost=%u budget=%d reason=%d evhead=0x%08X"
+                                " ring[off=0x%08X] pub[%06X %06X %06X %06X]"
+                                " done[%06X %06X %06X %06X]\n",
+
+                        lo, chg,
+                        vm_read32(0x76C080u + 0x110u),
+                        vm_read32(0x76C080u + 0x124u),
+                        vm_read32(0x76C080u + 0x114u),
+                        (int32_t)vm_read32(0x76C080u + 0x120u),
+                        (int32_t)vm_read32(0x76C080u + 0x138u),
+                        vm_read32(0x76C080u + 0x540u),
+                        roff, ls[0], ls[1], ls[2], ls[3],
+                        cons[0], cons[1], cons[2], cons[3]);
+                /* Does PS1 VRAM actually have pixels in it?
+                 *
+                 * The texture the PS3 side binds for the PS1 framebuffer is
+                 * location 1 (RSX local), offset 0x400000, 1024x512 fmt 0xE2 --
+                 * exactly PS1 VRAM. Everything upstream of here is now known
+                 * good (the four GPU SPUs consume every packet the R3000
+                 * produces), so this is the first place the picture can go
+                 * missing: either the SPUs are not writing pixels, or they are
+                 * and our compositing drops them. Count non-zero words rather
+                 * than guessing from a window capture -- PrintWindow on a D3D12
+                 * swapchain cannot tell "black" from "capture failed". */
+                { const u8* fb = guest_ptr(1u, 0x400000u, 1024u * 512u * 2u);
+                  /* The guest EA of PS1 VRAM, once. Watching 0xC0400000 --
+                   * derived from cellGcmSys's localAddress -- caught no writes
+                   * at all from either the PPU store path or SPU DMA, which is
+                   * either a real finding or a wrong address. This says which,
+                   * instead of assuming. */
+                  { static int shown = 0;
+                    extern uint8_t* vm_base;
+                    if (!shown && fb && vm_base) { shown = 1;
+                        fprintf(stderr, "[ps1] VRAM guest EA = 0x%08X\n",
+                                (u32)(size_t)(fb - vm_base)); } }
+                  if (!fb) fprintf(stderr, "[ps1] vram: not mapped\n");
+                  else {
+                      u32 nz = 0, first = 0xFFFFFFFFu, n = 1024u * 512u / 2u;
+                      const u32* w32 = (const u32*)fb;
+                      for (u32 i = 0; i < n; i++)
+                          if (w32[i]) { nz++; if (first == 0xFFFFFFFFu) first = i * 4u; }
+                      fprintf(stderr, "[ps1] vram nonzero=%u/%u first=+0x%X\n",
+                              nz, n, first == 0xFFFFFFFFu ? 0u : first);
+                      /* PS1_EVENTS=1: the three kernel events the BIOS polls.
+                       *
+                       * The BIOS parks at 0xBFC53840 calling TestEvent
+                       * (B-table 0x0B, trampoline 0xBFC58B60) on three
+                       * descriptors loaded from PS1 kernel RAM 0x0000B21C,
+                       * 0x0000B224 and 0x0000B228. Reading their event CLASS
+                       * says what it is waiting for; the PS1 CD class is
+                       * 0xF0000003.
+                       *
+                       * PS1 RAM base is *(TOC-0x79D4) = 0x00770780, and the
+                       * interpreter reads PS1 memory with lwbrx -- PS1 RAM is
+                       * stored LITTLE-endian in guest memory, so every read
+                       * here has to be byte-swapped. Reading it big-endian
+                       * would produce plausible-looking nonsense. */
+                      { static int ev = -1; static int ev_done = 0;
+                        if (ev < 0) ev = getenv("PS1_EVENTS") ? 1 : 0;
+                        static int ev_beats = 0;
+                        if (ev && !ev_done && ++ev_beats >= 3) {
+                            ev_done = 1;
+                            const u32 ram = vm_read32(0x001BC35Cu);
+                            #define PS1LE(a) __builtin_bswap32(vm_read32((ram) + (u32)(a)))
+                            const u32 tot_evcb = PS1LE(0x0120);
+                            const u32 tot_size = PS1LE(0x0124);
+                            fprintf(stderr, "[ps1ev] ram=0x%08X  EvCB tbl=0x%08X size=%u\n",
+                                    ram, tot_evcb, tot_size);
+                            /* All FIVE slots CdInit fills, not just the three
+                             * the poll loop reads: -0x4de8/-0x4de4/-0x4de0/
+                             * -0x4ddc/-0x4dd8 = 0xB218..0xB228. All zero means
+                             * CdInit never ran; a mix means it ran partway. */
+                            static const u32 slot[5] = { 0xB218u, 0xB21Cu, 0xB220u,
+                                                         0xB224u, 0xB228u };
+                            for (int k = 0; k < 5; k++) {
+                                const u32 h = PS1LE(slot[k]);
+                                fprintf(stderr, "[ps1ev]   slot 0x%04X handle=0x%08X",
+                                        slot[k], h);
+                                if ((h >> 24) == 0xF1u && tot_evcb) {
+                                    const u32 idx = h & 0xFFFFu;
+                                    const u32 cb  = (tot_evcb & 0x1FFFFFu) + idx * 0x1Cu;
+                                    fprintf(stderr, "  idx=%u class=0x%08X status=0x%08X"
+                                                    " spec=0x%08X mode=0x%08X",
+                                            idx, PS1LE(cb + 0), PS1LE(cb + 4),
+                                            PS1LE(cb + 8), PS1LE(cb + 12));
+                                }
+                                fprintf(stderr, "\n");
+                            }
+                            /* Dump the whole EvCB table. The table pointer
+                             * itself is valid (0xA000E028, 448 bytes = 16
+                             * entries of 0x1C), so the PS1 kernel IS up and
+                             * events CAN be opened. Whether any ARE distinguishes
+                             * "CdInit specifically never ran" from "nothing ever
+                             * opens an event", which are very different faults.
+                             * EvCB layout: class +0, status +4, spec +8,
+                             * mode +0xC, func +0x10. */
+                            { const u32 tb = tot_evcb & 0x1FFFFFu;
+                              const u32 n = tot_size / 0x1Cu;
+                              u32 live = 0;
+                              for (u32 i = 0; i < n && i < 32; i++) {
+                                  const u32 cb = tb + i * 0x1Cu;
+                                  const u32 cls = PS1LE(cb + 0);
+                                  const u32 st  = PS1LE(cb + 4);
+                                  if (!cls && !st) continue;
+                                  live++;
+                                  fprintf(stderr, "[ps1ev]   EvCB[%2u] class=0x%08X"
+                                                  " status=0x%08X spec=0x%08X"
+                                                  " mode=0x%08X func=0x%08X\n",
+                                          i, cls, st, PS1LE(cb + 8),
+                                          PS1LE(cb + 12), PS1LE(cb + 16));
+                              }
+                              fprintf(stderr, "[ps1ev]   %u of %u EvCB entries in use\n",
+                                      live, n); }
+                            #undef PS1LE
+                        } }
+                      /* PS1_GP0HIST=1: which GP0 PRIMITIVES the ring actually
+                       * carries, as a histogram over the last 64 packets.
+                       *
+                       * "The menu draws but nothing 3D does" is a statement
+                       * about primitive TYPES, and no counter here reported
+                       * those -- packets, groups and VRAM pixels all count the
+                       * same whether the PS1 is drawing a textured rectangle or
+                       * a gouraud triangle. GP0 opcodes: 0x20-0x3F polygons,
+                       * 0x40-0x5F lines, 0x60-0x7F rectangles, 0x80+ transfers,
+                       * 0x00-0x1F misc/state. If the 3D is missing because the
+                       * polygons never reach the ring, that is upstream in the
+                       * R3000; if they reach it, it is the rasteriser or the
+                       * composite. Opposite halves of the pipeline. */
+                      { static int gh = -1;
+                        if (gh < 0) gh = getenv("PS1_GP0HIST") ? 1 : 0;
+                        if (gh && rbase && roff >= 0x4000u) {
+                            unsigned cls[8] = {0}; unsigned pk_types[8] = {0};
+                            for (u32 k = 1; k <= 64u; k++) {
+                                const u32 pk = rbase + ((roff - k * 0x100u) & 0x007FFFFFu);
+                                pk_types[vm_read32(pk) & 7u]++;
+                                for (u32 q = 0; q < 60u; q++) {
+                                    const u32 w = vm_read32(pk + 0x10u + q * 4u);
+                                    if (!w) continue;
+                                    cls[(w >> 24) >> 5]++;   /* opcode/0x20 */
+                                }
+                            }
+                            /* PS1 VRAM comes out solid 0x83E0 -- R=0, G=31,
+                             * B=0, mask bit set -- across the full 640-pixel
+                             * display width, fully written (207 DMA writes per
+                             * 64-byte block). Something paints the screen
+                             * green. GP0 0x02 is Fill Rectangle and its colour
+                             * word is right here in the ring, so print the
+                             * fills: if the guest asks for green, the bug is
+                             * upstream in the R3000; if it asks for something
+                             * else, our SPU rasteriser is packing the colour
+                             * wrong. Opposite halves of the pipeline. */
+                            for (u32 k = 1; k <= 64u; k++) {
+                                const u32 pk = rbase + ((roff - k * 0x100u) & 0x007FFFFFu);
+                                for (u32 q = 0; q < 58u; q++) {
+                                    const u32 w = vm_read32(pk + 0x10u + q * 4u);
+                                    if ((w >> 24) != 0x02u) continue;
+                                    fprintf(stderr, "[gp0fill] pkt+0x%X"
+                                                    " cmd=%08X xy=%08X wh=%08X\n",
+                                            0x10u + q * 4u, w,
+                                            vm_read32(pk + 0x14u + q * 4u),
+                                            vm_read32(pk + 0x18u + q * 4u));
+                                    break;
+                                }
+                            }
+                            fprintf(stderr, "[gp0hist] last 64 pkts types[");
+                            for (int q = 0; q < 8; q++) fprintf(stderr, "%u ", pk_types[q]);
+                            fprintf(stderr, "] words: misc=%u POLY=%u line=%u"
+                                            " rect=%u xfer=%u %u %u %u\n",
+                                    cls[0], cls[1], cls[2], cls[3],
+                                    cls[4], cls[5], cls[6], cls[7]);
+                        } }
+                      /* PS1_RINGDUMP=1: the last few GP0 command packets.
+                       *
+                       * func_0010F658 writes one 0x100-byte packet per batch:
+                       * a type word at +0 (it writes 3 in one variant and 2 in
+                       * another) and the payload from +0x10. The four GPU SPUs
+                       * consume every packet and never DMA a pixel to VRAM, so
+                       * the question is what these packets actually contain --
+                       * PS1 GP0 drawing commands, or only state and sync. */
+                      { static int rd2 = -1; static int shown = 0;
+                        if (rd2 < 0) rd2 = getenv("PS1_RINGDUMP") ? 1 : 0;
+                        if (rd2 && shown < 3 && rbase && roff >= 0x300u) {
+                            shown++;
+                            for (int k = 3; k >= 1; k--) {
+                                const u32 pk = rbase + ((roff - (u32)k * 0x100u) & 0x007FFFFFu);
+                                fprintf(stderr, "[ring] pkt@0x%08X type=%u:", pk,
+                                        vm_read32(pk));
+                                for (u32 q = 0; q < 12; q++)
+                                    fprintf(stderr, " %08X", vm_read32(pk + 0x10u + q * 4u));
+                                fprintf(stderr, "\n");
+                            }
+                        } }
+                      { static u32 rdy = 0;
+                        if (!rdy) { const char* re = getenv("PS1_VRAM_READY");
+                                    rdy = re ? (u32)strtoul(re, 0, 0) : 20000u; }
+                        if (nz >= rdy) g_ld_ps1_vram_ready = 1; }
+                      /* PS1_FBDUMP=<path>: write PS1 VRAM out as a PPM.
+                       *
+                       * This exists because "the window is black" was an
+                       * ASSUMPTION for a long stretch of this port: PrintWindow
+                       * on a D3D12 swapchain returns black whether the page is
+                       * black or the capture simply failed, so every screenshot
+                       * was unfalsifiable. This reads the pixels the PS1 itself
+                       * produced, straight out of guest memory, with no D3D and
+                       * no window involved. 1024x512, 16-bit 1-5-5-5, pitch
+                       * 2048 -- the format the [tex-refresh] line reports. */
+                      /* ONE dump, taken once the framebuffer has at least
+                       * PS1_FBDUMP_MIN non-zero words (default 20000).
+                       *
+                       * It used to write a 1.5 MB PPM on every heartbeat, and
+                       * that instrumentation was itself most of the
+                       * "nondeterminism" this port was chasing: runs carrying
+                       * the periodic dump reached 0-7,127 non-zero words, while
+                       * clean runs reach 75,527 every time. Measuring the thing
+                       * was changing it. One dump, gated on content. */
+                      { const char* dp = getenv("PS1_FBDUMP");
+                        static int dumped = 0;
+                        u32 want = 20000;
+                        { const char* mn = getenv("PS1_FBDUMP_MIN");
+                          if (mn) want = (u32)strtoul(mn, 0, 0); }
+                        if (dp && !dumped && nz >= want) {
+                            dumped = 1;
+                            char path[512];
+                            snprintf(path, sizeof path, "%s", dp);
+                            FILE* f = fopen(path, "wb");
+                            if (f) {
+                                fprintf(f, "P6\n1024 512\n255\n");
+                                for (u32 y = 0; y < 512; y++) {
+                                    const u8* row = fb + (size_t)y * 2048u;
+                                    for (u32 x = 0; x < 1024; x++) {
+                                        u16 p = (u16)(row[x * 2] | (row[x * 2 + 1] << 8));
+                                        u8 rgb[3];
+                                        rgb[0] = (u8)(((p >> 10) & 0x1F) * 255 / 31);
+                                        rgb[1] = (u8)(((p >> 5)  & 0x1F) * 255 / 31);
+                                        rgb[2] = (u8)(( p        & 0x1F) * 255 / 31);
+                                        fwrite(rgb, 1, 3, f);
+                                    }
+                                }
+                                fclose(f);
+                            }
+                        } }
+                  } }
+                (void)hi; (void)rbase;
+            } }
           fprintf(stderr, "[fps] %.1f (frames %u..%u over %.1fs)\n",
                   (g_ld_frames - fps_f0) * 1000.0 / (double)(now - fps_t0),
                   fps_f0, g_ld_frames, (now - fps_t0) / 1000.0);
           fps_t0 = now; fps_f0 = g_ld_frames;
       } }
-    if (LD_DIAG_ENABLED("YZ_RSX_DUMP") && g_ld_frames <= 8) {
+    /* YZ_RSX_DUMP_EVERY=N: also dump every Nth frame, not just the first 8 --
+     * a title whose content starts after the boot clears is invisible otherwise. */
+    static int ld_dump_every = -1;
+    if (ld_dump_every < 0) { const char* e = getenv("YZ_RSX_DUMP_EVERY"); ld_dump_every = e ? atoi(e) : 0; }
+    if (LD_DIAG_ENABLED("YZ_RSX_DUMP") &&
+        (g_ld_frames <= 8 || (ld_dump_every > 0 && (g_ld_frames % (u32)ld_dump_every) == 0))) {
         /* Dump the presented color surface (RENDER_TARGET state -> safe). */
         const u32 cur = current_surface();
         if (cur != LD_INVALID_SURFACE) {

@@ -222,6 +222,9 @@ static int64_t signal_cond(uint32_t id, int all)
 int64_t sys_cond_signal(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 0); }
 int64_t sys_cond_signal_all(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1); }
 
+/* Preserve upstream's current broadcast fallback for signal_to. */
+int64_t sys_cond_signal_to(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1); }
+
 void sys_cond_init(lv2_syscall_table* tbl)
 {
     /* Static storage starts empty. Registration must not memset live locks. */
@@ -230,4 +233,5 @@ void sys_cond_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_COND_WAIT, sys_cond_wait);
     lv2_syscall_register(tbl, SYS_COND_SIGNAL, sys_cond_signal);
     lv2_syscall_register(tbl, SYS_COND_SIGNAL_ALL, sys_cond_signal_all);
+    lv2_syscall_register(tbl, SYS_COND_SIGNAL_TO, sys_cond_signal_to);
 }
