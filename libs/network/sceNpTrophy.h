@@ -135,6 +135,7 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
 #define SCE_NP_TROPHY_STATUS_DATA_CORRUPT       2
 #define SCE_NP_TROPHY_STATUS_INSTALLED          3
 #define SCE_NP_TROPHY_STATUS_REQUIRES_UPDATE    4
+#define SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE 8
 
 s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
                                     SceNpTrophyHandle handle,
