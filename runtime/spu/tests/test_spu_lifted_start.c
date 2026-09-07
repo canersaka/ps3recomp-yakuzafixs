@@ -405,6 +405,28 @@ static void test_resident_code_regions(void)
     free(ctx);
 }
 
+/* A real taskset also stores 0xA70 in its API table. That address alone
+ * cannot distinguish Sony's resident scheduler from a synthetic HLE task. */
+static void test_lle_taskset_syscall(void)
+{
+    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
+    if (!ctx) { check(0, "allocate taskset context"); return; }
+    spu_begin_image(84); spu_register_function(0xA70, code_a);
+    spu_begin_image(0);
+    ctx->image_id = 16;
+    ctx->resident_ovl = 84;
+    ctx->ls[0x27C6] = 0x0A; ctx->ls[0x27C7] = 0x70;
+    ctx->gpr[3]._u32[0] = 3;
+    ctx->pc = 0xA70; spu_indirect_branch(ctx);
+    check(ctx->gpr[3]._u32[0] == 81, "LLE taskset syscall executes resident policy code");
+    ctx->policy_mode = 1;
+    ctx->gpr[3]._u32[0] = 3;
+    ctx->pc = 0xA70; spu_indirect_branch(ctx);
+    check(ctx->gpr[3]._u32[0] == 0, "synthetic HLE taskset retains syscall emulation");
+    g_spu_trampoline_fn = 0;
+    free(ctx);
+}
+
 static uint32_t captured_queue;
 static uint64_t captured_event[4];
 static int push_result;
@@ -497,6 +519,7 @@ int main(void)
     test_smc_branch_hints();
     test_smc_xori();
     test_resident_code_regions();
+    test_lle_taskset_syscall();
 
     signal(SIGSEGV, guard_fault);
     signal(SIGBUS,  guard_fault);

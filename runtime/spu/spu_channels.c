@@ -1511,17 +1511,15 @@ void spu_indirect_branch(spu_context* ctx)
             return;
         }
     }
-    /* Taskset PM task-syscall entry (LS 0xA70): HLE it instead of branching into
-     * (absent) PM code. Fires for the cri task (image 22) AND any generic taskset
-     * task whose SpursTasksetContext we planted -- detected by the syscallAddr
-     * sentinel at LS 0x27C4 (== 0xA70), which only spurs_pm_build_context writes.
-     * Without generalizing this, an LBP FMOD task that reaches its EXIT/YIELD
-     * syscall would branch into empty LS 0xA70 and halt as "branch-to-0" instead
-     * of cleanly exiting. */
+    /* Synthetic HLE tasks have no resident taskset policy at 0xA70. Real
+     * tasksets use the SAME syscall address, so the API table alone is not
+     * evidence that this is an HLE context. LLE tasks must enter Sony's policy
+     * to yield/select workloads instead of parking an entire SPU host thread.
+     * Image 22 is the legacy standalone HLE CRI task runner. */
     if (ctx->pc == YDKJ_TASKSET_PM_SYSCALL_ADDR) {
         uint32_t sc = ((uint32_t)ctx->ls[0x27C4] << 24) | ((uint32_t)ctx->ls[0x27C5] << 16)
                     | ((uint32_t)ctx->ls[0x27C6] << 8)  | ctx->ls[0x27C7];
-        if (ctx->image_id == 22 || sc == YDKJ_TASKSET_PM_SYSCALL_ADDR) {
+        if (ctx->image_id == 22 || (ctx->policy_mode && sc == YDKJ_TASKSET_PM_SYSCALL_ADDR)) {
             spu_spurs_taskset_syscall(ctx); return;
         }
     }
