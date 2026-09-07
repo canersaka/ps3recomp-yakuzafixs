@@ -215,14 +215,11 @@ s32 sceNpTrophyCreateContext(SceNpTrophyContext* context,
 {
     (void)commSign; (void)options;
 
+    if (!s_trophy_initialized)
+        return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+
     if (!context || !commId)
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
-    /* Match the Windows runner's first-use initialization. Its module loader
-     * does not execute the firmware trophy initialization chain before this API.
-     * Only a valid first request initializes; later calls preserve live contexts. */
-    if (!s_trophy_initialized)
-        sceNpTrophyInit(NULL, 0, 0, 0);
-
     const SceNpCommunicationId* commId_h = GUEST_PTR(commId, const SceNpCommunicationId*);
 
     for (s32 i = 0; i < SCE_NP_TROPHY_MAX_CONTEXTS; i++) {

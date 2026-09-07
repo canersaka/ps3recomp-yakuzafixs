@@ -150,6 +150,17 @@ static void yz_rsx_present(uint32_t buffer_id)
         cellGcmQueueUserCommand(arg);
         break;
 #endif""", 'HLE user-command interrupt delivery')
+    # The legacy Yakuza host omits the firmware NP trophy initialization chain.
+    # Supply it in this runner, preserving the toolkit API's NOT_INITIALIZED
+    # contract for all other games.
+    main_cpp = replace_once(main_cpp, 'int main(int argc, char** argv)',
+        'extern "C" int32_t sceNpTrophyInit(void*, uint32_t, uint32_t, uint64_t);\n'
+        'int main(int argc, char** argv)', 'trophy initialization declaration')
+    main_cpp = replace_once(main_cpp,
+        '    CreateThread(NULL, 0, yz_vblank_thread, NULL, 0, NULL);',
+        '    sceNpTrophyInit(nullptr, 0, 0, 0);\n'
+        '    CreateThread(NULL, 0, yz_vblank_thread, NULL, 0, NULL);',
+        'legacy host trophy initialization')
     main_cpp = replace_once(main_cpp, '#include <atomic>',
         '#include <atomic>\n#include <mutex>', 'callback allocator include')
     main_cpp = replace_once(main_cpp,
