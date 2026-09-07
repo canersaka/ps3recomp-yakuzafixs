@@ -53,8 +53,9 @@ typedef struct {
     int in_use;
 } TrophyHandle;
 
-static TrophyContext s_contexts[SCE_NP_TROPHY_MAX_CONTEXTS];
-static TrophyHandle  s_handles[SCE_NP_TROPHY_MAX_HANDLES];
+/* ID zero is the firmware invalid sentinel; retain all four usable slots. */
+static TrophyContext s_contexts[SCE_NP_TROPHY_MAX_CONTEXTS + 1];
+static TrophyHandle  s_handles[SCE_NP_TROPHY_MAX_HANDLES + 1];
 
 /* ---------------------------------------------------------------------------
  * Persistent storage helpers
@@ -197,7 +198,7 @@ s32 sceNpTrophyTerm(void)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
     /* Save all registered contexts */
-    for (int i = 0; i < SCE_NP_TROPHY_MAX_CONTEXTS; i++) {
+    for (int i = 1; i <= SCE_NP_TROPHY_MAX_CONTEXTS; i++) {
         if (s_contexts[i].in_use && s_contexts[i].registered)
             trophy_save(&s_contexts[i]);
     }
@@ -222,7 +223,7 @@ s32 sceNpTrophyCreateContext(SceNpTrophyContext* context,
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
     const SceNpCommunicationId* commId_h = GUEST_PTR(commId, const SceNpCommunicationId*);
 
-    for (s32 i = 0; i < SCE_NP_TROPHY_MAX_CONTEXTS; i++) {
+    for (s32 i = 1; i <= SCE_NP_TROPHY_MAX_CONTEXTS; i++) {
         if (!s_contexts[i].in_use) {
             memset(&s_contexts[i], 0, sizeof(TrophyContext));
             s_contexts[i].in_use = 1;
@@ -243,7 +244,7 @@ s32 sceNpTrophyDestroyContext(SceNpTrophyContext context)
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (context < 0 || context >= SCE_NP_TROPHY_MAX_CONTEXTS ||
+    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
 
@@ -263,7 +264,7 @@ s32 sceNpTrophyCreateHandle(SceNpTrophyHandle* handle)
     if (!handle)
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
 
-    for (s32 i = 0; i < SCE_NP_TROPHY_MAX_HANDLES; i++) {
+    for (s32 i = 1; i <= SCE_NP_TROPHY_MAX_HANDLES; i++) {
         if (!s_handles[i].in_use) {
             s_handles[i].in_use = 1;
             vm_write32(GUEST_EA(handle), (u32)i);
@@ -280,7 +281,7 @@ s32 sceNpTrophyDestroyHandle(SceNpTrophyHandle handle)
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (handle < 0 || handle >= SCE_NP_TROPHY_MAX_HANDLES ||
+    if (handle <= 0 || handle > SCE_NP_TROPHY_MAX_HANDLES ||
         !s_handles[handle].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
 
@@ -324,11 +325,11 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (context < 0 || context >= SCE_NP_TROPHY_MAX_CONTEXTS ||
+    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
 
-    if (handle < 0 || handle >= SCE_NP_TROPHY_MAX_HANDLES ||
+    if (handle <= 0 || handle > SCE_NP_TROPHY_MAX_HANDLES ||
         !s_handles[handle].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
 
@@ -364,7 +365,7 @@ s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (context < 0 || context >= SCE_NP_TROPHY_MAX_CONTEXTS ||
+    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
 
@@ -394,7 +395,7 @@ s32 sceNpTrophyGetGameInfo(SceNpTrophyContext context,
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (context < 0 || context >= SCE_NP_TROPHY_MAX_CONTEXTS ||
+    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
 
@@ -442,7 +443,7 @@ s32 sceNpTrophyGetTrophyInfo(SceNpTrophyContext context,
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (context < 0 || context >= SCE_NP_TROPHY_MAX_CONTEXTS ||
+    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
 
@@ -485,7 +486,7 @@ s32 sceNpTrophyUnlockTrophy(SceNpTrophyContext context,
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (context < 0 || context >= SCE_NP_TROPHY_MAX_CONTEXTS ||
+    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
 
@@ -531,7 +532,7 @@ s32 sceNpTrophyGetTrophyUnlockState(SceNpTrophyContext context,
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (context < 0 || context >= SCE_NP_TROPHY_MAX_CONTEXTS ||
+    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
 
@@ -566,7 +567,7 @@ s32 sceNpTrophyGetGameProgress(SceNpTrophyContext context,
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (context < 0 || context >= SCE_NP_TROPHY_MAX_CONTEXTS ||
+    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
 
