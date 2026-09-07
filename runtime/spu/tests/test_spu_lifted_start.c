@@ -552,6 +552,14 @@ static void test_alternate_link_return(void)
 static uint32_t captured_queue;
 static uint64_t captured_event[4];
 static int push_result;
+static uint32_t captured_flag;
+static uint64_t captured_flag_bits;
+int64_t sys_event_flag_set(ppu_context* ctx)
+{
+    captured_flag = (uint32_t)ctx->gpr[3];
+    captured_flag_bits = ctx->gpr[4];
+    return captured_flag == 44 ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;
+}
 
 static void test_user_event_ports(uint32_t gid, uint32_t tid)
 {
@@ -598,6 +606,24 @@ static void test_user_event_ports(uint32_t gid, uint32_t tid)
     spu_wrch(spu, SPU_WrOutIntrMbox, spu_splat_u32(0x12000000));
     check(spu_channel_read(&spu->ch_in_mbox) == CELL_ENOTCONN,
           "send_event reports an unbound port");
+    captured_queue = 0;
+    spu_wrch(spu, SPU_WrOutMbox, spu_splat_u32(44));
+    spu_wrch(spu, SPU_WrOutIntrMbox, spu_splat_u32(0xC000003F));
+    check(captured_flag == 44 && captured_flag_bits == (1ull << 63) &&
+          captured_queue == 0 && spu->ch_in_mbox.count == 0,
+          "impatient flag request sets its bit without a queue event or ack");
+    spu_wrch(spu, SPU_WrOutMbox, spu_splat_u32(44));
+    spu_wrch(spu, SPU_WrOutIntrMbox, spu_splat_u32(0x80000000));
+    check(captured_flag_bits == 1 && spu_channel_read(&spu->ch_in_mbox) == CELL_OK,
+          "strict flag request sets bit zero and acknowledges success");
+    spu_wrch(spu, SPU_WrOutMbox, spu_splat_u32(45));
+    spu_wrch(spu, SPU_WrOutIntrMbox, spu_splat_u32(0x80000002));
+    check(spu_channel_read(&spu->ch_in_mbox) == CELL_ESRCH,
+          "strict flag request reports an unknown flag");
+    spu_wrch(spu, SPU_WrOutMbox, spu_splat_u32(44));
+    spu_wrch(spu, SPU_WrOutIntrMbox, spu_splat_u32(0x80000040));
+    check(spu_channel_read(&spu->ch_in_mbox) == CELL_EINVAL,
+          "flag request rejects a bit outside the 64-bit pattern");
     g_spu_user_event_hook = NULL;
     free(spu);
 }
