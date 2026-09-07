@@ -146,6 +146,7 @@ def main():
         '    spu_begin_image(14); spu_recomp_register_jobbin_a();',
         '''    spu_overlay_register_region(0x01254500u, 0x9540u, 14);
     spu_overlay_register_region(0x01275A00u, 0x14C0u, 15);
+    spu_overlay_register_region(0x02025500u, 0x680u, 12);
     spu_begin_image(14); spu_recomp_register_jobbin_a();''', 'streamed job code spans')
     main_cpp = replace_once(main_cpp,
         'extern "C" void spu_taskset_register_task_entry(uint32_t entry, int image_id);',
