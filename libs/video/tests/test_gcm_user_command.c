@@ -20,6 +20,7 @@ static uint32_t last;
 static void callback(uint32_t opd, uint64_t a, uint64_t b, uint64_t c,
                         uint64_t d, uint64_t e, uint64_t f, uint64_t h, uint64_t i)
 {
+    if (opd == 0x200) { cellGcmQueueUserCommand(0xDD); return; }
     assert(opd == 0x100 && !b && !c && !d && !e && !f && !h && !i);
     calls++; last = (uint32_t)a;
     if (a == 0xAA) { cellGcmQueueUserCommand(0xBB); ppu_gcm_pump(); }
@@ -39,7 +40,16 @@ int main(void)
     ppu_gcm_pump(); assert(calls == 2);
     cellGcmQueueUserCommand(0); ppu_gcm_pump();
     assert(calls == 3 && last == 0);
+    /* A vblank callback can publish another cause after this pump has
+     * claimed the old interrupt. It must not replace that claimed cause. */
+    s_vblank_handler_opd = 0x200;
+    cellGcmQueueUserCommand(0xCC);
+    cellGcmTickVBlank();
+    ppu_gcm_pump(); assert(calls == 4 && last == 0xCC);
+    s_vblank_handler_opd = 0;
+    ppu_gcm_pump(); assert(calls == 5 && last == 0xDD);
+    ppu_gcm_pump(); assert(calls == 5);
     cellGcmSetUserHandler(NULL);
-    cellGcmQueueUserCommand(7); ppu_gcm_pump(); assert(calls == 3);
+    cellGcmQueueUserCommand(7); ppu_gcm_pump(); assert(calls == 5);
     puts("Deferred GCM user-command checks passed");
 }
