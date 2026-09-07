@@ -3050,7 +3050,8 @@ class PPULifter:
         every chunk file (the helpers are `static inline`, so duplicating
         them across translation units is harmless and keeps each chunk
         self-contained)."""
-        lines = [SOURCE_PREAMBLE]
+        lines = [SOURCE_PREAMBLE.replace('#include "ppu_recomp.h"',
+                 f'#include "{getattr(self, "header_name", "ppu_recomp.h")}"')]
 
         # Emit helper macros
         lines.append("/* Rotate helpers */")
@@ -4168,6 +4169,7 @@ def main() -> None:
     print(f"Lifting {len(func_bounds)} functions...")
 
     lifter = PPULifter(prefix=args.symbol_prefix)
+    lifter.header_name = args.header_name
     # A single-module executable keeps r2 (TOC) constant, so an `ld r2, N(r1)` TOC
     # restore can be lowered to this literal instead of a stack read (the recomp has
     # no glink stub writing the save slot, so the stack read returns garbage -> r2
