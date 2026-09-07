@@ -150,6 +150,19 @@ static void yz_rsx_present(uint32_t buffer_id)
         cellGcmQueueUserCommand(arg);
         break;
 #endif""", 'HLE user-command interrupt delivery')
+    # The save-data library's legacy scratch address is inside pxd_shader's
+    # relocated image. Use an otherwise unclaimed window above audio buffers.
+    main_cpp = replace_once(main_cpp, 'int main(int argc, char** argv)',
+        'extern "C" int32_t cellSaveData_set_scratch_region(uint32_t, uint32_t);\n'
+        'int main(int argc, char** argv)', 'save-data scratch declaration')
+    main_cpp = replace_once(main_cpp, '    vm_stack_alloc_init(&g_stacks);',
+        '''    vm_stack_alloc_init(&g_stacks);
+    if (vm_commit(0x59000000u, 0x20000u) != 0 ||
+        cellSaveData_set_scratch_region(0x59000000u, 0x20000u) != 0) {
+        fprintf(stderr, "ERROR: save-data callback scratch allocation failed\\n");
+        return 1;
+    }''', 'save-data scratch allocation')
+
     # The legacy Yakuza host omits the firmware NP trophy initialization chain.
     # Supply it in this runner, preserving the toolkit API's NOT_INITIALIZED
     # contract for all other games.
