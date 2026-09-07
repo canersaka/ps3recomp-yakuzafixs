@@ -97,6 +97,7 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
 #else
   #include <pthread.h>
   #include <unistd.h>
+  #include <time.h>
   typedef pthread_t thread_t;
   typedef pthread_mutex_t mutex_t;
   #define mutex_init(m)    pthread_mutex_init(m, NULL)
@@ -136,6 +137,9 @@ typedef struct {
     u64  key;
 } AudioNotifySlot;
 static AudioNotifySlot s_notify_queues[CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES];
+
+/* Timestamp anchor for cellAudioGetPortTimestamp (microseconds, set at init) */
+static u64            s_audio_start_us = 0;
 
 /* Mixing thread */
 static volatile int  s_mix_thread_running = 0;
@@ -633,6 +637,16 @@ s32 cellAudioInit(void)
         /* Don't fail -- games should still run without audio */
     }
 
+
+#ifdef _WIN32
+    { LARGE_INTEGER f, c;
+      QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
+      s_audio_start_us = (u64)(c.QuadPart / f.QuadPart) * 1000000ULL +
+          (u64)(c.QuadPart % f.QuadPart) * 1000000ULL / (u64)f.QuadPart; }
+#else
+    { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+      s_audio_start_us = (u64)ts.tv_sec * 1000000ULL + (u64)ts.tv_nsec / 1000ULL; }
+#endif
     if (audio_start_mix_thread() < 0) {
         printf("[cellAudio] WARNING: Could not start mixing thread\n");
     }
@@ -810,6 +824,55 @@ s32 cellAudioPortStop(u32 portNum)
     s_ports[portNum].running = 0;
     mutex_unlock(&s_audio_mutex);
 
+    return CELL_OK;
+}
+
+s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag)
+{
+    uint32_t tag_ea = (uint32_t)(uintptr_t)tag;
+    if (!s_audio_initialized)
+        return CELL_AUDIO_ERROR_NOT_INIT;
+    if (portNum >= CELL_AUDIO_PORT_MAX)
+        return CELL_AUDIO_ERROR_PARAM;
+    if (!s_ports[portNum].in_use)
+        return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
+    if (!tag_ea)
+        return CELL_AUDIO_ERROR_PARAM;
+
+    mutex_lock(&s_audio_mutex);
+    AudioPortSlot* port = &s_ports[portNum];
+    u64 nblk = port->param.nBlock ? port->param.nBlock : 1;
+    if (blockNo >= nblk) {
+        mutex_unlock(&s_audio_mutex);
+        return CELL_AUDIO_ERROR_PARAM;
+    }
+    u64 t = port->read_index + blockNo - (port->read_index % nblk);
+    mutex_unlock(&s_audio_mutex);
+
+    vm_write64(tag_ea, t);
+    return CELL_OK;
+}
+
+s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp)
+{
+    uint32_t stamp_ea = (uint32_t)(uintptr_t)stamp;
+    if (!s_audio_initialized)
+        return CELL_AUDIO_ERROR_NOT_INIT;
+    if (portNum >= CELL_AUDIO_PORT_MAX)
+        return CELL_AUDIO_ERROR_PARAM;
+    if (!s_ports[portNum].in_use)
+        return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
+    if (!stamp_ea)
+        return CELL_AUDIO_ERROR_PARAM;
+
+    mutex_lock(&s_audio_mutex);
+    u64 global_counter = s_ports[portNum].read_index;
+    mutex_unlock(&s_audio_mutex);
+    if (tag > global_counter)
+        return CELL_AUDIO_ERROR_TAG_NOT_FOUND;
+
+    u64 t = s_audio_start_us + tag * 256000000ULL / 48000ULL;
+    vm_write64(stamp_ea, t);
     return CELL_OK;
 }
 
