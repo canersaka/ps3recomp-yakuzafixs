@@ -73,7 +73,7 @@ void spu_lifted_thread_setup(spu_context* ctx, const spu_lifted_thread_desc* d)
 {
     if (!ctx || !d) return;
 
-    memset(ctx, 0, sizeof(*ctx));
+    spu_context_init(ctx, d->tid);
     ctx->spu_id       = d->tid;
     ctx->spu_group_id = d->group_id;
     ctx->pc           = d->entry & SPU_LS_MASK;

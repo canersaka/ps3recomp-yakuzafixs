@@ -236,6 +236,10 @@ static inline void* ps3__thread_trampoline(void* p)
 
 /* Only the "spawn and forget" subset used in-tree: the returned handle is not
  * waited on or closed anywhere, so the thread is detached. */
+/* The threads above are detached, so there is no handle to release. Present
+ * because callers that spawn-and-close are written against the Win32 shape. */
+static inline BOOL CloseHandle(HANDLE h) { (void)h; return TRUE; }
+
 static inline HANDLE CreateThread(void* sa, size_t stack, PS3_THREAD_FN fn,
                                   LPVOID arg, DWORD flags, DWORD* out_tid)
 {
