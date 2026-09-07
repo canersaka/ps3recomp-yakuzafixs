@@ -146,6 +146,18 @@ def main():
         '''    spu_overlay_register_region(0x01254500u, 0x9540u, 14);
     spu_overlay_register_region(0x01275A00u, 0x14C0u, 15);
     spu_begin_image(14); spu_recomp_register_jobbin_a();''', 'streamed job code spans')
+    main_cpp = replace_once(main_cpp,
+        'extern "C" void spu_taskset_register_task_entry(uint32_t entry, int image_id);',
+        'extern "C" void spu_taskset_register_task_entry(uint32_t entry, int image_id);\nextern "C" void spu_taskset_register_task_elf(uint32_t, int, int);',
+        'task ELF registration declaration')
+    main_cpp = replace_once(main_cpp,
+        '    spu_taskset_register_task_entry(0x3070u, 3);',
+        '''    for (int i = 0; i < SPU_IMAGE_COUNT; ++i) {
+        const spu_image_desc& task = g_spu_images[i];
+        /* The legacy table calls gs_task image 0; this runner registers it as 17. */
+        spu_taskset_register_task_elf(task.elf_ea, task.image_id == 0 ? 17 : task.image_id, 2);
+    }
+    spu_taskset_register_task_entry(0x3070u, 3);''', 'task ELF registration')
     dispatch = replace_once(original_dispatch,
         'extern "C" yz_ppu_fn yz_lookup_func(uint32_t guest_addr)\n{',
         '''extern "C" const func_entry pxd_shader_function_table[];
