@@ -320,6 +320,11 @@ extern "C" uint32_t ppu_prof_resolve_host(void* address)
   file(GLOB shader_sources "${CMAKE_BINARY_DIR}/shader-module/pxd_shader_recomp_*.cpp")
   target_sources(ppu_recomp_objs PRIVATE ${shader_sources})
   target_include_directories(yakuza_recomp PRIVATE "${CMAKE_SOURCE_DIR}")
+  # Generated SPU helpers are compiled in the runner, outside the runtime's
+  # PRIVATE flags. Match its arithmetic and aliasing policy on Apple Clang.
+  if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(yakuza_recomp PRIVATE -fno-strict-aliasing -ffp-contract=off)
+  endif()
 endfunction()
 cmake_language(DEFER CALL ps3recomp_adapt_yakuza)
 '''
