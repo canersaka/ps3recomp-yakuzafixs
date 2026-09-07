@@ -652,9 +652,13 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
         uint64_t ea = (ea_base & 0xFFFFFFFF00000000ull) | eal;
 
         if (xfer_size) {
-            int rc = mfc_do_transfer(spu, dest_lsa, ea, xfer_size, base_cmd);
+            /* Each list element occupies whole LS quadwords, even for
+             * 1/2/4/8-byte transfers. The EA supplies its byte offset within
+             * the first quadword. Keep the rounded cursor for stall/resume. */
+            uint32_t transfer_lsa = (dest_lsa & ~15u) | (eal & 15u);
+            int rc = mfc_do_transfer(spu, transfer_lsa, ea, xfer_size, base_cmd);
             if (rc != 0) return rc;
-            dest_lsa += xfer_size;
+            dest_lsa = (dest_lsa & ~15u) + ((xfer_size + 15u) & ~15u);
         }
 
         if (stall_notify) {
