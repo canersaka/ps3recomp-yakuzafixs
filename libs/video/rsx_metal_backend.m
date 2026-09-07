@@ -3079,10 +3079,9 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
 }
 
 /* Opt-in readback of the game surface, useful on a locked Mac or in CI.
- * Headless submits have completed before this runs; no compositor access. */
+ * Headless submits have completed; windowed captures fence the same queue. */
 static void eng_dump_frame(id<MTLTexture> src)
 {
-    if (!s_headless) return;
     const char* path = getenv("PS3RECOMP_METAL_FRAME_DUMP");
     if (!path || !*path) return;
     static unsigned frame;
@@ -3093,6 +3092,11 @@ static void eng_dump_frame(id<MTLTexture> src)
     if (!w || !h || w > 16384 || h > 16384) return;
     unsigned char* rgba = malloc(w * h * 4);
     if (!rgba) return;
+    if (!s_headless) {
+        id<MTLCommandBuffer> fence = [s_queue commandBuffer];
+        [fence commit];
+        [fence waitUntilCompleted];
+    }
     [src getBytes:rgba bytesPerRow:w * 4
       fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
     FILE* f = fopen(path, "wb");
