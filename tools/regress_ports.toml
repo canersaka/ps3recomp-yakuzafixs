@@ -1,0 +1,104 @@
+# Ports the regression gate runs. See tools/regress.py.
+#
+# Paths are relative to the ps3recomp repo root, and assume the sibling layout
+# every port already uses (ps3recomp and the game trees next to each other).
+# A port that is not on this machine is SKIPPED, not failed -- nobody owns all
+# seven titles, and the gate has to be useful to someone who owns two.
+#
+# Deliberately NOT setting RSX_LIVE_DRAW: the draw milestone is recorded in
+# rsx_commands.c before the backend call, so draws are captured with the null
+# backend too. That keeps a gate run headless, faster, and identical on Linux
+# and macOS, where there is no D3D12 at all.
+#
+# `expect = "timeout"` is the normal case: a title that reaches its frame loop
+# never exits, so being killed on the timeout is what success looks like. The
+# milestone stream is flushed as each key is first seen so the kill still leaves
+# a complete record.
+#
+# `build` is how a golden stays reproducible. The gate builds the toolkit, then
+# builds each port against THAT toolkit into build-gate/ -- kept separate from
+# the developer's own build/ so a gate run cannot be fooled by a stale binary.
+# `{toolkit}` expands to the repo root; regress.py also exports PS3RECOMP_DIR and,
+# on Windows, the MSVC environment clang-cl needs (see tools/msvc_env.py), so the
+# commands below are the same ones a person would type.
+#
+# Regenerating the NID table is part of the build, not a nicety: building vf5
+# against master failed outright until its src/gen/ppu_hle_nids.cpp was
+# regenerated, because the table in its tree came from the ports' own toolkit
+# branch (ydkj-live-draw) and referenced three sysPrxForUser handlers master does
+# not have. That is the "no port pins a toolkit version" problem, and generating
+# the table from the toolkit under test is what fixes it.
+#
+# Ports without a `build` line are still the operator's job to build; they SKIP
+# cleanly until then.
+#
+# flOw is deliberately absent. Its lifted tree is git-ignored and cannot be
+# regenerated, so a golden recorded from it could never be reproduced or
+# explained. It stays a manual title until it is relifted from scratch.
+
+# The toolkit itself, built once per gate run before any port touches it.
+[toolkit]
+build = """cmake -S . -B build-gate -G Ninja   -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl   -DCMAKE_BUILD_TYPE=Release && cmake --build build-gate"""
+
+# Default build for every port: regenerate the NID table from the toolkit under
+# test, configure against it, build. Ports override with their own `build` only
+# if they differ.
+#
+# Note the side effect: this rewrites the port's src/gen/ppu_hle_nids.cpp in
+# place, so a gate run leaves that generated file regenerated. It is git-ignored
+# output that the port's own relift.sh regenerates too, but a developer's build/
+# will pick it up on their next rebuild.
+port_build = """python "{toolkit}/tools/gen_hle_nids.py" --all --out src/gen/ppu_hle_nids.cpp && cmake -S . -B build-gate -G Ninja   -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl   -DCMAKE_BUILD_TYPE=Release   -DPS3RECOMP_DIR="{toolkit}"   -DPS3RECOMP_RUNTIME_LIB="{toolkit}/build-gate/ps3recomp_runtime.lib" && cmake --build build-gate"""
+
+# --- showcase titles -------------------------------------------------------
+
+[[port]]
+name    = "vf5"
+dir     = "../ps3games/vf5"
+cmd     = ["build-gate/vf5.exe", "game/EBOOT.elf"]
+timeout = 60
+expect  = "timeout"
+env     = { PS3_VFS_ROOT = "vfs/PS3_GAME/USRDIR" }
+
+[[port]]
+name    = "tokyojungle"
+dir     = "../ps3games/tokyojungle"
+cmd     = ["build-gate/tokyojungle.exe", "input/EBOOT.elf"]
+timeout = 90
+expect  = "timeout"
+env     = { PS3_VFS_ROOT = "input" }
+
+# --- regression subjects: not being worked on, which is exactly why they are
+#     here. These are the ports a shared-runtime change breaks silently. ------
+
+[[port]]
+name    = "twistedmetal"
+dir     = "../ps3games/twistedmetal"
+cmd     = ["build-gate/twistedmetal.exe", "input/EBOOT.elf"]
+timeout = 90
+expect  = "timeout"
+env     = { PS3_VFS_ROOT = "input" }
+
+[[port]]
+name    = "simpsons"
+dir     = "../ps3games/simpsons"
+cmd     = ["build-gate/simpsons.exe", "vfs/PS3_GAME/USRDIR/EBOOT.elf"]
+timeout = 90
+expect  = "timeout"
+env     = { PS3_VFS_ROOT = "vfs/PS3_GAME/USRDIR" }
+
+[[port]]
+name    = "youdontknowjack"
+dir     = "../ps3games/youdontknowjack/project"
+cmd     = ["build-gate/ydkj_boot.exe", "input/EBOOT.elf"]
+timeout = 90
+expect  = "timeout"
+env     = { PS3_VFS_ROOT = "input" }
+
+[[port]]
+name    = "rubberducky"
+dir     = "../ps3games/rubberducky"
+cmd     = ["build-gate/rubberducky.exe", "input/EBOOT.elf"]
+timeout = 60
+expect  = "timeout"
+env     = { PS3_VFS_ROOT = "input", RD_SPU_INTERP = "1" }
