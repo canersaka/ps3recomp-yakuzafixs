@@ -600,11 +600,11 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         /* Plain mailbox data is consumed by the following interrupt request. */
         break;
     case SPU_WrOutIntrMbox:
-        if (g_spu_user_event_hook && g_spu_user_event_hook(ctx, v)) break;
-        spu_channel_write(&ctx->ch_out_intr_mbox, v);
         { static int s_t = -1; if (s_t < 0) s_t = getenv("YDKJ_MBOXTRACE") ? 1 : 0;
           if (s_t) fprintf(stderr, "[spu-mbox] INTR grp=0x%X spu=0x%X val=0x%08X\n",
                            ctx->spu_group_id, ctx->spu_id, v); }
+        if (g_spu_user_event_hook && g_spu_user_event_hook(ctx, v)) break;
+        spu_channel_write(&ctx->ch_out_intr_mbox, v);
         if (g_spu_out_mbox_hook) g_spu_out_mbox_hook(ctx->spu_group_id, ctx->spu_id, 1, v);
         break;
     case SPU_WrDec:          ctx->decrementer = v;
@@ -1012,7 +1012,7 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
  * the image id its lifted functions were registered under. The MFC GET path
  * marks that overlay resident in the streaming context; dispatch retries a
  * primary-image miss against the resident overlay's registry. */
-typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; } spu_ovl_src;
+typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span; } spu_ovl_src;
 /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
  * the same job code buffer at LS 0x4000, dispatched by content signature). */
 #define SPU_OVL_SRC_MAX 128
@@ -1027,6 +1027,15 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
         s_ovl_src[s_ovl_src_count].has_sig = 0;
         s_ovl_src_count++;
     }
+}
+
+/* Register a bounded code image that may coexist with other streamed images.
+ * Its functions must be translated at the local-store addresses used by the title. */
+void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_id)
+{
+    if (!span || span > SPU_LS_SIZE || s_ovl_src_count >= SPU_OVL_SRC_MAX) return;
+    spu_overlay_register_source(content_ea, image_id);
+    s_ovl_src[s_ovl_src_count - 1].span = span;
 }
 
 /* SPURS taskset TASK entries (see spu_context.resident_task). A taskset can hold
@@ -1077,11 +1086,34 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
  * chunks (overlay bodies are >= 0x500 bytes). */
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
+    uint32_t lsa = (uint32_t)(ls - ctx->ls);
+    for (unsigned slot = 0; slot < 4; ++slot) {
+        if (!ctx->resident_code[slot].image_id) continue;
+        uint32_t base = ctx->resident_code[slot].lsa;
+        uint32_t end = base + ctx->resident_code[slot].size;
+        if (lsa < end && lsa + size > base &&
+            (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)))
+            ctx->resident_code[slot].image_id = 0;
+    }
     for (int i = 0; i < s_ovl_src_count; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
         int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
                              : (o->src_ea == ea);
         if (hit) {
+            if (o->span) {
+                if (lsa + o->span > SPU_LS_SIZE) return;
+                for (unsigned slot = 0; slot < 4; ++slot) {
+                    if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
+                        continue;
+                    ctx->resident_code[slot].lsa = lsa;
+                    ctx->resident_code[slot].size = o->span;
+                    ctx->resident_code[slot].source_ea = ea;
+                    ctx->resident_code[slot].image_id = o->image_id;
+                    return;
+                }
+                fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);
+                return;
+            }
             if (ctx->resident_ovl != o->image_id) {
                 ctx->resident_ovl = o->image_id;
                 { static int _n = 0; if (_n++ < 32)
@@ -1584,13 +1616,22 @@ void spu_indirect_branch(spu_context* ctx)
      * so a co-resident task at the same LS base cannot shadow it. (resident_task
      * is 0 outside the region, so this only ever fires for genuine task code.) */
     spu_fn fn = NULL;
-    if (ctx->resident_task)
+    int code_owner = 0;
+    for (unsigned slot = 0; slot < 4; ++slot) {
+        if (ctx->resident_code[slot].image_id && ctx->pc >= ctx->resident_code[slot].lsa &&
+            ctx->pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
+            code_owner = ctx->resident_code[slot].image_id;
+            fn = spu_lookup(ctx->pc, code_owner);
+            break;
+        }
+    }
+    if (!code_owner && ctx->resident_task)
         fn = spu_lookup(ctx->pc, ctx->resident_task);
     /* Resident overlay next: streamed code overwrote that LS range, so its lift
      * is the truth there -- the base image's stale bytes at the same addresses
      * may also be registered (historical junk lifts) and must lose. */
-    if (!fn && ctx->resident_ovl) fn = spu_lookup(ctx->pc, ctx->resident_ovl);
-    if (!fn) fn = spu_lookup(ctx->pc, ctx->image_id);
+    if (!code_owner && !fn && ctx->resident_ovl) fn = spu_lookup(ctx->pc, ctx->resident_ovl);
+    if (!code_owner && !fn) fn = spu_lookup(ctx->pc, ctx->image_id);
     /* The job returned through the link register we planted: it is finished.
      * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
      * return landed on LS 0, which is the job's OWN entry, and it ran a second

@@ -137,6 +137,15 @@ def main():
     }
     while (!game_done.load""", 'guest thread startup result')
 
+    main_cpp = replace_once(main_cpp,
+        'extern \"C\" void spu_overlay_register_source(uint32_t content_ea, int image_id);',
+        'extern \"C\" void spu_overlay_register_source(uint32_t content_ea, int image_id);\nextern \"C\" void spu_overlay_register_region(uint32_t, uint32_t, int);',
+        'streamed job registration declaration')
+    main_cpp = replace_once(main_cpp,
+        '    spu_begin_image(14); spu_recomp_register_jobbin_a();',
+        '''    spu_overlay_register_region(0x01254500u, 0x9540u, 14);
+    spu_overlay_register_region(0x01275A00u, 0x14C0u, 15);
+    spu_begin_image(14); spu_recomp_register_jobbin_a();''', 'streamed job code spans')
     dispatch = replace_once(original_dispatch,
         'extern "C" yz_ppu_fn yz_lookup_func(uint32_t guest_addr)\n{',
         '''extern "C" const func_entry pxd_shader_function_table[];
