@@ -250,6 +250,22 @@ extern "C" yz_ppu_fn yz_lookup_func(uint32_t guest_addr)
             if (pxd_shader_function_table[i].addr == guest_addr)
                 return pxd_shader_function_table[i].func;
     }''', 'shader module dispatch')
+    # Upstream filesystem diagnostics resolve host PCs through the scaffold.
+    # This runner owns its function table, so supply the equivalent lookup here.
+    dispatch += """
+extern "C" uint32_t ppu_prof_resolve_host(void* address)
+{
+    uintptr_t pc = (uintptr_t)address, closest = 0;
+    uint32_t guest = 0;
+    for (unsigned i = 0; i < g_yz_func_count; ++i) {
+        uintptr_t host = (uintptr_t)g_yz_func_table[i].fn;
+        if (host <= pc && host > closest) {
+            closest = host; guest = g_yz_func_table[i].addr;
+        }
+    }
+    return guest && pc - closest < 0x20000 ? guest : 0;
+}
+"""
     adapter.mkdir(parents=True, exist_ok=True)
     write_changed(adapter / 'dispatch.cpp', dispatch)
     write_changed(adapter / 'main.cpp', main_cpp)
