@@ -342,3 +342,29 @@ int spu_tailret_enabled(void)
     if (s_on < 0) { const char* e = getenv("SPU_TAILRET"); s_on = (e && e[0] == 0x31) ? 1 : 0; }
     return s_on;
 }
+
+/* A return may use any register, not only r0. Running that branch target
+ * inside this drain executes the caller's continuation twice (once here,
+ * once when its real host frame resumes), including its stack adjustment. */
+void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+{
+    spu_depth_guard(ctx);
+    while (g_spu_trampoline_fn) {
+        if (g_spu_trampoline_fn == spu_indirect_branch &&
+            (ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
+            g_spu_trampoline_fn = 0;
+            return;
+        }
+        void (*fn)(spu_context*) = g_spu_trampoline_fn;
+        g_spu_trampoline_fn = 0;
+        yz_lockstep_tick(ctx);
+        spu_task_launch_check(ctx, (void*)fn);
+        if (ctx->int_enable && (ctx->event_status & ctx->event_mask))
+            fn = spu_take_interrupt(ctx, fn);
+        fn(ctx);
+    }
+    if ((ctx->pc & SPU_LS_MASK) != (return_pc & SPU_LS_MASK)) {
+        extern void spu_restart_dispatch(spu_context*);
+        spu_restart_dispatch(ctx);
+    }
+}

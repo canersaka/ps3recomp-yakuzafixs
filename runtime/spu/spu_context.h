@@ -641,6 +641,9 @@ int  spu_tailret_enabled(void);
 void (*spu_take_interrupt(spu_context* ctx,
                           void (*tf)(spu_context*)))(spu_context*);
 
+/* Drain a translated call up to its explicit architectural return PC. */
+void spu_drain_call(spu_context* ctx, uint32_t return_pc);
+
 /* Drain the pending trampoline chain: run each queued transfer target until
  * none remain. The one central hook site for the faithful execution model. */
 #define SPU_DRAIN(ctx) do {                                    \

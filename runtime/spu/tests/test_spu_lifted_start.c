@@ -518,6 +518,37 @@ static void test_taskset_resume_stack(void)
     free(ctx);
 }
 
+static int duplicate_continuation;
+static void caller_continuation(spu_context* ctx)
+{
+    ++duplicate_continuation;
+    ctx->gpr[1]._u32[0] += 16;
+}
+static void test_alternate_link_return(void)
+{
+    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
+    if (!ctx) { check(0, "allocate alternate return context"); return; }
+    spu_begin_image(89); spu_register_function(0x900, caller_continuation);
+    spu_begin_image(0);
+    ctx->image_id = 89; ctx->host_depth = 1;
+    ctx->gpr[0]._u32[0] = 0x888; /* callee used r0 for a nested call */
+    ctx->gpr[1]._u32[0] = 0x2c00;
+    ctx->pc = 0x900; /* bi r7, with r7 holding the caller's saved link */
+    g_spu_trampoline_fn = spu_indirect_branch;
+    duplicate_continuation = 0;
+    spu_drain_call(ctx, 0x900);
+    check(!duplicate_continuation && ctx->gpr[1]._u32[0] == 0x2c00,
+          "alternate-register return does not execute the caller inside the callee");
+    check(!g_spu_trampoline_fn, "alternate return leaves no pending continuation");
+    ctx->policy_mode = 1;
+    ctx->ls[0x27C6] = 0x0a; ctx->ls[0x27C7] = 0x70;
+    ctx->gpr[0]._u32[0] = 0x900; ctx->gpr[3]._u32[0] = 3;
+    ctx->pc = 0xa70; spu_indirect_branch(ctx); spu_drain_call(ctx, 0x900);
+    check(ctx->pc == 0x900 && ctx->gpr[3]._u32[0] == 0,
+          "synthetic HLE calls publish their architectural return PC");
+    free(ctx);
+}
+
 static uint32_t captured_queue;
 static uint64_t captured_event[4];
 static int push_result;
@@ -614,6 +645,7 @@ int main(void)
     test_taskset_resume_identity();
     test_guest_stack_reset();
     test_taskset_resume_stack();
+    test_alternate_link_return();
 
     signal(SIGSEGV, guard_fault);
     signal(SIGBUS,  guard_fault);
