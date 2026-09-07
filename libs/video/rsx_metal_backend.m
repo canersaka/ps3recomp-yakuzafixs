@@ -2059,6 +2059,7 @@ static id<MTLTexture> s_eng_obj[ENG_MAX_OBJECTS];
 static u32 s_eng_obj_count;
 static u32 s_eng_obj_free[ENG_MAX_OBJECTS];
 static u32 s_eng_obj_free_count;
+static u8 s_eng_obj_retired[ENG_MAX_OBJECTS];
 
 typedef struct {
     id<MTLRenderPipelineState> pso;
@@ -2172,13 +2173,26 @@ static id<MTLTexture> eng_obj(u32 handle)
     return (handle && handle <= s_eng_obj_count) ? s_eng_obj[handle - 1] : nil;
 }
 
+/* Recorded commands resolve numeric handles during encoding. Do not recycle
+ * a released slot until those commands have acquired their Metal resources.
+ * Submitted command buffers retain the objects for the GPU's remaining work. */
+static void eng_collect_retired_objects(void)
+{
+    if (s_eng_rec_count) return;
+    for (u32 i = 0; i < s_eng_obj_count; ++i) {
+        if (!s_eng_obj_retired[i]) continue;
+        s_eng_obj_retired[i] = 0;
+        s_eng_obj[i] = nil;
+        s_eng_obj_free[s_eng_obj_free_count++] = i;
+    }
+}
+
 static void eng_obj_release(void* user, u32 handle)
 {
     (void)user;
-    if (!handle || handle > s_eng_obj_count || !s_eng_obj[handle - 1]) return;
-    s_eng_obj[handle - 1] = nil;
-    if (s_eng_obj_free_count < ENG_MAX_OBJECTS)
-        s_eng_obj_free[s_eng_obj_free_count++] = handle - 1;
+    if (!handle || handle > s_eng_obj_count || !s_eng_obj[handle - 1] ||
+        s_eng_obj_retired[handle - 1]) return;
+    s_eng_obj_retired[handle - 1] = 1;
     /* Any view cut from this object stops being valid with it. */
     for (u32 i = 0; i < s_eng_view_count; i++)
         if (s_eng_view[i].surface == handle) {
@@ -2186,6 +2200,7 @@ static void eng_obj_release(void* user, u32 handle)
             s_eng_view[i] = s_eng_view[--s_eng_view_count];
             i--;
         }
+    eng_collect_retired_objects();
 }
 
 static MTLPixelFormat eng_pixel_format(rsx_be_format f)
@@ -2274,6 +2289,7 @@ static void eng_shutdown(void* user)
     for (u32 i = 0; i < s_eng_func_count; i++) s_eng_func[i].fn = nil;
     for (u32 i = 0; i < s_eng_samp_count; i++) s_eng_samp[i].samp = nil;
     s_eng_obj_count = s_eng_obj_free_count = 0;
+    memset(s_eng_obj_retired, 0, sizeof s_eng_obj_retired);
     s_eng_pipe_count = s_eng_func_count = s_eng_samp_count = s_eng_view_count = 0;
     s_eng_rec_count = 0;
     free(s_eng_stage); s_eng_stage = NULL;
@@ -3058,6 +3074,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         }
         s_eng_rec_count  = 0;
         s_eng_stage_used = 0;
+        eng_collect_retired_objects();
     }
 }
 
