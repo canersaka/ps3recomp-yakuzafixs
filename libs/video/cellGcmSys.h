@@ -417,6 +417,8 @@ void cellGcmSetVBlankFrequency(u32 freq);
 
 /* User command */
 void cellGcmSetUserCommand(u32 cmd);
+/* Host FIFO consumer: defer the retired command to ppu_gcm_pump. */
+void cellGcmQueueUserCommand(u32 cmd);
 
 /* Invalidate tile */
 s32 cellGcmSetInvalidateTile(u8 index);
