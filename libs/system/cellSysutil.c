@@ -93,23 +93,29 @@ static pthread_mutex_t s_completion_lock = PTHREAD_MUTEX_INITIALIZER;
 typedef struct GuestCompletion {
     struct GuestCompletion* next;
     u32 opd;
-    u64 arg0, arg1;
+    u64 args[8];
 } GuestCompletion;
 static GuestCompletion* s_completion_head;
 static GuestCompletion* s_completion_tail;
 
-s32 cellSysutilQueueGuestCallback(u32 opd, u64 arg0, u64 arg1)
+s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8])
 {
     if (!opd) return CELL_OK;
     GuestCompletion* item = malloc(sizeof(*item));
     if (!item) return (s32)CELL_ENOMEM;
-    item->next = NULL; item->opd = opd; item->arg0 = arg0; item->arg1 = arg1;
+    item->next = NULL; item->opd = opd; memcpy(item->args, args, sizeof(item->args));
     COMPLETION_LOCK();
     if (s_completion_tail) s_completion_tail->next = item;
     else s_completion_head = item;
     s_completion_tail = item;
     COMPLETION_UNLOCK();
     return CELL_OK;
+}
+
+s32 cellSysutilQueueGuestCallback(u32 opd, u64 arg0, u64 arg1)
+{
+    const u64 args[8] = {arg0, arg1, 0, 0, 0, 0, 0, 0};
+    return cellSysutilQueueGuestCallbackArgs(opd, args);
 }
 
 static void drain_guest_completions(void)
@@ -123,7 +129,8 @@ static void drain_guest_completions(void)
     COMPLETION_UNLOCK();
     while (item) {
         GuestCompletion* next = item->next;
-        g_ps3_guest_caller(item->opd, item->arg0, item->arg1, 0, 0, 0, 0, 0, 0);
+        g_ps3_guest_caller(item->opd, item->args[0], item->args[1], item->args[2],
+            item->args[3], item->args[4], item->args[5], item->args[6], item->args[7]);
         free(item);
         item = next;
     }
