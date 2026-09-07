@@ -872,6 +872,30 @@ static void test_readback(void)
     engine_down();
 }
 
+static unsigned custom_reads;
+static const u8* custom_guest_read(void* user, u32 location, u32 offset, u32 bytes)
+{
+    CHECK(user == &custom_reads, "custom memory resolver receives its user data");
+    ++custom_reads;
+    u32 ea = location == 0 ? GUEST_LOCAL_EA + offset : offset;
+    if ((u64)ea + bytes > GUEST_BYTES) return NULL;
+    return vm_base + ea;
+}
+
+static void test_custom_guest_mapping(void)
+{
+    engine_up();
+    rsx_draw_engine_set_guest_memory(custom_guest_read, &custom_reads);
+    custom_reads = 0;
+    draw_triangle();
+    CHECK(custom_reads > 0, "draw resolves vertices through runner's memory map");
+    unsigned calls = custom_reads;
+    rsx_draw_engine_set_guest_memory(NULL, NULL);
+    draw_triangle();
+    CHECK(custom_reads == calls, "clearing resolver restores default mapping");
+    engine_down();
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -893,6 +917,7 @@ int main(void)
     test_indexed_draws();
     test_scissor();
     test_readback();
+    test_custom_guest_mapping();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",
