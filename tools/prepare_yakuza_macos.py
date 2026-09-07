@@ -73,7 +73,7 @@ def main():
         'legacy tiled-pitch declaration')
 
     imports = replace_once(imports, '#include "rsx_live_draw.h"',
-        '#include "rsx_draw_engine.h"\n#include "rsx_live_draw.h"', 'Metal draw engine include')
+        '#include "rsx_draw_engine.h"\nextern "C" void cellGcmQueueUserCommand(uint32_t);\n#include "rsx_live_draw.h"', 'Metal draw engine include')
     imports = replace_once(imports, '    rsx_live_draw_method(method, arg);',
         '''    rsx_live_draw_method(method, arg);
 #ifdef __APPLE__
@@ -143,6 +143,13 @@ static void yz_rsx_present(uint32_t buffer_id)
       extern void ppu_gcm_pump(void);
       ppu_gcm_pump();
 #endif""", 'HLE interrupt delivery')
+    imports = replace_once(imports,
+        '        vm_write32(RSX_DRIVER_INFO + 0x12CC, arg);       /* driverInfo.userCmdParam */',
+        """        vm_write32(RSX_DRIVER_INFO + 0x12CC, arg);       /* driverInfo.userCmdParam */
+#ifndef YZ_LLE_LIBGCM_SYS
+        cellGcmQueueUserCommand(arg);
+        break;
+#endif""", 'HLE user-command interrupt delivery')
     main_cpp = replace_once(main_cpp, '#include <atomic>',
         '#include <atomic>\n#include <mutex>', 'callback allocator include')
     main_cpp = replace_once(main_cpp,
