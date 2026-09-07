@@ -9,6 +9,8 @@
  */
 
 #include "sceNpTrophy.h"
+#include "../system/cellSysutil.h"
+#include "ps3emu/guest_call.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -290,30 +292,6 @@ s32 sceNpTrophyDestroyHandle(SceNpTrophyHandle handle)
     return CELL_OK;
 }
 
-/* Fire a guest SceNpTrophyStatusCallback via the OPD in `statusCb`.
- * Callback ABI: int cb(context, status, completed, total, arg). */
-extern unsigned long long ppu_guest_call_ct(u32 code, u32 toc,
-                                            u64 a0, u64 a1, u64 a2, u64 a3,
-                                            u64 a4, u64 a5, u64 a6, u64 a7);
-
-static void trophy_fire_status_cb(u32 statusCb, u32 arg,
-                                  SceNpTrophyContext context,
-                                  u32 status, u32 completed, u32 total)
-{
-    if (!statusCb) return;
-    /* Resolve the guest OPD (big-endian: [code][toc]). */
-    const u8* opd = (const u8*)(vm_base + statusCb);
-    u32 code = ((u32)opd[0] << 24) | ((u32)opd[1] << 16) |
-               ((u32)opd[2] <<  8) |  (u32)opd[3];
-    u32 toc  = ((u32)opd[4] << 24) | ((u32)opd[5] << 16) |
-               ((u32)opd[6] <<  8) |  (u32)opd[7];
-    printf("[sceNpTrophy] firing status cb: opd=0x%08X code=0x%08X toc=0x%08X "
-           "status=%u (%u/%u)\n", statusCb, code, toc, status, completed, total);
-    ppu_guest_call_ct(code, toc,
-                      (u64)(u32)context, (u64)status, (u64)completed, (u64)total,
-                      (u64)arg, 0, 0, 0);
-}
-
 s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
                                SceNpTrophyHandle handle,
                                u32 statusCb,
@@ -336,6 +314,9 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
     if (s_contexts[context].registered)
         return SCE_NP_TROPHY_ERROR_CONTEXT_ALREADY_REG;
 
+    if (!statusCb) return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+    if (!g_ps3_guest_caller) return SCE_NP_TROPHY_ERROR_UNKNOWN;
+
     /* Load any previously saved trophy data */
     trophy_load(&s_contexts[context]);
     s_contexts[context].registered = 1;
@@ -343,14 +324,20 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
     printf("[sceNpTrophy] RegisterContext(ctx=%d, handle=%d, statusCb=0x%08X, "
            "arg=0x%08X) -> loaded saved data\n", context, handle, statusCb, arg);
 
-    /* The game blocks (TrophyThread poll on 0x543580) until registration
-     * completes.  Real fw drives that completion by invoking the guest status
-     * callback synchronously on this thread.  Matching the RPCS3 oracle, we
-     * fire it once with INSTALLED (trp_status=3). */
-    {
-        u32 total = s_contexts[context].total_trophies;
-        trophy_fire_status_cb(statusCb, arg, context,
-                              SCE_NP_TROPHY_STATUS_INSTALLED, total, total);
+    /* Use the runner's OPD bridge, not the optional code/TOC scaffold entry
+     * point. Registration status is synchronous; its terminal notification is
+     * delivered through sysutil polling, after the HLE storage load completes.
+     * Intermediate firmware installation progress is not simulated here. */
+    g_ps3_guest_caller(statusCb, (u32)context, SCE_NP_TROPHY_STATUS_INSTALLED,
+                       0, 0, arg, 0, 0, 0);
+    if (!s_trophy_initialized) return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+    if (!s_contexts[context].in_use) return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+    if (!s_handles[handle].in_use) return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
+    const u64 completion[8] = {(u32)context, SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE,
+                               0, 0, arg, 0, 0, 0};
+    if (cellSysutilQueueGuestCallbackArgs(statusCb, completion) != CELL_OK) {
+        s_contexts[context].registered = 0;
+        return SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY;
     }
 
     return CELL_OK;
