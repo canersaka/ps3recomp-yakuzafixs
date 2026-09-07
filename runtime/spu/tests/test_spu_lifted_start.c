@@ -37,7 +37,8 @@
  *         runtime/spu/spurs_job.c runtime/spu/spu_tsp_weak.c \
  *         runtime/spu/spu_vm_pagemap.c runtime/spu/spurs_policy_blob_weak.c \
  *         runtime/spu/spu_interp.c runtime/spu/spu_lifted_thread.c \
- *         runtime/syscalls/spu_fallback.c runtime/platform/win32_compat.c \
+ *         runtime/syscalls/spu_fallback.c runtime/syscalls/sdk_version_weak.c \
+ *         runtime/platform/win32_compat.c \
  *         -lpthread
  *
  * Exit code: 0 if all passed, 1 if any failed. Final line prints a summary.
@@ -341,6 +342,33 @@ static void test_smc_branch_hints(void)
     free(ctx);
 }
 
+/* Yakuza's generated job stub at LS 0x4C10 toggles a word using xori.
+ * Exercise the observed aliasing form and a negative immediate in every lane. */
+static void test_smc_xori(void)
+{
+    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
+    if (!ctx) { check(0, "allocate SMC XOR context"); return; }
+    const uint32_t pc = 0x500, target = 0x2000;
+    ls_put_be32(&ctx->ls[pc], 0x44012850u); /* xori $80,$80,4 */
+    ls_put_be32(&ctx->ls[pc + 4], 0x44FFE851u); /* xori $81,$80,-1 */
+    ls_put_be32(&ctx->ls[pc + 8], 0x35000380u); /* bi $7 */
+    const uint32_t lanes[4] = {0x4400A850u, 0x32000080u, 0, 0xFFFFFFFFu};
+    for (int i = 0; i < 4; ++i) ctx->gpr[80]._u32[i] = lanes[i];
+    ctx->gpr[7]._u32[0] = target;
+    ctx->pc = pc;
+    spu_indirect_branch(ctx);
+    int alias_ok = 1, signed_ok = 1;
+    for (int i = 0; i < 4; ++i) {
+        alias_ok &= ctx->gpr[80]._u32[i] == (lanes[i] ^ 4u);
+        signed_ok &= ctx->gpr[81]._u32[i] == ((lanes[i] ^ 4u) ^ 0xFFFFFFFFu);
+    }
+    check(alias_ok, "SMC xori applies to all lanes with rt == ra");
+    check(signed_ok, "SMC xori sign-extends its 10-bit immediate");
+    check(ctx->pc == target, "SMC xori continues to the following branch");
+    g_spu_trampoline_fn = 0;
+    free(ctx);
+}
+
 /* The registry holds one entry per lifted function across EVERY image, and a
  * whole game's SPU workload is far more than one image: Yakuza registers ~170k.
  * Images register in dependency order, so a too-small cap silently dropped the
@@ -378,6 +406,7 @@ int main(void)
     /* Runtime-generated branch hints, before the registry has anything in it
      * so the micro-interpreter path is the one that runs. */
     test_smc_branch_hints();
+    test_smc_xori();
 
     signal(SIGSEGV, guard_fault);
     signal(SIGBUS,  guard_fault);
