@@ -38,13 +38,17 @@ static void callback(u32 opd, u64 cb, u64 get, u64 set,
             assert(strcmp((char*)vm_base + get + 64, "Save test") == 0);
             assert(vm_read32(get + 64 + 1280) == 0x1234);
             u32 n = vm_read32(get + 1632), list = vm_read32(get + 1636);
-            int found = 0;
+            assert(n == 2 && vm_read32(get + 1628) == 2);
+            int found = 0, icon = 0;
             for (u32 i = 0; i < n; i++) {
+                if (!strcmp((char*)vm_base + list + i * 56 + 40, "ICON0.PNG")) {
+                    assert(vm_read32(list + i * 56) == CELL_SAVEDATA_FILETYPE_CONTENT_ICON0); icon = 1;
+                }
                 if (!strcmp((char*)vm_base + list + i * 56 + 40, "DATA.BIN")) {
                     assert(vm_read64(list + i * 56 + 8) == sizeof(payload)); found = 1;
                 }
             }
-            assert(found);
+            assert(found && icon);
         }
         vm_write32(cb + 16, 0xCAFE);
     } else {
@@ -70,7 +74,7 @@ int main(void)
     strcpy((char*)vm_base + 0x300, "TEST00000");
     strcpy((char*)vm_base + 0x340, "DATA.BIN");
     memcpy(vm_base + 0x400, payload, sizeof(payload));
-    vm_write32(0x108, 0x300); vm_write32(0x200, 4); vm_write32(0x204, 8);
+    vm_write32(0x108, 0x300); vm_write32(0x200, 4); vm_write32(0x204, 2);
     g_ps3_guest_caller = callback;
     assert(cellSaveDataFixedSave2(0, (void*)0x100, (void*)0x200, (void*)0x800,
                                 (void*)0x900, (void*)0xA00, 0, (void*)7) == CELL_OK);
