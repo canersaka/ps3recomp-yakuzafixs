@@ -73,6 +73,70 @@ void cellSysutilQueueEvent(int slot, uint32_t status, uint32_t param)
     s_event_tail = next;
 }
 
+/* Dialog and other one-shot completions carry their own OPD, rather than a
+ * registered sysutil slot. Detach one batch before invoking guest code so a
+ * callback may safely enqueue another completion for the next poll. */
+#ifdef _WIN32
+#include <windows.h>
+static SRWLOCK s_completion_lock = SRWLOCK_INIT;
+#define COMPLETION_LOCK() AcquireSRWLockExclusive(&s_completion_lock)
+#define COMPLETION_UNLOCK() ReleaseSRWLockExclusive(&s_completion_lock)
+#define COMPLETION_TLS __declspec(thread)
+#else
+#include <pthread.h>
+static pthread_mutex_t s_completion_lock = PTHREAD_MUTEX_INITIALIZER;
+#define COMPLETION_LOCK() pthread_mutex_lock(&s_completion_lock)
+#define COMPLETION_UNLOCK() pthread_mutex_unlock(&s_completion_lock)
+#define COMPLETION_TLS _Thread_local
+#endif
+
+typedef struct GuestCompletion {
+    struct GuestCompletion* next;
+    u32 opd;
+    u64 args[8];
+} GuestCompletion;
+static GuestCompletion* s_completion_head;
+static GuestCompletion* s_completion_tail;
+
+s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8])
+{
+    if (!opd) return CELL_OK;
+    GuestCompletion* item = malloc(sizeof(*item));
+    if (!item) return (s32)CELL_ENOMEM;
+    item->next = NULL; item->opd = opd; memcpy(item->args, args, sizeof(item->args));
+    COMPLETION_LOCK();
+    if (s_completion_tail) s_completion_tail->next = item;
+    else s_completion_head = item;
+    s_completion_tail = item;
+    COMPLETION_UNLOCK();
+    return CELL_OK;
+}
+
+s32 cellSysutilQueueGuestCallback(u32 opd, u64 arg0, u64 arg1)
+{
+    const u64 args[8] = {arg0, arg1, 0, 0, 0, 0, 0, 0};
+    return cellSysutilQueueGuestCallbackArgs(opd, args);
+}
+
+static void drain_guest_completions(void)
+{
+    static COMPLETION_TLS int draining;
+    if (draining || !g_ps3_guest_caller) return;
+    draining = 1;
+    COMPLETION_LOCK();
+    GuestCompletion* item = s_completion_head;
+    s_completion_head = s_completion_tail = NULL;
+    COMPLETION_UNLOCK();
+    while (item) {
+        GuestCompletion* next = item->next;
+        g_ps3_guest_caller(item->opd, item->args[0], item->args[1], item->args[2],
+            item->args[3], item->args[4], item->args[5], item->args[6], item->args[7]);
+        free(item);
+        item = next;
+    }
+    draining = 0;
+}
+
 static s32 s_bgm_enabled = 1;
 static s32 s_bgm_status = CELL_SYSUTIL_BGMPLAYBACK_STATUS_STOP;
 static char s_cache_path[CELL_SYSCACHE_PATH_MAX];
@@ -136,6 +200,7 @@ int cellSysutil_pump_seen(void) { return s_pump_seen; }
 
 s32 cellSysutilCheckCallback(void)
 {
+    drain_guest_completions();
     { extern void cellMsgDialog_pump(void);
       if (!s_pump_seen) {
           s_pump_seen = 1;
