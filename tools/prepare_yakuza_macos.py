@@ -340,6 +340,13 @@ extern "C" uint32_t ps3_spu_image_source_ea(uint32_t image)
             bridges, flags=re.DOTALL)
         if count != 1:
             raise SystemExit(f'Unsupported legacy {name} import bridge')
+    bridges, count = re.subn(
+        r'static void yz_imp_stub_cellSysutil_21425307\(ppu_context\* ctx\) \{.*?\n\}',
+        'extern "C" void ps3_savedata_list_auto_load(ppu_context*);\n'
+        'static void yz_imp_stub_cellSysutil_21425307(ppu_context* ctx) {\n'
+        '    ps3_savedata_list_auto_load(ctx);\n}', bridges, flags=re.DOTALL)
+    if count != 1:
+        raise SystemExit('Unsupported legacy list auto-load import bridge')
     write_changed(adapter / 'import_bridges_gen.cpp', bridges)
     write_changed(adapter / 'dispatch.cpp', dispatch)
     write_changed(adapter / 'main.cpp', main_cpp)
@@ -435,7 +442,7 @@ cmake_language(DEFER CALL ps3recomp_adapt_yakuza)
         'ppu_element_adapters': ppu_adapted,
         'adaptations': ['tiled-pitch guest ABI', 'main run loop until guest completion',
                         'HLE interrupt delivery', 'guest and interrupt host stacks',
-                        'translated shader module and dispatch', 'score lifecycle import bridges'],
+                        'translated shader module and dispatch', 'score lifecycle and list auto-load import bridges'],
     }, indent=2) + '\n')
     subprocess.run(['cmake', '-S', str(source), '-B', str(build), '-G', 'Ninja',
         '-DCMAKE_BUILD_TYPE=RelWithDebInfo', f'-DPS3RECOMP_DIR={toolkit}',
