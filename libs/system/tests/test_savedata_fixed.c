@@ -33,6 +33,7 @@ static void guest_callback(u32 opd, u64 cb, u64 get, u64 set,
         assert(strncmp((char*)vm_base + list, "TEST", 4) == 0);
         assert(vm_base[get + 3] == 2); /* big-endian field, not host struct */
         for (u32 i = 12; i < 0x4C; i++) assert(vm_base[get + i] == 0);
+        if (mode == 4) { vm_write32(cb, 2); return; } /* OK_LAST_NOCONFIRM */
         if (mode == 1) { vm_write32(cb, 1); return; } /* OK_LAST */
         if (mode == 2) { vm_write32(cb, (u32)-4); return; }
         if (mode == 3) return; /* No selected directory is invalid. */
@@ -78,6 +79,26 @@ int main(void)
     assert(cellSaveDataFixedLoad2(0, (void*)0x100, (void*)0x200, (void*)0x800,
                                 (void*)0x900, NULL, 0, (void*)0xCAFE) == CELL_SAVEDATA_ERROR_INTERNAL);
     assert(fixed_calls == 4 && stat_calls == 1);
+    g_ps3_guest_caller = guest_callback;
+    ppu_context ctx = {0};
+    ctx.gpr[1] = 0x400;
+    ctx.gpr[3] = 0; ctx.gpr[4] = 0;
+    ctx.gpr[5] = 0x100; ctx.gpr[6] = 0x200;
+    ctx.gpr[7] = 0x800; ctx.gpr[8] = 0x900;
+    vm_write64(0x400 + 112, 0xCAFE);
+    ctx.gpr[8] = 0;
+    mode = 1; /* Enumeration-only: fixed callback can finish without stat/file. */
+    ps3_savedata_list_auto_load(&ctx);
+    assert(ctx.gpr[3] == CELL_OK && fixed_calls == 5 && stat_calls == 1);
+    mode = 4;
+    ps3_savedata_list_auto_load(&ctx);
+    assert(ctx.gpr[3] == CELL_OK && fixed_calls == 6 && stat_calls == 1);
+    ctx.gpr[8] = 0x900;
+    mode = 0;
+    ps3_savedata_list_auto_load(&ctx);
+    assert(ctx.gpr[3] == CELL_OK && fixed_calls == 7 && stat_calls == 2);
+    assert(cellSaveDataListAutoLoad(0, 3, (void*)0x100, (void*)0x200,
+           (void*)0x800, (void*)0x900, NULL, 0, (void*)0xCAFE) == CELL_SAVEDATA_ERROR_PARAM);
     snprintf(path, sizeof(path), "%s/TEST00001", root); assert(rmdir(path) == 0);
     snprintf(path, sizeof(path), "%s/TEST00002", root); assert(rmdir(path) == 0);
     assert(rmdir(root) == 0); free(vm_base);

@@ -57,6 +57,7 @@ s32 cellSaveData_set_scratch_region(u32 base, u32 size);
 #define CELL_SAVEDATA_FILETYPE_CONTENT_SND0   5
 
 /* Callback result values */
+#define CELL_SAVEDATA_CBRESULT_OK_LAST_NOCONFIRM 2
 #define CELL_SAVEDATA_CBRESULT_OK_LAST      1
 #define CELL_SAVEDATA_CBRESULT_OK_NEXT      0
 #define CELL_SAVEDATA_CBRESULT_ERR_NOSPACE  (-1)
@@ -302,6 +303,13 @@ s32 cellSaveDataFixedSave2(u32 version, CellSaveDataSetList* setList,
 
 s32 cellSaveDataFixedLoad2(u32 version, CellSaveDataSetList* setList,
                             CellSaveDataSetBuf* setBuf,
+                            CellSaveDataFixedCallback funcFixed,
+                            CellSaveDataStatCallback funcStat,
+                            CellSaveDataFileCallback funcFile,
+                            u32 container, void* userdata);
+
+s32 cellSaveDataListAutoLoad(u32 version, u32 errDialog,
+                            CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
                             CellSaveDataFixedCallback funcFixed,
                             CellSaveDataStatCallback funcStat,
                             CellSaveDataFileCallback funcFile,

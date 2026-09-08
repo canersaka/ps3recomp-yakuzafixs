@@ -972,7 +972,7 @@ static s32 savedata_fixed(int is_save, CellSaveDataSetList* setList,
                          CellSaveDataStatCallback funcStat, CellSaveDataFileCallback funcFile,
                          void* userdata)
 {
-    if (!setList || !setBuf || !funcFixed || !funcStat)
+    if (!setList || !setBuf || !funcFixed)
         return CELL_SAVEDATA_ERROR_PARAM;
     if (!g_ps3_guest_caller) return CELL_SAVEDATA_ERROR_INTERNAL;
     u32 dir_max = vm_read32((u32)(uintptr_t)setBuf);
@@ -996,8 +996,10 @@ static s32 savedata_fixed(int is_save, CellSaveDataSetList* setList,
     free(dirs);
     g_ps3_guest_caller((u32)(uintptr_t)funcFixed, cb, get, set, 0, 0, 0, 0, 0);
     s32 result = marshal_cbresult_read_result(cb);
-    if (result == CELL_SAVEDATA_CBRESULT_OK_LAST) return CELL_OK;
+    if (result == CELL_SAVEDATA_CBRESULT_OK_LAST ||
+        result == CELL_SAVEDATA_CBRESULT_OK_LAST_NOCONFIRM) return CELL_OK;
     if (result != CELL_SAVEDATA_CBRESULT_OK_NEXT) return CELL_SAVEDATA_ERROR_CBRESULT;
+    if (!funcStat) return CELL_SAVEDATA_ERROR_PARAM;
     u32 selected = vm_read32(set);
     if (!selected || vm_read32(set + 8) > 1) return CELL_SAVEDATA_ERROR_PARAM;
     const char* name = (const char*)vm_base + selected;
@@ -1033,6 +1035,19 @@ s32 cellSaveDataFixedLoad2(u32 version, CellSaveDataSetList* setList,
 {
     (void)container;
     printf("[cellSaveData] FixedLoad2(version=%u)\n", version);
+    return savedata_fixed(0, setList, setBuf, funcFixed, funcStat, funcFile, userdata);
+}
+
+s32 cellSaveDataListAutoLoad(u32 version, u32 errDialog,
+                            CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
+                            CellSaveDataFixedCallback funcFixed,
+                            CellSaveDataStatCallback funcStat,
+                            CellSaveDataFileCallback funcFile,
+                            u32 container, void* userdata)
+{
+    (void)container;
+    if (errDialog > 2) return CELL_SAVEDATA_ERROR_PARAM;
+    printf("[cellSaveData] ListAutoLoad(version=%u)\n", version);
     return savedata_fixed(0, setList, setBuf, funcFixed, funcStat, funcFile, userdata);
 }
 
@@ -1350,6 +1365,19 @@ static void hle_cellSaveDataUserAutoLoad(ppu_context* ctx)
                               (CellSaveDataStatCallback)funcStat,
                               (CellSaveDataFileCallback)funcFile,
                               container, (void*)(uintptr_t)userdata);
+}
+
+/* ListAutoLoad's ninth argument is in the guest parameter save area. */
+void ps3_savedata_list_auto_load(ppu_context* ctx)
+{
+    ctx->gpr[3] = (uint64_t)(int64_t)cellSaveDataListAutoLoad(
+        (u32)ctx->gpr[3], (u32)ctx->gpr[4],
+        (CellSaveDataSetList*)(uintptr_t)(u32)ctx->gpr[5],
+        (CellSaveDataSetBuf*)(uintptr_t)(u32)ctx->gpr[6],
+        (CellSaveDataFixedCallback)(uintptr_t)(u32)ctx->gpr[7],
+        (CellSaveDataStatCallback)(uintptr_t)(u32)ctx->gpr[8],
+        (CellSaveDataFileCallback)(uintptr_t)(u32)ctx->gpr[9],
+        (u32)ctx->gpr[10], (void*)(uintptr_t)savedata_arg9(ctx));
 }
 
 void cellSaveData_register_ctx_handlers(void)
