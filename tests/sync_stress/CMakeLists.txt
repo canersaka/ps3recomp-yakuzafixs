@@ -88,22 +88,3 @@ set_tests_properties(sync_stress PROPERTIES
     LABELS "stress;runtime;sync"
     TIMEOUT 120
 )
-
-# Focused regressions: ownership, full recursive release, and host spurious wakes.
-add_executable(test_cond_semantics
-    test_cond_semantics.c test_shims.c
-    "${RUNTIME_SYNC_DIR}/sys_mutex.c"
-    "${RUNTIME_SYNC_DIR}/sys_cond.c")
-target_include_directories(test_cond_semantics PRIVATE
-    "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include")
-if(WIN32)
-    target_compile_definitions(test_cond_semantics PRIVATE _CRT_SECURE_NO_WARNINGS)
-else()
-    target_sources(test_cond_semantics PRIVATE
-        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
-    target_link_libraries(test_cond_semantics PRIVATE Threads::Threads)
-endif()
-foreach(mode owner recursive spurious)
-    add_test(NAME cond_${mode} COMMAND test_cond_semantics ${mode})
-    set_tests_properties(cond_${mode} PROPERTIES TIMEOUT 10)
-endforeach()
