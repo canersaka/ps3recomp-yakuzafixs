@@ -95,7 +95,7 @@ jobs:
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
             -std=gnu17 -I include -I runtime/spu \
-            -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c
+            -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c -lm
           /tmp/test_spu_helpers
 
       # runtime/ppu/ is the one part of the runtime no CMake target builds --
@@ -142,7 +142,7 @@ jobs:
       # missing -- the SPU just never wakes -- so it gets its own check.
       - name: Run the PPU/SPU lock-line coherence tests
         run: |
-          clang -std=gnu17 -I include -I runtime/spu \
+          ${{ matrix.cc }} -std=gnu17 -I include -I runtime/spu \
                 -o /tmp/test_spu_coherency runtime/spu/tests/test_spu_coherency.c
           /tmp/test_spu_coherency
 
@@ -151,7 +151,7 @@ jobs:
       # win the same compare-and-swap, and the queue is quietly wrong afterwards.
       - name: Run the SPU-to-SPU lock-line coherence tests
         run: |
-          clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+          ${{ matrix.cc }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
             -o /tmp/test_spu_lockline_peer \
             runtime/spu/tests/test_spu_lockline_peer.c \
             runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
@@ -173,7 +173,7 @@ jobs:
       # point and image the registry says, and each thread's own arguments.
       - name: Run the lifted SPU thread-group start test
         run: |
-          clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+          ${{ matrix.cc }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
             -o /tmp/test_spu_lifted_start \
             runtime/spu/tests/test_spu_lifted_start.c \
             runtime/spu/spu_channels.c runtime/spu/spu_drain.c \
@@ -196,7 +196,7 @@ jobs:
       # each one clean and holding only its own owner's state.
       - name: Run the SPU MFC engine slot test
         run: |
-          clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+          ${{ matrix.cc }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
             -o /tmp/test_spu_mfc_slots \
             runtime/spu/tests/test_spu_mfc_slots.c \
             runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \

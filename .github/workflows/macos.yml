@@ -61,7 +61,7 @@ jobs:
       - name: Run self-contained SPU helper tests
         run: |
           clang -std=gnu17 -I include -I runtime/spu \
-                -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c
+                -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c -lm
           /tmp/test_spu_helpers
 
       # Drives a real NV4097 command buffer through cellGcm -> RSX -> the Metal
