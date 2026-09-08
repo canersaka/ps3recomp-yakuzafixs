@@ -280,6 +280,40 @@ extern "C" uint32_t ppu_prof_resolve_host(void* address)
 }
 """
     adapter.mkdir(parents=True, exist_ok=True)
+    # Current toolkit diagnostics and image fallback lookup normally live in
+    # ppu_loader/ppu_sysprx; this external runner owns those layers itself.
+    imports = replace_once(imports,
+        '    vm_write32(img_ea + 0x0, 0);                  /* SYS_SPU_IMAGE_TYPE_USER */',
+        '    ps3_spu_image_record(img_ea, src);\n'
+        '    vm_write32(img_ea + 0x0, 0);                  /* SYS_SPU_IMAGE_TYPE_USER */',
+        'SPU image source registration')
+    imports = 'extern "C" void ps3_spu_image_record(unsigned int, unsigned int);\n' + imports
+    write_changed(adapter / 'toolkit_bridge.cpp', '''#include "ppu_context.h"
+#include <cstdint>
+#include <mutex>
+#include <unordered_map>
+extern "C" {
+/* The legacy host has its own per-thread diagnostic context and stack dump.
+ * These optional toolkit-only diagnostics have no active scaffold context. */
+PPU_THREAD_LOCAL ppu_context* g_active_ctx = nullptr;
+uint32_t g_spu_image_src_ea = 0, g_spu_image_ls_start = 0, g_spu_image_span = 0;
+void ppu_guest_callstack(const char*);
+void ppu_dump_bctrl_ring(uint32_t, const char* tag) { ppu_guest_callstack(tag); }
+}
+static std::mutex image_sources_lock;
+static std::unordered_map<uint32_t, uint32_t> image_sources;
+extern "C" void ps3_spu_image_record(uint32_t image, uint32_t source)
+{
+    std::lock_guard<std::mutex> lock(image_sources_lock);
+    image_sources[image] = source;
+}
+extern "C" uint32_t ps3_spu_image_source_ea(uint32_t image)
+{
+    std::lock_guard<std::mutex> lock(image_sources_lock);
+    auto it = image_sources.find(image);
+    return it == image_sources.end() ? 0 : it->second;
+}
+''')
     write_changed(adapter / 'dispatch.cpp', dispatch)
     write_changed(adapter / 'main.cpp', main_cpp)
     write_changed(adapter / 'import_overrides.cpp', imports)
@@ -316,7 +350,8 @@ extern "C" uint32_t ppu_prof_resolve_host(void* address)
   target_sources(yakuza_recomp PRIVATE
     "${CMAKE_BINARY_DIR}/runner-adapter/main.cpp"
     "${CMAKE_BINARY_DIR}/runner-adapter/import_overrides.cpp"
-    "${CMAKE_BINARY_DIR}/runner-adapter/dispatch.cpp")
+    "${CMAKE_BINARY_DIR}/runner-adapter/dispatch.cpp"
+    "${CMAKE_BINARY_DIR}/runner-adapter/toolkit_bridge.cpp")
   file(GLOB shader_sources "${CMAKE_BINARY_DIR}/shader-module/pxd_shader_recomp_*.cpp")
   target_sources(ppu_recomp_objs PRIVATE ${shader_sources})
   target_include_directories(yakuza_recomp PRIVATE "${CMAKE_SOURCE_DIR}")
