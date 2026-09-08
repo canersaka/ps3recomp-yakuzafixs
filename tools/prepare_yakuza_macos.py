@@ -2,7 +2,7 @@
 """Configure the external Yakuza macOS runner against this toolkit.
 
 Only generated files in --build-dir are changed. The runner must already have
-the PS3RECOMP_DIR split and macOS host support; no game assets are copied.
+the PS3RECOMP_DIR split and macOS host support; its source and assets stay unchanged.
 """
 import argparse
 import hashlib
@@ -118,6 +118,65 @@ def main():
             rsx_draw_engine_set_display_buffer(id, 0, g_rsx_dispbuf[id].offset,
                 g_rsx_dispbuf[id].pitch, g_rsx_dispbuf[id].width, g_rsx_dispbuf[id].height);
 #endif''', 'Metal display buffer registration')
+
+    # The old bridge arms a timer before the consumer reaches this frame.
+    # Emit an internal flip packet at the caller's command position instead.
+    flip_helper = r"""static void yz_enqueue_flip(ppu_context* ctx, bool wait_label)
+{
+    const uint32_t context = (uint32_t)ctx->gpr[3];
+    const uint32_t buffer = (uint32_t)ctx->gpr[4];
+    const uint32_t bytes = wait_label ? 20u : 8u;
+    uint32_t current = context ? vm_read32(context + 8) : 0;
+    const uint32_t end = context ? vm_read32(context + 4) : 0;
+    if (!current || (current & 3u) || buffer > 7 || current > end || end - current < bytes) {
+        fprintf(stderr, "[gcm] invalid flip command space ctx=%08X current=%08X end=%08X\n",
+                context, current, end);
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80210001u;
+        return;
+    }
+    if (wait_label) {
+        /* Wait for the label in FIFO order; never write its value on the CPU. */
+        vm_write32(current, 0x00080064u);
+        vm_write32(current + 4, ((uint32_t)ctx->gpr[5] & 255u) * 16u);
+        vm_write32(current + 8, (uint32_t)ctx->gpr[6]);
+        current += 12;
+    }
+    /* Internal HLE flip command, as used by the reference GCM implementation. */
+    vm_write32(current, 0x0004FEACu);
+    vm_write32(current + 4, buffer);
+    std::atomic_thread_fence(std::memory_order_release);
+    vm_write32(context + 8, current + 8);
+    ctx->gpr[3] = 0;
+}
+
+"""
+    for name, wait_label in (('_cellGcmSetFlipCommand', 'false'),
+                             ('_cellGcmSetFlipCommandWithWaitLabel', 'true')):
+        pattern = (r'extern "C" void yz_ovr_' + name +
+                   r'\(ppu_context\* ctx\)\n\{.*?\n\}')
+        replacement = (f'extern "C" void yz_ovr_{name}(ppu_context* ctx)\n'
+                       '{\n    yz_enqueue_flip(ctx, ' + wait_label + ');\n}')
+        imports, count = re.subn(pattern, lambda _: replacement, imports, flags=re.DOTALL)
+        if count != 1:
+            raise SystemExit(f'Unsupported legacy {name} flip bridge')
+    imports = replace_once(imports,
+        'extern "C" void yz_ovr__cellGcmSetFlipCommand(ppu_context* ctx)',
+        flip_helper + 'extern "C" void yz_ovr__cellGcmSetFlipCommand(ppu_context* ctx)',
+        'ordered flip emission')
+    imports = replace_once(imports,
+        'static int yz_rsx_method(uint32_t method, uint32_t arg)\n{',
+        '''static int yz_rsx_method(uint32_t method, uint32_t arg)
+{
+    if (method == 0xFEACu) {
+        const uint32_t head = g_rsx_queued_head & 1u;
+        vm_write32(yz_rsx_head_addr(head) + 0x14, arg & 7u);
+        InterlockedExchange(&g_rsx_flip_pending[head], 1);
+        return 0;
+    }''', 'ordered flip consumption')
+    imports = replace_once(imports,
+        'on = getenv("YZ_FLIP_ON_CONSUMER") ? 1 : 0;',
+        'on = 1; /* Retire only after the queued flip reaches the consumer. */',
+        'ordered flip completion')
 
     imports = replace_once(imports, 'static void yz_rsx_present(uint32_t buffer_id)\n{',
         '''extern "C" void yz_rsx_fifo_acquire(void);
