@@ -24,6 +24,30 @@ def write_changed(path, text):
         path.write_text(text)
 
 
+def adapt_vector_elements(content):
+    """Upgrade legacy element accesses without relifting or editing game sources."""
+    load = re.compile(
+        r'\{ uint64_t ea = ([^;]+); memset\(&ctx->vr\[(\d+)\], 0, 16\); '
+        r'memcpy\(&ctx->vr\[\2\], vm_base \+ \(uint32_t\)ea, ([124])\); \}')
+    store = re.compile(
+        r'\{ uint64_t ea = ([^;]+); '
+        r'memcpy\(vm_base \+ \(uint32_t\)ea, &ctx->vr\[(\d+)\], ([124])\); \}')
+
+    def rewrite(match, is_load):
+        ea, reg, width = match.groups()
+        prefix = f'{{ uint64_t ea = {ea}; ea &= ~{int(width) - 1}ULL; '
+        if is_load:
+            return (prefix + f'memset(&ctx->vr[{reg}], 0, 16); '
+                    f'memcpy((uint8_t*)&ctx->vr[{reg}] + (ea & 15), '
+                    f'vm_base + (uint32_t)ea, {width}); }}')
+        return (prefix + f'memcpy(vm_base + (uint32_t)ea, '
+                f'(const uint8_t*)&ctx->vr[{reg}] + (ea & 15), {width}); }}')
+
+    content, loads = load.subn(lambda m: rewrite(m, True), content)
+    content, stores = store.subn(lambda m: rewrite(m, False), content)
+    return content, loads + stores
+
+
 def prepare_shader(toolkit, game, build):
     """Lift the already relocated module; never copy game assets into source."""
     module = game / 'recomp_prx' / 'ogrez_shader_ps3.ppu'
@@ -332,6 +356,25 @@ extern "C" uint32_t ps3_spu_image_source_ea(uint32_t image)
             write_changed(spu_adapter / original.name, adapted)
             spu_adapted[str(original.resolve())] = {
                 'sha256': hashlib.sha256(content.encode()).hexdigest(), 'calls': count}
+    ppu_adapter = adapter / 'ppu'
+    ppu_adapter.mkdir(exist_ok=True)
+    ppu_adapted = {}
+    for folder in ('recomp', 'recomp_prx'):
+        for original in sorted((game / folder).glob('*.cpp')):
+            content = original.read_text()
+            adapted, count = adapt_vector_elements(content)
+            output = ppu_adapter / original.name
+            if count:
+                if output.name in ppu_adapted:
+                    raise SystemExit(f'Duplicate PPU source name: {original.name}')
+                write_changed(output, adapted)
+                ppu_adapted[output.name] = {
+                    'source': str(original.resolve()),
+                    'sha256': hashlib.sha256(content.encode()).hexdigest(),
+                    'element_accesses': count}
+            elif output.exists():
+                output.unlink()  # The external lift no longer needs adaptation.
+
     # Defer until the external project's add_executable has defined its target.
     injection = '''function(ps3recomp_adapt_yakuza)
   get_target_property(runner_sources yakuza_recomp SOURCES)
@@ -347,6 +390,19 @@ extern "C" uint32_t ps3_spu_image_source_ea(uint32_t image)
   endforeach()
   set(runner_sources "${adapted_sources}")
   set_property(TARGET yakuza_recomp PROPERTY SOURCES "${runner_sources}")
+  foreach(target IN ITEMS ppu_recomp_objs yakuza_recomp)
+    get_target_property(ppu_sources ${target} SOURCES)
+    set(adapted_ppu_sources)
+    foreach(source IN LISTS ppu_sources)
+      get_filename_component(source_name "${source}" NAME)
+      if(EXISTS "${CMAKE_BINARY_DIR}/runner-adapter/ppu/${source_name}")
+        list(APPEND adapted_ppu_sources "${CMAKE_BINARY_DIR}/runner-adapter/ppu/${source_name}")
+      else()
+        list(APPEND adapted_ppu_sources "${source}")
+      endif()
+    endforeach()
+    set_property(TARGET ${target} PROPERTY SOURCES "${adapted_ppu_sources}")
+  endforeach()
   target_sources(yakuza_recomp PRIVATE
     "${CMAKE_BINARY_DIR}/runner-adapter/main.cpp"
     "${CMAKE_BINARY_DIR}/runner-adapter/import_overrides.cpp"
@@ -371,6 +427,7 @@ cmake_language(DEFER CALL ps3recomp_adapt_yakuza)
         'dispatch_sha256': hashlib.sha256(original_dispatch.encode()).hexdigest(),
         'shader_inputs_sha256': shader_hash,
         'spu_call_adapters': spu_adapted,
+        'ppu_element_adapters': ppu_adapted,
         'adaptations': ['tiled-pitch guest ABI', 'main run loop until guest completion',
                         'HLE interrupt delivery', 'guest and interrupt host stacks',
                         'translated shader module and dispatch'],
