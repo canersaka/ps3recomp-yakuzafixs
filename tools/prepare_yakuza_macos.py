@@ -187,17 +187,6 @@ static void yz_rsx_present(uint32_t buffer_id)
         return 1;
     }''', 'save-data scratch allocation')
 
-    # The legacy Yakuza host omits the firmware NP trophy initialization chain.
-    # Supply it in this runner, preserving the toolkit API's NOT_INITIALIZED
-    # contract for all other games.
-    main_cpp = replace_once(main_cpp, 'int main(int argc, char** argv)',
-        'extern "C" int32_t sceNpTrophyInit(void*, uint32_t, uint32_t, uint64_t);\n'
-        'int main(int argc, char** argv)', 'trophy initialization declaration')
-    main_cpp = replace_once(main_cpp,
-        '    CreateThread(NULL, 0, yz_vblank_thread, NULL, 0, NULL);',
-        '    sceNpTrophyInit(nullptr, 0, 0, 0);\n'
-        '    CreateThread(NULL, 0, yz_vblank_thread, NULL, 0, NULL);',
-        'legacy host trophy initialization')
     main_cpp = replace_once(main_cpp, '#include <atomic>',
         '#include <atomic>\n#include <mutex>', 'callback allocator include')
     main_cpp = replace_once(main_cpp,
@@ -338,6 +327,20 @@ extern "C" uint32_t ps3_spu_image_source_ea(uint32_t image)
     return it == image_sources.end() ? 0 : it->second;
 }
 ''')
+    original_bridges = (source / 'import_bridges_gen.cpp').read_text()
+    bridges = original_bridges
+    # Older import tables left these local lifecycle calls unresolved. Let the
+    # guest initialize trophies itself once score setup no longer aborts it.
+    for nid, name in (('32CF311F', 'sceNpScoreInit'), ('9851F805', 'sceNpScoreTerm')):
+        bridges, count = re.subn(
+            rf'static void yz_imp_stub_sceNp_{nid}\(ppu_context\* ctx\) \{{.*?\n\}}',
+            f'extern "C" int32_t {name}(void);\n'
+            f'static void yz_imp_stub_sceNp_{nid}(ppu_context* ctx) {{\n'
+            f'    ctx->gpr[3] = (uint64_t)(int64_t){name}();\n}}',
+            bridges, flags=re.DOTALL)
+        if count != 1:
+            raise SystemExit(f'Unsupported legacy {name} import bridge')
+    write_changed(adapter / 'import_bridges_gen.cpp', bridges)
     write_changed(adapter / 'dispatch.cpp', dispatch)
     write_changed(adapter / 'main.cpp', main_cpp)
     write_changed(adapter / 'import_overrides.cpp', imports)
@@ -378,7 +381,7 @@ extern "C" uint32_t ps3_spu_image_source_ea(uint32_t image)
     # Defer until the external project's add_executable has defined its target.
     injection = '''function(ps3recomp_adapt_yakuza)
   get_target_property(runner_sources yakuza_recomp SOURCES)
-  list(REMOVE_ITEM runner_sources main.cpp import_overrides.cpp dispatch.cpp)
+  list(REMOVE_ITEM runner_sources main.cpp import_overrides.cpp dispatch.cpp import_bridges_gen.cpp)
   set(adapted_sources)
   foreach(source IN LISTS runner_sources)
     get_filename_component(source_name "${source}" NAME)
@@ -407,6 +410,7 @@ extern "C" uint32_t ps3_spu_image_source_ea(uint32_t image)
     "${CMAKE_BINARY_DIR}/runner-adapter/main.cpp"
     "${CMAKE_BINARY_DIR}/runner-adapter/import_overrides.cpp"
     "${CMAKE_BINARY_DIR}/runner-adapter/dispatch.cpp"
+    "${CMAKE_BINARY_DIR}/runner-adapter/import_bridges_gen.cpp"
     "${CMAKE_BINARY_DIR}/runner-adapter/toolkit_bridge.cpp")
   file(GLOB shader_sources "${CMAKE_BINARY_DIR}/shader-module/pxd_shader_recomp_*.cpp")
   target_sources(ppu_recomp_objs PRIVATE ${shader_sources})
@@ -425,12 +429,13 @@ cmake_language(DEFER CALL ps3recomp_adapt_yakuza)
         'main_sha256': hashlib.sha256(original_main.encode()).hexdigest(),
         'imports_sha256': hashlib.sha256(original_imports.encode()).hexdigest(),
         'dispatch_sha256': hashlib.sha256(original_dispatch.encode()).hexdigest(),
+        'bridges_sha256': hashlib.sha256(original_bridges.encode()).hexdigest(),
         'shader_inputs_sha256': shader_hash,
         'spu_call_adapters': spu_adapted,
         'ppu_element_adapters': ppu_adapted,
         'adaptations': ['tiled-pitch guest ABI', 'main run loop until guest completion',
                         'HLE interrupt delivery', 'guest and interrupt host stacks',
-                        'translated shader module and dispatch'],
+                        'translated shader module and dispatch', 'score lifecycle import bridges'],
     }, indent=2) + '\n')
     subprocess.run(['cmake', '-S', str(source), '-B', str(build), '-G', 'Ninja',
         '-DCMAKE_BUILD_TYPE=RelWithDebInfo', f'-DPS3RECOMP_DIR={toolkit}',
