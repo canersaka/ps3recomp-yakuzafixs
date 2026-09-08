@@ -2207,12 +2207,15 @@ class PPULifter:
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
-            # These load a single element into the vector register.
-            # For simplicity, zero the register and load at the element position.
+            # EA selects the element in the raw big-endian vector and is
+            # rounded down to that element's natural alignment. Other
+            # destination elements are undefined; keep our zero-fill policy.
             size = {"lvebx": 1, "lvehx": 2, "lvewx": 4}[mn]
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
+                    f"ea &= ~{size - 1}ULL; "
                     f"memset(&ctx->vr[{vd}], 0, 16); "
-                    f"memcpy(&ctx->vr[{vd}], vm_base + (uint32_t)ea, {size}); }}")
+                    f"memcpy((uint8_t*)&ctx->vr[{vd}] + (ea & 15), "
+                    f"vm_base + (uint32_t)ea, {size}); }}")
 
         if mn == "stvebx" or mn == "stvehx" or mn == "stvewx":
             vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
@@ -2220,7 +2223,9 @@ class PPULifter:
             rb = _reg_idx(ops[2])
             size = {"stvebx": 1, "stvehx": 2, "stvewx": 4}[mn]
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
-                    f"memcpy(vm_base + (uint32_t)ea, &ctx->vr[{vs}], {size}); }}")
+                    f"ea &= ~{size - 1}ULL; "
+                    f"memcpy(vm_base + (uint32_t)ea, "
+                    f"(const uint8_t*)&ctx->vr[{vs}] + (ea & 15), {size}); }}")
 
         if mn == "lvsl" or mn == "lvsr":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])

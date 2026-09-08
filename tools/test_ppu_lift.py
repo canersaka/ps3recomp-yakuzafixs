@@ -856,6 +856,7 @@ static void check_fpr(const char* name, int reg, uint64_t got, uint64_t want) {
  * later memory-op tranches need them. */
 #include <stdlib.h>   /* MSVC _byteswap_* */
 static uint8_t g_vm_stub[65536];
+extern "C" { uint8_t* vm_base = g_vm_stub; }
 #define VMOFF(a) ((uint32_t)(a) & 0xFFFFu)
 /* Trap guard. A "may_trap" case exists to prove lifted code does NOT fault --
  * e.g. divw by zero must be lowered to a defined result, not a hardware trap.
@@ -1000,6 +1001,48 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = CONF_BSWAP64(v); memcpy
                     f'check_vr("{nm}", (const uint8_t*)&ctx->vr[{c["vd_reg"]}], _want); }}')
         out.append("    }")
 
+    # AltiVec element loads/stores: every byte offset exercises lane selection
+    # and natural alignment, including RA=0 with a deliberately nonzero r0.
+    # Loads leave the other lanes undefined, so compare only the selected bytes.
+    n_vector_memory = 0
+    for stem, load_xo, store_xo, width in (("b", 7, 135, 1),
+                                         ("h", 39, 167, 2),
+                                         ("w", 71, 199, 4)):
+        for ra in (0, 3):
+            for offset in range(16):
+                ea = 0x220 + offset
+                lane = offset - (offset % width)
+                for load in (True, False):
+                    mn = ("lve" if load else "stve") + stem + "x"
+                    insn = ppu_disasm.decode(xo_form(load_xo if load else store_xo,
+                                                    2, ra, 4), 0x30000)
+                    assert insn.mnemonic == mn, (mn, insn)
+                    code = lifter._translate(insn, dummy)
+                    assert not code.startswith("/*"), code
+                    nm = f"{mn} RA={ra} offset={offset}"
+                    out.append("    { memset(ctx, 0, sizeof(*ctx));")
+                    out.append("      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));")
+                    out.append("      for (int k=0; k<16; ++k) { "
+                               "((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); "
+                               "g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }")
+                    out.append(f"      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; "
+                               f"ctx->gpr[4]={ea if ra == 0 else ea-0x200};")
+                    out.append(f"      {code}")
+                    if load:
+                        want = ",".join(str(0xA0+lane+k) for k in range(width))
+                        out.append(f"      const uint8_t want[] = {{{want}}};")
+                        check = f"memcmp((uint8_t*)&ctx->vr[2]+{lane}, want, {width}) == 0"
+                    else:
+                        want = [0xA0+k for k in range(16)]
+                        want[lane:lane+width] = [0x10+lane+k for k in range(width)]
+                        out.append("      const uint8_t want[] = {" +
+                                   ",".join(str(x) for x in want) + "};")
+                        check = ("memcmp(g_vm_stub+0x220, want, 16) == 0 && "
+                                 "g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC")
+                    out.append(f'      if ({check}) ++g_pass; else {{ '
+                               f'printf("FAIL {nm}: wrong element or address\\n"); ++g_fail; }} }}')
+                    n_vector_memory += 1
+
     out.append("""
     printf("\\n[ppu-conformance] %d checks passed, %d FAILED, %d skipped\\n",
            g_pass, g_fail, g_skip);
@@ -1009,7 +1052,7 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = CONF_BSWAP64(v); memcpy
     text = "\n".join(out)
     with open(path, "w") as f:
         f.write(text)
-    n_total = len(CASES) + len(VCASES)
+    n_total = len(CASES) + len(VCASES) + n_vector_memory
     print(f"wrote {path}: {n_total - n_encoding_skipped} cases "
           f"({n_encoding_skipped} skipped at generation)")
 
