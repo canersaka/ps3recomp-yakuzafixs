@@ -22,9 +22,7 @@
 #include <stdlib.h>
 #include <setjmp.h>
 #include <time.h>
-#ifdef _WIN32
-#include <windows.h>
-#endif
+#include "../platform/win32_compat.h"
 
 #ifdef __cplusplus
 extern "C" {

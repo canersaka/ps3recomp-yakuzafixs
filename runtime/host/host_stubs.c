@@ -105,3 +105,6 @@ void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context
 {
     (void)nid; (void)name; (void)fn;
 }
+
+/* This host has no lifted PPU caller. */
+unsigned int ppu_active_lr(void) { return 0; }

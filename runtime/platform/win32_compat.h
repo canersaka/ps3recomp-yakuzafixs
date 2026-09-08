@@ -104,6 +104,11 @@ static inline void ReleaseSRWLockExclusive(SRWLOCK* l)    { pthread_mutex_unlock
 static inline BOOL TryAcquireSRWLockExclusive(SRWLOCK* l) { return pthread_mutex_trylock(ps3_srw(l)) == 0; }
 
 static inline void WakeConditionVariable(CONDITION_VARIABLE* c)    { pthread_cond_signal(ps3_cv(c)); }
+/* The POSIX shim represents SRW locks with a mutex. Shared readers are
+ * serialized too; this preserves the lock contract without changing storage. */
+static inline void AcquireSRWLockShared(SRWLOCK* l) { AcquireSRWLockExclusive(l); }
+static inline void ReleaseSRWLockShared(SRWLOCK* l) { ReleaseSRWLockExclusive(l); }
+
 static inline void WakeAllConditionVariable(CONDITION_VARIABLE* c) { pthread_cond_broadcast(ps3_cv(c)); }
 
 static inline BOOL SleepConditionVariableSRW(CONDITION_VARIABLE* c, SRWLOCK* l,
